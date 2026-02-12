@@ -2,6 +2,10 @@
 
 Personal website and technical blog of Mehdi Akiki, built with Next.js, TypeScript, Tailwind CSS, and MDX.
 
+## Website
+
+The website is available at [mehdi.cz](https://www.mehdi.cz).
+
 ## Tech Stack
 
 - Next.js 14 (App Router)
