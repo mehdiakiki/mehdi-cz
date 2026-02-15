@@ -8,7 +8,7 @@ const MainCard = ({ title, description, imgSrc, href }) => (
         <Image
           alt={title}
           src={imgSrc}
-          className="h-100 m-0 rounded-md object-cover object-center" // Apply rounded-md here
+          className="h-100 m-0 rounded-md object-cover object-center"
           width={2000}
           height={1000}
         />

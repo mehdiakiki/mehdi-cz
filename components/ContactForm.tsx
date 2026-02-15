@@ -4,7 +4,6 @@ import { useForm, ValidationError } from "@formspree/react";
 import { useState } from "react";
 
 const ContactForm = () => {
-  // This hook is only called when the form key exists
   const [state, handleSubmit] = useForm(process.env.NEXT_PUBLIC_FORMSPREE_KEY || "");
   const [validationErrors, setValidationErrors] = useState<Record<string, string>>({});
 
@@ -12,7 +11,6 @@ const ContactForm = () => {
     const formData = new FormData(e.currentTarget);
     const errors: Record<string, string> = {};
 
-    // Email validation
     const email = formData.get("email") as string;
     if (!email || email.trim() === "") {
       errors.email = "Email is required";
@@ -20,7 +18,6 @@ const ContactForm = () => {
       errors.email = "Please enter a valid email address";
     }
 
-    // Help type validation
     const helpType = formData.get("help-type") as string;
     if (!helpType || helpType === "") {
       errors.helpType = "Please select what you need help with";
@@ -57,7 +54,6 @@ const ContactForm = () => {
         </div>
       )}
 
-      {/* Name */}
       <div>
         <label htmlFor="name" className="text-md block text-left font-medium text-white">
           Name
@@ -74,7 +70,6 @@ const ContactForm = () => {
         <ValidationError prefix="Name" field="name" errors={state.errors} />
       </div>
 
-      {/* Email */}
       <div>
         <label htmlFor="email" className="text-md block text-left font-medium text-white">
           Email <span className="text-red-500">*</span>
@@ -97,7 +92,6 @@ const ContactForm = () => {
         <ValidationError prefix="Email" field="email" errors={state.errors} />
       </div>
 
-      {/* What do you need help with? */}
       <div>
         <label htmlFor="help-type" className="text-md block text-left font-medium text-white">
           What do you need help with? <span className="text-red-500">*</span>
@@ -126,7 +120,6 @@ const ContactForm = () => {
         <ValidationError prefix="Help type" field="help-type" errors={state.errors} />
       </div>
 
-      {/* Budget range */}
       <div>
         <label htmlFor="budget" className="text-md block text-left font-medium text-white">
           Budget range
@@ -146,7 +139,6 @@ const ContactForm = () => {
         <ValidationError prefix="Budget" field="budget" errors={state.errors} />
       </div>
 
-      {/* Details */}
       <div>
         <label htmlFor="details" className="text-md block text-left font-medium text-white">
           Details
@@ -162,7 +154,6 @@ const ContactForm = () => {
         <ValidationError prefix="Details" field="details" errors={state.errors} />
       </div>
 
-      {/* Links */}
       <div>
         <label htmlFor="links" className="text-md block text-left font-medium text-white">
           Links
@@ -178,7 +169,6 @@ const ContactForm = () => {
         <ValidationError prefix="Links" field="links" errors={state.errors} />
       </div>
 
-      {/* Submit button */}
       <div className="text-center">
         <button
           type="submit"

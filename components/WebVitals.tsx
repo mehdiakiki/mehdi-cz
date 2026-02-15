@@ -9,10 +9,6 @@ export default function WebVitals() {
         const { onCLS, onFCP, onLCP, onTTFB, onINP } = await import("web-vitals");
 
         const handleMetric = (metric: any) => {
-          if (process.env.NODE_ENV === "development") {
-            console.log(`[${metric.name}]`, metric.value);
-          }
-
           if (process.env.NODE_ENV === "production" && typeof window !== "undefined") {
             if (window.gtag) {
               window.gtag("event", metric.name, {

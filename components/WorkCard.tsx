@@ -28,7 +28,6 @@ const WorkCard = ({ title, description, imgSrc, href, type }) => (
             title
           )}
         </h2>
-        {/* Use the  Tag component to display the type*/}
         <Tag text={type === "personal" ? "Project" : "OpenSource Contributor"} />
         <p className="prose mb-3 max-w-none text-gray-500 dark:text-gray-400">{description}</p>
         {href && (

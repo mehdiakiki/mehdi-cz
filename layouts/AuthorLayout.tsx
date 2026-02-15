@@ -3,7 +3,6 @@ import type { Authors } from "contentlayer/generated";
 import SocialIcon from "@/components/social-icons";
 import Image from "@/components/Image";
 
-// Experimental
 import MainProject from "@/components/MainProject";
 import { mainProjectData as d } from "@/data/projectsData";
 
@@ -13,7 +12,6 @@ interface Props {
 }
 
 export default function AuthorLayout({ children, content }: Props) {
-  // I printed file but it is "undefined" although you can see that it is part of the metadata in my author file.
   const { name, avatar, occupation, company, email, file, linkedin, github } = content;
 
   return (
