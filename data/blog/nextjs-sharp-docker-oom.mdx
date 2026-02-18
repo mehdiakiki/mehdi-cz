@@ -3,14 +3,26 @@ title: 'Next.js Image Optimization Crashes Docker with OOM? Install Sharp'
 date: '2026-02-18'
 tags: ['nextjs', 'docker', 'til', 'devops']
 draft: false
-summary: 'How a missing sharp package caused repeated OOM kills in production and how to fix it.'
+summary: 'Today I redeployed my blog and 4 out of 6 project images were broken. Here is the story of how I tracked down the issue.'
 ---
 
-## The Problem
+## The Story
 
-After deploying my Next.js blog to a VPS (2 cores, 2GB RAM) with Docker, I noticed that most images on the site were broken. Only the smallest images (under ~60KB) loaded, while larger ones caused the page to hang.
+Today I rebuilt my personal site — the one you're reading right now — from scratch as a new Docker image. Fresh Dockerfile, fresh build, fresh push to Docker Hub. Locally, everything looked perfect. All six project images on the [Work](/work) page loaded instantly. The contact form worked. Blog posts rendered fine.
 
-Checking the container logs revealed the culprit:
+Then I pulled the image on my VPS and ran `docker compose up -d`. I opened the site and... four out of six project images were broken. The Rust and Rust Analyzer cards showed their images, but MonitorMe, Deno, DICOM Viewer, and Go Async Image Processing were all blank.
+
+I tried a different browser. I tried from a different machine entirely. Same result — the same four images consistently failed.
+
+## The Confusing Part
+
+This is what made it tricky: it worked **perfectly** on my local machine. The exact same Docker image, the exact same code. And it wasn't *all* images that broke — just the bigger ones. The two that worked happened to be the smallest files (5.6KB and 55KB).
+
+My first instinct was a permissions issue. The `nextjs` user in the container might not have write access to `.next/cache` for the image optimization cache. I fixed that with a `chown` in the Dockerfile. Still broken.
+
+## Reading the Logs
+
+I should have done this first. Running `docker compose logs blog` on the VPS revealed:
 
 ```
 ⚠ For production Image Optimization with Next.js, the optional 'sharp' package
@@ -19,30 +31,45 @@ Checking the container logs revealed the culprit:
 error Command failed with signal "SIGKILL".
 ```
 
-The container was getting **OOM killed** every time someone requested a larger image.
+That warning appeared over and over, followed by `SIGKILL` each time. The container was stuck in a crash loop — it would start, serve a page, try to optimize an image, get killed by the kernel, and restart. The `restart: unless-stopped` policy in my docker-compose kept bringing it back.
 
-## Why This Happens
+`SIGKILL` from the kernel means one thing: **the process exceeded available memory and the OOM killer stepped in.**
 
-Without `sharp`, Next.js falls back to a pure JavaScript image optimizer called `squoosh`. While it works, it's extremely memory-hungry — especially with large source images. In my case, one of my project screenshots was **12,276 x 4,042 pixels**. When the JS optimizer tried to decode, resize, and re-encode that image, it consumed all available memory and the kernel killed the process (`SIGKILL`).
+## Why It Happened
 
-The small images (like a 5.6KB WebP file) processed fine because they didn't push memory over the limit. This made the bug confusing — some images worked, some didn't, and it worked perfectly on my local machine (which has plenty of RAM).
+Without the `sharp` package, Next.js falls back to a pure JavaScript image optimizer. It works, but it's extremely memory-hungry. My VPS has 2GB of RAM — shared across Traefik, PostgreSQL, Listmonk, and the blog container.
+
+One of my project screenshots (`monitorme.png`) is **12,276 x 4,042 pixels**. It's only 132KB on disk because PNG compression is efficient, but when the JS optimizer decodes it into raw pixels for resizing, that's:
+
+```
+12,276 × 4,042 × 4 bytes (RGBA) ≈ 190 MB
+```
+
+Just decoding one image consumed nearly all available memory. The optimizer tried to resize it, allocate more buffers, and the kernel killed the process.
+
+The smaller images (rust.png at 5.6KB, rust_analyzer.png at 55KB) were small enough to process within the memory limit, which is why they worked fine and made the bug so confusing.
 
 ## The Fix
 
-Install [`sharp`](https://sharp.pixelplumbing.com/) in your Docker image. Sharp uses native `libvips` bindings, which are far more memory-efficient than the JS fallback.
-
-In my Dockerfile, I added it to the dependency installation step:
+One line in the Dockerfile:
 
 ```dockerfile
 # Install dependencies + sharp for production image optimization
 RUN yarn install && yarn add sharp --ignore-engines
 ```
 
-That's it. Next.js automatically detects `sharp` and uses it instead of the JS fallback.
+[Sharp](https://sharp.pixelplumbing.com/) is a Node.js image processing library built on `libvips`, a native C library. It's orders of magnitude more memory-efficient than the JavaScript fallback. Next.js automatically detects it and uses it for image optimization.
 
-## Key Takeaways
+After rebuilding and redeploying, all six images loaded instantly.
 
-- **Always install `sharp` in production Next.js Docker images.** The JS fallback is fine for development but can OOM on memory-constrained servers.
-- **`SIGKILL` in Docker logs usually means OOM.** The kernel killed the process because it exceeded memory limits.
-- **Large source images amplify the problem.** A 12K-wide PNG might only be 132KB on disk, but decoding it into raw pixels takes hundreds of megabytes of RAM.
-- **Test with production-sized images locally** — if your dev machine has 32GB RAM, you won't catch memory issues that appear on a 2GB VPS.
+## What I Learned
+
+1. **Always install `sharp` in production Next.js Docker images.** The JS fallback is fine for development on a machine with plenty of RAM, but it will OOM on memory-constrained servers.
+
+2. **`SIGKILL` in Docker logs = OOM.** Don't waste time debugging code — check your memory usage first.
+
+3. **Image dimensions matter more than file size.** A 132KB PNG can consume 190MB of RAM when decoded. File size on disk is misleading.
+
+4. **"Works on my machine" has a memory dimension.** My dev machine has plenty of RAM. The 2GB VPS doesn't. Always test with production constraints in mind.
+
+5. **Read the logs first.** The warning was right there the whole time. I just didn't look until after trying two other fixes.
