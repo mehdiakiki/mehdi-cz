@@ -34,7 +34,7 @@ export function OptimizedImage({
       quality={quality}
       sizes={sizes}
       fill={fill}
-      loading={priority ? "eager" : "lazy"}
+      {...(!priority && { loading: "lazy" })}
     />
   );
 }

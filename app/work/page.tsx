@@ -29,6 +29,30 @@ export default function Projects() {
           ))}
         </div>
       </div>
+
+      <section className="space-y-4 rounded-lg bg-gray-50 p-8 text-center dark:bg-gray-900">
+        <h2 className="text-2xl font-bold md:text-3xl">Have a Project in Mind?</h2>
+        <p className="text-lg text-gray-600 dark:text-gray-400">
+          I'm available for <strong>full-time</strong>, <strong>contract</strong>, and{" "}
+          <strong>freelance</strong> work. Let's discuss how I can help.
+        </p>
+        <div className="flex flex-col items-center gap-4 pt-4 sm:flex-row sm:justify-center">
+          <a
+            href="https://cal.com/mehdicz/30min"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="inline-block rounded-lg bg-primary-500 px-8 py-3 text-lg font-semibold text-white transition-colors hover:bg-primary-600 dark:bg-primary-600 dark:hover:bg-primary-700"
+          >
+            Book a Discovery Call
+          </a>
+          <a
+            href="/contact"
+            className="inline-block rounded-lg border border-gray-300 px-8 py-3 text-lg font-semibold text-gray-700 transition-colors hover:bg-gray-100 dark:border-gray-600 dark:text-gray-300 dark:hover:bg-gray-800"
+          >
+            Send a Message
+          </a>
+        </div>
+      </section>
     </>
   );
 }

@@ -147,15 +147,22 @@ export default function HireMe() {
             improving production software.
           </p>
           <p className="text-lg text-gray-600 dark:text-gray-400">
-            If you have a clear scope or role in mind, share a few details below (timeline, scope,
-            freelance vs full-time). I typically respond <strong>within 24 hours</strong>.
+            Book a 30-minute discovery call to discuss your project.
           </p>
-          <div className="pt-4">
+          <div className="flex flex-col items-center gap-4 pt-4 sm:flex-row sm:justify-center">
             <a
-              href="/contact"
+              href="https://cal.com/mehdicz/30min"
+              target="_blank"
+              rel="noopener noreferrer"
               className="inline-block rounded-lg bg-primary-500 px-8 py-3 text-lg font-semibold text-white transition-colors hover:bg-primary-600 dark:bg-primary-600 dark:hover:bg-primary-700"
             >
-              → Request a Discovery Call
+              Book a Discovery Call
+            </a>
+            <a
+              href="/contact"
+              className="inline-block rounded-lg border border-gray-300 px-8 py-3 text-lg font-semibold text-gray-700 transition-colors hover:bg-gray-100 dark:border-gray-600 dark:text-gray-300 dark:hover:bg-gray-800"
+            >
+              Send a Message
             </a>
           </div>
         </section>

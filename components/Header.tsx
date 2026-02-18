@@ -53,6 +53,14 @@ const Header = () => {
               );
             })}
         </div>
+        <a
+          href="https://cal.com/mehdicz/30min"
+          target="_blank"
+          rel="noopener noreferrer"
+          className="hidden rounded-lg bg-primary-500 px-4 py-1.5 text-sm font-semibold text-white transition-colors hover:bg-primary-600 dark:bg-primary-600 dark:hover:bg-primary-700 sm:block"
+        >
+          Book a Call
+        </a>
         <SearchButton />
         <MobileNav />
       </div>

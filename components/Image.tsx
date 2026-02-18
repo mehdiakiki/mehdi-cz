@@ -25,7 +25,7 @@ const Image = ({
     <NextImage
       src={imageSrc}
       alt={alt}
-      loading={loading}
+      {...(!priority && { loading })}
       quality={quality}
       priority={priority}
       className={`${className} transition-opacity duration-300`}

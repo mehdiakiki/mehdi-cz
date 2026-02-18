@@ -95,6 +95,15 @@ const MobileNav = () => {
                     </Link>
                   );
                 })}
+                <a
+                  href="https://cal.com/mehdicz/30min"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="mb-4 mt-4 rounded-lg bg-primary-500 px-6 py-2 text-xl font-bold text-white transition-colors hover:bg-primary-600"
+                  onClick={onToggleNav}
+                >
+                  Book a Call
+                </a>
               </nav>
 
               <button
