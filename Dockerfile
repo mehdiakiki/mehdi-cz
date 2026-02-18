@@ -31,6 +31,10 @@ COPY . .
 # Prevent Next.js telemetry in build containers
 ENV NEXT_TELEMETRY_DISABLED=1
 
+# NEXT_PUBLIC_ vars must be present at build time (Next.js inlines them)
+ARG NEXT_PUBLIC_FORMSPREE_KEY
+ENV NEXT_PUBLIC_FORMSPREE_KEY=$NEXT_PUBLIC_FORMSPREE_KEY
+
 RUN yarn build
 
 ###############################
@@ -54,8 +58,8 @@ COPY --from=build /app/.next ./.next
 COPY package.json yarn.lock ./
 COPY --from=deps /app/node_modules ./node_modules
 
-# We reuse the node_modules from the deps layer to avoid a second install.
-# (Optional) After migrating lockfile you can prune dev deps with: `yarn workspaces focus --production` (if using workspaces) or switch to npm prune strategy.
+# Ensure nextjs user can write to .next/cache for image optimization
+RUN chown -R nextjs:nodejs .next
 
 USER nextjs
 EXPOSE 3000
