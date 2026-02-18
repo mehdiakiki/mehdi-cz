@@ -10,11 +10,8 @@ RUN if ! command -v yarn >/dev/null 2>&1; then corepack enable && corepack prepa
 # Copy only files needed to install dependencies
 COPY package.json yarn.lock ./
 
-# Install dependencies (lockfile requires update due to recent package.json edits).
-# NOTE: For now we allow yarn to update the lockfile in the image. To restore
-# reproducible builds, regenerate and commit an updated yarn.lock locally, then
-# switch this back to: `RUN yarn install --frozen-lockfile`.
-RUN yarn install
+# Install dependencies + sharp for production image optimization
+RUN yarn install && yarn add sharp --ignore-engines
 
 ###############################
 # Build layer
