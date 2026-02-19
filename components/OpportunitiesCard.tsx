@@ -2,13 +2,11 @@ const OpportunitiesCard = () => {
   return (
     <div className="my-4 rounded-md bg-gray-100 p-4  text-center dark:bg-gray-800">
       <p className="text-md my-4 text-gray-700 dark:text-gray-300">
-        I'm a software engineer focused on building and scaling reliable production systems. I work
-        with startups and established teams on U.S.-based full-time roles and freelance projects
-        where ownership and execution matter.
+        I build and scale reliable production systems. Open to full-time and freelance work with
+        U.S.-based teams that value ownership and execution.
       </p>
-      <p className="text-md my-2 text-gray-700 dark:text-gray-300">
-        If you're evaluating a role or planning a project, start with a free 30-minute discovery
-        call.
+      <p className="text-md my-2 font-medium text-gray-700 dark:text-gray-300">
+        Got something in mind?
       </p>
       <a
         href="https://cal.com/mehdicz/30min"

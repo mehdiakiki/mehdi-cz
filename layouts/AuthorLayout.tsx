@@ -18,7 +18,7 @@ export default function AuthorLayout({ children, content }: Props) {
     <>
       <div className="space-y-4 pb-8 pt-6">
         <h1 className="text-center text-2xl font-extrabold leading-9 tracking-tight text-gray-900 dark:text-gray-100 sm:text-3xl sm:leading-10 md:text-5xl md:leading-14">
-          Mehdi Akiki — Software Engineer
+          Mehdi Akiki · Software Engineer
         </h1>
         <p className="text-center text-lg font-medium text-gray-500 dark:text-gray-400 md:text-xl">
           Systems thinking. Full-stack execution. Open-source depth.
