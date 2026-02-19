@@ -12,7 +12,8 @@ import PostBanner from "@/layouts/PostBanner";
 import { Metadata } from "next";
 import siteMetadata from "@/data/siteMetadata";
 import { notFound } from "next/navigation";
-import OpportunitiesCard from "@/components/OpportunitiesCard";
+import dynamic from "next/dynamic";
+const OpportunitiesCard = dynamic(() => import("@/components/OpportunitiesCard"));
 import { ArticleJsonLd, BreadcrumbJsonLd } from "@/components/JsonLd";
 
 const defaultLayout = "PostLayout";

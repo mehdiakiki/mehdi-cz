@@ -64,7 +64,7 @@ export default function PostLayout({ content, authorDetails, next, prev, childre
                           height={38}
                           alt={`${author.name} avatar`}
                           className="h-10 w-10 rounded-full"
-                          priority={false}
+                          priority={true}
                           quality={80}
                         />
                       )}

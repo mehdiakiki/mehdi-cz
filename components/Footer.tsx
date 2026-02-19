@@ -1,7 +1,8 @@
 import Link from "./Link";
 import siteMetadata from "@/data/siteMetadata";
 import SocialIcon from "@/components/social-icons";
-import NewsletterForm from "pliny/ui/NewsletterForm";
+import dynamic from "next/dynamic";
+const NewsletterForm = dynamic(() => import("pliny/ui/NewsletterForm"));
 
 export default function Footer() {
   return (
