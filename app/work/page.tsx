@@ -21,6 +21,7 @@ export default function Projects() {
             <WorkCard
               key={d.title}
               title={d.title}
+              subtitle={d.subtitle}
               description={d.description}
               imgSrc={d.imgSrc}
               href={d.href}

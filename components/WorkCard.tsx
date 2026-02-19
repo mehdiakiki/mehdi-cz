@@ -2,7 +2,7 @@ import Image from "./Image";
 import Link from "./Link";
 import Tag from "./Tag";
 
-const WorkCard = ({ title, description, imgSrc, href, type }) => (
+const WorkCard = ({ title, subtitle, description, imgSrc, href, type }) => (
   <div className="md max-w-[544px] p-4 md:w-1/2">
     <div
       className={`${
@@ -28,7 +28,9 @@ const WorkCard = ({ title, description, imgSrc, href, type }) => (
             title
           )}
         </h2>
-        <Tag text={type === "personal" ? "Project" : "OpenSource Contributor"} />
+        {subtitle && (
+          <p className="mb-2 text-sm font-medium text-gray-500 dark:text-gray-400">{subtitle}</p>
+        )}
         <p className="prose mb-3 max-w-none text-gray-500 dark:text-gray-400">{description}</p>
         {href && (
           <div className="text-right">
