@@ -16,10 +16,13 @@ export default function AuthorLayout({ children, content }: Props) {
 
   return (
     <>
-      <div className="space-y-2 pb-8 pt-6 md:space-y-5">
+      <div className="space-y-4 pb-8 pt-6">
         <h1 className="text-center text-2xl font-extrabold leading-9 tracking-tight text-gray-900 dark:text-gray-100 sm:text-3xl sm:leading-10 md:text-5xl md:leading-14">
-          Pushing Limits, One Line of Code at a Time
+          Mehdi Akiki — Software Engineer
         </h1>
+        <p className="text-center text-lg font-medium text-gray-500 dark:text-gray-400 md:text-xl">
+          Systems thinking. Full-stack execution. Open-source depth.
+        </p>
       </div>
       <div className="items-start space-y-2 xl:grid xl:grid-cols-3 xl:gap-x-8 xl:space-y-0">
         <div className="flex flex-col items-center space-x-2 pt-8">

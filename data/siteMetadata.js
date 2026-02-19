@@ -4,14 +4,14 @@ const siteMetadata = {
   author: "Mehdi Akiki",
   headerTitle: "MEHDI>_",
   description:
-    "Full-stack engineer and AI-driven builder sharing projects, notes, and consulting services.",
+    "Software engineer building high-performance systems — from low-latency trading platforms to OSS contributions in Rust, Deno, and Mozilla.",
   language: "en-us",
   theme: "system", // system, dark or light
   siteUrl: "https://www.mehdi.cz",
   siteRepo: "https://github.com/mehdiakiki/mehdi-cz",
   siteLogo: `${process.env.BASE_PATH || ""}/static/images/logo.png`,
   socialBanner: `${process.env.BASE_PATH || ""}/static/images/twitter-card.png`,
-  email: "mehdi.akiki@gmail.com",
+  email: "hello@mehdi.cz",
   github: "https://github.com/mehdiakiki",
   x: "https://twitter.com/mehdiakiki",
   twitter: "https://twitter.com/mehdiakiki",
