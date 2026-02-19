@@ -1,11 +1,17 @@
 import Link from "./Link";
 import siteMetadata from "@/data/siteMetadata";
 import SocialIcon from "@/components/social-icons";
+import NewsletterForm from "pliny/ui/NewsletterForm";
 
 export default function Footer() {
   return (
     <footer>
       <div className="mt-16 flex flex-col items-center">
+        {siteMetadata.newsletter?.provider && (
+          <div className="w-full max-w-md pb-8">
+            <NewsletterForm />
+          </div>
+        )}
         <div className="mb-3 flex space-x-4">
           <SocialIcon kind="mail" href={`mailto:${siteMetadata.email}`} size={6} />
           <SocialIcon kind="github" href={siteMetadata.github} size={6} />
