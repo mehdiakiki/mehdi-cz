@@ -113,9 +113,9 @@ export default function HireMe() {
 
         {/* CTA */}
         <section className="space-y-4 rounded-lg bg-gray-50 p-8 text-center dark:bg-gray-900">
-          <h2 className="text-2xl font-bold md:text-3xl">Let's Work Together</h2>
+          <h2 className="text-2xl font-bold md:text-3xl">Let's Build Something Great</h2>
           <p className="text-lg text-gray-600 dark:text-gray-400">
-            Book a 30-minute discovery call or send me a message to discuss your project.
+            Have a project in mind? Book a 30-minute call or drop me a message. I'll get back to you within 24 hours.
           </p>
           <div className="flex flex-col items-center gap-4 pt-4 sm:flex-row sm:justify-center">
             <a
