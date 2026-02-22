@@ -1,0 +1,13 @@
+/home/medvih/Documents/mehdiakikisite_static/js_go_rust_playground/pin-playground/target/debug/deps/tracing_opentelemetry-c6a3b772c0616a4e.d: /home/medvih/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tracing-opentelemetry-0.32.1/src/lib.rs /home/medvih/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tracing-opentelemetry-0.32.1/src/metrics.rs /home/medvih/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tracing-opentelemetry-0.32.1/src/layer.rs /home/medvih/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tracing-opentelemetry-0.32.1/src/layer/filtered.rs /home/medvih/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tracing-opentelemetry-0.32.1/src/otel_context.rs /home/medvih/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tracing-opentelemetry-0.32.1/src/span_ext.rs /home/medvih/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tracing-opentelemetry-0.32.1/src/stack.rs
+
+/home/medvih/Documents/mehdiakikisite_static/js_go_rust_playground/pin-playground/target/debug/deps/libtracing_opentelemetry-c6a3b772c0616a4e.rmeta: /home/medvih/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tracing-opentelemetry-0.32.1/src/lib.rs /home/medvih/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tracing-opentelemetry-0.32.1/src/metrics.rs /home/medvih/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tracing-opentelemetry-0.32.1/src/layer.rs /home/medvih/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tracing-opentelemetry-0.32.1/src/layer/filtered.rs /home/medvih/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tracing-opentelemetry-0.32.1/src/otel_context.rs /home/medvih/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tracing-opentelemetry-0.32.1/src/span_ext.rs /home/medvih/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tracing-opentelemetry-0.32.1/src/stack.rs
+
+/home/medvih/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tracing-opentelemetry-0.32.1/src/lib.rs:
+/home/medvih/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tracing-opentelemetry-0.32.1/src/metrics.rs:
+/home/medvih/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tracing-opentelemetry-0.32.1/src/layer.rs:
+/home/medvih/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tracing-opentelemetry-0.32.1/src/layer/filtered.rs:
+/home/medvih/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tracing-opentelemetry-0.32.1/src/otel_context.rs:
+/home/medvih/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tracing-opentelemetry-0.32.1/src/span_ext.rs:
+/home/medvih/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tracing-opentelemetry-0.32.1/src/stack.rs:
+
+# env-dep:CARGO_PKG_VERSION=0.32.1
