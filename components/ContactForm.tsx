@@ -55,22 +55,6 @@ const ContactForm = () => {
       )}
 
       <div>
-        <label htmlFor="name" className="text-md block text-left font-medium text-white">
-          Name
-        </label>
-        <input
-          type="text"
-          id="name"
-          name="name"
-          minLength={2}
-          maxLength={80}
-          placeholder="Your name"
-          className="mt-1 block w-full rounded-md border border-gray-300 px-3 py-2 text-gray-900 shadow-sm focus:border-primary-500 focus:ring-primary-500"
-        />
-        <ValidationError prefix="Name" field="name" errors={state.errors} />
-      </div>
-
-      <div>
         <label htmlFor="email" className="text-md block text-left font-medium text-white">
           Email <span className="text-red-500">*</span>
         </label>
@@ -106,12 +90,9 @@ const ContactForm = () => {
           }`}
         >
           <option value="">Select one...</option>
-          <option value="Build a new feature">Build a new feature</option>
-          <option value="Fix a bug / production issue">Fix a bug / production issue</option>
-          <option value="Performance / scaling work">Performance / scaling work</option>
-          <option value="Codebase cleanup / refactor">Codebase cleanup / refactor</option>
-          <option value="Architecture / tech direction">Architecture / tech direction</option>
-          <option value="Ongoing help (retainer)">Ongoing help (retainer)</option>
+          <option value="Build something new">Build something new</option>
+          <option value="Fix production issue">Fix production issue</option>
+          <option value="Review / audit / consulting">Review / audit / consulting</option>
           <option value="Other">Other</option>
         </select>
         {validationErrors.helpType && (
@@ -121,52 +102,18 @@ const ContactForm = () => {
       </div>
 
       <div>
-        <label htmlFor="budget" className="text-md block text-left font-medium text-white">
-          Budget range
-        </label>
-        <select
-          id="budget"
-          name="budget"
-          className="mt-1 block w-full rounded-md border border-gray-300 px-3 py-2 text-gray-900 shadow-sm focus:border-primary-500 focus:ring-primary-500"
-        >
-          <option value="">Select budget...</option>
-          <option value="< $2k">&lt; $2k</option>
-          <option value="$2–5k">$2–5k</option>
-          <option value="$5–10k">$5–10k</option>
-          <option value="$10–20k">$10–20k</option>
-          <option value="$20k+">$20k+</option>
-        </select>
-        <ValidationError prefix="Budget" field="budget" errors={state.errors} />
-      </div>
-
-      <div>
         <label htmlFor="details" className="text-md block text-left font-medium text-white">
           Details
         </label>
         <textarea
           id="details"
           name="details"
-          rows={6}
-          maxLength={2000}
-          placeholder="Tell me about your project, timeline, constraints, etc."
+          rows={4}
+          maxLength={1000}
+          placeholder="Tell me briefly about what you're working on..."
           className="mt-1 block w-full rounded-md border border-gray-300 px-3 py-2 text-gray-900 shadow-sm focus:border-primary-500 focus:ring-primary-500"
         />
         <ValidationError prefix="Details" field="details" errors={state.errors} />
-      </div>
-
-      <div>
-        <label htmlFor="links" className="text-md block text-left font-medium text-white">
-          Links
-        </label>
-        <input
-          type="text"
-          id="links"
-          name="links"
-          maxLength={300}
-          placeholder="Website / repo / Loom / spec doc"
-          className="mt-1 block w-full rounded-md border border-gray-300 px-3 py-2 text-gray-900 shadow-sm focus:border-primary-500 focus:ring-primary-500"
-        />
-        <ValidationError prefix="Links" field="links" errors={state.errors} />
       </div>
 
       <div className="text-center">
@@ -175,7 +122,7 @@ const ContactForm = () => {
           disabled={state.submitting}
           className="text-md inline-flex items-center rounded-md bg-primary-500 px-6 py-3 font-semibold text-white hover:bg-primary-600 focus:outline-none focus:ring-2 focus:ring-primary-500 disabled:opacity-50"
         >
-          {state.submitting ? "Sending..." : "Send Project Inquiry"}
+          {state.submitting ? "Sending..." : "Send Message"}
         </button>
         <p className="mt-3 text-sm text-gray-500 dark:text-gray-400">
           Typical response time: within 24 hours.
