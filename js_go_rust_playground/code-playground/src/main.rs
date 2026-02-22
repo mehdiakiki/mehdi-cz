@@ -28,6 +28,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::Semaphore;
 use tower_http::compression::CompressionLayer;
 use tower_http::trace::TraceLayer;
 use tracing;
@@ -47,6 +48,10 @@ struct Config {
     min_similarity: f64,
     /// JS execution timeout in milliseconds.
     js_timeout_ms: u64,
+    /// Maximum simultaneous executions before queuing (Semaphore capacity).
+    max_concurrent: usize,
+    /// Maximum output size in bytes per response field (stdout).
+    max_output_bytes: usize,
     /// Circuit breaker: failures before opening.
     cb_failure_threshold: u64,
     /// Circuit breaker: cooldown in seconds before half-open probe.
@@ -67,6 +72,8 @@ impl Config {
             cache_path: PathBuf::from(env_or("CACHE_PATH", "/data/cache.json")),
             min_similarity: env_or("MIN_SIMILARITY", "0.3").parse().unwrap_or(0.3),
             js_timeout_ms: env_or("JS_TIMEOUT_MS", "5000").parse().unwrap_or(5000),
+            max_concurrent: env_or("MAX_CONCURRENT", "4").parse().unwrap_or(4),
+            max_output_bytes: env_or("MAX_OUTPUT_BYTES", "65536").parse().unwrap_or(65_536),
             cb_failure_threshold: env_or("CB_FAILURE_THRESHOLD", "3").parse().unwrap_or(3),
             cb_cooldown_secs: env_or("CB_COOLDOWN_SECS", "60").parse().unwrap_or(60),
         }
@@ -91,6 +98,8 @@ struct AppState {
     /// Circuit breakers for external services.
     cb_rust: CircuitBreaker,
     cb_go: CircuitBreaker,
+    /// Limits simultaneous executions — prevents one burst from exhausting resources.
+    semaphore: Arc<Semaphore>,
 }
 
 // =============================================================
@@ -359,6 +368,14 @@ async fn execute(
         tracing::Span::current().record("cache_hit", false);
     }
 
+    // --- Concurrency cap: acquire a slot before any real execution ---
+    // The permit is dropped when this handler returns, freeing the slot.
+    // If all slots are taken the request waits here (no 503, just back-pressure).
+    let _permit = Arc::clone(&state.semaphore)
+        .acquire_owned()
+        .await
+        .map_err(|_| ProblemDetail::internal("Semaphore closed".into()))?;
+
     // --- Layer 7: Execute ---
     let exec_start = Instant::now();
     let result = match example.language {
@@ -437,7 +454,9 @@ async fn execute_rust(
                 success: false, stdout: String::new(), stderr: "Parse error".into(),
             });
             Ok(Json(ExecuteResponse {
-                success: parsed.success, stdout: parsed.stdout, stderr: parsed.stderr,
+                success: parsed.success,
+                stdout: truncate_output(parsed.stdout, state.config.max_output_bytes),
+                stderr: truncate_output(parsed.stderr, state.config.max_output_bytes / 8),
                 cached: false, cache_status: None, execution_ms: None,
             }))
         }
@@ -485,7 +504,9 @@ async fn execute_javascript(
             let json = serde_json::to_string(&result).unwrap_or_default();
             state.cache.insert(code, "interpret", edition, json, example_id, is_default);
             Ok(Json(ExecuteResponse {
-                success: result.success, stdout: result.output, stderr: result.error,
+                success: result.success,
+                stdout: truncate_output(result.output, state.config.max_output_bytes),
+                stderr: truncate_output(result.error, state.config.max_output_bytes / 8),
                 cached: false, cache_status: None, execution_ms: None,
             }))
         }
@@ -536,7 +557,9 @@ async fn execute_go(
             );
             let (stdout, stderr, success) = go_proxy::parse_go_response(&go_resp);
             Ok(Json(ExecuteResponse {
-                success, stdout, stderr,
+                success,
+                stdout: truncate_output(stdout, state.config.max_output_bytes),
+                stderr: truncate_output(stderr, state.config.max_output_bytes / 8),
                 cached: false, cache_status: None, execution_ms: None,
             }))
         }
@@ -655,22 +678,25 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
     })
 }
 
-/// POST /api/playground/sign
-async fn sign_request(
-    State(state): State<Arc<AppState>>,
-    body: String,
-) -> Json<serde_json::Value> {
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let signature = state.signer.sign(timestamp, &body);
-    Json(serde_json::json!({ "signature": signature, "timestamp": timestamp }))
-}
-
 // =============================================================
 // Helpers
 // =============================================================
+
+/// Truncate output fields to prevent extremely large API responses.
+/// stdout gets the full budget; stderr gets 1/8 (error messages are short).
+fn truncate_output(s: String, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    // Truncate at a UTF-8 boundary to avoid splitting a multi-byte character.
+    let boundary = (0..=max_bytes).rev().find(|&i| s.is_char_boundary(i)).unwrap_or(0);
+    format!(
+        "{}\n… (output truncated — {} bytes shown of {} total)",
+        &s[..boundary],
+        boundary,
+        s.len()
+    )
+}
 
 fn extract_ip(headers: &HeaderMap, addr: &SocketAddr) -> String {
     // Support Cloudflare, nginx, and direct connections.
@@ -701,6 +727,7 @@ async fn main() {
     let port = config.port;
     let cb_threshold = config.cb_failure_threshold;
     let cb_cooldown = Duration::from_secs(config.cb_cooldown_secs);
+    let max_concurrent = config.max_concurrent;
 
     let state = Arc::new(AppState {
         cache: CompilationCache::new(
@@ -718,6 +745,7 @@ async fn main() {
         examples: examples::all_examples(),
         cb_rust: CircuitBreaker::new("rust-playground", cb_threshold, cb_cooldown),
         cb_go: CircuitBreaker::new("go-playground", cb_threshold, cb_cooldown),
+        semaphore: Arc::new(Semaphore::new(max_concurrent)),
         config,
     });
 
@@ -795,7 +823,6 @@ async fn main() {
         .route("/api/playground/examples", get(list_examples))
         .route("/api/playground/examples/{id}", get(get_example))
         .route("/api/playground/execute", post(execute))
-        .route("/api/playground/sign", post(sign_request))
         .route("/api/playground/health", get(health))
         .layer(middleware::from_fn_with_state(Arc::clone(&state), cors_middleware))
         .layer(middleware::from_fn(security_headers_middleware))
@@ -804,7 +831,7 @@ async fn main() {
         .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    tracing::info!("Pin Playground listening on {}", addr);
+    tracing::info!("Code Playground listening on {}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())

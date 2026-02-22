@@ -69,12 +69,18 @@ export async function POST(request: NextRequest) {
   const timestamp = Math.floor(Date.now() / 1000);
   const signature = sign(timestamp, body);
 
+  // Server-to-server calls have no Origin header by default.
+  // Axum's validate_origin blocks requests with no matching Origin,
+  // so we set it explicitly here (we are the trusted caller).
+  const origin = process.env.NEXT_PUBLIC_SITE_URL || "https://mehdi.cz";
+
   const axumRes = await fetch(`${AXUM_URL}/execute`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       "X-Playground-Signature": signature,
       "X-Playground-Timestamp": String(timestamp),
+      "Origin": origin,
     },
     body,
   });
