@@ -1,0 +1,94 @@
+---
+title: 'Building a Sandboxed Code Playground in Rust'
+date: '2026-02-23'
+tags: ['rust', 'axum', 'security', 'javascript', 'systems-programming', 'web-development']
+draft: false
+summary: 'How I built a custom code execution engine backed by a Rust/Axum microservice, embedded directly in blog articles. Covers the security model, subprocess isolation with setrlimit, HMAC request signing, and the tradeoffs behind every decision.'
+---
+
+Most code playgrounds are wrappers around someone else's infrastructure. You write a snippet, it gets sent to a Docker container managed by a third party, and the result comes back. That works fine — until you want to understand what's actually happening, control the security boundaries yourself, or embed it seamlessly into a blog article without a 300ms CDN round-trip for the UI alone.
+
+I built mine from scratch. Here's what it looks like embedded in this post:
+
+<CodePlayground ids={["js_01_event_loop"]} />
+
+That's a live execution environment, backed by a Rust microservice running on the same server as this blog.
+
+---
+
+## The architecture in one paragraph
+
+A React component (`CodePlayground`) renders the editor and a run button. When you click run, the browser POSTs to a Next.js API route — unsigned, no secrets in the client. The API route signs the request with an HMAC-SHA256 digest and forwards it to an Axum microservice on the private Docker network. Axum validates the signature, checks a similarity threshold against the original example, and either returns a cached result or executes the code. JavaScript runs in-process via the [Boa engine](https://boajs.dev/). Rust and Go proxy to the official playgrounds at `play.rust-lang.org` and `go.dev/_/compile`.
+
+---
+
+## Why not just use Docker?
+
+The obvious approach is to spin up a throwaway container per execution. It's what Repl.it, CodeSandbox, and most hosted playgrounds do. The problem is latency and resource overhead — each container cold-start adds hundreds of milliseconds, and orchestrating them at scale requires infrastructure I don't want to operate for a blog.
+
+The alternative I chose: **Boa**, a JavaScript interpreter written in pure Rust. It compiles into the service binary, creates a fresh JS context per execution in under a millisecond, and exposes exactly zero OS APIs. No `fetch`, no `require`, no `fs`, no `process`. It can't reach the network, read files, or fork processes — not because of runtime checks, but because those APIs don't exist in the context.
+
+For Rust and Go code, I proxy to the official playgrounds. They already have proper sandboxing. No reason to reinvent that.
+
+---
+
+## The security model
+
+Even with Boa's inherent isolation, I wanted defense in depth. Three layers worth noting:
+
+**HMAC request signing.** Every request from Next.js to Axum carries an `X-Playground-Signature` header: `SHA256(secret:timestamp:body)`. The secret never reaches the browser. Axum rejects any request with a missing, wrong, or expired (>5 min old) signature. This prevents the Axum service from being used as a proxy even if someone discovers its internal address.
+
+**Subprocess isolation with `setrlimit`.** JavaScript execution doesn't happen in the Axum process. Before running any user code, Axum spawns itself in `--js-runner` mode — a subprocess that immediately applies OS-level resource limits via `setrlimit(2)`:
+
+```rust
+setrlimit(Resource::RLIMIT_CPU, 5, 5);                                // 5 CPU seconds
+setrlimit(Resource::RLIMIT_AS, 256 * 1024 * 1024, 256 * 1024 * 1024); // 256 MB virtual memory
+setrlimit(Resource::RLIMIT_NOFILE, 16, 16);                            // 16 file descriptors
+setrlimit(Resource::RLIMIT_NPROC, 0, 0);                               // no fork bombs
+```
+
+A crash, OOM, or infinite loop in the subprocess cannot bring down the Axum server. The limits are enforced by the kernel, not by application logic — no amount of clever JS can escape them.
+
+**Similarity check.** The service only runs code that's at least 30% similar to the original example. This isn't a security boundary by itself, but it dramatically narrows what's worth attacking. You can modify the examples, explore edge cases, fix bugs — you can't submit arbitrary unrelated programs.
+
+---
+
+## Caching and circuit breakers
+
+Default examples are pre-warmed on startup. The service fetches each one from the upstream playgrounds, stores the result in a `DashMap`, and persists to disk on a Docker volume. On restart, the cache loads from disk — the warmup only runs when the cache is cold.
+
+Both external services (Rust and Go playgrounds) are wrapped in circuit breakers. After three consecutive failures, the breaker opens and the service falls back to the stale cache rather than returning errors. For unmodified examples, users never see a failure even if the upstream is down.
+
+---
+
+## What the component looks like in MDX
+
+Embedding a playground in an article is a one-liner:
+
+```mdx
+<CodePlayground ids={["js_01_event_loop"]} />
+```
+
+Or by language to show all examples of that type:
+
+```mdx
+<CodePlayground lang="rust" />
+```
+
+The component fetches the example list from the Axum service at render time, shows a tabbed editor with syntax highlighting, and handles loading/error states. The whole thing is ~300 lines of TypeScript — nothing exotic.
+
+---
+
+## Tradeoffs I'd make differently
+
+**Boa's ES2023 support is partial.** Some modern JS syntax doesn't work. For a teaching context this is fine — the examples are deliberate and tested. For a general-purpose playground you'd want V8 (via `deno_core`) or QuickJS, both of which add significant binary size and build complexity.
+
+**The similarity check is a blunt instrument.** The 30% threshold is tuned for the current examples. A reader who wants to significantly modify a Rust example will hit the limit and get an unhelpful rejection. A proper solution is per-example configurable bounds, or a different mechanism entirely.
+
+**No `nsjail` yet.** The subprocess + `setrlimit` approach gives real isolation for Boa. Adding `nsjail` on top would add proper namespace isolation (network, filesystem, PID) and is the right path before adding Python or Java support — both of which require actually running a subprocess binary with real OS access.
+
+---
+
+The full source is in the repo. The Axum service is about 900 lines of Rust across 10 files — small enough to read in an afternoon, large enough to have real structure: cache, circuit breaker, rate limiter, request signer, telemetry, security middleware, and execution handlers all as separate modules.
+
+If you're curious about any specific part — the HMAC implementation, the Boa integration, the circuit breaker logic — the code is the documentation.
