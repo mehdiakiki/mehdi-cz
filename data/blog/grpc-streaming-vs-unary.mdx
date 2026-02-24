@@ -1,0 +1,95 @@
+---
+title: 'gRPC Streaming vs Unary: What Actually Changes at the Wire Level'
+date: '2026-02-24'
+tags: ['grpc', 'go', 'networking', 'systems-programming', 'performance']
+draft: false
+summary: 'Most comparisons of gRPC streaming vs unary stop at the API surface. This one goes to the wire — HTTP/2 frames, protobuf framing, peak memory, and latency to first byte.'
+---
+
+Most gRPC comparisons show you two code snippets and say "streaming is better for large data." That's true, but it skips the part that actually matters: *why*, at the protocol level.
+
+---
+
+## The framing layer
+
+gRPC runs over HTTP/2. Every message — streaming or unary — is framed the same way:
+
+```
+[ 1 byte: compression flag ][ 4 bytes: message length ][ N bytes: protobuf payload ]
+```
+
+This is called the **Length-Prefixed Message** format. The receiver reads the 5-byte header, knows exactly how many bytes to expect, and reads that many. No delimiter scanning, no chunked encoding dance.
+
+What differs between unary and streaming isn't the message format — it's when messages are delivered and how many HTTP/2 DATA frames carry them.
+
+---
+
+## Unary: collect everything, then respond
+
+In a unary RPC, the server processes the entire request, builds the complete response in memory, and sends it in one go:
+
+```
+Client → [HEADERS] → Server
+Client → [DATA: request] → Server
+Server → [HEADERS] → Client
+Server → [DATA: full response] → Client   ← single frame, full payload in RAM
+Server → [DATA + END_STREAM] → Client
+```
+
+The server holds the complete result in memory before writing a single byte to the wire. For a 10 MB response, that's 10 MB allocated, then serialized, then sent. Peak memory scales with response size.
+
+---
+
+## Streaming: flush as you go
+
+Server-side streaming changes the shape:
+
+```
+Client → [HEADERS] → Server
+Client → [DATA: request] → Server
+Server → [HEADERS] → Client
+Server → [DATA: chunk 1] → Client         ← client can process this immediately
+Server → [DATA: chunk 2] → Client
+...
+Server → [DATA: last chunk + END_STREAM] → Client
+```
+
+Each chunk is framed independently with the 5-byte header. The server serializes and flushes one message at a time. Peak memory is proportional to *one chunk*, not the full dataset.
+
+---
+
+## The numbers
+
+I benchmarked a simple scenario: fetch 10,000 records from a Go gRPC server. One endpoint returns them all at once (unary), another streams them in batches of 100.
+
+| | Unary | Streaming |
+|---|---|---|
+| **Peak server memory** | ~42 MB | ~3 MB |
+| **Latency to first byte** | 680 ms | 8 ms |
+| **Total transfer time** | 720 ms | 740 ms |
+
+Total time is nearly identical. Everything else is different.
+
+The latency to first byte is the one that changes user experience. With streaming, the client can start rendering or processing record #1 while the server is still fetching record #5000. With unary, the user waits for the full dataset before anything appears.
+
+---
+
+## Why not WebSocket or chunked HTTP?
+
+WebSocket is a framed protocol too, but it's designed for bidirectional messaging over a single TCP connection. It doesn't have HTTP/2's multiplexing — you'd need one WebSocket per logical stream, or you'd have to implement your own multiplexing on top.
+
+HTTP/1.1 chunked transfer encoding is the closest analog to gRPC streaming over HTTP/1.1, but it's text-protocol adjacent (the chunk size is hex-encoded in ASCII), it doesn't multiplex streams over a single TCP connection, and it has no equivalent to protobuf's schema enforcement.
+
+gRPC gives you: binary framing, schema enforcement, bidirectional streaming, multiplexed streams over a single TCP connection, and generated client/server code — all at once.
+
+---
+
+## When unary is still the right call
+
+Streaming adds complexity. The client has to handle partial results, the server has to flush at the right granularity, and debugging is harder because there's no single response to inspect.
+
+For responses under ~1 MB where latency-to-first-byte isn't user-visible, unary is simpler and that simplicity is worth something. The rule of thumb: if you'd consider pagination for a REST endpoint, consider streaming for gRPC.
+
+---
+
+The full Go implementation — server, client, proto definitions, and benchmarks — is at [github.com/mehdiakiki/grpc-streaming-vs-unary](https://github.com/mehdiakiki/grpc-streaming-vs-unary/tree/main).
