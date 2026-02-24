@@ -25,9 +25,9 @@ export default function PlaygroundTestPage() {
 
       <section className="space-y-3">
         <h2 className="text-lg font-semibold text-gray-700 dark:text-gray-300">
-          Single example, hand-picked
+          Go — goroutines
         </h2>
-        <CodePlayground ids={["rs_01_hello"]} />
+        <CodePlayground ids={["go_01_goroutines"]} />
       </section>
     </div>
   );

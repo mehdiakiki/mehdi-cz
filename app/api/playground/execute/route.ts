@@ -58,7 +58,8 @@ export async function POST(request: NextRequest) {
   const body = await request.text();
 
   // Development: skip signing and return canned output.
-  if (process.env.NODE_ENV === "development") {
+  // Set FORCE_REAL_BACKEND=true to proxy to the local Axum service instead.
+  if (process.env.NODE_ENV === "development" && !process.env.FORCE_REAL_BACKEND) {
     await new Promise((r) => setTimeout(r, 600)); // simulate compile latency
     const parsed = JSON.parse(body);
     const output = MOCK_OUTPUTS[parsed?.example_id ?? ""] ?? DEFAULT_MOCK;
@@ -74,17 +75,36 @@ export async function POST(request: NextRequest) {
   // so we set it explicitly here (we are the trusted caller).
   const origin = process.env.NEXT_PUBLIC_SITE_URL || "https://mehdi.cz";
 
-  const axumRes = await fetch(`${AXUM_URL}/execute`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Playground-Signature": signature,
-      "X-Playground-Timestamp": String(timestamp),
-      "Origin": origin,
-    },
-    body,
-  });
+  let axumRes: Response;
+  try {
+    axumRes = await fetch(`${AXUM_URL}/api/playground/execute`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Playground-Signature": signature,
+        "X-Playground-Timestamp": String(timestamp),
+        "Origin": origin,
+      },
+      body,
+    });
+  } catch (err) {
+    console.error("[playground] Failed to reach Axum:", err);
+    return NextResponse.json(
+      { success: false, stdout: "", stderr: `Backend unreachable: ${(err as Error).message}` },
+      { status: 502 }
+    );
+  }
 
-  const data = await axumRes.json();
+  let data: unknown;
+  try {
+    data = await axumRes.json();
+  } catch (err) {
+    console.error("[playground] Axum returned non-JSON (status", axumRes.status, "):", err);
+    return NextResponse.json(
+      { success: false, stdout: "", stderr: `Backend error (HTTP ${axumRes.status})` },
+      { status: 502 }
+    );
+  }
+
   return NextResponse.json(data, { status: axumRes.status });
 }
