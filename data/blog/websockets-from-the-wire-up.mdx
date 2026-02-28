@@ -105,7 +105,90 @@ The `os.write` and `os.read` calls on a socket fd go through the exact same kern
 
 ---
 
-## 3. TCP: a byte stream, not a message protocol
+## 3. What `listen()` and `connect()` actually mean
+
+Before TCP, before WebSocket — before any of it — you need to understand what these two syscalls do at the kernel level. These are words engineers use every day without a concrete picture. Here is the picture.
+
+### `listen()` — opening a door in kernel memory
+
+When a server calls `listen(fd, backlog)`, the kernel does two things:
+
+**First**, it changes the socket's state from `CLOSED` to `LISTEN` and registers the 4-tuple `(0.0.0.0, port, *, *)` in the kernel's hash table of listening sockets. This is the "door". Any TCP SYN packet arriving on that port will be matched against this table.
+
+**Second**, it allocates two queues in kernel memory:
+
+```
+Listening socket
+├── SYN queue (incomplete connections)
+│   └── half-open connections: SYN received, SYN+ACK sent, waiting for ACK
+│       [ slot ] [ slot ] [ slot ] ...   ← size: /proc/sys/net/ipv4/tcp_max_syn_backlog
+│
+└── Accept queue (complete connections)
+    └── full 3-way handshake done, waiting for the app to call accept()
+        [ conn ] [ conn ] [ conn ] ...   ← size: the backlog argument to listen()
+```
+
+The kernel manages the 3-way handshake entirely by itself — no application code runs during it. A SYN arrives → kernel puts it in the SYN queue and sends SYN+ACK. The client's ACK arrives → kernel moves the connection from the SYN queue to the accept queue. The application hasn't done anything yet.
+
+The `backlog` in `listen(fd, 128)` is the maximum size of the **accept queue** — how many fully established connections can sit waiting before the application calls `accept()`. If the accept queue is full when a new connection completes its handshake, the kernel silently drops the connection (or sends a RST). This is where servers get overwhelmed: not because they can't handle connections, but because the application calls `accept()` too slowly.
+
+```python
+import socket
+
+# AF_INET = IPv4, SOCK_STREAM = TCP
+server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+server.bind(("0.0.0.0", 8080))
+
+# At this point: no kernel queue, no connection possible
+server.listen(128)
+# NOW: two queues exist in kernel memory
+# The kernel starts answering SYN packets by itself
+# Your application is not involved yet
+
+conn, addr = server.accept()
+# THIS is when your application gets involved.
+# accept() pops one entry from the accept queue.
+# It returns a NEW socket fd — a connected socket with its own sk_rcvbuf/sk_sndbuf.
+# The listening socket keeps listening.
+```
+
+The listening socket and the connected socket are two different `struct sock` objects. The listening socket lives on port 8080 forever. Each connected socket has a unique 4-tuple — `(server_ip, 8080, client_ip, client_port)` — and its own independent buffers. This is how thousands of connections can exist on the same port simultaneously: they are different sockets sharing the same listening port.
+
+### `connect()` — the active open
+
+When a client calls `connect(fd, address)`, the kernel:
+
+1. Picks an ephemeral source port (typically from the range `32768–60999`, configurable via `net.ipv4.ip_local_port_range`)
+2. Records the 4-tuple `(client_ip, ephemeral_port, server_ip, server_port)` in the socket
+3. Sends a TCP SYN packet
+4. Blocks the calling thread/process in the `SYN_SENT` state
+
+The `connect()` call does not return until the 3-way handshake completes (or times out). When it returns without error, the TCP connection is `ESTABLISHED` — the kernel has already exchanged SYN, SYN+ACK, and ACK. The application gets back a fd to a working byte pipe.
+
+```go
+// Go: connect to a server
+conn, err := net.Dial("tcp", "example.com:8080")
+// If err == nil: 3-way handshake is complete.
+// conn is a net.Conn wrapping a socket fd in ESTABLISHED state.
+// The kernel has already allocated sk_rcvbuf and sk_sndbuf for this connection.
+```
+
+### The mental model that doesn't leave
+
+Think of it this way:
+
+- **`listen()`** tells the kernel: *"build a waiting room for me on this port, handle the handshakes yourself, and put finished connections in a queue — I'll pick them up when I'm ready."*
+- **`accept()`** is you walking into the waiting room and picking up the next finished connection.
+- **`connect()`** is the client knocking on the door — executing the handshake — and getting a direct line once the door opens.
+
+The key insight: **the kernel, not your application, does the TCP handshake**. Your code is never in the loop during SYN/SYN-ACK/ACK. By the time your code runs, the connection is already established. `accept()` just hands you the key to an already-open channel.
+
+This is also why a SYN flood attack works: it fills the SYN queue with half-open connections, preventing real connections from completing, without the application being able to do anything about it. The kernel is under attack, not the app.
+
+---
+
+## 4. TCP: a byte stream, not a message protocol
 
 This is the most important thing to internalize before talking about WebSockets.
 
@@ -134,7 +217,7 @@ The 3-way handshake (`SYN → SYN+ACK → ACK`) is happening below the applicati
 
 ---
 
-## 4. HTTP/1.1 upgrade: turning a TCP connection into a WebSocket
+## 5. HTTP/1.1 upgrade: turning a TCP connection into a WebSocket
 
 A WebSocket connection starts as a plain HTTP/1.1 connection. The client sends a normal HTTP GET request with a few extra headers:
 
@@ -170,7 +253,7 @@ This is the upgrade: one HTTP request, one HTTP response, then the connection is
 
 ---
 
-## 5. WebSocket framing: the binary format
+## 6. WebSocket framing: the binary format
 
 TCP is a byte stream. WebSocket needs to deliver messages. It solves this the same way gRPC does: a fixed-size header that tells the receiver how many bytes to read.
 
@@ -214,7 +297,7 @@ This is why a WebSocket frame has a 2-byte minimum header for small messages, 4-
 
 ---
 
-## 6. Tracing `ws.send("hello")` from browser to server
+## 7. Tracing `ws.send("hello")` from browser to server
 
 Put it all together. You call `ws.send("hello")` in a browser.
 
@@ -245,7 +328,7 @@ Thirteen steps. Every one of them is real; none of them is hidden by the abstrac
 
 ---
 
-## 7. A working server and client
+## 8. A working server and client
 
 ### Go
 
