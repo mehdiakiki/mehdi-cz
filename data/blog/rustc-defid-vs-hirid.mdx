@@ -1,0 +1,109 @@
+---
+title: 'DefId vs HirId in the Rust Compiler'
+date: '2026-02-27'
+tags: ['rust', 'compilers', 'rustc-internals']
+draft: false
+summary: 'Two identifiers, two different jobs. DefId names a definition across the whole compiler pipeline and across crates. HirId points to a node in the syntax tree of the current crate. Mixing them up is the first stumbling block when reading rustc source code.'
+---
+
+If you've read any `rustc` source or written a compiler plugin, you've seen both `DefId` and `HirId` used as keys everywhere. They look similar but live at completely different layers of the compiler.
+
+---
+
+## The two representations
+
+`rustc` lowers Rust source through several intermediate representations:
+
+```
+Source → AST → HIR → THIR → MIR → codegen
+```
+
+**HIR** (High-level Intermediate Representation) is the first major lowering. It strips syntactic sugar — `for` loops become `loop`/`match`, `impl Trait` becomes a named parameter — but it stays close to what you wrote. It exists only for the current crate, only during the current compilation session.
+
+**MIR** (Mid-level IR) is a control-flow graph of basic blocks. It's what the borrow checker and the optimizer work on. This is also where cross-crate information becomes central: to inline a function from `serde`, the compiler needs to refer to it from a compiled artifact, not from source.
+
+`HirId` lives in HIR. `DefId` spans the whole pipeline and crosses crate boundaries.
+
+---
+
+## HirId — a node in the current crate's tree
+
+```rust
+pub struct HirId {
+    pub owner: OwnerId,      // which item owns this node (e.g., which function)
+    pub local_id: ItemLocalId, // which node within that item
+}
+```
+
+`HirId` identifies any node in the HIR tree: an expression, a pattern, a block, a let-binding, a match arm. The key word is *any*. Not everything in HIR is a named definition. The literal `42` in `let x = 42;` gets a `HirId`. It has no name, no definition, just a position in the tree.
+
+`HirId` is always local. You cannot construct a `HirId` that refers to something in another crate, because other crates don't have HIR — only their compiled metadata survives.
+
+**Typical use**: the `TypeckResults` struct (the output of type-checking a function body) is keyed by `HirId`. When you ask "what type does this expression have?", you look up the expression's `HirId`.
+
+```rust
+// Inside a lint or a compiler pass
+let ty = cx.typeck_results().expr_ty(expr); // expr.hir_id is the key internally
+```
+
+---
+
+## DefId — a definition, anywhere
+
+```rust
+pub struct DefId {
+    pub krate: CrateNum,   // which crate (0 = LOCAL_CRATE)
+    pub index: DefIndex,   // which definition within that crate
+}
+```
+
+`DefId` only exists for *definitions* — things that can be named and referenced: functions, structs, enums, traits, impl blocks, constants, type aliases, modules. Not expressions. Not patterns.
+
+Because it carries a `CrateNum`, a `DefId` can point into any crate the compiler has loaded. `std::vec::Vec` has a `DefId`. `serde::Serialize` has a `DefId`. Your local `fn main` has a `DefId` too (with `krate == LOCAL_CRATE`).
+
+When `krate == LOCAL_CRATE`, the compiler often uses `LocalDefId` instead — a newtype that makes the local constraint explicit and avoids a redundant field.
+
+**Typical use**: the query system is almost entirely keyed by `DefId`. "What are the generic parameters of this function?" → `tcx.generics_of(def_id)`. "What are the trait bounds?" → `tcx.predicates_of(def_id)`. "Give me the MIR body" → `tcx.optimized_mir(def_id)`.
+
+---
+
+## Conversions between them
+
+Not every `HirId` has a `DefId` — only the nodes that are definitions:
+
+```rust
+// HirId → LocalDefId (only works if the node is a definition)
+let local_def_id: LocalDefId = cx.tcx.hir().local_def_id(hir_id);
+
+// LocalDefId → DefId (always works, just sets krate = LOCAL_CRATE)
+let def_id: DefId = local_def_id.to_def_id();
+```
+
+Going the other way:
+
+```rust
+// LocalDefId → HirId (always works for local defs)
+let hir_id: HirId = cx.tcx.local_def_id_to_hir_id(local_def_id);
+
+// DefId → HirId only works if the def is local
+if let Some(local) = def_id.as_local() {
+    let hir_id = cx.tcx.local_def_id_to_hir_id(local);
+}
+```
+
+There is no conversion from a foreign `DefId` to a `HirId` — foreign crates have no HIR.
+
+---
+
+## The mental model
+
+| | `HirId` | `DefId` |
+|---|---|---|
+| **What it identifies** | Any HIR node (incl. expressions) | Named definitions only |
+| **Cross-crate?** | No | Yes |
+| **Survives past HIR?** | No | Yes (through MIR, codegen) |
+| **Primary use** | Type-checking results, linting | Query system, trait solving, codegen |
+
+If you're writing a lint or walking the HIR tree, you'll work with `HirId`. If you're asking the compiler about types, traits, or generics — or if you need to refer to something from another crate — you'll work with `DefId`.
+
+The confusion usually hits when you have one and need the other. The rule: if the node is a definition, the compiler can give you both; if it's just a node (an expression, a pattern), only `HirId` exists.
