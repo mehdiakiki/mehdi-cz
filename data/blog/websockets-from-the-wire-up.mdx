@@ -42,7 +42,66 @@ The kernel's networking stack takes over:
 2. **TCP layer**: finds the right socket by matching `(src_ip, src_port, dst_ip, dst_port)` — a 4-tuple that uniquely identifies a TCP connection. Each socket has two buffers: a **receive buffer** (`sk_rcvbuf`) where incoming bytes pile up, and a **send buffer** (`sk_sndbuf`) where outgoing bytes wait to be transmitted.
 3. The payload bytes are appended to the socket's receive buffer. If a userspace process is blocked in `read()` or `recv()` on that socket's file descriptor, it is woken up.
 
-The socket is exposed to userspace as a **file descriptor** — an integer. Every socket is a file in Linux. `read()`, `write()`, `select()`, `epoll()` all work on it. This is not an abstraction convenience; it's the actual design. The VFS (Virtual File System) layer routes `read()` on a socket fd to the TCP receive buffer.
+### What a socket actually is in memory
+
+This is the part most explanations skip. A socket is not an abstraction — it is a concrete data structure in kernel memory.
+
+In Linux, every socket is a `struct sock` (defined in `include/net/sock.h`). The fields that matter for understanding WebSocket behavior:
+
+```c
+struct sock {
+    // The 4-tuple (src_ip, src_port, dst_ip, dst_port) lives here
+    struct sock_common  __sk_common;
+
+    // Receive buffer: a linked list of sk_buff (one per TCP segment)
+    struct sk_buff_head sk_receive_queue;
+    int                 sk_rcvbuf;       // max bytes allowed in receive queue
+                                         // default: ~87 KB (net.core.rmem_default)
+
+    // Send buffer: bytes waiting to go out on the wire
+    struct sk_buff_head sk_write_queue;
+    int                 sk_sndbuf;       // max bytes allowed in send queue
+                                         // default: ~212 KB (net.core.wmem_default)
+
+    // Current TCP state: TCP_ESTABLISHED, TCP_LISTEN, TCP_CLOSE_WAIT, etc.
+    unsigned int        sk_state;
+
+    // Wait queue: processes sleeping on this socket (blocked in read/write)
+    wait_queue_head_t   sk_wq;
+};
+```
+
+Each packet in the kernel is a `struct sk_buff` (skb). It's not a copy of the packet — it's a descriptor with four pointers (`head`, `data`, `tail`, `end`) into a contiguous memory region. As a packet moves up the network stack, headers are stripped by advancing `data` forward. As it moves down, headers are prepended by moving `data` backward. No copying happens; only the pointer moves.
+
+```
+head → [ headroom for headers ]
+data → [ IP header ][ TCP header ][ payload bytes ]
+tail →
+end  → [ tailroom ]
+```
+
+The socket is exposed to userspace as a **file descriptor** — just an integer. The chain is:
+
+```
+process fd table
+  └─ int fd (e.g. 5)
+       └─ struct file  (kernel VFS object)
+            └─ struct socket  (POSIX socket layer)
+                 └─ struct sock  (protocol-specific: TCP state, buffers, 4-tuple)
+```
+
+Every socket is a file in Linux. `read()`, `write()`, `select()`, `epoll()` all work on file descriptors — they don't know or care that fd 5 is a TCP socket. The VFS layer dispatches `read()` to the socket's receive queue. This is not an abstraction convenience; it's the actual kernel design, which is why you can do:
+
+```python
+import socket, os
+s = socket.socket()
+s.connect(("example.com", 80))
+# s.fileno() returns the raw integer fd
+os.write(s.fileno(), b"GET / HTTP/1.0\r\n\r\n")
+data = os.read(s.fileno(), 4096)
+```
+
+The `os.write` and `os.read` calls on a socket fd go through the exact same kernel path as writing to a file.
 
 ---
 
@@ -186,7 +245,300 @@ Thirteen steps. Every one of them is real; none of them is hidden by the abstrac
 
 ---
 
-## What WebSocket is not
+## 7. A working server and client
+
+### Go
+
+```go
+// go get github.com/gorilla/websocket
+package main
+
+import (
+    "fmt"
+    "log"
+    "net/http"
+
+    "github.com/gorilla/websocket"
+)
+
+var upgrader = websocket.Upgrader{
+    // In production: check r.Header.Get("Origin") here
+    CheckOrigin: func(r *http.Request) bool { return true },
+}
+
+func handle(w http.ResponseWriter, r *http.Request) {
+    // This performs the HTTP → WebSocket upgrade (the 101 exchange)
+    conn, err := upgrader.Upgrade(w, r, nil)
+    if err != nil {
+        log.Println("upgrade error:", err)
+        return
+    }
+    defer conn.Close()
+
+    // Each connection gets its own goroutine — this IS the read loop.
+    // conn.ReadMessage() blocks until a full WebSocket frame arrives,
+    // parses the header, unmasks the payload, and returns the message.
+    for {
+        msgType, msg, err := conn.ReadMessage()
+        if err != nil {
+            // websocket.IsCloseError checks for clean close frames (1000, 1001, ...)
+            if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
+                log.Println("client closed connection cleanly")
+            } else {
+                log.Println("read error:", err)
+            }
+            return
+        }
+        fmt.Printf("received [type=%d]: %s\n", msgType, msg)
+
+        // Echo back. WriteMessage builds the frame (FIN=1, no mask — server never masks),
+        // writes it to sk_sndbuf, the kernel handles the rest.
+        if err := conn.WriteMessage(msgType, msg); err != nil {
+            log.Println("write error:", err)
+            return
+        }
+    }
+}
+
+func main() {
+    http.HandleFunc("/ws", handle)
+    log.Println("listening on :8080")
+    log.Fatal(http.ListenAndServe(":8080", nil))
+}
+```
+
+The Go model: one goroutine per connection. Goroutines are cheap (~2 KB stack, grows on demand), so 10,000 concurrent connections is normal. Each goroutine blocks in `ReadMessage()` — which internally calls `read()` on the fd — while the Go scheduler runs other goroutines on OS threads. Blocking in Go is not blocking an OS thread.
+
+### Python
+
+```python
+# pip install websockets
+import asyncio
+import websockets
+
+async def handle(websocket):
+    print(f"client connected: {websocket.remote_address}")
+    try:
+        async for message in websocket:
+            # 'message' is already unmasked, decoded if text frame
+            print(f"received: {message}")
+            await websocket.send(f"echo: {message}")
+    except websockets.exceptions.ConnectionClosedOK:
+        print("client closed connection cleanly")
+    except websockets.exceptions.ConnectionClosedError as e:
+        print(f"connection dropped: {e}")
+
+async def main():
+    # websockets.serve() does the HTTP upgrade for each incoming connection
+    async with websockets.serve(handle, "localhost", 8080):
+        await asyncio.Future()  # run forever
+
+asyncio.run(main())
+```
+
+The Python model: one event loop, all connections share it. `async for message in websocket` is a coroutine that yields control back to the event loop while waiting for a frame. When the kernel signals the fd is readable (via `epoll`), the event loop resumes the coroutine. No threads. No blocking.
+
+Both models sit on top of the same OS primitives: `epoll_wait()` to know when an fd has data, `read()` to pull bytes from `sk_receive_queue`, `write()` to push bytes into `sk_write_queue`.
+
+---
+
+## 8. Connection lifecycle
+
+A WebSocket connection passes through four states:
+
+```
+CONNECTING → OPEN → CLOSING → CLOSED
+```
+
+**CONNECTING**: the TCP connection exists and the HTTP upgrade request has been sent, but `101` hasn't been received yet. You cannot call `send()`.
+
+**OPEN**: `101` was received. Both sides can send frames freely. This is the only state where data frames are valid.
+
+**CLOSING**: one side has sent a close frame. The connection is in the close handshake. You should not send new data frames, but you must still read to process the close echo.
+
+**CLOSED**: the close handshake completed (or the TCP connection dropped). The fd is gone. Any further reads/writes return an error.
+
+---
+
+## 9. The close handshake
+
+Closing a WebSocket is not the same as dropping the TCP connection. The protocol defines a two-step close:
+
+```
+Side A sends:  [close frame, code=1000]
+Side B reads:  close frame → echoes back [close frame, code=1000]
+Side A reads:  the echo
+Both sides:    call TCP close() — FIN/FIN-ACK exchange
+```
+
+Close status codes you'll encounter:
+
+| Code | Meaning |
+|------|---------|
+| 1000 | Normal closure |
+| 1001 | Going away (server restarting, browser navigating away) |
+| 1002 | Protocol error |
+| 1003 | Unsupported data type |
+| 1006 | **Abnormal** — no close frame was received; TCP dropped |
+| 1011 | Server encountered an unexpected error |
+
+Code 1006 is important: it means the TCP connection was terminated without a WebSocket close frame. The library synthesizes this code — it never appears on the wire. Seeing 1006 in your logs means a router dropped the connection, a proxy timed out, or the process crashed.
+
+In Go:
+```go
+// Send a clean close frame before closing
+conn.WriteMessage(
+    websocket.CloseMessage,
+    websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""),
+)
+```
+
+In Python:
+```python
+# websockets handles the close echo automatically
+await websocket.close(code=1000, reason="done")
+```
+
+---
+
+## 10. Ping, pong, and dead connection detection
+
+TCP keepalive exists at the OS level, but it has a problem: it only detects that the TCP path is alive, not that the *application* at the other end is still running. A proxy between client and server can be alive while the client behind it is gone.
+
+WebSocket has its own keepalive: **ping and pong frames** (opcodes `0x9` and `0xA`). Either side can send a ping at any time. The other side must respond with a pong containing the same payload. If no pong arrives within a timeout, the connection is considered dead.
+
+```go
+// Go: send a ping every 30 seconds, close if no pong within 10 seconds
+conn.SetPongHandler(func(data string) error {
+    // reset the read deadline on every pong
+    conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+    return nil
+})
+
+go func() {
+    ticker := time.NewTicker(30 * time.Second)
+    defer ticker.Stop()
+    for range ticker.C {
+        if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+            return
+        }
+    }
+}()
+```
+
+```python
+# Python: websockets handles ping/pong automatically
+# ping_interval=20 sends a ping every 20s
+# ping_timeout=10 closes if no pong within 10s
+async with websockets.serve(handle, "localhost", 8080,
+                            ping_interval=20, ping_timeout=10):
+    await asyncio.Future()
+```
+
+The rule: always implement heartbeat. Default TCP keepalive is often 2 hours. Your dead connections will pile up long before the OS notices.
+
+---
+
+## 11. TLS and WSS
+
+`wss://` is WebSocket over TLS. The stack order is:
+
+```
+WebSocket framing
+    └─ TLS record layer  (encryption, MAC, handshake)
+         └─ TCP byte stream
+              └─ IP / Ethernet / wire
+```
+
+TLS sits between TCP and WebSocket. The TLS handshake happens *before* the HTTP upgrade. By the time the `GET /ws HTTP/1.1 Upgrade: websocket` request is sent, TLS is already established and the HTTP bytes are already encrypted.
+
+From the kernel's perspective, TLS changes nothing about the socket: `sk_receive_queue` still holds TCP segments, the fd still works the same way. TLS is handled entirely in userspace (by OpenSSL, BoringSSL, or rustls). The kernel delivers encrypted bytes; the TLS library decrypts them before the WebSocket library ever sees them.
+
+Proxies treat `wss://` differently from `ws://`. An HTTP proxy that handles `ws://` can inspect and potentially interfere with the frames. With `wss://`, the proxy sees only encrypted bytes — it can tunnel the connection but not inspect it. This is why enterprise proxies often block `wss://` on non-standard ports: they can't tell if it's WebSocket or something else.
+
+---
+
+## 12. Proxies, nginx, and the Upgrade header problem
+
+WebSocket breaks behind reverse proxies by default because HTTP proxies were designed for request/response cycles, not long-lived bidirectional streams.
+
+The specific problem: HTTP/1.1 proxies forward the `Upgrade` header by name, but the HTTP spec says hop-by-hop headers (including `Upgrade` and `Connection`) must not be forwarded. So a naive proxy strips them. The server never sees the upgrade request and responds with a normal HTTP response instead of `101`.
+
+The nginx fix:
+
+```nginx
+location /ws {
+    proxy_pass http://backend:8080;
+
+    # Tell nginx to forward the Upgrade header
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+
+    # Disable buffering — WebSocket frames must be forwarded immediately
+    proxy_buffering off;
+
+    # Long timeout: WebSocket connections can be idle for minutes
+    proxy_read_timeout 3600s;
+    proxy_send_timeout 3600s;
+}
+```
+
+Without `proxy_read_timeout`, nginx will close the connection after 60 seconds of inactivity (the default). Without `proxy_buffering off`, nginx buffers the stream and your frames won't be forwarded until the buffer fills up — which defeats the purpose of WebSocket.
+
+Load balancing adds another problem: WebSocket connections are **stateful and long-lived**. If a load balancer routes connection A to server 1 and later routes a new connection from the same client to server 2, server 2 has no state for that client. Solutions: sticky sessions (route the same client to the same server), or move state to a shared store (Redis pub/sub is common for broadcasting).
+
+---
+
+## 13. Backpressure: what happens when the sender is faster than the receiver
+
+The `sk_rcvbuf` field in `struct sock` is the maximum number of bytes allowed in the receive queue — typically 87 KB by default, configurable up to `net.core.rmem_max`. When the receive buffer fills up, TCP advertises a **window size of zero** to the sender. The sender stops sending and waits for the window to open.
+
+This is TCP flow control, and it propagates all the way up to your application:
+
+```
+app writes fast → sk_sndbuf fills → write() blocks
+                                         ↓
+                              TCP sends data until
+                              remote sk_rcvbuf fills
+                                         ↓
+                              remote TCP sends window=0
+                                         ↓
+                              your TCP stops sending
+                                         ↓
+                              sk_sndbuf stays full
+                                         ↓
+                              your write() stays blocked
+```
+
+In Go, `conn.WriteMessage()` will block if the send buffer is full. In Python, `await websocket.send()` will block the coroutine (returning control to the event loop) until the send buffer has room.
+
+This is correct behavior — it means the application is being naturally throttled to the speed the receiver can handle. The failure mode is when you don't respect backpressure: queuing messages in memory faster than they can be sent, until your process runs out of RAM. Always check for write errors and respect blocking writes.
+
+---
+
+## 14. Comparison: WebSocket vs the alternatives
+
+| | WebSocket | Server-Sent Events | Long polling | HTTP/2 streams |
+|---|---|---|---|---|
+| **Direction** | Bidirectional | Server → Client only | Server → Client (simulated) | Bidirectional |
+| **Protocol** | WebSocket (after upgrade) | HTTP | HTTP | HTTP/2 |
+| **Framing** | Binary frames | Text, `\n\n` delimited | Full HTTP response per message | HTTP/2 DATA frames |
+| **Proxy friendly** | Needs config | Yes | Yes | Needs HTTP/2 support |
+| **Latency** | Low | Low | High (round-trip per message) | Low |
+| **Multiplexing** | No (one stream per connection) | N/A | N/A | Yes (many streams per TCP conn) |
+| **Browser support** | Universal | Universal | Universal | Universal |
+| **Complexity** | Medium | Low | Low | Medium |
+
+**Use SSE** when: server pushes events to the browser and the browser never needs to send data back (live feeds, notifications, progress bars). It's HTTP, so it works through every proxy without configuration.
+
+**Use long polling** when: you need server push but can't change infrastructure. It's wasteful (a new HTTP request per message) but works everywhere.
+
+**Use WebSocket** when: you need low-latency bidirectional messaging (chat, multiplayer games, collaborative editing, live terminals).
+
+**Use HTTP/2 streams** when: you're building a service API and want streaming responses without leaving HTTP. gRPC is the most common case.
+
+---
 
 **WebSocket is not HTTP.** After the `101` response, HTTP is done. There are no HTTP headers, no request/response cycles, no status codes. The protocol is WebSocket.
 
