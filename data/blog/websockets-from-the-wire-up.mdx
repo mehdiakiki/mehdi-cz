@@ -623,6 +623,226 @@ This is correct behavior — it means the application is being naturally throttl
 
 ---
 
+---
+
+## 15. Experiments — see it yourself
+
+Theory is only half the work. Every concept in this article is observable from your terminal right now. Run these, look at the output, and the model becomes permanent.
+
+### Experiment 1: Watch the exact syscalls with strace
+
+Start a Python WebSocket server in one terminal:
+
+```bash
+pip install websockets
+python3 -c "
+import asyncio, websockets
+async def h(ws): await ws.send('hello')
+asyncio.run(websockets.serve(h, 'localhost', 8765).serve_forever())
+"
+```
+
+In a second terminal, attach strace to it:
+
+```bash
+PID=$(pgrep -f "websockets.serve")
+strace -p $PID -e trace=network,read,write -s 128 2>&1
+```
+
+Then connect a client. What you'll see in strace:
+
+```
+accept4(3, {sa_family=AF_INET, sin_port=htons(54321), ...}) = 5
+read(5, "GET / HTTP/1.1\r\nUpgrade: websocket\r\n...", 65536) = 187
+write(5, "HTTP/1.1 101 Switching Protocols\r\n...", 129) = 129
+write(5, "\x81\x05hello", 7) = 7
+```
+
+Four lines: accept queue pop, HTTP upgrade read, 101 write, WebSocket frame write. Decode that last write:
+- `\x81` = `10000001` = FIN=1, opcode=0x1 (text frame)
+- `\x05` = payload length 5
+- `hello` = unmasked payload (server never masks)
+
+The entire framing spec, visible in one line of strace output.
+
+---
+
+### Experiment 2: Watch socket states and queue sizes live
+
+```bash
+# All established TCP connections with process info
+ss -tnp state established
+
+# Watch it update every second
+watch -n1 'ss -tnp'
+
+# Show just the listening socket
+ss -tnlp sport = 8765
+```
+
+Expected output while a connection is open:
+
+```
+State   Recv-Q  Send-Q  Local Address:Port  Peer Address:Port  Process
+ESTAB   0       0       127.0.0.1:8765      127.0.0.1:54321    users:(("python3",pid=1234,fd=5))
+LISTEN  0       128     0.0.0.0:8765        0.0.0.0:*          users:(("python3",pid=1234,fd=3))
+```
+
+`Recv-Q` is bytes sitting in `sk_receive_queue` not yet read by the app. `Send-Q` is bytes in `sk_write_queue` not yet sent. Now create backpressure: slow down the server's reading loop and flood it with messages. Watch `Recv-Q` climb in real time. When it hits `sk_rcvbuf` (~87 KB), TCP advertises window=0 and the sender stalls.
+
+---
+
+### Experiment 3: The accept queue — watch it fill up
+
+```python
+# slow_server.py
+import socket, time
+
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("0.0.0.0", 9000))
+s.listen(5)           # backlog=5: accept queue holds max 5 connections
+print("listening — sleeping 5s before first accept()")
+time.sleep(5)         # kernel handles handshakes; app does nothing
+
+while True:
+    conn, addr = s.accept()
+    print(f"accepted: {addr}")
+```
+
+```bash
+python3 slow_server.py &
+
+# Fire 10 simultaneous connections
+for i in $(seq 10); do
+  python3 -c "import socket; s=socket.socket(); s.connect(('localhost',9000))" &
+done
+
+# Check the accept queue depth while the server is sleeping
+ss -tnlp sport = 9000
+```
+
+Output:
+
+```
+State   Recv-Q  Send-Q  Local Address:Port
+LISTEN  5       5       0.0.0.0:9000
+```
+
+`Recv-Q` on a LISTEN socket = connections currently queued, waiting for `accept()`. It is capped at 5 (the backlog). The other 5 clients had their 3-way handshake completed by the kernel — they think they're connected — but `accept()` will never be called for them. They were silently dropped. This is how a slow application causes connection loss under load, with no error visible at the network level.
+
+---
+
+### Experiment 4: Do the WebSocket handshake by hand with nc
+
+No library. Just netcat and your keyboard. Proves the handshake is plain HTTP text.
+
+```bash
+# Start a server
+python3 -c "
+import asyncio, websockets
+async def h(ws): msg = await ws.recv(); await ws.send(f'got: {msg}')
+asyncio.run(websockets.serve(h, 'localhost', 8765).serve_forever())
+" &
+
+# Connect with nc
+nc localhost 8765
+```
+
+Type this exactly (blank line at the end):
+
+```
+GET / HTTP/1.1
+Host: localhost:8765
+Upgrade: websocket
+Connection: Upgrade
+Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==
+Sec-WebSocket-Version: 13
+
+```
+
+You get back:
+
+```
+HTTP/1.1 101 Switching Protocols
+Upgrade: websocket
+Connection: Upgrade
+Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=
+```
+
+The connection is now in WebSocket mode. The terminal is live. To send a frame you'd need to type raw binary — but you've proved the upgrade is nothing more than HTTP text.
+
+---
+
+### Experiment 5: Capture frames with tcpdump
+
+```bash
+# Capture loopback, show ASCII content
+sudo tcpdump -i lo -A -s 0 port 8765
+```
+
+You'll see the HTTP upgrade as plain text, then binary frames after `101`. For a full field-by-field decode: open Wireshark, capture on `lo`, filter `websocket`. The dissector labels every bit: FIN, opcode, MASK, masking key, length, unmasked payload.
+
+---
+
+### Experiment 6: Read the kernel's socket table directly
+
+```bash
+# No tools — raw kernel data
+cat /proc/net/tcp
+```
+
+```
+sl  local_address rem_address   st tx_queue rx_queue
+0:  0100007F:225D 00000000:0000 0A 00000000:00000000
+1:  0100007F:225D 0100007F:D431 01 00000000:00000000
+```
+
+Decode: `0100007F` = `127.0.0.1` (little-endian hex). `225D` = port 8765. `0A` = LISTEN, `01` = ESTABLISHED. `tx_queue:rx_queue` = send/recv buffer depth in bytes. Same numbers `ss` shows — but here you're reading the kernel's own data structure with no abstraction in between.
+
+---
+
+### Experiment 7: Build and send a WebSocket frame manually
+
+No library on the send side. This is the full protocol in 25 lines:
+
+```python
+import socket, base64, os, struct
+
+def handshake(sock, host, port):
+    key = base64.b64encode(os.urandom(16)).decode()
+    sock.sendall((
+        f"GET / HTTP/1.1\r\nHost: {host}:{port}\r\n"
+        f"Upgrade: websocket\r\nConnection: Upgrade\r\n"
+        f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+    ).encode())
+    assert b"101" in sock.recv(4096)
+
+def send_text(sock, msg: str):
+    payload = msg.encode()
+    mask = os.urandom(4)
+    # XOR each payload byte with mask[i % 4] — that's the entire masking algorithm
+    masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+    # FIN=1, opcode=1 (text), MASK=1, 7-bit length
+    sock.sendall(bytes([0x81, 0x80 | len(payload)]) + mask + masked)
+
+def recv_text(sock):
+    h = sock.recv(2)
+    length = h[1] & 0x7F          # server never masks, no masking key to read
+    return sock.recv(length).decode()
+
+s = socket.socket()
+s.connect(("localhost", 8765))
+handshake(s, "localhost", 8765)
+send_text(s, "hello from raw socket")
+print("server replied:", recv_text(s))
+s.close()
+```
+
+Run this against the Python server from Experiment 4. It works. The masking loop is the only "complex" part — it's XOR with a cycling 4-byte key. Everything else in a WebSocket library is error handling and edge cases around this core.
+
+---
+
 **WebSocket is not HTTP.** After the `101` response, HTTP is done. There are no HTTP headers, no request/response cycles, no status codes. The protocol is WebSocket.
 
 **WebSocket is not TCP.** TCP is the byte stream underneath. WebSocket adds framing (message boundaries), opcodes (text/binary/ping/pong/close), and the masking requirement. You could implement WebSocket on top of any ordered reliable byte stream.
