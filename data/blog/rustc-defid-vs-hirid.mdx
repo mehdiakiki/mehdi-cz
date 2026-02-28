@@ -6,7 +6,9 @@ draft: false
 summary: 'Two identifiers, two different jobs. DefId names a definition across the whole compiler pipeline and across crates. HirId points to a node in the syntax tree of the current crate. Mixing them up is the first stumbling block when reading rustc source code.'
 ---
 
-If you've read any `rustc` source or written a compiler plugin, you've seen both `DefId` and `HirId` used as keys everywhere. They look similar but live at completely different layers of the compiler.
+As I will be contributing to the source code of `rustc`, I needed to dig deeper to understand both `DefId` and `HirId`.
+So at first, I was confused. It is because they look similar but realized that they live at completely different layers
+of the compiler.
 
 ---
 
@@ -107,3 +109,36 @@ There is no conversion from a foreign `DefId` to a `HirId` — foreign crates ha
 If you're writing a lint or walking the HIR tree, you'll work with `HirId`. If you're asking the compiler about types, traits, or generics — or if you need to refer to something from another crate — you'll work with `DefId`.
 
 The confusion usually hits when you have one and need the other. The rule: if the node is a definition, the compiler can give you both; if it's just a node (an expression, a pattern), only `HirId` exists.
+
+---
+
+## Why do both need to exist?
+
+A reasonable question is: why not just one universal ID? The answer is that they solve fundamentally different problems, and collapsing them into one would force every layer of the compiler to carry information it doesn't need.
+
+**HIR is ephemeral and crate-local by design.** The compiler processes one crate at a time. Once HIR is lowered to MIR, the HIR arena is freed. Keeping an ID system that tracks individual expressions inside function bodies across crate boundaries would mean retaining an enormous amount of data that external consumers (other crates, the linker, incremental compilation caches) have no use for.
+
+**Definitions need to survive compilation.** When you compile `serde` and then compile your crate that depends on it, `rustc` doesn't re-parse `serde`'s source — it reads the compiled `.rlib` metadata. That metadata contains `DefId`s. Any query that touches a foreign type, trait implementation, or function goes through a `DefId`. A system based purely on HIR nodes couldn't express this at all.
+
+**The split also enables incremental compilation.** The query system memoizes results keyed by `DefId`. If you change one function, only the queries that depend on that function's `DefId` are invalidated. There's no equivalent granularity for `HirId` — re-typechecking a function body re-generates all the `HirId`s inside it anyway.
+
+In short: `HirId` is the right tool for "where in the source tree is this?", and `DefId` is the right tool for "what is this thing and how does the rest of the world refer to it?". They answer different questions.
+
+---
+
+## FAQ
+
+**Can two different nodes have the same `HirId`?**
+No. `HirId` is unique within a crate for a given compilation session. The combination of `owner` (which definition contains the node) and `local_id` (which node within that definition) is always unique.
+
+**Can a `DefId` become invalid between compilations?**
+Yes, in the sense that `DefIndex` values are not stable across compilations — they're assigned during each compile. Incremental compilation handles this by mapping `DefId`s through a stable hash of the definition's path (`DefPathHash`). If you're storing `DefId`s anywhere persistent, you want the hash, not the raw index.
+
+**What is `LocalDefId` and when should I use it over `DefId`?**
+`LocalDefId` is just `DefId` with the `krate` field removed — it's a newtype that statically guarantees you're referring to something in the current crate. Prefer it in any pass that only operates on local definitions. It avoids a redundant check and makes the intent clear at the type level.
+
+**Why does `HirId` have an `owner` field? Couldn't it just be a flat index?**
+The `owner` field exists for parallel compilation. Each "owner" (roughly: each item that can have its own MIR body, like a function) can be type-checked independently. The `owner` + `local_id` split means the compiler can assign `HirId`s within each owner without coordinating a global counter, which would be a synchronization bottleneck.
+
+**I have a `Span`. How do I get a `HirId` from it?**
+You generally can't go directly from a `Span` to a `HirId` — spans are source positions, not tree node identities. The typical pattern is to visit the HIR tree and match on the node you care about, then use the `HirId` the visitor hands you. `tcx.hir().find_by_def_id(local_def_id)` can help if you already know which definition you're looking at.
