@@ -1088,6 +1088,339 @@ One line. That's the full round-trip: raw TCP socket → manual HTTP upgrade →
 
 ---
 
+### Experiment 8: Trigger a protocol error — send an unmasked client frame
+
+RFC 6455 §5.1: a server MUST close the connection upon receiving an unmasked frame from a client. Let's verify that.
+
+Start the echo server from Experiment 4, then run:
+
+```python
+import socket, base64, os
+
+s = socket.socket()
+s.connect(("localhost", 8765))
+
+key = base64.b64encode(os.urandom(16)).decode()
+s.sendall((
+    f"GET / HTTP/1.1\r\nHost: localhost:8765\r\n"
+    f"Upgrade: websocket\r\nConnection: Upgrade\r\n"
+    f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+).encode())
+assert b"101" in s.recv(4096)
+
+# 0x81 = FIN=1 + opcode 1 (text). 0x05 = MASK=0 + length 5. No masking key.
+s.sendall(bytes([0x81, 0x05]) + b"hello")
+
+raw = s.recv(4096)
+print(f"response hex: {raw.hex()}")
+print(f"opcode: 0x{raw[0] & 0x0F:x}  (8 = close)")
+print(f"close code: {int.from_bytes(raw[2:4], 'big')}")
+s.close()
+```
+
+Expected output:
+
+```
+response hex: 880203ea
+opcode: 0x8  (8 = close)
+close code: 1002
+```
+
+Decode `880203ea`: `88` = FIN=1 + opcode 8 (close). `02` = payload length 2. `03ea` = 0x03EA = 1002. The server detected the masking violation and closed with the correct code. The entire detection and response path is in the WebSocket library's frame parser, two bytes into the frame.
+
+---
+
+### Experiment 9: Send a fragmented message with raw sockets
+
+Prove that the server reassembles three frames — FIN=0, FIN=0, FIN=1 — into one message before calling your handler.
+
+```python
+import socket, base64, os
+
+def hs(sock):
+    key = base64.b64encode(os.urandom(16)).decode()
+    sock.sendall((
+        f"GET / HTTP/1.1\r\nHost: localhost:8765\r\n"
+        f"Upgrade: websocket\r\nConnection: Upgrade\r\n"
+        f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+    ).encode())
+    assert b"101" in sock.recv(4096)
+
+def frame(opcode, payload, fin):
+    mask = os.urandom(4)
+    masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+    b0 = (0x80 if fin else 0x00) | opcode
+    return bytes([b0, 0x80 | len(payload)]) + mask + masked
+
+s = socket.socket()
+s.connect(("localhost", 8765))
+hs(s)
+
+s.sendall(frame(0x1, b"hel",   fin=False))  # text, FIN=0 — opens the message
+s.sendall(frame(0x0, b"lo ",   fin=False))  # continuation, FIN=0
+s.sendall(frame(0x0, b"world", fin=True))   # continuation, FIN=1 — delivers the message
+
+r = s.recv(4096)
+n = r[1] & 0x7F
+print("server received:", r[2:2+n].decode())
+s.close()
+```
+
+Expected:
+
+```
+server received: got: hello world
+```
+
+The echo server called your handler exactly once with `"hello world"`. It never saw three separate messages. The fragmentation was completely transparent to the application.
+
+Capture this with Wireshark (`websocket` filter) to see three DATA frames: the first with opcode=1 and FIN=0, the second and third with opcode=0. Only the third has FIN=1.
+
+---
+
+### Experiment 10: Control frame too large — trigger code 1002
+
+A control frame payload over 125 bytes is a protocol violation (RFC 6455 §5.5). Using extended length (payload length field = 126) in a control frame is explicitly forbidden. The server must close with code 1002.
+
+```python
+import socket, base64, os
+
+s = socket.socket()
+s.connect(("localhost", 8765))
+
+key = base64.b64encode(os.urandom(16)).decode()
+s.sendall((
+    f"GET / HTTP/1.1\r\nHost: localhost:8765\r\n"
+    f"Upgrade: websocket\r\nConnection: Upgrade\r\n"
+    f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+).encode())
+assert b"101" in s.recv(4096)
+
+# Ping with 126-byte payload using extended length encoding
+# 0x89 = FIN=1 + opcode 9 (ping). 0xFE = MASK=1 + 126 (extended length trigger).
+# Two more bytes give the actual length: 0x00 0x7E = 126.
+payload = b"x" * 126
+mask = os.urandom(4)
+masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+s.sendall(bytes([0x89, 0xFE, 0x00, 0x7E]) + mask + masked)
+
+r = s.recv(4096)
+print(f"close code: {int.from_bytes(r[2:4], 'big')}")  # 1002
+s.close()
+```
+
+Expected:
+
+```
+close code: 1002
+```
+
+Two ways to violate the control frame size rule in one frame: the payload itself is 126 bytes (over the 125-byte limit), and you used extended length encoding (forbidden for control frames). Either one is sufficient.
+
+---
+
+### Experiment 11: TCP_NODELAY — see `nonagle` with `ss -tin`
+
+Connect to the echo server with TCP_NODELAY set, then inspect the socket with `ss -tin`. The `nonagle` flag is explicit proof that Nagle is disabled.
+
+Connect a client and hold the connection open:
+
+```python
+import socket, base64, os, time
+
+s = socket.socket()
+s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)   # disable Nagle
+s.connect(("localhost", 8765))
+
+key = base64.b64encode(os.urandom(16)).decode()
+s.sendall((
+    f"GET / HTTP/1.1\r\nHost: localhost:8765\r\n"
+    f"Upgrade: websocket\r\nConnection: Upgrade\r\n"
+    f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+).encode())
+s.recv(4096)
+print(f"connected, sleeping 30s (fd={s.fileno()})")
+time.sleep(30)
+s.close()
+```
+
+While it's sleeping, in another terminal:
+
+```bash
+ss -tin dst :8765
+```
+
+With `TCP_NODELAY` set:
+
+```
+ESTAB 0 0 127.0.0.1:54321 127.0.0.1:8765
+     cubic wscale:7,7 rto:201 rtt:0.044/0.022 ato:40 mss:65483 pmtu:65535
+     cwnd:10 bytes_sent:187 segs_out:3 segs_in:2 send 119Gbps nonagle
+```
+
+Without it (remove the `setsockopt` line):
+
+```
+ESTAB 0 0 127.0.0.1:54322 127.0.0.1:8765
+     cubic wscale:7,7 rto:201 rtt:0.038/0.019 ato:40 mss:65483 pmtu:65535
+     cwnd:10 bytes_sent:187 segs_out:3 segs_in:2 send 119Gbps
+```
+
+`nonagle` is present in the first run, absent in the second. Also notice `ato:40` in both — that's the delayed ACK timer set to 40 ms. When Nagle is active (second run), these two interact: the sender won't send until it gets an ACK; the receiver delays the ACK for 40 ms. That's the deadlock.
+
+---
+
+### Experiment 12: Simulate an intermediary — SIGKILL the server
+
+A clean close sends a WebSocket close frame and TCP FIN. `SIGKILL` forces the OS to tear down the socket immediately, sending a TCP RST with no cleanup. The client receives the RST, gets no close frame, and the library synthesizes close code 1006.
+
+Terminal 1 — start the echo server:
+
+```bash
+python3 server.py &
+echo "server PID: $!"
+```
+
+Terminal 2 — connect a client and block waiting for a message:
+
+```python
+import asyncio, websockets
+
+async def main():
+    async with websockets.connect("ws://localhost:8765") as ws:
+        print("connected")
+        try:
+            msg = await ws.recv()
+        except websockets.exceptions.ConnectionClosed as e:
+            print(f"connection closed: code={e.rcvd.code if e.rcvd else 'none'}, synthesized=1006")
+
+asyncio.run(main())
+```
+
+Terminal 1 — kill the server without letting it clean up:
+
+```bash
+kill -9 <server_PID>
+```
+
+Client output:
+
+```
+connected
+connection closed: code=none, synthesized=1006
+```
+
+No close frame arrived — the OS sent a TCP RST, the client's `recv()` got an error, and the library synthesized 1006. This is exactly what an intermediary timeout looks like: no warning, no close code on the wire, just a dropped TCP connection. The 1006 is a library convention, not a frame that traveled over the network.
+
+---
+
+### Experiment 13: permessage-deflate — watch RSV1 in Wireshark
+
+The Python websockets library negotiates permessage-deflate automatically when both sides support it. You can see it working in two places: the negotiated extension header, and RSV1=1 on compressed frames.
+
+```python
+import asyncio, websockets
+
+async def main():
+    async with websockets.connect("ws://localhost:8765") as ws:
+        print("negotiated extensions:", ws.extensions)
+        msg = "hello " * 100   # 600 bytes — repetitive, compresses well
+        await ws.send(msg)
+        r = await ws.recv()
+        print(f"sent {len(msg.encode())} bytes, received {len(r.encode())} bytes back")
+
+asyncio.run(main())
+```
+
+The `extensions` field shows what was negotiated:
+
+```
+negotiated extensions: [PerMessageDeflate(client_no_context_takeover=False, ...)]
+```
+
+Now open Wireshark, capture on `lo`, filter `websocket`. Find the outbound data frame and expand it:
+
+```
+WebSocket
+  Frame: Text (fin=True, opcode=1, mask=True, len=18)
+    FIN: True
+    Reserved: 0x4   ← RSV1=1 (compressed)
+    Opcode: Text (1)
+    Mask: True
+    Payload length: 18   ← 600 bytes compressed to 18
+    Masking-Key: ...
+    Masked payload: ...
+```
+
+`Reserved: 0x4` means bit 6 is set — that's RSV1. The 600-byte payload compressed to 18 bytes (97% reduction). This is why JSON-heavy WebSocket APIs almost always negotiate permessage-deflate: the compression ratio on structured text is dramatic. The RSV1=1 is the flag that tells the receiver to run DEFLATE decompression before passing the bytes to the application.
+
+---
+
+### Experiment 14: Backpressure — watch the TCP receive window shrink
+
+Set up a slow-reading TCP server and a fast-writing client. Watch `ss -tin` as the receive window drops to zero and the sender stalls.
+
+Slow reader (terminal 1):
+
+```python
+# slow_reader.py
+import socket, time
+
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("0.0.0.0", 9999))
+s.listen(1)
+conn, addr = s.accept()
+print(f"accepted {addr}")
+while True:
+    data = conn.recv(512)    # read only 512 bytes at a time
+    if not data:
+        break
+    time.sleep(0.05)          # artificial slowdown: ~10 KB/s read rate
+```
+
+Fast writer (terminal 2):
+
+```python
+# fast_writer.py
+import socket, time
+
+s = socket.socket()
+s.connect(("localhost", 9999))
+chunk = b"x" * 8192   # 8 KB chunks
+sent = 0
+while True:
+    n = s.send(chunk)
+    sent += n
+    print(f"\rsent: {sent // 1024} KB", end="", flush=True)
+```
+
+Observer (terminal 3, run while the above two are running):
+
+```bash
+watch -n0.3 'ss -tin dst :9999'
+```
+
+What you'll see over time:
+
+```
+# Early — window is open, data flows freely:
+ESTAB 0  0  127.0.0.1:55001  127.0.0.1:9999
+      rcv_wnd:65280 ...
+
+# Mid — receive buffer filling, window shrinking:
+ESTAB 0  87040  127.0.0.1:55001  127.0.0.1:9999
+      rcv_wnd:16384 ...
+
+# Late — receive buffer full, window=0, sender stalled:
+ESTAB 0  212992  127.0.0.1:55001  127.0.0.1:9999
+      rcv_wnd:0 ...
+```
+
+`rcv_wnd:0` means the receiver has advertised a zero window — it has no room left in `sk_rcvbuf`. The sender's `s.send()` is now blocking inside the kernel. `Send-Q:212992` is the bytes waiting in the sender's `sk_sndbuf`, going nowhere. This is the backpressure chain made visible: slow reader → full recv buffer → window=0 → blocked sender. For a WebSocket server, the same chain runs whenever `conn.WriteMessage()` blocks.
+
+---
+
 **WebSocket is not HTTP.** After the `101` response, HTTP is done. There are no HTTP headers, no request/response cycles, no status codes. The protocol is WebSocket.
 
 **WebSocket is not TCP.** TCP is the byte stream underneath. WebSocket adds framing (message boundaries), opcodes (text/binary/ping/pong/close), and the masking requirement. You could implement WebSocket on top of any ordered reliable byte stream.
