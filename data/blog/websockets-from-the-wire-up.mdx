@@ -14,7 +14,7 @@ This article starts from the physical layer and works up. By the end, tracing wh
 
 ## 1. The wire: analog signals becoming bits
 
-Ethernet (the most common physical layer for servers) encodes bits as voltage changes on a copper cable, or as light pulses on fiber. The exact encoding varies — twisted pair uses a scheme called MLT-3 or PAM4 depending on speed — but the principle is the same: a voltage transition *at a specific time* represents a 1 or a 0.
+Ethernet (the most common physical layer for servers) encodes bits as voltage changes on a copper cable, or as light pulses on fiber. The exact encoding depends on the standard and link speed — 100BASE-TX uses MLT-3, 1000BASE-T uses PAM5, 25G/100G+ links use PAM4 — but the principle is the same: a signal transition *at a specific time* maps to a 1 or a 0.
 
 The NIC (Network Interface Card) on the receiving end has a clock recovery circuit that samples the incoming signal and produces a stream of bits. This is the boundary between analog and digital. Below this line: physics. Above it: bytes.
 
@@ -71,7 +71,7 @@ struct sock {
 };
 ```
 
-Each packet in the kernel is a `struct sk_buff` (skb). It's not a copy of the packet — it's a descriptor with four pointers (`head`, `data`, `tail`, `end`) into a contiguous memory region. As a packet moves up the network stack, headers are stripped by advancing `data` forward. As it moves down, headers are prepended by moving `data` backward. No copying happens; only the pointer moves.
+Each packet in the kernel is a `struct sk_buff` (skb). It's not a copy of the packet — it's a descriptor with four pointers (`head`, `data`, `tail`, `end`) into a contiguous memory region. As a packet moves up the network stack, headers are stripped by advancing `data` forward. As it moves down, headers are prepended by moving `data` backward. In the common path, no copying happens — the kernel does pointer arithmetic rather than `memcpy`. Copies do occur in specific cases: cloning for multicast delivery, retransmission of TCP segments, and some hardware offload paths.
 
 ```
 head → [ headroom for headers ]
@@ -130,7 +130,7 @@ Listening socket
 
 The kernel manages the 3-way handshake entirely by itself — no application code runs during it. A SYN arrives → kernel puts it in the SYN queue and sends SYN+ACK. The client's ACK arrives → kernel moves the connection from the SYN queue to the accept queue. The application hasn't done anything yet.
 
-The `backlog` in `listen(fd, 128)` is the maximum size of the **accept queue** — how many fully established connections can sit waiting before the application calls `accept()`. If the accept queue is full when a new connection completes its handshake, the kernel silently drops the connection (or sends a RST). This is where servers get overwhelmed: not because they can't handle connections, but because the application calls `accept()` too slowly.
+The `backlog` in `listen(fd, 128)` is the maximum size of the **accept queue** — how many fully established connections can sit waiting before the application calls `accept()`. If the accept queue is full when a new connection completes its handshake, the kernel's default behavior is to drop the final ACK from the client. The client-side `connect()` returns success (the client believes the connection is established), but the server-side accept queue never logs it. The client's first data send will eventually time out or be RST'd. Setting `net.ipv4.tcp_abort_on_overflow=1` makes the kernel send an explicit RST instead of silently dropping. This is where servers get overwhelmed: not because they can't handle connections, but because the application calls `accept()` too slowly.
 
 ```python
 import socket
@@ -308,7 +308,7 @@ Put it all together. You call `ws.send("hello")` in a browser.
 **Kernel (send path)**:
 3. The bytes land in the TCP send buffer (`sk_sndbuf`).
 4. The TCP layer segments them (5 bytes of WebSocket data fits in one TCP segment with plenty of room), adds the TCP header (`src_port`, `dst_port`, sequence number, ACK number, flags), and passes the segment down to IP.
-5. IP adds its header (src/dst IP, TTL, protocol=6), computes the header checksum.
+5. IP adds its header (src/dst IP, TTL, protocol=6). IPv4 computes a header checksum over the IP header itself; IPv6 omits it entirely, relying on lower-layer (Ethernet CRC) and upper-layer (TCP checksum) integrity checks instead.
 6. The Ethernet layer adds the MAC addresses (looked up via ARP or the routing table) and the frame goes into the NIC's DMA transmit ring buffer.
 7. The NIC reads from the ring buffer, serializes the bytes, drives the electrical or optical signal onto the wire.
 
@@ -390,7 +390,7 @@ func main() {
 }
 ```
 
-The Go model: one goroutine per connection. Goroutines are cheap (~2 KB stack, grows on demand), so 10,000 concurrent connections is normal. Each goroutine blocks in `ReadMessage()` — which internally calls `read()` on the fd — while the Go scheduler runs other goroutines on OS threads. Blocking in Go is not blocking an OS thread.
+The Go model: one goroutine per connection. Goroutines start with a small stack (around 2–8 KB, depending on Go version) that grows on demand — far cheaper than OS threads (1–8 MB each). This makes tens of thousands of concurrent connections achievable on a typical server; actual limits depend on available memory, OS file descriptor limits (`ulimit -n`), and your specific workload. Each goroutine blocks in `ReadMessage()` — which internally calls `read()` on the fd — while the Go scheduler multiplexes goroutines across a small pool of OS threads. Blocking in a goroutine is not the same as blocking an OS thread.
 
 ### Python
 
@@ -637,8 +637,15 @@ Start a Python WebSocket server in one terminal:
 pip install websockets
 python3 -c "
 import asyncio, websockets
-async def h(ws): await ws.send('hello')
-asyncio.run(websockets.serve(h, 'localhost', 8765).serve_forever())
+
+async def h(ws):
+    await ws.send('hello')
+
+async def main():
+    async with websockets.serve(h, 'localhost', 8765):
+        await asyncio.Future()
+
+asyncio.run(main())
 "
 ```
 
@@ -741,8 +748,16 @@ No library. Just netcat and your keyboard. Proves the handshake is plain HTTP te
 # Start a server
 python3 -c "
 import asyncio, websockets
-async def h(ws): msg = await ws.recv(); await ws.send(f'got: {msg}')
-asyncio.run(websockets.serve(h, 'localhost', 8765).serve_forever())
+
+async def h(ws):
+    msg = await ws.recv()
+    await ws.send(f'got: {msg}')
+
+async def main():
+    async with websockets.serve(h, 'localhost', 8765):
+        await asyncio.Future()
+
+asyncio.run(main())
 " &
 
 # Connect with nc
@@ -911,4 +926,5 @@ One line. That's the full round-trip: raw TCP socket → manual HTTP upgrade →
 
 ---
 
-The WebSocket RFC is [RFC 6455](https://www.rfc-editor.org/rfc/rfc6455). It's 71 pages and unusually readable for an RFC. The framing section (Section 5) and the handshake section (Section 4) are worth reading in full if this article left you wanting more detail.
+The WebSocket RFC is [RFC 6455](https://www.rfc-editor.org/rfc/rfc6455). 
+Although, it is 71 pages, it is unusually readable for an RFC. The framing section is Section 5 and the handshake section is Section 4 and these are worth a read if the current article left you wanting to know even more. 
