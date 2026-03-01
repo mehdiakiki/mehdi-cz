@@ -251,6 +251,22 @@ This is the upgrade: one HTTP request, one HTTP response, then the connection is
 
 **"Client" and "server" at the HTTP/WebSocket level** inherit the TCP roles. The one that initiated the TCP connection sent the HTTP upgrade request. But after `101`, the WebSocket protocol is symmetric — both sides can send frames at any time without the other side asking.
 
+### Subprotocol negotiation
+
+The client can declare which application-level protocols it speaks:
+
+```http
+Sec-WebSocket-Protocol: chat, superchat
+```
+
+The server picks one and echoes it back:
+
+```http
+Sec-WebSocket-Protocol: chat
+```
+
+If the server doesn't include `Sec-WebSocket-Protocol`, no subprotocol is active — the connection still works, but both sides must agree out-of-band on message format. Common subprotocols you'll encounter in the wild: STOMP (message brokers), MQTT (IoT), and the various GraphQL-over-WebSocket protocols (graphql-ws, subscriptions-transport-ws).
+
 ---
 
 ## 6. WebSocket framing: the binary format
@@ -294,6 +310,50 @@ Each WebSocket frame:
 - 127: the actual length follows as a 64-bit big-endian integer
 
 This is why a WebSocket frame has a 2-byte minimum header for small messages, 4-byte for medium, and 10-byte for large — the length field expands as needed.
+
+### RSV bits and extensions
+
+The three RSV bits (RSV1, RSV2, RSV3) must be 0 in every frame unless the client and server negotiated an extension that assigns them meaning. A receiver that sees non-zero RSV bits without a corresponding negotiated extension must close the connection with code 1002.
+
+The most common extension is **permessage-deflate** (RFC 7692): it compresses each message payload with DEFLATE and uses RSV1=1 to signal that a frame is compressed. Negotiate it during the upgrade:
+
+```http
+Sec-WebSocket-Extensions: permessage-deflate; client_max_window_bits
+```
+
+The server responds with what it accepts:
+
+```http
+Sec-WebSocket-Extensions: permessage-deflate
+```
+
+After that, RSV1=1 on any data frame means "decompress before delivering." For text-heavy payloads (JSON, XML) this typically cuts wire size by 60–80% with negligible CPU cost.
+
+### Control frame rules
+
+Opcodes `0x8` (close), `0x9` (ping), and `0xA` (pong) are **control frames**. The spec imposes constraints that don't apply to data frames:
+
+- **Cannot be fragmented** — control frames must always have FIN=1. Sending a ping with FIN=0 is a protocol error.
+- **Payload limited to 125 bytes** — the 7-bit payload length field only; extended length is forbidden.
+- **Can interleave with fragmented data messages** — a ping can arrive in the middle of a fragmented message sequence and the receiver must respond immediately, without waiting for the fragmented message to finish.
+
+The 125-byte payload limit matters for close frames: the 2-byte status code takes the first two bytes, leaving only 123 bytes for the human-readable reason string. Reason strings that exceed this get truncated or omitted.
+
+### Fragmentation and reassembly
+
+A message that's too large to send in one frame — or that the application wants to stream — can be split across multiple frames using the FIN bit and the continuation opcode (`0x0`):
+
+```
+Frame 1: FIN=0, opcode=0x1 (text)          ← opens a new text message
+Frame 2: FIN=0, opcode=0x0 (continuation)  ← middle fragment
+Frame 3: FIN=1, opcode=0x0 (continuation)  ← final fragment, deliver now
+```
+
+The receiver accumulates payloads and delivers the assembled message when it sees FIN=1. The original opcode (`0x1` text or `0x2` binary) only appears in the first frame; continuation frames always use `0x0`.
+
+Control frames can interrupt a fragmented sequence without disturbing it. A ping arriving between fragment 1 and fragment 2 is answered immediately; the partially received message stays in the reassembly buffer.
+
+Most WebSocket libraries handle fragmentation invisibly — splitting large sends, reassembling on receipt. Where it surfaces: frame-level captures in Wireshark, or writing a custom WebSocket parser from scratch.
 
 ---
 
@@ -571,6 +631,25 @@ Without `proxy_read_timeout`, nginx will close the connection after 60 seconds o
 
 Load balancing adds another problem: WebSocket connections are **stateful and long-lived**. If a load balancer routes connection A to server 1 and later routes a new connection from the same client to server 2, server 2 has no state for that client. Solutions: sticky sessions (route the same client to the same server), or move state to a shared store (Redis pub/sub is common for broadcasting).
 
+### Intermediary timeouts and the idle-connection problem
+
+Every hop between client and server has an idle timeout — a timer that fires if no bytes cross the TCP connection for N seconds:
+
+| Intermediary | Typical default |
+|---|---|
+| nginx | 60 s (`proxy_read_timeout`) |
+| AWS ALB | 60 s (configurable up to 4000 s) |
+| Cloudflare | 100 s |
+| Enterprise firewall | 5 min (varies widely) |
+
+When the timer fires, the intermediary closes the TCP connection without sending a WebSocket close frame. Both endpoints may not notice for seconds or minutes (until the next send or read). The client sees close code 1006 — the library-synthesized "no close frame received" code.
+
+This is the real reason heartbeat is mandatory in production. You're not asking "is my peer alive?" — you're asking "is the entire network path between us still forwarding packets?" A proxy doesn't know about WebSocket keepalive; it counts seconds since the last byte on the TCP stream.
+
+Diagnostic signatures: connections drop on suspiciously round intervals (60 s, 300 s). Code 1006. Only affects users behind specific corporate proxies or VPNs. Never reproduces when connecting directly to the server.
+
+Fix: set ping interval below the lowest timeout in your infrastructure. 25–45 seconds covers most environments. Confirm nginx `proxy_read_timeout` is set to at least 2× your ping interval.
+
 ---
 
 ## 13. Backpressure: what happens when the sender is faster than the receiver
@@ -600,6 +679,33 @@ This is correct behavior — it means the application is being naturally throttl
 
 ---
 
+## TCP gotchas: Nagle's algorithm and delayed ACK
+
+Two TCP features that interact poorly with WebSocket's small-frame pattern.
+
+**Nagle's algorithm** (enabled by default on every TCP socket) buffers small writes. When your application calls `write()` with a small payload — a ping, a short event, a control frame — the kernel holds the bytes and waits until either a full-size segment accumulates or a TCP ACK arrives from the remote end. On interactive workloads this adds 40–200 ms of latency per small message.
+
+The fix is `TCP_NODELAY`, which disables Nagle:
+
+```python
+import socket
+s = socket.socket()
+s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+```
+
+```go
+tc, _ := conn.(*net.TCPConn)
+tc.SetNoDelay(true)
+```
+
+Most WebSocket libraries enable `TCP_NODELAY` automatically. If you're seeing latency spikes on small messages that go away under load, check that it's actually set (`ss -tin` will show `nonagle` in the options).
+
+**Delayed ACK** holds acknowledgments for up to 40 ms on the receiving side, hoping to piggyback them on outbound data. When the sender has Nagle enabled and the receiver uses delayed ACK, they deadlock: the sender waits for an ACK before sending the next segment; the receiver waits 40 ms before sending the ACK, hoping data will arrive to piggyback it on. The result is a guaranteed ~40 ms stall on every request/response exchange that involves small messages in both directions.
+
+`TCP_NODELAY` on the sender breaks the deadlock — the sender stops waiting for ACKs before sending. The combination of `TCP_NODELAY` on both ends eliminates this entirely.
+
+---
+
 ## 14. Comparison: WebSocket vs the alternatives
 
 | | WebSocket | Server-Sent Events | Long polling | HTTP/2 streams |
@@ -622,6 +728,37 @@ This is correct behavior — it means the application is being naturally throttl
 **Use HTTP/2 streams** when: you're building a service API and want streaming responses without leaving HTTP. gRPC is the most common case.
 
 ---
+
+## Security checklist
+
+A WebSocket connection bypasses most of the protections that come with HTTP:
+
+- **Validate the `Origin` header** — browsers always send it; non-browser clients don't. If your server only serves browsers, reject connections from unexpected origins. Don't rely on this alone.
+- **Authenticate on connection or in the first message** — HTTP session cookies ride along with the upgrade request, but most WebSocket frameworks don't check them automatically. Pass a signed token in a query parameter (WSS only — never WS) or authenticate via a first-message handshake.
+- **Rate-limit at the message level** — a single WebSocket connection can send thousands of messages per second. HTTP rate limiters only see one request: the upgrade. Track messages-per-connection-per-second in your handler.
+- **Enforce a maximum message size** — read the frame header, check the declared payload length before allocating memory, and close with code 1009 (message too big) if it exceeds your limit. Don't buffer first and validate later.
+- **Validate every message** — WebSocket has no schema enforcement. Parse and validate before acting on anything.
+- **CSRF via WebSocket** — a malicious page can open a WebSocket connection to your server from a user's browser, inheriting their session cookies. Origin validation is the primary defense. `SameSite=Strict` cookies also help.
+
+---
+
+## WebSocket over HTTP/2 (RFC 8441)
+
+Classic WebSocket requires HTTP/1.1. The `Upgrade` header doesn't exist in HTTP/2 — HTTP/2 has its own multiplexing model and doesn't use connection-level upgrades.
+
+RFC 8441 adds a WebSocket tunnel over HTTP/2 using an extended `CONNECT` method with a `:protocol` pseudo-header:
+
+```
+:method    = CONNECT
+:protocol  = websocket
+:scheme    = https
+:path      = /ws
+:authority = server.example.com
+```
+
+The HTTP/2 stream acts as a byte pipe: WebSocket framing sits inside it instead of on a raw TCP connection. The benefit is that a single TCP connection can multiplex both regular HTTP/2 requests and WebSocket streams simultaneously — something classic WebSocket can't do.
+
+Browser support: Chrome 91+, Firefox 89+. Server library support is uneven. If you're deploying HTTP/2 everywhere and need WebSocket, it's worth checking RFC 8441 support in your stack. The pragmatic fallback — and what most production systems do today — is to serve WebSocket on a separate HTTP/1.1 endpoint.
 
 ---
 
