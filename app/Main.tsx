@@ -4,7 +4,7 @@ import siteMetadata from "@/data/siteMetadata";
 import { formatDate } from "pliny/utils/formatDate";
 import { WebsiteJsonLd } from "@/components/JsonLd";
 
-const MAX_DISPLAY = 2;
+const MAX_DISPLAY = 4;
 
 export default function Home({ posts }) {
   return (
