@@ -1,0 +1,1013 @@
+---
+title: "Load Balancing and Sticky Sessions: A Complete Course"
+date: "2026-03-20"
+tags: ["go", "load-balancer", "backend", "architecture", "websockets", "networking", "devops"]
+draft: false
+summary: "Learn load balancing from scratch: build a production-ready load balancer with sticky sessions in Go. Complete with WebSocket support, health checking, rate limiting, and real-world deployment strategies."
+---
+
+# Load Balancing and Sticky Sessions: A Complete Course
+
+Build a production-ready load balancer with sticky sessions from scratch in Go. This course covers everything from basic concepts to advanced implementations.
+
+![Load Balancer Architecture](/static/images/stick-sessions-load-balancer.webp)
+
+**GitHub Repository:** [mehdiakiki/load-balancer-sticky-sessions](https://github.com/mehdiakiki/load-balancer-sticky-sessions)
+
+## What You'll Learn
+
+By the end of this course, you'll understand:
+
+- How load balancers work internally
+- Why sticky sessions are critical for stateful applications
+- How to implement WebSocket support
+- Production-ready features: rate limiting, metrics, health checking
+- When to use different load balancing algorithms
+
+---
+
+## Chapter 1: What is Load Balancing?
+
+### The Problem
+
+Imagine you have a popular web application. As traffic grows, a single server can't handle all the requests. You add more servers, but now you need a way to distribute traffic across them.
+
+**Without load balancing:**
+
+```
+1,000 users → Single server → Server crashes
+```
+
+**With load balancing:**
+
+```
+1,000 users → Load Balancer → 3 servers → Each handles ~333 users ✅
+```
+
+### Why Load Balancing Matters
+
+1. **Scalability** - Handle more requests by adding servers
+2. **Reliability** - If one server fails, others take over
+3. **Performance** - Distribute load to prevent overload
+
+### Types of Load Balancing
+
+**Layer 4 (Transport Layer):**
+
+- Routes based on IP and port
+- Faster (no packet inspection)
+- Examples: HAProxy, AWS Network Load Balancer
+
+**Layer 7 (Application Layer):**
+
+- Routes based on HTTP path, headers, cookies
+- More intelligent routing
+- Examples: Nginx, AWS Application Load Balancer
+
+**This course implements Layer 7 load balancing** in Go.
+
+---
+
+## Chapter 2: Load Balancing Algorithms
+
+### Round-Robin (Simplest)
+
+Distributes requests sequentially:
+
+```go
+// pkg/loadbalancer/loadbalancer.go
+func (lb *LoadBalancer) getNextBackend() *backend.Backend {
+    lb.mux.Lock()
+    defer lb.mux.Unlock()
+
+    next := int(lb.Current+1) % len(lb.Backends)
+    lb.Current++
+
+    return lb.Backends[next]
+}
+```
+
+**Flow:**
+
+```
+Request 1 → Backend 1
+Request 2 → Backend 2
+Request 3 → Backend 3
+Request 4 → Backend 1 (cycle repeats)
+```
+
+**Pros:**
+
+- Simple to implement
+- Fair distribution
+- O(1) time complexity
+
+**Cons:**
+
+- Doesn't account for server capacity
+- Doesn't consider current load
+
+### Weighted Round-Robin (Better)
+
+Distributes based on server capacity:
+
+```go
+func (lb *LoadBalancer) getWeightedRoundRobinBackend() *backend.Backend {
+    var selectedBackend *backend.Backend
+    var totalWeight int
+
+    for _, b := range lb.Backends {
+        if !b.IsAlive() {
+            continue
+        }
+
+        b.CurrentWeight += b.Weight
+        totalWeight += b.Weight
+
+        if selectedBackend == nil || b.CurrentWeight > selectedBackend.CurrentWeight {
+            selectedBackend = b
+        }
+    }
+
+    if selectedBackend != nil {
+        selectedBackend.CurrentWeight -= totalWeight
+    }
+
+    return selectedBackend
+}
+```
+
+**Example:**
+
+```
+Backend 1 (weight=5): Gets ~50% traffic
+Backend 2 (weight=3): Gets ~30% traffic
+Backend 3 (weight=2): Gets ~20% traffic
+```
+
+**When to use:**
+
+- Heterogeneous servers (different CPU/RAM)
+- Geographic distribution
+- Gradual rollout (v2 gets higher weight)
+
+### Least Connections (Advanced)
+
+Routes to server with fewest active connections:
+
+```go
+func (lb *LoadBalancer) getLeastConnectionsBackend() *backend.Backend {
+    var selected *backend.Backend
+    minConnections := math.MaxInt64
+
+    for _, b := range lb.Backends {
+        if !b.IsAlive() {
+            continue
+        }
+
+        if b.ActiveConnections < minConnections {
+            minConnections = b.ActiveConnections
+            selected = b
+        }
+    }
+
+    return selected
+}
+```
+
+**Pros:**
+
+- Considers actual server load
+- Better for heterogeneous traffic
+
+**Cons:**
+
+- Requires tracking connections
+- More complex implementation
+
+---
+
+## Chapter 3: Sticky Sessions (Session Affinity)
+
+### The Problem Stateful Applications Face
+
+Many applications store session state locally:
+
+```go
+// User logs in on Server 1
+User → Server 1
+Server 1: Creates session in memory { userID: 123, preferences: {...} }
+
+// Next request goes to Server 2 (round-robin)
+User → Server 2
+Server 2: "I don't have this session!"
+User gets logged out ❌
+```
+
+**Stateful applications:**
+
+- In-memory session storage
+- WebSocket connections
+- Local caches (Redis on same server)
+- File uploads in progress
+
+### What Are Sticky Sessions?
+
+Sticky sessions ensure a client's requests always go to the same backend server:
+
+```
+First Request:
+  Client → LB (no cookie)
+  LB: Pick Backend 2 (round-robin)
+  LB: Set cookie: LB_SESSION=abc123 → Backend 2
+
+All Future Requests:
+  Client → LB (with cookie: LB_SESSION=abc123)
+  LB: Look up "abc123" → Backend 2
+  LB: Route to Backend 2
+  Session stays intact ✅
+```
+
+### Implementation
+
+**Session Storage (In-Memory):**
+
+```go
+type StickySession struct {
+    BackendID string    // Which backend owns this session
+    ExpiresAt time.Time // When session expires
+}
+
+type LoadBalancer struct {
+    StickySession map[string]*StickySession
+    //              ↑ sessionID   ↑ session data
+}
+```
+
+**Session Creation:**
+
+```go
+func (lb *LoadBalancer) setStickySession(w http.ResponseWriter, r *http.Request, backendID string) {
+    // Generate unique session ID
+    sessionID := generateSessionID(r)
+
+    // Store in memory map
+    lb.StickySession[sessionID] = &StickySession{
+        BackendID: backendID,
+        ExpiresAt:  time.Now().Add(lb.sessionTTL),
+    }
+
+    // Set cookie
+    http.SetCookie(w, &http.Cookie{
+        Name:     "LB_SESSION",
+        Value:    sessionID,
+        HttpOnly: true,
+        MaxAge:   int(lb.sessionTTL.Seconds()),
+    })
+}
+```
+
+**Session Lookup:**
+
+```go
+func (lb *LoadBalancer) getStickyBackend(r *http.Request) *backend.Backend {
+    // Extract cookie
+    cookie, err := r.Cookie("LB_SESSION")
+    if err != nil {
+        return nil  // New session
+    }
+
+    // Look up session in memory
+    lb.mux.RLock()
+    session, exists := lb.StickySession[cookie.Value]
+    lb.mux.RUnlock()
+
+    if !exists {
+        return nil  // Invalid session
+    }
+
+    // Check expiration
+    if time.Now().After(session.ExpiresAt) {
+        delete(lb.StickySession, cookie.Value)
+        return nil  // Expired
+    }
+
+    // Find backend
+    backend := lb.getBackendByID(session.BackendID)
+
+    if backend != nil && backend.IsAlive() {
+        return backend  // ✅ Sticky backend found
+    }
+
+    return nil
+}
+```
+
+### Request Flow
+
+```go
+func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+    // Step 1: Check for sticky session
+    targetBackend := lb.getStickyBackend(r)
+
+    // Step 2: If no session, pick backend using round-robin
+    if targetBackend == nil {
+        targetBackend = lb.getNextBackend()
+
+        // Create new sticky session
+        lb.setStickySession(w, r, targetBackend.ServerID)
+    }
+
+    // Step 3: Route to backend
+    targetBackend.ReverseProxy.ServeHTTP(w, r)
+}
+```
+
+### Do You Need External Storage?
+
+**NO!** For single load balancer instances, in-memory session storage is perfect:
+
+**Memory footprint:**
+
+```
+Session ID: ~44 bytes
+Backend ID: ~10 bytes
+Timestamp: 8 bytes
+Total: ~62 bytes per session
+
+10,000 concurrent sessions = ~600KB
+1,000,000 concurrent sessions = ~60MB
+```
+
+**When would you need Redis/Database?**
+
+Only for **multiple load balancer instances**:
+
+```
+Problem: Multiple LBs, different session maps
+LB-1: sessions["abc123"] = "backend-1"
+LB-2: sessions["abc123"] = NOT FOUND ❌
+
+Solution: Shared session storage
+LB-1: sessions["abc123"] = "backend-1" → Redis
+LB-2: reads from Redis → "backend-1" ✅
+```
+
+---
+
+## Chapter 4: WebSocket Support
+
+### Why WebSockets Need Sticky Sessions
+
+WebSockets are **long-lived, stateful connections**. Once established:
+
+- Connection stays open indefinitely
+- Server maintains connection-specific state
+- Connection cannot be "transferred" between servers
+
+**Without sticky sessions:**
+
+```javascript
+// WebSocket connection established on Backend 1
+const ws = new WebSocket("ws://loadbalancer.com/ws");
+// → Connected to Backend 1
+
+// After 5 minutes, WebSocket message
+ws.send("Hello");
+// Load balancer routes to Backend 2 (round-robin)
+// Backend 2: "I don't have this connection!" ❌
+// Connection lost!
+```
+
+**With sticky sessions:**
+
+```javascript
+// WebSocket connection
+const ws = new WebSocket("ws://loadbalancer.com/ws");
+// LB: Set cookie LB_SESSION=abc123 → Backend 1
+// Connected to Backend 1 ✅
+
+// After 5 minutes
+ws.send("Hello");
+// LB: Cookie abc123 → Backend 1
+// Backend 1: "I have this connection!"
+// Message delivered ✅
+```
+
+### Implementation
+
+**Go's ReverseProxy handles WebSockets automatically:**
+
+```go
+import "net/http/httputil"
+
+backend := &Backend{
+    ReverseProxy: httputil.NewSingleHostReverseProxy(url),
+}
+
+// When client sends:
+// GET /ws HTTP/1.1
+// Upgrade: websocket
+// Connection: Upgrade
+
+// ReverseProxy:
+// 1. Detects Upgrade header
+// 2. Hijacks connection
+// 3. Upgrades to WebSocket on backend
+// 4. Streams frames bidirectionally
+```
+
+**No code changes needed!** Sticky sessions handle the routing, ReverseProxy handles the WebSocket protocol.
+
+### Testing WebSocket Stickiness
+
+```bash
+# Start WebSocket backends
+go run cmd/backend-ws/main.go -port 8081 -name ws-backend-1
+go run cmd/backend-ws/main.go -port 8082 -name ws-backend-2
+go run cmd/backend-ws/main.go -port 8083 -name ws-backend-3
+
+# Start load balancer
+go run cmd/server/main.go -config configs/config.toml
+
+# Connect WebSocket
+wscat -c ws://localhost:8080/ws
+
+# Send messages
+> Hello
+< [ws-backend-1] Echo: Hello
+
+> World
+< [ws-backend-1] Echo: World
+
+> Test
+< [ws-backend-1] Echo: Test
+```
+
+**All messages go to the SAME backend!** Check backend logs:
+
+```
+[ws-backend-1] WebSocket connection established
+[ws-backend-1] Received: Hello
+[ws-backend-1] Received: World
+[ws-backend-1] Received: Test
+```
+
+---
+
+## Chapter 5: Health Checking
+
+### Why Health Checking Matters
+
+Backends can fail:
+
+- Server crashes
+- Network issues
+- Application errors
+
+Without health checking, load balancer would route to dead servers.
+
+### Implementation
+
+**Backend Health Check:**
+
+```go
+func (b *Backend) HealthCheck(timeout time.Duration) error {
+    client := http.Client{Timeout: timeout}
+
+    resp, err := client.Get(b.URL.String())
+    if err != nil {
+        b.SetAlive(false)
+        return err
+    }
+    defer resp.Body.Close()
+
+    // Consider 2xx and 3xx as healthy
+    alive := resp.StatusCode >= 200 && resp.StatusCode < 500
+    b.SetAlive(alive)
+
+    return nil
+}
+```
+
+**Background Health Monitoring:**
+
+```go
+func (lb *LoadBalancer) HealthCheck(interval, timeout time.Duration) {
+    // One goroutine per backend
+    for _, b := range lb.Backends {
+        go func(backend *Backend) {
+            ticker := time.NewTicker(interval)
+            for range ticker.C {
+                backend.HealthCheck(timeout)
+            }
+        }(b)
+    }
+}
+```
+
+**Failover Behavior:**
+
+When backend fails:
+
+1. Health check marks it as `Alive = false`
+2. New requests skip this backend
+3. Existing sticky sessions become invalid
+4. Clients get new backend on next request
+
+---
+
+## Chapter 6: Rate Limiting
+
+### Token Bucket Algorithm
+
+Allow bursts while maintaining average rate:
+
+```go
+type RateLimiter struct {
+    limiters    map[string]*rate.Limiter
+    rate        rate.Limit    // Tokens per second
+    burst       int           // Max burst
+}
+
+func (rl *RateLimiter) Middleware(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        // Use client IP as key
+        key := r.RemoteAddr
+
+        // Get or create limiter for this client
+        limiter := rl.getLimiter(key)
+
+        // Try to consume a token
+        if !limiter.Allow() {
+            http.Error(w, "Rate limit exceeded", http.StatusTooManyRequests)
+            return
+        }
+
+        next.ServeHTTP(w, r)
+    })
+}
+```
+
+**Configuration:**
+
+```toml
+[ratelimit]
+enabled = true
+requests_per_second = 100.0
+burst = 200
+cleanup_interval = "1m"
+```
+
+**How it works:**
+
+- Tokens replenish at 100/second
+- Bucket holds max 200 tokens
+- Request consumes 1 token
+- Empty bucket → HTTP 429
+
+---
+
+## Chapter 7: Configuration
+
+### TOML Configuration
+
+Easy to read and modify:
+
+```toml
+[server]
+port = 8080
+host = "0.0.0.0"
+
+[loadbalancer]
+algorithm = "weighted-round-robin"
+session_ttl = "30m"
+
+[[loadbalancer.backends]]
+id = "backend-1"
+url = "http://localhost:8081"
+weight = 3
+
+[[loadbalancer.backends]]
+id = "backend-2"
+url = "http://localhost:8082"
+weight = 2
+
+[logging]
+level = "info"
+format = "json"
+
+[metrics]
+enabled = true
+port = 9090
+```
+
+### Configuration Validation
+
+```go
+func (c *Config) Validate() error {
+    if c.Server.Port < 1 || c.Server.Port > 65535 {
+        return fmt.Errorf("invalid port: %d", c.Server.Port)
+    }
+
+    if len(c.LoadBalancer.Backends) == 0 {
+        return fmt.Errorf("no backends configured")
+    }
+
+    for _, backend := range c.LoadBalancer.Backends {
+        if backend.Weight < 0 {
+            return fmt.Errorf("negative weight")
+        }
+    }
+
+    return nil
+}
+```
+
+---
+
+## Chapter 8: Production Features
+
+### Prometheus Metrics
+
+```go
+var (
+    TotalRequests = prometheus.NewCounter(
+        prometheus.CounterOpts{
+            Name: "lb_total_requests_total",
+            Help: "Total requests processed",
+        },
+    )
+
+    BackendRequests = prometheus.NewCounterVec(
+        prometheus.CounterOpts{
+            Name: "lb_requests_per_backend_total",
+            Help: "Requests per backend",
+        },
+        []string{"backend_id"},
+    )
+)
+
+// Access metrics at /metrics endpoint
+```
+
+**Key metrics:**
+
+```promql
+lb_total_requests_total
+lb_requests_per_backend_total{backend_id="backend-1"}
+lb_session_count
+lb_backend_health{backend_id="backend-1"}
+lb_rate_limit_exceeded_total
+```
+
+### Structured Logging
+
+```go
+func (l *Logger) log(level LogLevel, message string, fields map[string]interface{}) {
+    entry := LogEntry{
+        Timestamp: time.Now().UTC().Format(time.RFC3339),
+        Level:     string(level),
+        Message:   message,
+        Fields:    fields,
+    }
+
+    if l.format == "json" {
+        json.NewEncoder(l.writer).Encode(entry)
+    } else {
+        log.Printf("[%s] %s %v", level, message, fields)
+    }
+}
+```
+
+**JSON output:**
+
+```json
+{
+  "timestamp": "2024-01-15T10:30:00Z",
+  "level": "info",
+  "message": "Request processed",
+  "fields": {
+    "backend": "backend-1",
+    "duration_ms": 45,
+    "path": "/api/users"
+  }
+}
+```
+
+---
+
+## Chapter 9: Testing
+
+### Proving Sticky Sessions Work
+
+**Test 1: Round-Robin (No Cookie)**
+
+```bash
+for i in {1..6}; do
+    curl -s http://localhost:8080/ | grep "Hello from"
+done
+
+# Output:
+# Hello from backend-1
+# Hello from backend-2
+# Hello from backend-3
+# Hello from backend-1
+# Hello from backend-2
+# Hello from backend-3
+```
+
+Different backends — round-robin working! ✓
+
+**Test 2: Sticky Session (With Cookie)**
+
+```bash
+curl -c cookies.txt http://localhost:8080/ > /dev/null
+
+for i in {1..6}; do
+    curl -b cookies.txt -s http://localhost:8080/ | grep "Hello from"
+done
+
+# Output:
+# Hello from backend-2
+# Hello from backend-2
+# Hello from backend-2
+# Hello from backend-2
+# Hello from backend-2
+# Hello from backend-2
+```
+
+Same backend — sticky session working! ✓
+
+**Test 3: Multiple Clients**
+
+```bash
+# Client 1
+curl -c client1.txt http://localhost:8080/ > /dev/null
+curl -b client1.txt http://localhost:8080/ | grep "Hello from"
+# → backend-1, backend-1, backend-1...
+
+# Client 2
+curl -c client2.txt http://localhost:8080/ > /dev/null
+curl -b client2.txt http://localhost:8080/ | grep "Hello from"
+# → backend-3, backend-3, backend-3...
+```
+
+Different clients, different backends — sessions isolated! ✓
+
+---
+
+## Chapter 10: Deployment Considerations
+
+### Single Instance Deployment
+
+For most use cases, a single load balancer instance with in-memory sessions is sufficient:
+
+```yaml
+# docker-compose.yml
+services:
+  loadbalancer:
+    build: .
+    ports:
+      - "8080:8080"
+      - "9090:9090" # Metrics
+    volumes:
+      - ./configs:/config
+    command: ["./loadbalancer", "-config", "/config/config.toml"]
+
+  backend1:
+    image: yourapp:latest
+    ports:
+      - "8081:8081"
+
+  backend2:
+    image: yourapp:latest
+    ports:
+      - "8082:8082"
+```
+
+### High Availability Deployment
+
+For production, run multiple LB instances with shared session storage:
+
+```yaml
+services:
+  lb1:
+    image: loadbalancer:latest
+    environment:
+      - REDIS_URL=redis://redis:6379
+
+  lb2:
+    image: loadbalancer:latest
+    environment:
+      - REDIS_URL=redis://redis:6379
+
+  redis:
+    image: redis:alpine
+    volumes:
+      - redis-data:/data
+
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+    # Routes to lb1 or lb2
+```
+
+### Performance Considerations
+
+**In-memory session storage:**
+
+- Lookup time: ~10ns
+- Memory: 62 bytes per session
+- 1M sessions ≈ 60MB RAM
+
+**Health checking:**
+
+- Interval: 10 seconds
+- Timeout: 2 seconds
+- Each check: ~5ms
+
+**Rate limiting:**
+
+- Overhead: ~50ns per request
+- Memory: ~1KB per client
+
+---
+
+## Complete Implementation
+
+Get the full source code:
+
+**GitHub:** [mehdiakiki/load-balancer-sticky-sessions](https://github.com/mehdiakiki/load-balancer-sticky-sessions)
+
+### Project Structure
+
+```
+loadbalancer-sticky-sessions/
+├── cmd/
+│   ├── server/main.go          # Load balancer entry point
+│   ├── backend/main.go         # HTTP test backend
+│   └── backend-ws/main.go      # WebSocket test backend
+├── pkg/
+│   ├── backend/backend.go      # Backend management
+│   ├── config/config.go        # TOML configuration
+│   ├── loadbalancer/           # Core load balancer logic
+│   ├── logging/logging.go      # Structured logging
+│   ├── metrics/metrics.go      # Prometheus metrics
+│   └── ratelimit/ratelimit.go  # Rate limiting
+└── configs/config.toml         # Example configuration
+```
+
+### Quick Start
+
+```bash
+# Clone repository
+git clone https://github.com/mehdiakiki/load-balancer-sticky-sessions.git
+cd load-balancer-sticky-sessions
+
+# Start backends
+go run cmd/backend/main.go -port 8081 -name backend-1 &
+go run cmd/backend/main.go -port 8082 -name backend-2 &
+go run cmd/backend/main.go -port 8083 -name backend-3 &
+
+# Start load balancer
+go run cmd/server/main.go -config configs/config.toml
+
+# Test
+curl http://localhost:8080/
+```
+
+---
+
+## Course Summary
+
+### What You Learned
+
+✅ **Load Balancing Fundamentals**
+
+- Round-robin and weighted round-robin algorithms
+- When to use each algorithm
+- Performance characteristics
+
+✅ **Sticky Sessions**
+
+- Why stateful applications need them
+- Cookie-based implementation
+- In-memory storage (no Redis needed!)
+- Session lifecycle management
+
+✅ **WebSocket Support**
+
+- Why WebSockets require sticky sessions
+- How Go's ReverseProxy handles upgrades
+- Testing WebSocket stickiness
+
+✅ **Production Features**
+
+- Health checking with automatic failover
+- Rate limiting (token bucket)
+- Prometheus metrics
+- Structured logging
+- TOML configuration
+
+✅ **Testing and Deployment**
+
+- How to verify sticky sessions work
+- Single-instance vs HA deployment
+- Performance tuning
+
+### Next Steps
+
+1. **Study the code** - Read through the implementation
+2. **Modify and experiment** - Try different algorithms
+3. **Add features** - Implement IP-hash, least connections
+4. **Deploy** - Use it for learning projects
+
+### Resources
+
+**GitHub Repository:** [mehdiakiki/load-balancer-sticky-sessions](https://github.com/mehdiakiki/load-balancer-sticky-sessions)
+
+**Related Topics:**
+
+- Nginx Load Balancing
+- HAProxy Configuration
+- Kubernetes Services and Ingress
+- Service Mesh (Istio, Linkerd)
+
+---
+
+## Course Exercises
+
+### Exercise 1: Implement IP-Hash
+
+Add IP-hash algorithm to route based on client IP:
+
+```go
+func (lb *LoadBalancer) getIPHashBackend(r *http.Request) *backend.Backend {
+    ip := r.RemoteAddr
+    hash := fnv.New32a()
+    hash.Write([]byte(ip))
+    index := int(hash.Sum32()) % len(lb.Backends)
+    return lb.Backends[index]
+}
+```
+
+### Exercise 2: Add Least Connections
+
+Track active connections per backend:
+
+```go
+type Backend struct {
+    // ... existing fields
+    ActiveConnections int
+    mux               sync.Mutex
+}
+
+func (b *Backend) IncrementConnections() {
+    b.mux.Lock()
+    b.ActiveConnections++
+    b.mux.Unlock()
+}
+```
+
+### Exercise 3: Implement Circuit Breaker
+
+Add circuit breaker pattern to prevent cascading failures:
+
+```go
+type CircuitBreaker struct {
+    maxFailures   int
+    timeout       time.Duration
+    state         State // Closed, Open, HalfOpen
+    failureCount  int
+    lastFailTime  time.Time
+}
+```
+
+### Exercise 4: Add HTTPS Support
+
+Configure TLS in the config:
+
+```go
+server := &http.Server{
+    Addr:    ":443",
+    Handler: lb,
+}
+server.ListenAndServeTLS("cert.pem", "key.pem")
+```
+
+---
+
+## Conclusion
+
+Load balancing and sticky sessions are fundamental to modern web architecture. By building one from scratch, you understand:
+
+- **How** requests are distributed
+- **Why** certain algorithms work better for different scenarios
+- **When** sticky sessions are necessary
+- **What** production concerns exist (health checks, rate limiting, metrics)
+
+The complete implementation is available on GitHub with comprehensive documentation, tests, and deployment examples. Use it as a learning tool or as a foundation for more complex systems.
+
+[→ Get the Code on GitHub](https://github.com/mehdiakiki/load-balancer-sticky-sessions)
