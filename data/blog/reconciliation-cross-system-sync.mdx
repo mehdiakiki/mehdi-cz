@@ -1,0 +1,253 @@
+---
+title: "How to Keep Two Systems in Sync"
+date: "2026-05-31"
+tags:
+  ["api-design", "distributed-systems", "system-design", "backend", "idempotency", "reliability"]
+draft: false
+summary: "When you sync two systems with webhooks, the copy slowly becomes wrong: some events are lost, some are duplicated, some arrive in the wrong order. Reconciliation is the way to make the two systems agree again. Here is how to design an API for it."
+---
+
+You have two systems that must agree.
+
+System A owns the data. We call it the source of truth. System B needs its own copy of this data: to join it with other tables, to show a dashboard, or simply to avoid calling A on every request.
+
+This is a very common situation. Almost every backend has at least one case like this.
+
+So how do you keep the copy in B up to date? The answer looks easy. Every time something changes in A, A sends a webhook, and B applies it. A customer is created? B inserts a row. A customer is updated? B updates the row. A customer is deleted? B deletes the row.
+
+You build this in one afternoon. The demo works perfectly. You ship it.
+
+This article explains why this afternoon of work will give you wrong data for months without you noticing, and the one idea that fixes it: reconciliation.
+
+> You cannot make two systems agree by replaying events. You make them agree by comparing them.
+
+## The naive approach: just replay the events
+
+Here is the full idea in code. A sends events, B applies them:
+
+```ts
+// B's webhook handler - the version everybody writes first
+async function applyEvent(event: CustomerEvent) {
+  switch (event.type) {
+    case "customer.created":
+    case "customer.updated":
+      await db.customers.upsert(event.customer);
+      break;
+    case "customer.deleted":
+      await db.customers.delete(event.customerId);
+      break;
+  }
+}
+```
+
+That is all. A is the source of truth, the events are the changes, and B replays the changes.
+
+It is clean, it is simple, and for about three weeks it works perfectly.
+
+Then you go to production.
+
+## Then you go to production
+
+The thing nobody tells you about event delivery is that it is a promise, not a guarantee. Here is how this promise breaks, more or less in the order you will discover it.
+
+**You miss an event.** B was restarting during a deploy. Or its database was doing a failover. Or A tried five times, B answered with 500 errors for ninety seconds, and A gave up.
+
+A continues normally. The event is lost. B never received it, and nobody in the system knows that B is now missing a customer.
+
+**You receive an event two times.** Almost every webhook system is _at-least-once_. This is not a bug. It is the only honest guarantee a network can give.
+
+So sometimes the same `customer.updated` arrives twice. If your handler only does an upsert, this is not a problem. But if it does something incremental, like increment a counter or add to a balance, then you just counted the same thing two times.
+
+**Events arrive in the wrong order.** The `updated` event passes the `created` event. Or two updates change places, and the older one is applied last. Now B shows a value that A already replaced ten minutes ago.
+
+The network does not guarantee order, and retries make it worse.
+
+**The delete never arrives.** This is the most dangerous case. A customer leaves. A sends `customer.deleted`. But B is down at this moment. The event is lost like any other event.
+
+The difference is that this time there is no "old row" that a future update will fix later. There is a customer in B, looking completely normal and active, that A deleted months ago. Your number of "active customers" is wrong, and it has been wrong for a long time.
+
+This is the table you will draw on a whiteboard one day while debugging:
+
+| What went wrong       | What you see in B                                                                  |
+| --------------------- | ---------------------------------------------------------------------------------- |
+| Lost event            | A row that should exist is missing, or a row that should be deleted is still there |
+| Duplicate delivery    | Changes applied two times: wrong counters, balances, totals                        |
+| Out-of-order delivery | The old value wins; B shows data that A already changed                            |
+| Missed delete         | Ghost rows that stay forever                                                       |
+
+But the real problem is not one specific row.
+
+The real problem is this: **B is wrong, you cannot detect it, and even if you suspect it, you have no way to repair it.** There is no button that says "make B correct again." The events are gone. The only solution would be to ask A to send again every event from the beginning, which is usually not possible.
+
+Keep this idea in mind.
+
+## The patches you will try (and why they are not enough)
+
+Nobody arrives at this wall and immediately rewrites the whole sync. First, you patch. And every patch is reasonable, because each one removes exactly one of the problems above.
+
+This is exactly why this phase can continue for months: you always feel that you are one fix away from the solution.
+
+**"I will retry more."** Add retries, a dead-letter queue, and an alert when delivery fails. Good. You will lose fewer events. But "fewer" is not "zero", and this does nothing against duplicates, ordering, or the delete that is already lost. You made the stream more reliable, not complete.
+
+**"I will add idempotency keys."** Put a unique id on each event and ignore the ids you already saw. Now duplicates are not a problem anymore. This is really worth doing. But a lost event has no id to ignore, and a missed delete is still a ghost. One more problem solved, the dangerous ones are still there.
+
+**"I will add sequence numbers."** Give a version to each change, and ignore an event whose version is older than the one you already have. Now an old update cannot replace fresh data. This is also worth doing. But a version number cannot recover an event that you never received. If you are missing version 7, knowing that you have version 6 only tells you that you are broken, it does not tell you how to fix it.
+
+**"I will re-fetch the record when an event arrives."** Now we are getting closer. Instead of trusting the content of the event, you treat it as a signal: "customer 42 changed, go ask A for its current state." This fixes ordering and stale content at the same time.
+
+But look carefully at the trigger: _when an event arrives._ You only learn about the customers for which you received an event. The create you missed silently, the delete you lost, these never trigger a re-fetch, because the problem itself is that their event never arrived. The blind spot has exactly the same shape as before.
+
+Take a step back and the pattern becomes clear. Every patch makes the _event stream_ more reliable. No patch makes it _complete_.
+
+At the bottom, you are still betting that you saw every event that happened. This bet is the bug. You cannot transform an incomplete signal into a complete one only by patching it.
+
+So stop patching the signal.
+
+## The solution: stop trusting events, reconcile
+
+Change the question.
+
+The naive approach asks: _"Did I apply every event correctly?"_ You can never answer this with confidence, because the answer depends on a history that you cannot fully see.
+
+Reconciliation asks a different question: _"Does B match A right now?"_ And this question you can answer, simply by looking.
+
+Periodically, or on demand, you read the current state of A and the current state of B, you align them by id, and you compute the difference. Everything that is in A but missing or old in B, you write it. Everything that is in B but not in A anymore, you delete it. At the end, B equals A.
+
+```ts
+// Reconcile B against A. It does not care what events were lost, doubled, or reordered.
+async function reconcile() {
+  const source = await a.listAllCustomers(); // must be the COMPLETE list of A
+  const local = await db.customers.listAll(); // B's current copy
+
+  const sourceById = new Map(source.map((c) => [c.id, c]));
+  const localById = new Map(local.map((c) => [c.id, c]));
+
+  // In A but missing or old in B -> write it.
+  for (const [id, src] of sourceById) {
+    const mine = localById.get(id);
+    if (!mine || mine.version < src.version) {
+      await db.customers.upsert(src); // idempotent: safe to run again
+    }
+  }
+
+  // In B but not in A anymore -> A deleted it.
+  // Only safe if "source" above is the complete list. See the warning below.
+  for (const id of localById.keys()) {
+    if (!sourceById.has(id)) {
+      await db.customers.delete(id);
+    }
+  }
+}
+```
+
+Look at what this function does, and especially at what it does not depend on. It never asks "what happened?". It asks "what is true now?".
+
+A lost event? Reconcile writes the missing row. An update applied two times? Reconcile writes A's real value on top. A delete you missed six months ago? The ghost is in B but not in A, so it is removed.
+
+The function is **self-healing**: you can point it at any quantity of accumulated drift, and it brings B back to A. This is the property that the patched event stream could never give you.
+
+The twenty lines above show the idea. But real code needs three small cares, and the first one can delete your data.
+
+**Do not delete on a partial read.** The delete step trusts that `a.listAllCustomers()` returned the complete list of A. Imagine this call reads many pages, and one page fails silently and returns nothing. Now many rows of A are missing from your `source` map. The function will think that all these rows were deleted, and it will delete real, live data in B. So you must treat a partial or failed read of A as a reason to stop the whole reconciliation, never as "everything else was deleted." If you are not sure that you saw all of A, you must not delete anything.
+
+**Choose your version carefully.** The line `mine.version < src.version` is safe only if the version always grows when the data changes. If two different changes can produce the same version, the function sees the same number on both sides, skips the row even when the content is different, and never repairs it. This happens, for example, with an `updatedAt` that has only one-second precision, or with a clock that can go backward. The safe choice is a counter that always increases. If you only have a timestamp, compare a hash of the content when the versions are equal.
+
+**Mind the memory.** This simple version reads all of A and all of B into memory, in two maps. This is fine for ten or a hundred thousand rows. It is not fine for tens of millions. For large data you do not load everything; you reconcile page by page, or you compare only what changed. We come back to this in the tradeoffs.
+
+And here this becomes a story about _API design_, not only about your sync job. Look at the function again and notice everything that it silently assumes about A's API:
+
+- **Stable ids to match on.** `c.id` must mean the same customer in A and in B, forever. Not the email (people change their email), not the name. It must be an identifier owned by the system that never moves. If the "id" of A is in reality a business value that can change, reconciliation has nothing to align.
+- **A way to list everything.** `a.listAllCustomers()` is the most important part. If A only lets you fetch one record by id, you can never discover the records that you are missing, and the records you are missing are exactly the point. An API with no way to enumerate cannot be reconciled. There is no way around it.
+- **A version or an `updatedAt`.** This is how `reconcile` ignores the thousands of rows that did not change and writes only the few that changed. Without it, every run rewrites everything.
+- **Idempotent writes.** `upsert` and `delete` must be safe to call many times, because reconciliation calls them all the time. Here idempotency is not an option, it is essential.
+- **Deletes that you can observe.** B must be able to know that something is gone. If A simply makes records disappear, with no marker and no way to list what currently exists, then deletes are invisible and ghosts are guaranteed.
+
+If A's API gives you these things, reconciliation is twenty lines of code. If it does not, you cannot reconcile, even if you are very clever. And this is a problem of API design on the side of A, not a missing trick on your side.
+
+**This is the real lesson: any API that wants to be a source of truth for another system must be designed so that its state can be listed, identified, versioned, and converged to. "Send an event and hope" is not an integration contract.**
+
+## The tradeoffs
+
+No solution is free, and a person who tells you that reconciliation is only advantages has never run it at scale. The honest tradeoffs:
+
+**It is expensive if you do it naively.** "Read everything from A, read everything from B, compare" is fine for ten thousand customers and a catastrophe for fifty million.
+
+The solutions exist: read only what changed since the last run (`listChangedSince(cursor)`), run the cheap incremental pass often and a full pass from time to time, or compare checksums or Merkle hashes by range so you look in detail only at the parts that disagree. But each of these adds complexity, and each one depends even more on A's API exposing the right things.
+
+**It has a delay.** Reconciliation is periodic, so between two runs B is allowed to be a little old. If your loop runs every five minutes, B can be five minutes behind. For many systems this is acceptable. For some, it is not.
+
+This is the real reason why you do not throw the events away: **you keep both.** Events give you freshness, B usually updates in a few seconds. Reconciliation gives you correctness, the guarantee that, whatever the events did or did not do, B will be correct again soon.
+
+The sentence to remember: _the event stream is the optimization, the reconciliation loop is the guarantee._ The answer to "events or reconciliation?" is "both".
+
+**Two-way sync becomes complicated very fast.** Everything above assumes that A is the source of truth and B is only a copy, so one direction. The moment the two sides can modify the same record, you must handle conflicts: last-write-wins (simple, but it silently loses data), version vectors (correct, but more bookkeeping), or CRDTs (powerful, but a real architectural commitment). If you can keep one single direction, keep it, and write it clearly in the design.
+
+**Sometimes it is just not possible.** If A is a third-party API that does not give you a way to enumerate or stable ids, and many do not, then no engineering effort on your side makes reconciliation possible. This is a real dead end, and it is better to see it early, because it changes what you can promise about B.
+
+**It can hide a broken pipeline.** This problem appears for the teams that do reconciliation correctly. Because the loop repairs the drift silently every few minutes, your events can be failing without anybody noticing, and everything still looks fine.
+
+The solution: monitor the size of the difference at each reconciliation. A difference close to zero means your event stream is healthy. A difference that suddenly becomes large means that something broke upstream, reconciliation is hiding it, and you want to know.
+
+## This is not React or Kubernetes reconciliation
+
+If the word "reconciliation" reminds you of something else, you are not wrong. The word is reused because the basic idea is the same: find the difference between what exists and what should exist, then close this difference.
+
+React's reconciler compares a virtual DOM with the previous one to compute the minimum of real DOM updates. Kubernetes runs control loops that compare the desired state (your YAML) with the actual state of the cluster, and act to make them converge.
+
+Same idea, completely different domain. Here we talk about reconciliation at the level of data, between the records of two systems. But if you already understand "compare, do not replay" from one of these worlds, you already have the correct reflex.
+
+## TL;DR
+
+- Syncing B from A by replaying the events of A feels correct but breaks silently: events are lost, duplicated, reordered, and a missed delete becomes a ghost that never disappears.
+- Every patch (retries, idempotency keys, versions, re-fetch on event) fixes one problem and leaves the dangerous ones, because all of them still assume that you saw every event.
+- Stop trusting the stream. **Reconcile:** read the current state of A and of B, compare by stable id, and write the difference. It is self-healing, it repairs the drift whatever the cause was.
+- Be careful in real code: never delete on a partial read of A, use a version that always grows, and do not load millions of rows into memory.
+- Keep the events too: events for freshness, reconciliation for correctness.
+- This only works if A's API is _designed_ for it: stable ids, a way to enumerate, versions, idempotent writes, observable deletes. If not, this is a bug of API design.
+
+## FAQ
+
+### Is this not simply eventual consistency?
+
+It is the way to obtain eventual consistency in an honest manner. "Eventually consistent" is the promise. Reconciliation is the mechanism that really delivers it, instead of hoping that a fragile event stream will do it. Without a convergence step, "eventually" becomes "never" very quietly.
+
+### Do I really need both events and reconciliation?
+
+Usually yes. Events alone are fast but never complete. Reconciliation alone is correct but late, and expensive if it is your only path.
+
+Together they complete each other: events keep B fresh second by second, reconciliation guarantees that B is correct minute by minute. If you can build only one first, build reconciliation. A system a little bit late but provably correct is better than a fast system that is silently wrong.
+
+### How often should I reconcile?
+
+As often as your tolerance for delay and your budget allow. A common shape: a cheap incremental pass (only what changed since last time) every few minutes, plus a full pass every night or every week as a safety net.
+
+Adjust with the size of the differences: if the full passes find nothing most of the time, your incremental path is healthy and you can slow down the cadence.
+
+### Last-write-wins, version vectors, or CRDTs?
+
+This is only a question if the sync is bidirectional. Last-write-wins is the simplest, and it silently drops the losing write, which is fine when conflicts are rare and cheap. Version vectors detect the real conflicts so that you can resolve them on purpose, with more bookkeeping. CRDTs let concurrent edits merge without a central arbiter, but they are a real architectural commitment.
+
+For one single direction you need none of this, which is the best argument to keep one single direction.
+
+### Is a full sync not too expensive?
+
+It is, if you do it brutally on a large dataset. This is the role of `updatedSince` cursors, of full passes that are periodic instead of constant, and of checksum or Merkle comparisons: they let you reconcile only the part that maybe changed, instead of the whole table every time. The price is more moving parts and a stronger dependency on what A's API exposes.
+
+### How is this different from Kubernetes or React reconciliation?
+
+Same idea, compare the current state with the target state and close the gap, applied to a different problem. Kubernetes converges the state of the cluster to your manifests. React converges the DOM to your component tree. Here you converge the data of one system to the data of another. The pattern is the same, the domain is not.
+
+### What is an idempotency key, concretely?
+
+It is a unique id that you attach to a write so that the receiver can recognize a repetition and ignore it. You send "create payment, idempotency-key=abc123". If the request times out and you retry with the same key, the server sees that it already did this one, and it returns the original result instead of charging two times. This is what makes "just retry" and "just reconcile" safe to do again and again.
+
+---
+
+**Related reading:**
+
+- [Pub/Sub vs Message Queues](/blog/pub-sub-vs-message-queues)
+- [Why Kafka Is Fast](/blog/why-kafka-is-fast)
+- [HTTP Cache Validation](/blog/http-cache-validation)
+- [Centralize Your API IDLs](/blog/centralized-idl-api-versioning)
+- [Designing the Control Plane of a Distributed Database](/blog/design-control-plane-distributed-database)
+- [React Fiber In Depth](/blog/reat-fiber-in-depth)
