@@ -62,7 +62,6 @@ export default async function TagPage({
       initialDisplayPosts={initialDisplayPosts}
       pagination={pagination}
       title={`Posts tagged "${originalTag}"`}
-      currentTag={tag}
       basePath={`/blog/tags/${tag}`}
     />
   );

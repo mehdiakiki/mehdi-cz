@@ -8,6 +8,15 @@ import { BreadcrumbJsonLd, JsonLd } from "@/components/JsonLd";
 import Link from "@/components/Link";
 import { contentClusters, getContentCluster } from "@/data/content-clusters.mjs";
 import siteMetadata from "@/data/siteMetadata";
+import {
+  getWritingTheme,
+  investigationHref,
+  investigations,
+  writingRank,
+  writingThemeOf,
+  writingThemeSlugs,
+  writingTier,
+} from "@/data/writing-tiers.mjs";
 import { filterVisiblePosts } from "lib/publication.mjs";
 
 type PageProps = { params: Promise<{ cluster: string }> };
@@ -46,6 +55,25 @@ export default async function ContentClusterPage({ params }: PageProps) {
     .map((featuredSlug) => posts.find((post) => post.slug === featuredSlug))
     .filter((post): post is NonNullable<typeof post> => Boolean(post));
   const remainingPosts = posts.filter((post) => !cluster.featuredSlugs.includes(post.slug));
+  const postSlugs = new Set(posts.map((post) => post.slug));
+  const seriesInvestigations = investigations
+    .filter((investigation) => postSlugs.has(investigation.parts[0]))
+    .map((investigation) => ({
+      ...investigation,
+      href: investigationHref(investigation),
+      partCount: investigation.parts.filter((partSlug) => postSlugs.has(partSlug)).length,
+    }));
+  const themeOrder = (post: (typeof posts)[number]) => {
+    const theme = writingThemeOf(post);
+    return theme ? writingThemeSlugs.indexOf(theme) : writingThemeSlugs.length;
+  };
+  const seriesArticles = remainingPosts
+    .filter((post) => writingTier(post) === "article")
+    .sort(
+      (left, right) =>
+        themeOrder(left) - themeOrder(right) || writingRank(left) - writingRank(right)
+    );
+  const seriesReference = remainingPosts.filter((post) => writingTier(post) === "reference");
   const pageUrl = `${siteMetadata.siteUrl}/blog/topics/${cluster.slug}`;
 
   return (
@@ -81,7 +109,7 @@ export default async function ContentClusterPage({ params }: PageProps) {
           data-umami-event-destination="writing-index"
           data-umami-event-cluster={cluster.slug}
         >
-          Writing / Technical series
+          Writing / Series
         </Link>
         <h1 className="mt-5 text-4xl leading-tight font-bold tracking-tight text-gray-950 md:text-6xl dark:text-gray-100">
           {cluster.title}
@@ -92,20 +120,10 @@ export default async function ContentClusterPage({ params }: PageProps) {
         <p className="mt-7 max-w-3xl text-xl leading-9 text-gray-600 dark:text-gray-300">
           {cluster.description}
         </p>
-        <p className="mt-5 max-w-3xl leading-7 text-gray-600 dark:text-gray-400">
-          This series is part of the{" "}
-          <Link
-            href="/blog/roadmap"
-            className="text-primary-600 hover:text-primary-700 dark:text-primary-400 dark:hover:text-primary-300 font-semibold"
-          >
-            technical writing roadmap through December
-          </Link>
-          .
-        </p>
         {cluster.slug === "rust-under-the-hood" && (
           <p className="mt-5 max-w-3xl leading-7 text-gray-600 dark:text-gray-400">
-            The compiler, Cargo, async, memory, target, release, and failure investigations are also
-            connected through the{" "}
+            The same Rust writing is also mapped as one system, from compiler internals to async
+            runtimes, in the{" "}
             <Link
               href="/rust"
               className="text-primary-600 hover:text-primary-700 dark:text-primary-400 dark:hover:text-primary-300 font-semibold"
@@ -181,7 +199,7 @@ export default async function ContentClusterPage({ params }: PageProps) {
               Start here
             </h2>
             <p className="mt-3 text-lg leading-8 text-gray-600 dark:text-gray-400">
-              The strongest entry points into this subject, ordered as a useful reading path.
+              Entry points into this subject, ordered as a reading path.
             </p>
           </div>
           <div className="mt-8 grid gap-5 md:grid-cols-2">
@@ -217,41 +235,71 @@ export default async function ContentClusterPage({ params }: PageProps) {
         </section>
       )}
 
-      {remainingPosts.length > 0 && (
-        <section className="py-16 md:py-20" aria-labelledby="series-all-articles">
-          <div className="flex flex-col justify-between gap-3 sm:flex-row sm:items-end">
-            <div>
-              <h2
-                id="series-all-articles"
-                className="text-3xl font-bold tracking-tight text-gray-950 dark:text-gray-100"
+      {seriesInvestigations.length > 0 && (
+        <section className="pt-16 md:pt-20" aria-labelledby="series-investigations">
+          <h2
+            id="series-investigations"
+            className="text-3xl font-bold tracking-tight text-gray-950 dark:text-gray-100"
+          >
+            Investigations
+          </h2>
+          <p className="mt-3 max-w-3xl text-lg leading-8 text-gray-600 dark:text-gray-400">
+            Multi-part work with the code and measurements that produced its evidence.
+          </p>
+          <div className="mt-8 grid gap-5 md:grid-cols-2">
+            {seriesInvestigations.map((investigation) => (
+              <article
+                key={investigation.slug}
+                className="rounded-lg border border-gray-200 p-6 dark:border-gray-800"
               >
-                All articles in this series
-              </h2>
-              <p className="mt-3 text-lg text-gray-600 dark:text-gray-400">
-                {posts.length} focused {posts.length === 1 ? "article" : "articles"}, organized
-                around one engineering problem at a time.
-              </p>
-            </div>
+                <p className="text-primary-600 dark:text-primary-400 text-sm font-semibold tracking-[0.12em] uppercase">
+                  {investigation.partCount} parts
+                </p>
+                <h3 className="mt-2 text-xl leading-8 font-bold tracking-tight">
+                  <Link
+                    href={investigation.href}
+                    className="hover:text-primary-600 dark:hover:text-primary-400 text-gray-950 dark:text-gray-100"
+                    data-umami-event="cluster-investigation-click"
+                    data-umami-event-cluster={cluster.slug}
+                    data-umami-event-investigation={investigation.slug}
+                  >
+                    {investigation.title}
+                  </Link>
+                </h3>
+                <p className="mt-3 leading-7 text-gray-600 dark:text-gray-400">
+                  {investigation.summary}
+                </p>
+              </article>
+            ))}
           </div>
+        </section>
+      )}
+
+      {seriesArticles.length > 0 && (
+        <section className="py-16 md:py-20" aria-labelledby="series-articles">
+          <h2
+            id="series-articles"
+            className="text-3xl font-bold tracking-tight text-gray-950 dark:text-gray-100"
+          >
+            Articles
+          </h2>
           <div className="mt-8 divide-y divide-gray-200 border-y border-gray-200 dark:divide-gray-800 dark:border-gray-800">
-            {remainingPosts.map((post) => (
+            {seriesArticles.map((post) => (
               <article
                 key={post.slug}
                 className="grid gap-3 py-5 md:grid-cols-[minmax(0,1fr)_auto] md:items-baseline md:gap-8"
               >
                 <div>
-                  {post.draft && (
-                    <p className="mb-2 text-xs font-semibold tracking-wide text-amber-700 uppercase dark:text-amber-400">
-                      Local draft preview
-                    </p>
-                  )}
-                  <h3 className="text-lg font-bold">
+                  <p className="text-xs font-semibold tracking-[0.12em] text-gray-500 uppercase dark:text-gray-400">
+                    {getWritingTheme(writingThemeOf(post))?.label}
+                  </p>
+                  <h3 className="mt-1 text-lg font-bold">
                     <Link
                       href={`/blog/${post.slug}`}
                       className="hover:text-primary-600 dark:hover:text-primary-400 text-gray-950 dark:text-gray-100"
                       data-umami-event="cluster-article-click"
                       data-umami-event-cluster={cluster.slug}
-                      data-umami-event-position="archive"
+                      data-umami-event-position="article"
                       data-umami-event-article={post.slug}
                     >
                       {post.title}
@@ -268,6 +316,41 @@ export default async function ContentClusterPage({ params }: PageProps) {
               </article>
             ))}
           </div>
+        </section>
+      )}
+
+      {seriesReference.length > 0 && (
+        <section className="pb-16 md:pb-20" aria-labelledby="series-reference">
+          <h2
+            id="series-reference"
+            className="text-2xl font-bold tracking-tight text-gray-950 dark:text-gray-100"
+          >
+            Shorter pieces and reference
+          </h2>
+          <p className="mt-3 max-w-3xl leading-7 text-gray-600 dark:text-gray-400">
+            Older, introductory or narrower pieces on the same subject.
+          </p>
+          <ul className="mt-6 grid gap-x-8 md:grid-cols-2">
+            {seriesReference.map((post) => (
+              <li key={post.slug} className="border-b border-gray-200 py-3 dark:border-gray-800">
+                {post.draft && (
+                  <p className="text-xs font-semibold tracking-wide text-amber-700 uppercase dark:text-amber-400">
+                    Local draft preview
+                  </p>
+                )}
+                <Link
+                  href={`/blog/${post.slug}`}
+                  className="hover:text-primary-600 dark:hover:text-primary-400 leading-6 text-gray-700 dark:text-gray-300"
+                  data-umami-event="cluster-article-click"
+                  data-umami-event-cluster={cluster.slug}
+                  data-umami-event-position="reference"
+                  data-umami-event-article={post.slug}
+                >
+                  {post.title}
+                </Link>
+              </li>
+            ))}
+          </ul>
         </section>
       )}
 

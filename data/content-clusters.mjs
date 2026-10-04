@@ -13,10 +13,10 @@ export const contentClusters = [
     description:
       "Practical explanations of the Rust behaviour that only becomes obvious after reading compiler output, measuring a program, or working close to the language and its tools.",
     featuredSlugs: [
+      "hir-thir-and-mir-the-same-rust-function-at-three-compiler-stages",
       "rustc-defid-vs-hirid",
       "deno_files",
       "tokio-main-deep-dive",
-      "acquire-release-rust",
     ],
     introduction: [
       "Rust gives us strong guarantees, but the most useful mental models often sit below the surface syntax. Futures become state machines. A harmless-looking local changes a future's size. Variance, drop checking, pinning, and pointer provenance shape which abstractions are actually sound.",
@@ -48,7 +48,7 @@ export const contentClusters = [
     cta: {
       title: "When implementation details shape the product",
       description:
-        "I work on systems where compiler behaviour, runtime constraints, correctness, and performance are part of the design—not cleanup after it.",
+        "I work on systems where compiler behaviour, runtime constraints, correctness, and performance are part of the design, not cleanup after it.",
       primary: { label: "Review open-source work", href: "/open-source" },
       secondary: { label: "Discuss a role or problem", href: "/contact" },
     },
@@ -62,9 +62,9 @@ export const contentClusters = [
       "Engineering patterns for integrations and distributed data flows that must stay understandable when APIs change, deliveries repeat, and parts of the system fail.",
     featuredSlugs: [
       "reconciliation-cross-system-sync",
-      "design-control-plane-distributed-database",
+      "when-to-advance-a-sync-checkpoint-after-partial-success",
       "grpc-from-the-ground-up",
-      "centralized-idl-api-versioning",
+      "design-control-plane-distributed-database",
     ],
     introduction: [
       "Connecting two systems is easy in the successful case. The durable design appears in the less comfortable cases: duplicate delivery, partial progress, conflicting changes, disappearing records, schema drift, and a replay that happens months later.",
@@ -109,10 +109,10 @@ export const contentClusters = [
     description:
       "A software-engineering view of AI-enabled products: where models help, where deterministic boundaries remain necessary, and how to operate the whole system responsibly.",
     featuredSlugs: [
-      "rag-vs-agents-vs-workflow-automation-startups",
-      "the-review-ratchet-how-ai-is-quietly-eating-your-codebase-from-the-inside",
-      "how-to-build-secure-internal-ai-tool",
-      "agent-tool-call-deadline",
+      "what-evidence-an-ai-feature-needs-before-you-ship-it",
+      "the-final-answer-can-be-right-while-the-tool-trajectory-is-unsafe",
+      "eval-scores-move-between-runs-how-to-compare-two-versions-honestly",
+      "make-retried-agent-actions-idempotent-before-adding-autonomy",
     ],
     introduction: [
       "A useful AI feature is still a production system. It depends on permissions, identity, current data, tool contracts, latency budgets, evaluation, and a recovery path when a probabilistic component behaves differently than expected.",
@@ -151,6 +151,7 @@ export const contentClusters = [
   },
 ];
 
+/** Internal planning targets. */
 export const authorityCampaign = {
   opportunityTarget: 200,
   canonicalPageTarget: 200,

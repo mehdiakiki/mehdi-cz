@@ -18,7 +18,8 @@ export const generateStaticParams = async () => {
 
 export const metadata = genPageMetadata({
   title: "Writing Archive",
-  description: "The complete archive of engineering notes and tutorials by Mehdi Akiki.",
+  description:
+    "Everything Mehdi Akiki has published under Writing, newest first: investigations, articles and reference material.",
 });
 
 export default async function Page({ params }: { params: Promise<{ page: string }> }) {
@@ -42,6 +43,7 @@ export default async function Page({ params }: { params: Promise<{ page: string 
       initialDisplayPosts={initialDisplayPosts}
       pagination={pagination}
       title="Writing archive"
+      description="Everything published under Writing, newest first. Each entry is labelled as part of an investigation, an article or reference. Short engineering notes have their own archive."
       basePath="/blog"
     />
   );

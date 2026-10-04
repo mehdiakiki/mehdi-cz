@@ -3,6 +3,7 @@ import { allBlogs, allRustFailures, type Blog, type RustFailure } from "contentl
 import { slug } from "github-slugger";
 import siteMetadata from "@/data/siteMetadata";
 import { contentClusters } from "@/data/content-clusters.mjs";
+import { writingThemeOf, writingThemes } from "@/data/writing-tiers.mjs";
 import {
   isRustFailureAtlasLaunched,
   rustFailureAreas,
@@ -46,12 +47,6 @@ export default function sitemap(): MetadataRoute.Sitemap {
       ...(latestBlogModification ? { lastModified: latestBlogModification } : {}),
       changeFrequency: "daily",
       priority: 0.9, // Blog index is very important
-    },
-    {
-      url: `${siteUrl}/blog/roadmap`,
-      ...(latestBlogModification ? { lastModified: latestBlogModification } : {}),
-      changeFrequency: "weekly",
-      priority: 0.7,
     },
     {
       url: `${siteUrl}/rust`,
@@ -140,6 +135,18 @@ export default function sitemap(): MetadataRoute.Sitemap {
     };
   });
 
+  const themeRoutes: MetadataRoute.Sitemap = writingThemes.map((theme) => {
+    const lastModified = latestModified(
+      publishedWriting.filter((post) => writingThemeOf(post) === theme.slug)
+    );
+    return {
+      url: `${siteUrl}/blog/themes/${theme.slug}`,
+      ...(lastModified ? { lastModified } : {}),
+      changeFrequency: "weekly",
+      priority: 0.8,
+    };
+  });
+
   // Dynamic blog posts with proper SEO metadata
   const blogRoutes: MetadataRoute.Sitemap = publishedBlogs
     .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime())
@@ -221,6 +228,7 @@ export default function sitemap(): MetadataRoute.Sitemap {
 
   return [
     ...staticPages,
+    ...themeRoutes,
     ...clusterRoutes,
     ...rustFailureRoutes,
     ...blogRoutes,

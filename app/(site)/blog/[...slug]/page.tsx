@@ -10,14 +10,23 @@ import PostBanner from "@/layouts/PostBanner";
 import { Metadata } from "next";
 import siteMetadata from "@/data/siteMetadata";
 import { notFound } from "next/navigation";
+import Link from "@/components/Link";
 import OpportunitiesCard from "@/components/OpportunitiesCard";
 import { ArticleJsonLd, BreadcrumbJsonLd } from "@/components/JsonLd";
 import { authorityOpportunities } from "@/data/authority-opportunities.mjs";
 import { getContentCluster } from "@/data/content-clusters.mjs";
-import { filterVisiblePosts, publicationStatus } from "lib/publication.mjs";
+import {
+  getWritingTheme,
+  investigationPartOf,
+  writingThemeOf,
+  writingTier,
+  writingTierLabels,
+} from "@/data/writing-tiers.mjs";
+import { filterVisiblePosts, isPostPublished, publicationStatus } from "lib/publication.mjs";
 import { selectPrerenderEntries } from "lib/prerender-budget.mjs";
 import { isNotePost } from "lib/content-format.mjs";
 import { articleStyleRequirements } from "lib/article-style-requirements.mjs";
+import { selectAdjacentWriting, selectRelatedWriting } from "lib/related-writing.mjs";
 
 const defaultLayout = "PostLayout";
 const layouts = {
@@ -107,39 +116,31 @@ export default async function Page({ params }: { params: Promise<{ slug: string[
     return notFound();
   }
 
-  const prev = sortedCoreContents[postIndex + 1];
-  const next = sortedCoreContents[postIndex - 1];
+  const { prev, next } = selectAdjacentWriting(post, sortedCoreContents);
   const status = publicationStatus(post);
   const cluster = getContentCluster(post.cluster);
-  const currentOpportunity = opportunityBySlug.get(post.slug);
-  const currentTags = new Set(post.tags || []);
-  const relatedPosts = cluster
-    ? visibleBlogs
-        .filter((candidate) => candidate.cluster === cluster.slug && candidate.slug !== post.slug)
-        .sort((left, right) => {
-          const leftSameSubcluster =
-            currentOpportunity &&
-            opportunityBySlug.get(left.slug)?.subcluster === currentOpportunity.subcluster
-              ? 1
-              : 0;
-          const rightSameSubcluster =
-            currentOpportunity &&
-            opportunityBySlug.get(right.slug)?.subcluster === currentOpportunity.subcluster
-              ? 1
-              : 0;
-          if (leftSameSubcluster !== rightSameSubcluster) {
-            return rightSameSubcluster - leftSameSubcluster;
-          }
-
-          const leftTagOverlap = (left.tags || []).filter((tag) => currentTags.has(tag)).length;
-          const rightTagOverlap = (right.tags || []).filter((tag) => currentTags.has(tag)).length;
-          if (leftTagOverlap !== rightTagOverlap) return rightTagOverlap - leftTagOverlap;
-
-          return new Date(right.date).getTime() - new Date(left.date).getTime();
-        })
-        .slice(0, 4)
-        .map((candidate) => ({ slug: candidate.slug, title: candidate.title }))
-    : [];
+  const tier = writingTier(post);
+  const theme = getWritingTheme(writingThemeOf(post));
+  const investigationPart = investigationPartOf(post);
+  const recommendable = visibleBlogs.filter((candidate) => isPostPublished(candidate));
+  const relatedPosts = note
+    ? []
+    : selectRelatedWriting(post, recommendable, {
+        subclusterOf: (candidateSlug) => opportunityBySlug.get(candidateSlug)?.subcluster,
+      });
+  const recommendableSlugs = new Set(recommendable.map((candidate) => candidate.slug));
+  const investigationOverview = `/blog#investigation-${investigationPart?.investigation.slug}`;
+  const investigation = investigationPart && {
+    title: investigationPart.investigation.title,
+    href: investigationOverview,
+    parts: investigationPart.investigation.parts
+      .filter((partSlug) => partSlug === post.slug || recommendableSlugs.has(partSlug))
+      .map((partSlug) => ({
+        href: `/blog/${partSlug}`,
+        title: visibleBlogs.find((candidate) => candidate.slug === partSlug)?.title ?? partSlug,
+        current: partSlug === post.slug,
+      })),
+  };
   const authorList = post?.authors || ["default"];
   const authorDetails = authorList.map((author) => {
     const authorResults = allAuthors.find((p) => p.slug === author);
@@ -212,12 +213,59 @@ export default async function Page({ params }: { params: Promise<{ slug: string[
             included in production pages, search, RSS, or the sitemap.
           </aside>
         )}
+        <p className="not-prose mb-8 text-xs font-semibold tracking-[0.12em] text-gray-500 uppercase dark:text-gray-400">
+          {note ? (
+            <>
+              Note ·{" "}
+              <Link href="/notes" className="hover:text-primary-600 dark:hover:text-primary-400">
+                Engineering notes
+              </Link>
+            </>
+          ) : investigationPart ? (
+            <>
+              <span className="text-primary-700 dark:text-primary-300">
+                {writingTierLabels.investigation}
+              </span>{" "}
+              · Part {investigationPart.index + 1} of {investigationPart.investigation.parts.length}{" "}
+              ·{" "}
+              <Link
+                href={investigationOverview}
+                className="hover:text-primary-600 dark:hover:text-primary-400"
+              >
+                {investigationPart.investigation.title}
+              </Link>
+            </>
+          ) : (
+            <>
+              <span
+                className={
+                  tier === "article" ? "text-primary-700 dark:text-primary-300" : undefined
+                }
+              >
+                {writingTierLabels[tier]}
+              </span>
+              {theme && (
+                <>
+                  {" "}
+                  ·{" "}
+                  <Link
+                    href={`/blog/themes/${theme.slug}`}
+                    className="hover:text-primary-600 dark:hover:text-primary-400"
+                  >
+                    {theme.label}
+                  </Link>
+                </>
+              )}
+            </>
+          )}
+        </p>
         <MDXLayoutRenderer code={post.body.code} components={components} toc={post.toc} />
         {!note && (
           <OpportunitiesCard
             clusterSlug={cluster?.slug}
             currentSlug={post.slug}
             relatedPosts={relatedPosts}
+            investigation={investigation || undefined}
           />
         )}
       </Layout>
