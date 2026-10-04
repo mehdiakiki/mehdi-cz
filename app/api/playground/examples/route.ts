@@ -6,7 +6,7 @@ export async function GET(request: NextRequest) {
   const { searchParams } = new URL(request.url);
   const lang = searchParams.get("lang");
 
-  // In development without real backend: return empty list (UI will show nothing).
+  // In development without real backend: return an empty list.
   // With FORCE_REAL_BACKEND or in production: proxy to Axum.
   if (process.env.NODE_ENV === "development" && !process.env.FORCE_REAL_BACKEND) {
     return NextResponse.json([]);
@@ -20,9 +20,15 @@ export async function GET(request: NextRequest) {
     res = await fetch(url.toString());
   } catch (err) {
     console.error("[playground] Failed to reach Axum for examples:", err);
-    return NextResponse.json([], { status: 502 });
+    return NextResponse.json({ error: "Playground backend unavailable" }, { status: 502 });
   }
 
-  const data = await res.json();
+  let data: unknown;
+  try {
+    data = await res.json();
+  } catch (err) {
+    console.error("[playground] Axum returned non-JSON examples:", err);
+    return NextResponse.json({ error: "Playground backend unavailable" }, { status: 502 });
+  }
   return NextResponse.json(data, { status: res.status });
 }

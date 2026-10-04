@@ -1,6 +1,7 @@
 import { defineDocumentType, ComputedFields, makeSource } from "contentlayer2/source-files";
 import { writeFileSync } from "fs";
 import readingTime from "reading-time";
+import { remark } from "remark";
 import { slug } from "github-slugger";
 import path from "path";
 import { fromHtmlIsomorphic } from "hast-util-from-html-isomorphic";
@@ -11,7 +12,7 @@ import {
   remarkExtractFrontmatter,
   remarkCodeTitles,
   remarkImgToJsx,
-  extractTocHeadings,
+  remarkTocHeadings,
 } from "pliny/mdx-plugins/index.js";
 import rehypeSlug from "rehype-slug";
 import rehypeAutolinkHeadings from "rehype-autolink-headings";
@@ -20,10 +21,23 @@ import rehypeCitation from "rehype-citation";
 import rehypePrismPlus from "rehype-prism-plus";
 import rehypePresetMinify from "rehype-preset-minify";
 import siteMetadata from "./data/siteMetadata";
-import { allCoreContent, sortPosts } from "pliny/utils/contentlayer.js";
+import { sortPosts } from "pliny/utils/contentlayer.js";
+import { filterVisiblePosts } from "./lib/publication.mjs";
+import { filterWritingPosts } from "./lib/content-format.mjs";
+import { toSearchDocument } from "./lib/search-document.mjs";
+import { remarkPromoteFirstContentImage } from "./lib/remark-promote-first-content-image.mjs";
+import remarkNormalizeHeadingOrder from "./lib/remark-normalize-heading-order.mjs";
 
 const root = process.cwd();
-const isProduction = process.env.NODE_ENV === "production";
+
+async function extractNormalizedTocHeadings(markdown: string) {
+  const result = await remark()
+    .use(remarkNormalizeHeadingOrder)
+    .use(remarkTocHeadings)
+    .process(markdown);
+
+  return result.data.toc;
+}
 
 const icon = fromHtmlIsomorphic(
   `
@@ -51,7 +65,7 @@ const computedFields: ComputedFields = {
     type: "string",
     resolve: (doc) => doc._raw.sourceFilePath,
   },
-  toc: { type: "json", resolve: (doc) => extractTocHeadings(doc.body.raw) },
+  toc: { type: "json", resolve: (doc) => extractNormalizedTocHeadings(doc.body.raw) },
 };
 
 /**
@@ -59,8 +73,8 @@ const computedFields: ComputedFields = {
  */
 function createTagCount(allBlogs) {
   const tagCount: Record<string, number> = {};
-  allBlogs.forEach((file) => {
-    if (file.tags && (!isProduction || file.draft !== true)) {
+  filterWritingPosts(filterVisiblePosts<any>(allBlogs)).forEach((file) => {
+    if (file.tags) {
       file.tags.forEach((tag) => {
         const formattedTag = slug(tag);
         if (formattedTag in tagCount) {
@@ -74,14 +88,17 @@ function createTagCount(allBlogs) {
   writeFileSync("./app/tag-data.json", JSON.stringify(tagCount));
 }
 
-function createSearchIndex(allBlogs) {
+function createSearchIndex(allBlogs, allRustFailures) {
   if (
     siteMetadata?.search?.provider === "kbar" &&
     siteMetadata.search.kbarConfig.searchDocumentsPath
   ) {
     writeFileSync(
       `public/${path.basename(siteMetadata.search.kbarConfig.searchDocumentsPath)}`,
-      JSON.stringify(allCoreContent(sortPosts(allBlogs)))
+      JSON.stringify([
+        ...sortPosts(filterVisiblePosts<any>(allBlogs)).map(toSearchDocument),
+        ...sortPosts(filterVisiblePosts<any>(allRustFailures)).map(toSearchDocument),
+      ])
     );
   }
 }
@@ -96,6 +113,12 @@ export const Blog = defineDocumentType(() => ({
     tags: { type: "list", of: { type: "string" }, default: [] },
     lastmod: { type: "date" },
     draft: { type: "boolean" },
+    format: { type: "string", default: "article" },
+    reviewed: { type: "boolean" },
+    reviewedHash: { type: "string" },
+    cluster: { type: "string" },
+    campaign: { type: "string" },
+    opportunity: { type: "string" },
     summary: { type: "string" },
     images: { type: "json" },
     authors: { type: "list", of: { type: "string" } },
@@ -140,17 +163,82 @@ export const Authors = defineDocumentType(() => ({
   computedFields,
 }));
 
+export const RustFailure = defineDocumentType(() => ({
+  name: "RustFailure",
+  filePathPattern: "rust-failures/**/*.mdx",
+  contentType: "mdx",
+  fields: {
+    caseId: { type: "string", required: true },
+    title: { type: "string", required: true },
+    date: { type: "date", required: true },
+    lastmod: { type: "date" },
+    draft: { type: "boolean", default: false },
+    reviewed: { type: "boolean", required: true },
+    reviewedHash: { type: "string", required: true },
+    area: { type: "string", required: true },
+    symptom: { type: "string", required: true },
+    summary: { type: "string", required: true },
+    rustVersions: { type: "list", of: { type: "string" }, default: [] },
+    targets: { type: "list", of: { type: "string" }, default: [] },
+    profiles: { type: "list", of: { type: "string" }, default: [] },
+    searchTerms: { type: "list", of: { type: "string" }, default: [] },
+    evidence: { type: "list", of: { type: "string" }, default: [] },
+    sources: { type: "list", of: { type: "string" }, default: [] },
+  },
+  computedFields: {
+    ...computedFields,
+    path: {
+      type: "string",
+      resolve: (doc) => `rust/failures/${doc._raw.flattenedPath.replace(/^.+?(\/)/, "")}`,
+    },
+    structuredData: {
+      type: "json",
+      resolve: (doc) => ({
+        "@context": "https://schema.org",
+        "@type": "TechArticle",
+        headline: doc.title,
+        datePublished: doc.date,
+        dateModified: doc.lastmod || doc.date,
+        description: doc.summary,
+        url: `${siteMetadata.siteUrl}/rust/failures/${doc._raw.flattenedPath.replace(
+          /^.+?(\/)/,
+          ""
+        )}`,
+        isPartOf: {
+          "@type": "CollectionPage",
+          name: "Rust Failure Atlas",
+          url: `${siteMetadata.siteUrl}/rust-failure-atlas`,
+        },
+      }),
+    },
+  },
+}));
+
 export default makeSource({
   contentDirPath: "data",
-  documentTypes: [Blog, Authors],
+  documentTypes: [Blog, Authors, RustFailure],
   mdx: {
     cwd: process.cwd(),
     remarkPlugins: [
       remarkExtractFrontmatter,
       remarkGfm,
+      remarkNormalizeHeadingOrder,
       remarkCodeTitles,
       remarkMath,
       remarkImgToJsx,
+      [
+        remarkPromoteFirstContentImage,
+        {
+          // Only diagrams measured inside the matching initial viewport receive
+          // a preload. Native lazy eligibility remains authoritative elsewhere.
+          preloadMediaBySrc: {
+            "/static/images/system-design-db-control-pane.webp":
+              "(min-width: 1280px) and (min-height: 640px)",
+            "/static/images/stick-sessions-load-balancer.webp":
+              "(min-width: 1280px) and (min-height: 640px)",
+          },
+        },
+      ],
       remarkAlert,
     ],
     rehypePlugins: [
@@ -172,8 +260,8 @@ export default makeSource({
     ],
   },
   onSuccess: async (importData) => {
-    const { allBlogs } = await importData();
+    const { allBlogs, allRustFailures } = await importData();
     createTagCount(allBlogs);
-    createSearchIndex(allBlogs);
+    createSearchIndex(allBlogs, allRustFailures);
   },
 });

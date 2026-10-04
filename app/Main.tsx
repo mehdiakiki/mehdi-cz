@@ -11,13 +11,13 @@ export default function Home({ posts }) {
     <>
       <WebsiteJsonLd />
       <div>
-        <div className="space-y-2 pb-8 pt-6 md:space-y-5">
-          <h1 className="text-center text-2xl font-extrabold leading-9 tracking-tight text-gray-900 dark:text-gray-100 sm:text-3xl sm:leading-10 md:text-4xl md:leading-14">
-            Latest from the Blog
-          </h1>
+        <div className="space-y-2 pt-6 pb-8 md:space-y-5">
+          <h2 className="text-center text-2xl leading-9 font-extrabold tracking-tight text-gray-900 sm:text-3xl sm:leading-10 md:text-4xl md:leading-14 dark:text-gray-100">
+            What I write about
+          </h2>
         </div>
 
-        <ul className="grid grid-cols-1 gap-8  sm:grid-cols-2">
+        <ul className="grid grid-cols-1 gap-8 sm:grid-cols-2">
           {!posts.length && "No posts found."}
           {posts.slice(0, MAX_DISPLAY).map((post: any) => {
             const { slug, date, title, summary, tags } = post;
@@ -33,7 +33,7 @@ export default function Home({ posts }) {
                     </dl>
                     <div className="space-y-5">
                       <div className="space-y-2">
-                        <h2 className="text-xl font-bold leading-8 tracking-tight">
+                        <h2 className="text-xl leading-8 font-bold tracking-tight">
                           <Link href={`/blog/${slug}`} className="text-gray-900 dark:text-gray-100">
                             {title}
                           </Link>
@@ -48,10 +48,10 @@ export default function Home({ posts }) {
                         {summary}
                       </div>
                     </div>
-                    <div className="text-base font-medium leading-6">
+                    <div className="text-base leading-6 font-medium">
                       <Link
                         href={`/blog/${slug}`}
-                        className="text-primary-500 hover:text-primary-600 dark:hover:text-primary-400"
+                        className="text-primary-700 hover:text-primary-800 dark:text-primary-400 dark:hover:text-primary-300"
                         aria-label={`Read more: "${title}"`}
                       >
                         Read more &rarr;
@@ -65,10 +65,10 @@ export default function Home({ posts }) {
         </ul>
       </div>
       {posts.length > MAX_DISPLAY && (
-        <div className="flex justify-center text-base font-medium leading-6">
+        <div className="flex justify-center text-base leading-6 font-medium">
           <Link
             href="/blog"
-            className="text-primary-500 hover:text-primary-600 dark:hover:text-primary-400"
+            className="text-primary-700 hover:text-primary-800 dark:text-primary-400 dark:hover:text-primary-300"
             aria-label="All posts"
           >
             All Posts &rarr;

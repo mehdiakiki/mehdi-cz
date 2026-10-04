@@ -43,6 +43,13 @@ export default function robots(): MetadataRoute.Robots {
         disallow: ["/api/", "/_next/", "/admin/", "/private/", "/draft/"],
         // No crawl delay for Google - they're efficient
       },
+      // OpenAI's search crawler can surface public pages in ChatGPT search.
+      // This is independent from GPTBot, which controls model-training crawls.
+      {
+        userAgent: "OAI-SearchBot",
+        allow: "/",
+        disallow: ["/api/", "/_next/", "/admin/", "/private/", "/draft/"],
+      },
       // Block aggressive crawlers that might impact performance
       {
         userAgent: "AhrefsBot",

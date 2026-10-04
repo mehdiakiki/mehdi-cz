@@ -26,8 +26,10 @@ use security::RequestSigner;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::process::Command as TokioCommand;
 use tokio::sync::Semaphore;
 use tower_http::compression::CompressionLayer;
 use tower_http::trace::TraceLayer;
@@ -200,7 +202,7 @@ async fn cors_middleware(
             }
         }
         headers.insert("Access-Control-Allow-Methods", HeaderValue::from_static("GET, POST, OPTIONS"));
-        headers.insert("Access-Control-Allow-Headers", HeaderValue::from_static("Content-Type, X-Playground-Signature, X-Playground-Timestamp, X-Correlation-ID"));
+        headers.insert("Access-Control-Allow-Headers", HeaderValue::from_static("Content-Type, X-Playground-Signature-V2, X-Playground-Timestamp, X-Correlation-ID"));
         headers.insert("Access-Control-Max-Age", HeaderValue::from_static("86400"));
         return response;
     }
@@ -473,7 +475,11 @@ async fn execute_rust(
     }
 }
 
-/// Execute JS in-process via Boa — with proper timeout.
+/// Execute JS in a sandboxed subprocess with OS resource limits.
+///
+/// The subprocess is this same binary invoked as `--js-runner`. Before
+/// running Boa it applies setrlimit(CPU=5s, AS=256MB, NOFILE=16, NPROC=0).
+/// A crash, OOM, or infinite loop in the subprocess cannot affect Axum.
 #[tracing::instrument(name = "execute_javascript", skip(state, code))]
 async fn execute_javascript(
     state: &Arc<AppState>,
@@ -483,23 +489,47 @@ async fn execute_javascript(
     is_default: bool,
 ) -> Result<Json<ExecuteResponse>, ProblemDetail> {
     let timeout = Duration::from_millis(state.config.js_timeout_ms);
-    let code_owned = code.to_string();
 
-    // CRITICAL: wrap spawn_blocking in tokio::time::timeout.
-    // Without this, while(true){} hangs your entire server.
-    // spawn_blocking moves the work off the async executor onto a
-    // dedicated thread pool. timeout kills it if Boa gets stuck.
-    // Use .instrument() so the span correctly covers the await point (EnteredSpan is !Send).
-    let js_result = tokio::time::timeout(
-        timeout,
-        tokio::task::spawn_blocking(move || {
-            js_runner::execute_js(&code_owned, timeout)
-        }),
-    )
-    .instrument(tracing::info_span!("boa_engine_execution"))
+    // Resolve the path to this binary once — the subprocess re-uses it.
+    let binary = std::env::current_exe()
+        .unwrap_or_else(|_| PathBuf::from("./code-playground"));
+
+    let input = serde_json::json!({"code": code}).to_string();
+
+    let subprocess_result = tokio::time::timeout(timeout, async {
+        let mut child = TokioCommand::new(&binary)
+            .arg("--js-runner")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| ProblemDetail::internal(format!("Failed to spawn js-runner: {}", e)))?;
+
+        // Write the code to the subprocess stdin.
+        if let Some(mut stdin) = child.stdin.take() {
+            use tokio::io::AsyncWriteExt;
+            let _ = stdin.write_all(input.as_bytes()).await;
+            // stdin drops here, closing the pipe and signalling EOF to the child.
+        }
+
+        let output = child
+            .wait_with_output()
+            .await
+            .map_err(|e| ProblemDetail::internal(format!("js-runner wait failed: {}", e)))?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let result: js_runner::JsResult = serde_json::from_str(&stdout).unwrap_or(js_runner::JsResult {
+            success: false,
+            output: String::new(),
+            error: "Failed to parse js-runner output".into(),
+            execution_time_ms: 0,
+        });
+        Ok::<js_runner::JsResult, ProblemDetail>(result)
+    })
+    .instrument(tracing::info_span!("boa_subprocess_execution"))
     .await;
 
-    match js_result {
+    match subprocess_result {
         Ok(Ok(result)) => {
             let json = serde_json::to_string(&result).unwrap_or_default();
             state.cache.insert(code, "interpret", edition, json, example_id, is_default);
@@ -510,9 +540,7 @@ async fn execute_javascript(
                 cached: false, cache_status: None, execution_ms: None,
             }))
         }
-        Ok(Err(e)) => {
-            Err(ProblemDetail::internal(format!("JS execution task failed: {}", e)))
-        }
+        Ok(Err(e)) => Err(e),
         Err(_timeout) => {
             tracing::warn!(timeout_ms = state.config.js_timeout_ms, "JS execution timed out");
             Err(ProblemDetail::execution_timeout("JavaScript", state.config.js_timeout_ms))
@@ -710,18 +738,89 @@ fn extract_ip(headers: &HeaderMap, addr: &SocketAddr) -> String {
 }
 
 // =============================================================
+// JS Runner subprocess mode
+//
+// When invoked as `./code-playground --js-runner`:
+//   - Applies OS resource limits via setrlimit (CPU, memory, fds, processes)
+//   - Reads JSON {"code": "..."} from stdin
+//   - Executes the code in Boa
+//   - Writes JSON JsResult to stdout
+//   - Exits
+//
+// This subprocess isolation means a Boa crash, OOM, or infinite loop
+// cannot bring down the Axum server. The parent kills it after the
+// wall-clock timeout; RLIMIT_CPU kills it if it burns CPU time.
+// =============================================================
+
+/// Entry point for the --js-runner subprocess mode.
+fn run_js_runner() {
+    use std::io::Read;
+
+    // Apply OS-level resource limits before touching any user code.
+    // These are hard limits — the OS enforces them regardless of what the
+    // JS code does.
+    #[cfg(target_os = "linux")]
+    apply_resource_limits();
+
+    let mut input = String::new();
+    let _ = std::io::stdin().read_to_string(&mut input);
+
+    #[derive(serde::Deserialize)]
+    struct JsInput {
+        code: String,
+    }
+
+    let code = match serde_json::from_str::<JsInput>(&input) {
+        Ok(j) => j.code,
+        Err(e) => {
+            let result = js_runner::JsResult {
+                success: false,
+                output: String::new(),
+                error: format!("Invalid runner input: {}", e),
+                execution_time_ms: 0,
+            };
+            println!("{}", serde_json::to_string(&result).unwrap_or_default());
+            return;
+        }
+    };
+
+    let result = js_runner::execute_js(&code);
+    println!("{}", serde_json::to_string(&result).unwrap_or_default());
+}
+
+/// Apply OS-level resource limits to the current process.
+/// Called in subprocess mode only — never from the Axum server.
+#[cfg(target_os = "linux")]
+fn apply_resource_limits() {
+    use nix::sys::resource::{setrlimit, Resource};
+    let _ = setrlimit(Resource::RLIMIT_CPU, 5, 5);                                // 5 CPU seconds
+    let _ = setrlimit(Resource::RLIMIT_AS, 256 * 1024 * 1024, 256 * 1024 * 1024); // 256 MB virtual memory
+    let _ = setrlimit(Resource::RLIMIT_NOFILE, 16, 16);                            // 16 file descriptors
+    let _ = setrlimit(Resource::RLIMIT_NPROC, 0, 0);                               // no new processes (fork bombs)
+}
+
+// =============================================================
 // Server startup
 // =============================================================
 
 #[tokio::main]
 async fn main() {
+    // If invoked as a JS runner subprocess, handle that and exit immediately.
+    // This happens before tokio does any meaningful work.
+    if std::env::args().any(|a| a == "--js-runner") {
+        run_js_runner();
+        return;
+    }
+
     // Initialize OpenTelemetry before anything else.
     telemetry::init_telemetry();
 
     let config = Config::from_env();
 
-    if config.playground_secret == "change-me-in-production" {
-        tracing::warn!("⚠ Using default PLAYGROUND_SECRET — set this in production!");
+    if config.playground_secret.trim().is_empty()
+        || config.playground_secret == "change-me-in-production"
+    {
+        panic!("PLAYGROUND_SECRET must be configured before starting the playground");
     }
 
     let port = config.port;
@@ -797,7 +896,7 @@ async fn main() {
                 }
                 examples::Language::JavaScript => {
                     let code = example.code.to_string();
-                    if let Ok(r) = tokio::task::spawn_blocking(move || js_runner::execute_js(&code, Duration::from_secs(5))).await {
+                    if let Ok(r) = tokio::task::spawn_blocking(move || js_runner::execute_js(&code)).await {
                         let json = serde_json::to_string(&r).unwrap_or_default();
                         warmup_state.cache.insert(example.code, "interpret", edition, json, example.id, true);
                         tracing::info!("  Warmed (in-process): {}", example.id);

@@ -4,25 +4,43 @@ on:
   push:
     branches: main
   workflow_dispatch:
+  schedule:
+    # Scheduled articles are checked hourly and deploy only when one is due.
+    - cron: "17 * * * *"
+
+concurrency:
+  group: production-site-deployment
+  cancel-in-progress: false
 
 jobs:
   docker:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
+      - name: Check scheduled publications
+        id: publication
+        if: ${{ github.event_name == 'schedule' }}
+        run: node scripts/check-publication-due.mjs --site-url https://www.mehdi.cz --github-output "$GITHUB_OUTPUT"
+
       - uses: docker/setup-buildx-action@v3
+        if: ${{ github.event_name != 'schedule' || steps.publication.outputs.deploy == 'true' }}
 
       - uses: docker/login-action@v3
+        if: ${{ github.event_name != 'schedule' || steps.publication.outputs.deploy == 'true' }}
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - uses: docker/build-push-action@v6
+        if: ${{ github.event_name != 'schedule' || steps.publication.outputs.deploy == 'true' }}
         with:
           context: .
           push: true
-          tags: mast2133/mehdicz-site:latest
+          tags: |
+            mast2133/mehdicz-site:latest
+            mast2133/mehdicz-site:${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           build-args: |
             NEXT_PUBLIC_FORMSPREE_KEY=${{ secrets.NEXT_PUBLIC_FORMSPREE_KEY }}
             NEXT_PUBLIC_GISCUS_REPO=${{ secrets.NEXT_PUBLIC_GISCUS_REPO }}
@@ -30,14 +48,53 @@ jobs:
             NEXT_PUBLIC_GISCUS_CATEGORY=${{ secrets.NEXT_PUBLIC_GISCUS_CATEGORY }}
             NEXT_PUBLIC_GISCUS_CATEGORY_ID=${{ secrets.NEXT_PUBLIC_GISCUS_CATEGORY_ID }}
             NEXT_UMAMI_ID=${{ secrets.NEXT_UMAMI_ID }}
+            PUBLICATION_BUILD_ID=${{ github.run_id }}-${{ github.run_attempt }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
       - name: Deploy to VPS
+        if: ${{ github.event_name != 'schedule' || steps.publication.outputs.deploy == 'true' }}
         uses: appleboy/ssh-action@v1
+        env:
+          DEPLOY_IMAGE: mast2133/mehdicz-site:${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
         with:
           host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
+          envs: DEPLOY_IMAGE
           script: |
-            cd ~/blog && docker compose pull blog && docker compose up -d blog && docker image prune -f
+            set -e
+            cd ~/blog
+            docker compose config --quiet
+            if ! docker compose config --services | grep -Fxq code-playground; then
+              echo "VPS Compose is missing code-playground; deploy its service before the site."
+              exit 1
+            fi
+            if [ "$(docker inspect --format '{{.State.Health.Status}}' code-playground 2>/dev/null)" != healthy ]; then
+              echo "VPS code-playground is not healthy; refusing to update the site."
+              exit 1
+            fi
+            previous_image=$(docker image inspect mast2133/mehdicz-site:latest --format '{{.Id}}' 2>/dev/null || true)
+            docker pull "$DEPLOY_IMAGE"
+            docker tag "$DEPLOY_IMAGE" mast2133/mehdicz-site:latest
+            if docker compose up -d --no-build --pull never --force-recreate --wait --wait-timeout 120 blog; then
+              docker image prune -f
+            else
+              if [ -n "$previous_image" ]; then
+                docker tag "$previous_image" mast2133/mehdicz-site:latest
+                docker compose up -d --no-build --pull never --force-recreate --wait --wait-timeout 120 blog
+              fi
+              exit 1
+            fi
+
+      - name: Fail on overdue campaign work
+        if: ${{ always() && github.event_name == 'schedule' && steps.publication.outputs.overdue == 'true' }}
+        run: |
+          echo "${{ steps.publication.outputs.overdue_count }} campaign actions are overdue. See the publication check for details."
+          exit 1
+
+      - name: Fail when live publication state cannot be checked
+        if: ${{ always() && github.event_name == 'schedule' && steps.publication.outputs.check_failed == 'true' }}
+        run: |
+          echo "The live sitemap could not be verified, so no speculative deployment was attempted."
+          exit 1

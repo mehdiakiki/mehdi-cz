@@ -1,8 +1,30 @@
 "use client";
 
 import { useCallback, useRef, useState } from "react";
-import Editor, { OnMount } from "@monaco-editor/react";
+import Editor, { loader, OnMount } from "@monaco-editor/react";
+import * as monaco from "monaco-editor";
 import { useTheme } from "next-themes";
+
+if (typeof self !== "undefined") {
+  self.MonacoEnvironment = {
+    getWorker(_workerId: string, label: string) {
+      if (label === "typescript" || label === "javascript") {
+        return new Worker(
+          new URL("monaco-editor/language/typescript/ts.worker.js", import.meta.url),
+          {
+            type: "module",
+          }
+        );
+      }
+
+      return new Worker(new URL("monaco-editor/editor/editor.worker.js", import.meta.url), {
+        type: "module",
+      });
+    },
+  };
+}
+
+loader.config({ monaco });
 
 // ---------------------------------------------------------------------------
 // Types
@@ -145,7 +167,7 @@ export default function FullEditor() {
     >
       {/* ── Toolbar ───────────────────────────────────────────── */}
       <div
-        className="flex items-center gap-3 px-4 shrink-0"
+        className="flex shrink-0 items-center gap-3 px-4"
         style={{ height: 46, borderBottom: `1px solid ${border}`, background: surface }}
       >
         {/* Language tabs */}
@@ -154,7 +176,7 @@ export default function FullEditor() {
             <button
               key={l}
               onClick={() => handleLangChange(l)}
-              className="px-3 py-1 rounded text-sm font-medium transition-colors"
+              className="rounded px-3 py-1 text-sm font-medium transition-colors"
               style={{
                 background: lang === l ? (isDark ? "#0e639c" : "#0078d4") : "transparent",
                 color: lang === l ? "#fff" : muted,
@@ -171,7 +193,7 @@ export default function FullEditor() {
         <button
           onClick={run}
           disabled={running}
-          className="flex items-center gap-2 px-4 py-1.5 rounded text-sm font-semibold"
+          className="flex items-center gap-2 rounded px-4 py-1.5 text-sm font-semibold"
           style={{
             background: running ? (isDark ? "#3a3a3a" : "#ccc") : "#22c55e",
             color: running ? muted : "#fff",
@@ -180,7 +202,7 @@ export default function FullEditor() {
         >
           {running ? (
             <>
-              <span className="inline-block w-3 h-3 border-2 border-current border-t-transparent rounded-full animate-spin" />
+              <span className="inline-block h-3 w-3 animate-spin rounded-full border-2 border-current border-t-transparent" />
               Running…
             </>
           ) : (
@@ -190,7 +212,7 @@ export default function FullEditor() {
       </div>
 
       {/* ── Editor ────────────────────────────────────────────── */}
-      <div className="flex-1 min-h-0">
+      <div className="min-h-0 flex-1">
         <Editor
           language={LANGS[lang].monaco}
           value={code}
@@ -198,6 +220,7 @@ export default function FullEditor() {
           onChange={(v) => setCode(v ?? "")}
           onMount={(editor: Parameters<OnMount>[0]) => editor.focus()}
           options={{
+            ariaLabel: "Code editor",
             fontSize: 14,
             minimap: { enabled: false },
             scrollBeyondLastLine: false,
@@ -211,9 +234,21 @@ export default function FullEditor() {
       </div>
 
       {/* ── Drag handle ───────────────────────────────────────── */}
-      <div
+      <button
+        type="button"
         onMouseDown={onDragStart}
-        className="shrink-0 flex items-center justify-center"
+        onKeyDown={(event) => {
+          if (event.key !== "ArrowUp" && event.key !== "ArrowDown") return;
+
+          event.preventDefault();
+          const direction = event.key === "ArrowUp" ? 1 : -1;
+          const containerHeight = containerRef.current?.clientHeight ?? window.innerHeight;
+          setOutputHeight((height) =>
+            Math.min(Math.max(height + direction * 16, 80), containerHeight - 120)
+          );
+        }}
+        aria-label="Resize output panel with the up and down arrow keys"
+        className="flex w-full shrink-0 items-center justify-center border-0 p-0"
         style={{
           height: 6,
           background: border,
@@ -221,7 +256,7 @@ export default function FullEditor() {
           userSelect: "none",
         }}
       >
-        <div
+        <span
           style={{
             width: 32,
             height: 2,
@@ -230,16 +265,13 @@ export default function FullEditor() {
             opacity: 0.5,
           }}
         />
-      </div>
+      </button>
 
       {/* ── Output panel ──────────────────────────────────────── */}
-      <div
-        className="shrink-0 flex flex-col"
-        style={{ height: outputHeight, background: surface }}
-      >
+      <div className="flex shrink-0 flex-col" style={{ height: outputHeight, background: surface }}>
         {/* Panel header */}
         <div
-          className="flex items-center gap-2 px-4 shrink-0"
+          className="flex shrink-0 items-center gap-2 px-4"
           style={{
             height: 32,
             borderBottom: `1px solid ${border}`,
@@ -250,12 +282,10 @@ export default function FullEditor() {
           }}
         >
           <span
-            className="w-2 h-2 rounded-full"
+            className="h-2 w-2 rounded-full"
             style={{
               background:
-                output == null ? (running ? "#f59e0b" : "#555")
-                : output.ok ? "#22c55e"
-                : "#ef4444",
+                output == null ? (running ? "#f59e0b" : "#555") : output.ok ? "#22c55e" : "#ef4444",
             }}
           />
           OUTPUT
@@ -268,7 +298,7 @@ export default function FullEditor() {
 
         {/* Output text */}
         <pre
-          className="flex-1 overflow-auto px-5 py-3 text-sm font-mono"
+          className="flex-1 overflow-auto px-5 py-3 font-mono text-sm"
           style={{
             margin: 0,
             color: output?.ok === false ? "#f87171" : text,

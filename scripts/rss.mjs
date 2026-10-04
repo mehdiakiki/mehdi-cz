@@ -1,4 +1,4 @@
-import { writeFileSync, mkdirSync } from "fs";
+import { writeFileSync, mkdirSync, rmSync } from "fs";
 import path from "path";
 import { slug } from "github-slugger";
 import { escape } from "pliny/utils/htmlEscaper.js";
@@ -6,6 +6,8 @@ import siteMetadata from "../data/siteMetadata.js";
 import tagData from "../app/tag-data.json" with { type: "json" };
 import { allBlogs } from "../.contentlayer/generated/index.mjs";
 import { sortPosts } from "pliny/utils/contentlayer.js";
+import { filterPublishedPosts } from "../lib/publication.mjs";
+import { filterNotePosts, filterWritingPosts } from "../lib/content-format.mjs";
 
 const generateRssItem = (config, post) => `
   <item>
@@ -36,18 +38,36 @@ const generateRss = (config, posts, page = "feed.xml") => `
 `;
 
 async function generateRSS(config, allBlogs, page = "feed.xml") {
-  const publishPosts = allBlogs.filter((post) => post.draft !== true);
-  // RSS for blog post
-  if (publishPosts.length > 0) {
-    const rss = generateRss(config, sortPosts(publishPosts));
+  const publishPosts = filterPublishedPosts(allBlogs);
+  const writingPosts = sortPosts(filterWritingPosts(publishPosts));
+  const notePosts = sortPosts(filterNotePosts(publishPosts));
+  const tagFeedRoot = path.join("public", "tags");
+
+  // Tag feeds are generated artifacts. Clear them first so removed, drafted,
+  // or not-yet-published posts cannot survive in a stale feed from an older build.
+  rmSync(tagFeedRoot, { recursive: true, force: true });
+  rmSync(path.join("public", "notes.xml"), { force: true });
+
+  // Keep long-form writing and short notes in distinct feeds.
+  if (writingPosts.length > 0) {
+    const rss = generateRss(config, writingPosts);
     writeFileSync(`./public/${page}`, rss);
   }
 
-  if (publishPosts.length > 0) {
+  if (notePosts.length > 0) {
+    const rss = generateRss(config, notePosts, "notes.xml");
+    writeFileSync("./public/notes.xml", rss);
+  }
+
+  if (writingPosts.length > 0) {
     for (const tag of Object.keys(tagData)) {
-      const filteredPosts = allBlogs.filter((post) => post.tags.map((t) => slug(t)).includes(tag));
+      const filteredPosts = writingPosts.filter((post) =>
+        post.tags.map((t) => slug(t)).includes(tag)
+      );
+      if (filteredPosts.length === 0) continue;
+
       const rss = generateRss(config, filteredPosts, `tags/${tag}/${page}`);
-      const rssPath = path.join("public", "tags", tag);
+      const rssPath = path.join(tagFeedRoot, tag);
       mkdirSync(rssPath, { recursive: true });
       writeFileSync(path.join(rssPath, page), rss);
     }

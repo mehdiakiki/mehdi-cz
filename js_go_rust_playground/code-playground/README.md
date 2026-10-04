@@ -1,5 +1,7 @@
 # Pin Playground
 
+> Historical prototype notes. For the current site release and container rollout, follow [the production checklist](../../DEPLOY.md) and the source in `app/api/playground/`; the setup commands and file names below are not the current deployment procedure.
+
 An interactive Rust playground embedded in a Next.js blog, built as a companion to the article *"Pin Explained: How I Finally Stopped Memorizing and Started Understanding."*
 
 Readers can edit and run 8 progressive examples that demonstrate Pin's mechanics — from memory corruption without Pin, to safe pinning patterns, to deliberate contract violations.
@@ -42,7 +44,7 @@ The service is designed for a publicly accessible VPS. Every request passes thro
 | Layer | What | Why |
 |-------|------|-----|
 | 1. Origin validation | Checks `Origin` / `Referer` header | Blocks requests not from your domain |
-| 2. HMAC signature | SHA-256(secret + timestamp + body) | Only your frontend can forge valid requests |
+| 2. HMAC signature | HMAC-SHA256(secret, timestamp:body) | Only your server can forge valid requests |
 | 3. Replay protection | Signatures expire after 5 minutes | Captured requests cannot be reused |
 | 4. Rate limiting | 10 req/min/IP, sliding window | Prevents abuse and protects the Playground API |
 | 5. Code sanitization | Blocks `std::net`, `std::fs`, `std::process`, etc. | Filters obviously dangerous code |
@@ -54,13 +56,12 @@ The service is designed for a publicly accessible VPS. Every request passes thro
 ```
 Browser                    Next.js (server)              Axum
   │                             │                          │
-  │──POST /api/playground/sign──▶                          │
+  │──POST /api/playground/execute▶                         │
   │  (body = execute payload)   │                          │
-  │                             │  HMAC(secret, ts+body)   │
-  │◀──{ signature, timestamp }──│                          │
-  │                             │                          │
-  │──POST /api/playground/execute──────────────────────────▶
-  │  Headers: X-Playground-Signature, X-Playground-Timestamp
+  │                             │──POST /api/playground/execute▶
+  │                             │  X-Playground-Signature-V2 =
+  │                             │  HMAC(secret, timestamp:body)
+  │                             │  X-Playground-Timestamp   │
   │                             │                          │
   │                             │     validates HMAC ──────│
   │                             │     checks origin ──────│
@@ -68,7 +69,7 @@ Browser                    Next.js (server)              Axum
   │                             │     sanitizes code ─────│
   │                             │     checks similarity ──│
   │                             │     cache lookup ───────│
-  │◀───────────────── { stdout, stderr, cached } ─────────│
+  │◀────────────────── { stdout, stderr, cached } ─────────│
 ```
 
 The PLAYGROUND_SECRET never reaches the browser. The Next.js API route signs the request server-side. Even if an attacker reads the client-side JavaScript, they cannot forge requests.

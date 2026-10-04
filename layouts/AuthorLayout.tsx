@@ -3,9 +3,6 @@ import type { Authors } from "contentlayer/generated";
 import SocialIcon from "@/components/social-icons";
 import Image from "@/components/Image";
 
-import MainProject from "@/components/MainProject";
-import { mainProjectData as d } from "@/data/projectsData";
-
 interface Props {
   children: ReactNode;
   content: Omit<Authors, "_id" | "_raw" | "body">;
@@ -16,15 +13,15 @@ export default function AuthorLayout({ children, content }: Props) {
 
   return (
     <>
-      <div className="space-y-4 pb-8 pt-6">
-        <h1 className="text-center text-2xl font-extrabold leading-9 tracking-tight text-gray-900 dark:text-gray-100 sm:text-3xl sm:leading-10 md:text-5xl md:leading-14">
-          Mehdi Akiki · Software Engineer
+      <div className="space-y-4 pt-6 pb-8">
+        <h1 className="text-center text-4xl leading-tight font-bold tracking-tight text-gray-900 md:text-6xl dark:text-gray-100">
+          About
         </h1>
-        <p className="text-center text-lg font-medium text-gray-500 dark:text-gray-400 md:text-xl">
-          Systems thinking. Full-stack execution. Open-source depth.
+        <p className="text-center text-lg font-medium text-gray-500 md:text-xl dark:text-gray-400">
+          The path behind the systems, products, and open-source work.
         </p>
       </div>
-      <div className="items-start space-y-2 xl:grid xl:grid-cols-3 xl:gap-x-8 xl:space-y-0">
+      <div className="items-start space-y-2 xl:grid xl:grid-cols-3 xl:space-y-0 xl:gap-x-8">
         <div className="flex flex-col items-center space-x-2 pt-8">
           {avatar && (
             <Image
@@ -33,32 +30,33 @@ export default function AuthorLayout({ children, content }: Props) {
               width={192}
               height={192}
               className="h-48 w-48 rounded-full"
-              priority={true}
+              blur={true}
               quality={90}
             />
           )}
-          <h3 className="pb-2 pt-4 text-2xl font-bold leading-8 tracking-tight">{name}</h3>
-          <div className="text-gray-500 dark:text-gray-400">{occupation}</div>
-          <div className="font-bold text-gray-500 dark:text-primary-400">{company}</div>
+          <h2 className="pt-4 pb-2 text-2xl leading-8 font-bold tracking-tight">{name}</h2>
+          {occupation && <div className="text-gray-500 dark:text-gray-400">{occupation}</div>}
+          {company && (
+            <div className="dark:text-primary-400 font-bold text-gray-500">{company}</div>
+          )}
           <div className="flex space-x-3 pt-6">
             <SocialIcon kind="mail" href={`mailto:${email}`} />
             <SocialIcon kind="github" href={github} />
             <SocialIcon kind="linkedin" href={linkedin} />
-            <SocialIcon kind="file" href={file} />
           </div>
+          {file && (
+            <a
+              href={file}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="bg-primary-700 hover:bg-primary-800 mt-4 inline-block rounded-lg px-4 py-1.5 text-sm font-semibold text-white transition-colors"
+            >
+              Resume / CV
+            </a>
+          )}
         </div>
 
-        <div className="prose pb-8 pt-8 text-lg dark:prose-invert xl:col-span-2">{children}</div>
-      </div>
-
-      <div className="col-span-3 mt-10 w-full">
-        <MainProject
-          key={d.title}
-          title={d.title}
-          description={d.description}
-          imgSrc={d.imgSrc}
-          href={d.href}
-        />
+        <div className="prose dark:prose-invert pt-8 pb-8 text-lg xl:col-span-2">{children}</div>
       </div>
     </>
   );

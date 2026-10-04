@@ -5,9 +5,7 @@
  * Tests the sitemap.xml and robots.txt endpoints
  */
 
-const fetch = require("node-fetch");
-
-const BASE_URL = "http://localhost:3000";
+const BASE_URL = process.env.BASE_URL || "http://localhost:3000";
 
 async function validateSitemap() {
   console.log("🔍 Validating sitemap.xml...");
@@ -58,7 +56,7 @@ async function validateRobots() {
     const text = await response.text();
 
     // Check basic structure
-    if (!text.includes("User-agent:")) {
+    if (!/User-[Aa]gent:/.test(text)) {
       console.error("❌ Robots.txt missing User-agent directive");
       return false;
     }

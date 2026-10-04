@@ -1,6 +1,6 @@
 use boa_engine::{Context, Source};
 use serde::{Deserialize, Serialize};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 // =============================================================
 // Embedded JavaScript execution via Boa Engine
@@ -46,23 +46,25 @@ pub struct JsResult {
 /// - `timeout`: maximum execution time (defense against infinite loops)
 ///
 /// Returns captured console.log output or an error message.
-pub fn execute_js(code: &str, timeout: Duration) -> JsResult {
+pub fn execute_js(code: &str) -> JsResult {
     let start = Instant::now();
 
     // Create a fresh context for each execution.
     // This is cheap (~1ms) and ensures no state leaks between requests.
     let mut context = Context::default();
 
+    // Cap loop iterations and call-stack depth inside Boa.
+    // These are defense-in-depth — the outer wall-clock timeout in the
+    // caller (tokio::time::timeout or OS RLIMIT_CPU) is the primary guard.
+    context.runtime_limits_mut().set_loop_iteration_limit(500_000);
+    context.runtime_limits_mut().set_recursion_limit(256);
+
     // Inject a console.log that captures output into a string.
     // Boa does not have a built-in console; we build one.
     inject_console(&mut context);
 
-    // Execute with timeout protection.
-    // Boa does not have built-in timeout, so we run it synchronously
-    // inside a thread with a deadline. For our small examples (~100 lines),
-    // execution is <50ms. The timeout is a safety net for infinite loops.
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        execute_with_timeout(&mut context, code, timeout)
+        execute_with_timeout(&mut context, code)
     }));
 
     let elapsed = start.elapsed().as_millis() as u64;
@@ -134,11 +136,7 @@ fn inject_console(context: &mut Context) {
 }
 
 /// Execute code and extract captured output.
-fn execute_with_timeout(
-    context: &mut Context,
-    code: &str,
-    _timeout: Duration,
-) -> Result<String, String> {
+fn execute_with_timeout(context: &mut Context, code: &str) -> Result<String, String> {
     // Execute the user code.
     match context.eval(Source::from_bytes(code)) {
         Ok(_) => {}
@@ -201,14 +199,14 @@ mod tests {
 
     #[test]
     fn test_basic_execution() {
-        let result = execute_js("console.log('hello world');", Duration::from_secs(5));
+        let result = execute_js("console.log('hello world');");
         assert!(result.success);
         assert_eq!(result.output.trim(), "hello world");
     }
 
     #[test]
     fn test_syntax_error() {
-        let result = execute_js("let x = ;", Duration::from_secs(5));
+        let result = execute_js("let x = ;");
         assert!(!result.success);
         assert!(!result.error.is_empty());
     }
@@ -221,7 +219,6 @@ mod tests {
             console.log("line 2");
             console.log(1 + 2);
             "#,
-            Duration::from_secs(5),
         );
         assert!(result.success);
         assert!(result.output.contains("line 1"));
@@ -231,10 +228,7 @@ mod tests {
 
     #[test]
     fn test_object_logging() {
-        let result = execute_js(
-            r#"console.log({ name: "test", value: 42 });"#,
-            Duration::from_secs(5),
-        );
+        let result = execute_js(r#"console.log({ name: "test", value: 42 });"#);
         assert!(result.success);
         assert!(result.output.contains("test"));
         assert!(result.output.contains("42"));

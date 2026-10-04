@@ -1,39 +1,88 @@
-import NextImage, { ImageProps } from "next/image";
+import NextImage, { getImageProps, ImageProps } from "next/image";
+import { preload as preloadResource } from "react-dom";
+import { getBlurDataURL } from "@/data/blurPlaceholders";
 
 const basePath = process.env.BASE_PATH;
 
-interface OptimizedImageProps extends Omit<ImageProps, "alt"> {
-  alt: string; // Make alt required for accessibility
-  loading?: "lazy" | "eager";
+type BaseImageProps = Omit<
+  ImageProps,
+  "alt" | "blurDataURL" | "fetchPriority" | "loading" | "placeholder" | "preload" | "priority"
+> & {
+  alt: string;
+  blur?: boolean;
+  blurDataURL?: string;
   quality?: number;
-  priority?: boolean;
-}
+};
+
+type ImageLoadingPolicy =
+  | {
+      preload: true;
+      fetchPriority?: never;
+      loading?: never;
+      preloadMedia?: never;
+    }
+  | {
+      preload?: false;
+      fetchPriority?: ImageProps["fetchPriority"];
+      loading?: "lazy" | "eager";
+      preloadMedia?: never;
+    }
+  | {
+      preload?: false;
+      fetchPriority: "high";
+      loading?: "lazy";
+      /**
+       * Emit an exact responsive-image preload only when this media query matches.
+       * Keep this opt-in: callers must first verify that the image is near the
+       * initial viewport for the matching layout.
+       */
+      preloadMedia: string;
+    };
+
+type OptimizedImageProps = BaseImageProps & ImageLoadingPolicy;
 
 const Image = ({
   src,
   alt,
+  blur = false,
+  blurDataURL: providedBlurDataURL,
   loading = "lazy",
   quality = 75,
-  priority = false,
+  preload = false,
+  preloadMedia,
+  fetchPriority,
   className = "",
+  sizes,
   ...rest
 }: OptimizedImageProps) => {
-  // Handle external URLs vs local paths
-  const imageSrc = src?.toString().startsWith("http") ? src : `${basePath || ""}${src}`;
+  const imageSrc = typeof src === "string" && src.startsWith("/") ? `${basePath || ""}${src}` : src;
+  const sourcePath = typeof src === "string" ? src : "default" in src ? src.default.src : src.src;
+  const blurDataURL = blur ? providedBlurDataURL || getBlurDataURL(sourcePath) : undefined;
+  const imageProps: ImageProps = {
+    src: imageSrc,
+    alt,
+    ...(preload ? { preload: true } : { loading }),
+    quality,
+    ...(sizes ? { sizes } : {}),
+    placeholder: blurDataURL ? "blur" : "empty",
+    blurDataURL: blurDataURL || undefined,
+    fetchPriority,
+    className,
+    ...rest,
+  };
 
-  return (
-    <NextImage
-      src={imageSrc}
-      alt={alt}
-      {...(!priority && { loading })}
-      quality={quality}
-      priority={priority}
-      className={`${className} transition-opacity duration-300`}
-      placeholder="blur"
-      blurDataURL="data:image/jpeg;base64,/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAYEBQYFBAYGBQYHBwYIChAKCgkJChQODwwQFxQYGBcUFhYaHSUfGhsjHBYWICwgIyYnKSopGR8tMC0oMCUoKSj/2wBDAQcHBwoIChMKChMoGhYaKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCj/wAARCAABAAEDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAv/xAAhEAACAQMDBQAAAAAAAAAAAAABAgMABAUGIWGRkqGx0f/EABUBAQEAAAAAAAAAAAAAAAAAAAMF/8QAGhEAAgIDAAAAAAAAAAAAAAAAAAECEgMRkf/aAAwDAQACEQMRAD8AltJagyeH0AthI5xdrLcNM91BF5pX2HaH9bcfaSXWGaRmknyEQZHbFFFirsVgGFfhGWMcDFFFB4qy2qCAyMR1XBRRQR/9k="
-      {...rest}
-    />
-  );
+  if (preloadMedia) {
+    const { props } = getImageProps(imageProps);
+    preloadResource(props.src, {
+      as: "image",
+      imageSrcSet: props.srcSet,
+      imageSizes: props.sizes,
+      fetchPriority: "high",
+      media: preloadMedia,
+    });
+  }
+
+  return <NextImage {...imageProps} />;
 };
 
 export default Image;

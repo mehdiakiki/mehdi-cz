@@ -33,11 +33,6 @@ export function WebsiteJsonLd() {
       name: siteMetadata.author,
       url: siteMetadata.siteUrl,
     },
-    potentialAction: {
-      "@type": "SearchAction",
-      target: `${siteMetadata.siteUrl}/search?q={search_term_string}`,
-      "query-input": "required name=search_term_string",
-    },
   };
 
   return <JsonLd data={websiteSchema} />;
@@ -51,10 +46,18 @@ export function PersonJsonLd() {
     name: siteMetadata.author,
     url: siteMetadata.siteUrl,
     sameAs: [siteMetadata.github, siteMetadata.linkedin, siteMetadata.x].filter(Boolean),
-    jobTitle: "Software Developer",
+    jobTitle: "Backend and Systems Engineer",
     description:
-      "Programming enthusiast sharing knowledge through tutorials and insights on software development.",
-    image: `${siteMetadata.siteUrl}${siteMetadata.siteLogo}`,
+      "Mehdi Akiki builds startup products, financial systems, distributed infrastructure, developer tooling, and open-source systems.",
+    image: `${siteMetadata.siteUrl}${siteMetadata.authorImage}`,
+    knowsAbout: [
+      "Distributed systems",
+      "Systems programming",
+      "Reliability engineering",
+      "Compiler internals",
+      "Developer tooling",
+      "Rust",
+    ],
   };
 
   return <JsonLd data={personSchema} />;

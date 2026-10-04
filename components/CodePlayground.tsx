@@ -7,6 +7,10 @@ import "prismjs/components/prism-rust";
 import "prismjs/components/prism-go";
 // prism-javascript is bundled in Prism core
 
+// The MDX pipeline already highlights static code blocks. Prevent Prism's
+// browser auto-run from rewriting that server-rendered markup before hydration.
+Prism.manual = true;
+
 // ==============================================================
 // CodePlayground — Interactive code runner for blog articles.
 //
@@ -111,7 +115,10 @@ export default function CodePlayground({ lang, ids, initialId }: CodePlaygroundP
     const url = lang ? `${API_BASE}/examples?lang=${lang}` : `${API_BASE}/examples`;
 
     fetch(url)
-      .then((res) => res.json())
+      .then((res) => {
+        if (!res.ok) throw new Error("Playground backend unavailable");
+        return res.json();
+      })
       .then((data: Example[]) => {
         const filtered =
           ids && ids.length > 0
@@ -164,9 +171,19 @@ export default function CodePlayground({ lang, ids, initialId }: CodePlaygroundP
         body: JSON.stringify({ example_id: activeExample.id, code }),
       });
 
-      if (res.status === 429) { setError("Rate limited — wait a moment and try again."); return; }
-      if (res.status === 403 || res.status === 401) { setError("Request validation failed. Please refresh the page."); return; }
-      if (!res.ok) { const text = await res.text(); setError(text || `HTTP ${res.status}`); return; }
+      if (res.status === 429) {
+        setError("Rate limited — wait a moment and try again.");
+        return;
+      }
+      if (res.status === 403 || res.status === 401) {
+        setError("Request validation failed. Please refresh the page.");
+        return;
+      }
+      if (!res.ok) {
+        const text = await res.text();
+        setError(text || `HTTP ${res.status}`);
+        return;
+      }
 
       setResult(await res.json());
     } catch (err: unknown) {
@@ -191,17 +208,28 @@ export default function CodePlayground({ lang, ids, initialId }: CodePlaygroundP
 
   if (loadingExamples) {
     return (
-      <div className="rounded-xl border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-950 px-6 py-10 text-center text-sm text-gray-500 dark:text-gray-400 font-sans shadow-sm">
+      <div className="rounded-xl border border-gray-200 bg-white px-6 py-10 text-center font-sans text-sm text-gray-500 shadow-sm dark:border-gray-700 dark:bg-gray-950 dark:text-gray-400">
         Loading playground…
       </div>
     );
   }
 
+  if (!activeExample) {
+    return (
+      <div
+        role="status"
+        className="rounded-xl border border-gray-200 bg-white px-6 py-10 text-center font-sans text-sm text-gray-600 shadow-sm dark:border-gray-700 dark:bg-gray-950 dark:text-gray-300"
+      >
+        {error ?? "No playground examples are available right now."}
+      </div>
+    );
+  }
+
   return (
-    <div className="rounded-xl border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-950 overflow-hidden font-sans text-gray-900 dark:text-gray-100 max-w-full not-prose shadow-sm">
+    <div className="not-prose max-w-full overflow-hidden rounded-xl border border-gray-200 bg-white font-sans text-gray-900 shadow-sm dark:border-gray-700 dark:bg-gray-950 dark:text-gray-100">
       {/* Prism Night Owl-inspired token colours, scoped to this component */}
       <style>{`
-        .prism-editor .token.comment,.prism-editor .token.prolog,.prism-editor .token.doctype,.prism-editor .token.cdata{color:#637777;font-style:italic}
+        .prism-editor .token.comment,.prism-editor .token.prolog,.prism-editor .token.doctype,.prism-editor .token.cdata{color:#94a3a3;font-style:italic}
         .prism-editor .token.punctuation{color:#c792ea}
         .prism-editor .token.property,.prism-editor .token.tag,.prism-editor .token.boolean,.prism-editor .token.number,.prism-editor .token.constant,.prism-editor .token.symbol{color:#f78c6c}
         .prism-editor .token.selector,.prism-editor .token.attr-name,.prism-editor .token.string,.prism-editor .token.char,.prism-editor .token.builtin{color:#ecc48d}
@@ -214,7 +242,7 @@ export default function CodePlayground({ lang, ids, initialId }: CodePlaygroundP
       `}</style>
 
       {/* ========== Example Tabs ========== */}
-      <div className="flex overflow-x-auto border-b border-gray-200 dark:border-gray-700 [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden">
+      <div className="flex [scrollbar-width:none] overflow-x-auto border-b border-gray-200 [-ms-overflow-style:none] dark:border-gray-700 [&::-webkit-scrollbar]:hidden">
         {examples.map((ex, i) => {
           const isActive = activeExample?.id === ex.id;
           const dot = getLanguageDot(ex.id);
@@ -223,14 +251,18 @@ export default function CodePlayground({ lang, ids, initialId }: CodePlaygroundP
               key={ex.id}
               onClick={() => selectExample(ex)}
               className={[
-                "group flex items-center gap-2 px-4 py-3 text-[13px] border-b-2 whitespace-nowrap transition-all duration-150 focus:outline-none",
+                "group flex items-center gap-2 border-b-2 px-4 py-3 text-[13px] whitespace-nowrap transition-all duration-150 focus:outline-none",
                 isActive
-                  ? "border-primary-500 text-gray-900 dark:text-gray-100 bg-gray-50 dark:bg-gray-900 font-medium"
-                  : "border-transparent text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 hover:bg-gray-50/50 dark:hover:bg-gray-900/50",
+                  ? "border-primary-500 bg-gray-50 font-medium text-gray-900 dark:bg-gray-900 dark:text-gray-100"
+                  : "border-transparent text-gray-500 hover:bg-gray-50/50 hover:text-gray-700 dark:text-gray-400 dark:hover:bg-gray-900/50 dark:hover:text-gray-200",
               ].join(" ")}
             >
-              <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${dot} ${isActive ? "opacity-100" : "opacity-40 group-hover:opacity-70"} transition-opacity`} />
-              <span className="opacity-30 font-mono text-[11px] mr-0.5">{String(i + 1).padStart(2, "0")}</span>
+              <span
+                className={`h-1.5 w-1.5 shrink-0 rounded-full ${dot} ${isActive ? "opacity-100" : "opacity-40 group-hover:opacity-70"} transition-opacity`}
+              />
+              <span className="mr-0.5 font-mono text-[11px] opacity-30">
+                {String(i + 1).padStart(2, "0")}
+              </span>
               {ex.title}
             </button>
           );
@@ -239,20 +271,20 @@ export default function CodePlayground({ lang, ids, initialId }: CodePlaygroundP
 
       {/* ========== Description Bar ========== */}
       {activeExample && (
-        <div className="px-4 py-2.5 border-b border-gray-200 dark:border-gray-700 flex items-center gap-3 flex-wrap bg-gray-50/50 dark:bg-gray-900/30">
-          <p className="m-0 text-[13px] text-gray-500 dark:text-gray-400 flex-1 leading-relaxed min-w-0">
+        <div className="flex flex-wrap items-center gap-3 border-b border-gray-200 bg-gray-50/50 px-4 py-2.5 dark:border-gray-700 dark:bg-gray-900/30">
+          <p className="m-0 min-w-0 flex-1 text-[13px] leading-relaxed text-gray-500 dark:text-gray-400">
             {activeExample.description}
           </p>
-          <div className="flex gap-2 items-center shrink-0">
+          <div className="flex shrink-0 items-center gap-2">
             {isModified && (
-              <span className="px-2 py-0.5 rounded text-[10px] font-semibold tracking-wide text-primary-500 bg-primary-50 dark:bg-primary-900/20 border border-primary-200 dark:border-primary-800">
+              <span className="border-primary-200 bg-primary-50 text-primary-700 dark:border-primary-800 dark:bg-primary-900/20 dark:text-primary-300 rounded border px-2 py-0.5 text-[10px] font-semibold tracking-wide">
                 MODIFIED
               </span>
             )}
             {behavior && (
               <span
                 className={[
-                  "px-2.5 py-0.5 rounded-full text-[11px] font-semibold whitespace-nowrap border",
+                  "rounded-full border px-2.5 py-0.5 text-[11px] font-semibold whitespace-nowrap",
                   behavior.textClass,
                   behavior.borderClass,
                 ].join(" ")}
@@ -265,19 +297,18 @@ export default function CodePlayground({ lang, ids, initialId }: CodePlaygroundP
       )}
 
       {/* ========== Editor + Output ========== */}
-      <div className="grid grid-cols-1 md:grid-cols-2 min-h-[400px]">
-
+      <div className="grid min-h-[400px] grid-cols-1 md:grid-cols-2">
         {/* --- Code Editor --- */}
-        <div className="border-b md:border-b-0 md:border-r border-gray-200 dark:border-gray-700 flex flex-col">
-          <div className="px-4 py-2 flex justify-between items-center border-b border-gray-200 dark:border-gray-700 bg-gray-50/80 dark:bg-gray-900/50">
-            <span className="text-[10px] text-gray-400 dark:text-gray-500 uppercase tracking-widest font-semibold">
+        <div className="flex flex-col border-b border-gray-200 md:border-r md:border-b-0 dark:border-gray-700">
+          <div className="flex items-center justify-between border-b border-gray-200 bg-gray-50/80 px-4 py-2 dark:border-gray-700 dark:bg-gray-900/50">
+            <span className="text-[10px] font-semibold tracking-widest text-gray-400 uppercase dark:text-gray-500">
               Editor
             </span>
             <div className="flex gap-1.5">
               {isModified && (
                 <button
                   onClick={resetCode}
-                  className="px-2.5 py-1 text-[11px] rounded-md border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-100 hover:border-gray-300 dark:hover:border-gray-600 transition-all focus:outline-none"
+                  className="rounded-md border border-gray-200 bg-white px-2.5 py-1 text-[11px] text-gray-500 transition-all hover:border-gray-300 hover:text-gray-900 focus:outline-none dark:border-gray-700 dark:bg-gray-800 dark:text-gray-400 dark:hover:border-gray-600 dark:hover:text-gray-100"
                 >
                   ↺ Reset
                 </button>
@@ -286,10 +317,10 @@ export default function CodePlayground({ lang, ids, initialId }: CodePlaygroundP
                 onClick={execute}
                 disabled={loading}
                 className={[
-                  "flex items-center gap-1.5 px-3 py-1 text-[11px] font-semibold rounded-md transition-all focus:outline-none",
+                  "flex items-center gap-1.5 rounded-md px-3 py-1 text-[11px] font-semibold transition-all focus:outline-none",
                   loading
-                    ? "bg-gray-100 dark:bg-gray-800 text-gray-400 cursor-wait"
-                    : "bg-primary-500 hover:bg-primary-600 active:scale-95 text-white shadow-sm shadow-primary-500/30",
+                    ? "cursor-wait bg-gray-100 text-gray-400 dark:bg-gray-800"
+                    : "bg-primary-700 shadow-primary-500/30 hover:bg-primary-800 text-white shadow-sm active:scale-95",
                 ].join(" ")}
               >
                 {loading ? (
@@ -298,7 +329,7 @@ export default function CodePlayground({ lang, ids, initialId }: CodePlaygroundP
                       {[0, 150, 300].map((delay) => (
                         <span
                           key={delay}
-                          className="w-1 h-1 rounded-full bg-gray-400 animate-bounce"
+                          className="h-1 w-1 animate-bounce rounded-full bg-gray-400"
                           style={{ animationDelay: `${delay}ms` }}
                         />
                       ))}
@@ -307,7 +338,7 @@ export default function CodePlayground({ lang, ids, initialId }: CodePlaygroundP
                   </>
                 ) : (
                   <>
-                    <svg className="w-2.5 h-2.5 fill-current" viewBox="0 0 10 10">
+                    <svg className="h-2.5 w-2.5 fill-current" viewBox="0 0 10 10">
                       <polygon points="0,0 10,5 0,10" />
                     </svg>
                     Run
@@ -321,7 +352,7 @@ export default function CodePlayground({ lang, ids, initialId }: CodePlaygroundP
             <Editor
               value={code}
               onValueChange={setCode}
-              highlight={(c) => activeExample ? highlight(c, activeExample.id) : c}
+              highlight={(c) => (activeExample ? highlight(c, activeExample.id) : c)}
               onKeyDown={handleKeyDown}
               padding={16}
               style={{
@@ -336,15 +367,19 @@ export default function CodePlayground({ lang, ids, initialId }: CodePlaygroundP
             />
           </div>
 
-          <div className="px-4 py-1.5 border-t border-gray-200 dark:border-gray-700 bg-gray-50/80 dark:bg-gray-900/50 flex items-center justify-between">
+          <div className="flex items-center justify-between border-t border-gray-200 bg-gray-50/80 px-4 py-1.5 dark:border-gray-700 dark:bg-gray-900/50">
             <span className="text-[10px] text-gray-400 dark:text-gray-500">
-              <kbd className="px-1 py-0.5 rounded border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 font-mono text-[9px] text-gray-500 dark:text-gray-400">Ctrl</kbd>
+              <kbd className="rounded border border-gray-200 bg-white px-1 py-0.5 font-mono text-[9px] text-gray-500 dark:border-gray-700 dark:bg-gray-800 dark:text-gray-400">
+                Ctrl
+              </kbd>
               {" + "}
-              <kbd className="px-1 py-0.5 rounded border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 font-mono text-[9px] text-gray-500 dark:text-gray-400">↵</kbd>
+              <kbd className="rounded border border-gray-200 bg-white px-1 py-0.5 font-mono text-[9px] text-gray-500 dark:border-gray-700 dark:bg-gray-800 dark:text-gray-400">
+                ↵
+              </kbd>
               {" to run"}
             </span>
             {activeExample && (
-              <span className="text-[10px] text-gray-400 dark:text-gray-500 font-mono">
+              <span className="font-mono text-[10px] text-gray-400 dark:text-gray-500">
                 {activeExample.mode} · 2021
               </span>
             )}
@@ -353,35 +388,42 @@ export default function CodePlayground({ lang, ids, initialId }: CodePlaygroundP
 
         {/* --- Output Panel --- */}
         <div className="flex flex-col">
-          <div className="px-4 py-2 flex justify-between items-center border-b border-gray-200 dark:border-gray-700 bg-gray-50/80 dark:bg-gray-900/50">
-            <span className="text-[10px] text-gray-400 dark:text-gray-500 uppercase tracking-widest font-semibold">
+          <div className="flex items-center justify-between border-b border-gray-200 bg-gray-50/80 px-4 py-2 dark:border-gray-700 dark:bg-gray-900/50">
+            <span className="text-[10px] font-semibold tracking-widest text-gray-400 uppercase dark:text-gray-500">
               Output
             </span>
             <div className="flex items-center gap-2">
               {/* Invisible spacer — matches Run button height so both headers stay aligned */}
-              <span aria-hidden className="invisible flex items-center gap-1.5 px-3 py-1 text-[11px] font-semibold rounded-md">
-                <svg className="w-2.5 h-2.5" viewBox="0 0 10 10"><polygon points="0,0 10,5 0,10" /></svg>
+              <span
+                aria-hidden
+                className="invisible flex items-center gap-1.5 rounded-md px-3 py-1 text-[11px] font-semibold"
+              >
+                <svg className="h-2.5 w-2.5" viewBox="0 0 10 10">
+                  <polygon points="0,0 10,5 0,10" />
+                </svg>
                 Run
               </span>
               {result?.cached && (
-                <span className="text-[10px] text-indigo-500 dark:text-indigo-400 font-medium">
+                <span className="text-[10px] font-medium text-indigo-500 dark:text-indigo-400">
                   ● cached
                 </span>
               )}
               {result && !loading && (
-                <span className={[
-                  "text-[10px] font-semibold px-1.5 py-0.5 rounded-full border",
-                  result.success
-                    ? "text-green-600 dark:text-green-400 border-green-500/30 bg-green-50 dark:bg-green-900/20"
-                    : "text-red-500 dark:text-red-400 border-red-500/30 bg-red-50 dark:bg-red-900/20",
-                ].join(" ")}>
+                <span
+                  className={[
+                    "rounded-full border px-1.5 py-0.5 text-[10px] font-semibold",
+                    result.success
+                      ? "border-green-500/30 bg-green-50 text-green-600 dark:bg-green-900/20 dark:text-green-400"
+                      : "border-red-500/30 bg-red-50 text-red-500 dark:bg-red-900/20 dark:text-red-400",
+                  ].join(" ")}
+                >
                   {result.success ? "✓ ok" : "✗ failed"}
                 </span>
               )}
             </div>
           </div>
 
-          <div className="flex-1 p-4 bg-[#011627] font-mono text-[13px] leading-[1.7] overflow-y-auto whitespace-pre-wrap break-words">
+          <div className="flex-1 overflow-y-auto bg-[#011627] p-4 font-mono text-[13px] leading-[1.7] break-words whitespace-pre-wrap">
             {loading && (
               <div className="flex flex-col gap-2 text-gray-400">
                 <div className="flex items-center gap-2">
@@ -389,22 +431,20 @@ export default function CodePlayground({ lang, ids, initialId }: CodePlaygroundP
                     {[0, 150, 300].map((delay) => (
                       <span
                         key={delay}
-                        className="w-1.5 h-1.5 rounded-full bg-primary-400 animate-bounce"
+                        className="bg-primary-400 h-1.5 w-1.5 animate-bounce rounded-full"
                         style={{ animationDelay: `${delay}ms` }}
                       />
                     ))}
                   </span>
                   <span>Compiling…</span>
                 </div>
-                <span className="text-[11px] text-gray-600 font-sans">
+                <span className="font-sans text-[11px] text-gray-600">
                   First run may take 10–15 seconds.
                 </span>
               </div>
             )}
 
-            {error && (
-              <span className="text-red-400">{error}</span>
-            )}
+            {error && <span className="text-red-400">{error}</span>}
 
             {result && !loading && (
               <>
@@ -428,14 +468,16 @@ export default function CodePlayground({ lang, ids, initialId }: CodePlaygroundP
             )}
 
             {!loading && !error && !result && (
-              <div className="flex flex-col items-center justify-center h-full gap-3 text-center select-none">
-                <svg className="w-8 h-8 text-gray-700" viewBox="0 0 24 24" fill="currentColor">
+              <div className="flex h-full flex-col items-center justify-center gap-3 text-center select-none">
+                <svg className="h-8 w-8 text-gray-700" viewBox="0 0 24 24" fill="currentColor">
                   <path d="M8 5v14l11-7z" />
                 </svg>
-                <p className="text-[12px] text-gray-600 font-sans leading-relaxed">
+                <p className="font-sans text-[12px] leading-relaxed text-gray-600">
                   Press{" "}
-                  <kbd className="px-1 py-0.5 rounded border border-gray-700 bg-gray-800 font-mono text-[10px] text-gray-400">Ctrl+↵</kbd>
-                  {" "}or click <strong className="text-gray-400 font-semibold">Run</strong> to execute.
+                  <kbd className="rounded border border-gray-700 bg-gray-800 px-1 py-0.5 font-mono text-[10px] text-gray-400">
+                    Ctrl+↵
+                  </kbd>{" "}
+                  or click <strong className="font-semibold text-gray-400">Run</strong> to execute.
                 </p>
               </div>
             )}

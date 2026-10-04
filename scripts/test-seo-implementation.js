@@ -31,7 +31,7 @@ function testRobotsRules() {
   console.log("\n🤖 Testing Robots.txt Rules...");
 
   const blockedPaths = ["/api/", "/_next/", "/admin/", "/private/", "/draft/"];
-  const allowedPaths = ["/", "/blog", "/work", "/hire"];
+  const allowedPaths = ["/", "/blog", "/work", "/how-i-work"];
 
   console.log("✅ Blocked paths:", blockedPaths.join(", "));
   console.log("✅ Allowed paths:", allowedPaths.join(", "));
@@ -47,7 +47,7 @@ function testSitemapCoverage() {
     "Homepage (priority 1.0)",
     "Blog index (priority 0.9)",
     "Work page (priority 0.9)",
-    "Hire page (priority 0.8)",
+    "How I Work page (priority 0.8)",
     "Contact page (priority 0.7)",
     "Tags overview (priority 0.6)",
     "Individual blog posts (0.5-0.8)",

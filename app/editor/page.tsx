@@ -1,7 +1,15 @@
-import dynamic from "next/dynamic";
+import type { Metadata } from "next";
 
-const FullEditor = dynamic(() => import("@/components/FullEditor"), { ssr: false });
+import ClientOnlyFullEditor from "@/components/ClientOnlyFullEditor";
+
+export const metadata: Metadata = {
+  title: "Editor",
+  robots: {
+    index: false,
+    follow: false,
+  },
+};
 
 export default function EditorPage() {
-  return <FullEditor />;
+  return <ClientOnlyFullEditor />;
 }

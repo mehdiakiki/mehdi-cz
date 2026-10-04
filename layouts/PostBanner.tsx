@@ -37,9 +37,9 @@ export default function PostMinimal({ content, next, prev, children }: LayoutPro
                     alt={`${title} - Featured image`}
                     fill
                     className="object-cover"
-                    priority={true}
+                    preload={true}
                     quality={85}
-                    sizes="(max-width: 768px) 100vw, (max-width: 1200px) 100vw, 100vw"
+                    sizes="(max-width: 767px) calc( 100vw + 1rem), (max-width: 1279px) 784px, (max-width: 1535px) 1088px, 1216px"
                   />
                 </div>
               </Bleed>
@@ -48,9 +48,9 @@ export default function PostMinimal({ content, next, prev, children }: LayoutPro
               <PageTitle>{title}</PageTitle>
             </div>
           </div>
-          <div className="prose max-w-none py-4 dark:prose-invert">{children}</div>
+          <div className="prose dark:prose-invert max-w-none py-4">{children}</div>
           {siteMetadata.comments && (
-            <div className="pb-6 pt-6 text-center text-gray-700 dark:text-gray-300" id="comment">
+            <div className="pt-6 pb-6 text-center text-gray-700 dark:text-gray-300" id="comment">
               <Comments slug={slug} />
             </div>
           )}
@@ -60,7 +60,7 @@ export default function PostMinimal({ content, next, prev, children }: LayoutPro
                 <div className="pt-4 xl:pt-8">
                   <Link
                     href={`/${prev.path}`}
-                    className="text-primary-500 hover:text-primary-600 dark:hover:text-primary-400"
+                    className="text-primary-700 hover:text-primary-800 dark:text-primary-400 dark:hover:text-primary-300"
                     aria-label={`Previous post: ${prev.title}`}
                   >
                     &larr; {prev.title}
@@ -71,7 +71,7 @@ export default function PostMinimal({ content, next, prev, children }: LayoutPro
                 <div className="pt-4 xl:pt-8">
                   <Link
                     href={`/${next.path}`}
-                    className="text-primary-500 hover:text-primary-600 dark:hover:text-primary-400"
+                    className="text-primary-700 hover:text-primary-800 dark:text-primary-400 dark:hover:text-primary-300"
                     aria-label={`Next post: ${next.title}`}
                   >
                     {next.title} &rarr;

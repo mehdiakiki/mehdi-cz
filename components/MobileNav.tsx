@@ -1,41 +1,41 @@
 "use client";
 
-import { Dialog, Transition } from "@headlessui/react";
-import { disableBodyScroll, enableBodyScroll, clearAllBodyScrollLocks } from "body-scroll-lock";
-import { Fragment, useState, useEffect, useRef } from "react";
-import { usePathname } from "next/navigation";
-import Link from "./Link";
-import headerNavLinks from "@/data/headerNavLinks";
+import dynamic from "next/dynamic";
+import { useState } from "react";
+
+const loadMobileNavPanel = () => import("./MobileNavPanel");
+const MobileNavPanel = dynamic(loadMobileNavPanel, { ssr: false });
 
 const MobileNav = () => {
   const [navShow, setNavShow] = useState(false);
-  const navRef = useRef(null);
-  const pathname = usePathname();
+  const [hasOpened, setHasOpened] = useState(false);
 
-  const onToggleNav = () => {
-    setNavShow((status) => {
-      if (status) {
-        enableBodyScroll(navRef.current);
-      } else {
-        // Prevent scrolling
-        disableBodyScroll(navRef.current);
-      }
-      return !status;
-    });
+  const preloadNav = () => {
+    void loadMobileNavPanel();
   };
 
-  useEffect(() => {
-    return clearAllBodyScrollLocks;
-  });
+  const openNav = () => {
+    setHasOpened(true);
+    setNavShow(true);
+  };
 
   return (
     <>
-      <button aria-label="Toggle Menu" onClick={onToggleNav} className="sm:hidden">
+      <button
+        aria-label="Open menu"
+        aria-haspopup="dialog"
+        aria-expanded={navShow}
+        onClick={openNav}
+        onFocus={preloadNav}
+        onPointerEnter={preloadNav}
+        onTouchStart={preloadNav}
+        className="md:hidden"
+      >
         <svg
           xmlns="http://www.w3.org/2000/svg"
           viewBox="0 0 20 20"
           fill="currentColor"
-          className="h-8 w-8 text-gray-900 hover:text-primary-500 dark:text-gray-100 dark:hover:text-primary-400"
+          className="hover:text-primary-700 dark:hover:text-primary-300 h-8 w-8 text-gray-900 dark:text-gray-100"
         >
           <path
             fillRule="evenodd"
@@ -44,85 +44,7 @@ const MobileNav = () => {
           />
         </svg>
       </button>
-      <Transition appear show={navShow} as={Fragment} unmount={false}>
-        <Dialog as="div" onClose={onToggleNav} unmount={false}>
-          <Transition.Child
-            as={Fragment}
-            enter="ease-out duration-300"
-            enterFrom="opacity-0"
-            enterTo="opacity-100"
-            leave="ease-in duration-200"
-            leaveFrom="opacity-100"
-            leaveTo="opacity-0"
-            unmount={false}
-          >
-            <div className="fixed inset-0 z-60 bg-black/25" />
-          </Transition.Child>
-
-          <Transition.Child
-            as={Fragment}
-            enter="transition ease-in-out duration-300 transform"
-            enterFrom="translate-x-full opacity-0"
-            enterTo="translate-x-0 opacity-95"
-            leave="transition ease-in duration-200 transform"
-            leaveFrom="translate-x-0 opacity-95"
-            leaveTo="translate-x-full opacity-0"
-            unmount={false}
-          >
-            <Dialog.Panel className="fixed left-0 top-0 z-70 h-full w-full bg-white opacity-95 duration-300 dark:bg-gray-950 dark:opacity-[0.98]">
-              <nav
-                ref={navRef}
-                className="mt-8 flex h-full basis-0 flex-col items-start overflow-y-auto pl-12 pt-2 text-left"
-              >
-                {headerNavLinks.map((link) => {
-                  const isActive = pathname === link.href || pathname.startsWith(link.href + "/");
-                  const isHire = link.href === "/hire";
-
-                  return (
-                    <Link
-                      key={link.title}
-                      href={link.href}
-                      className={`mb-4 py-2 pr-4 text-2xl font-bold tracking-widest outline outline-0 hover:text-primary-500 dark:hover:text-primary-400 ${
-                        isHire
-                          ? `font-extrabold text-green-600 dark:text-green-400 ${isActive ? "border-l-4 border-green-600 pl-8 dark:border-green-400" : ""}`
-                          : isActive
-                            ? "border-l-4 border-primary-500 pl-8 text-primary-500 dark:border-primary-400 dark:text-primary-400"
-                            : "text-gray-900 dark:text-gray-100"
-                      }`}
-                      onClick={onToggleNav}
-                    >
-                      {link.title}
-                    </Link>
-                  );
-                })}
-                <a
-                  href="https://cal.com/mehdicz/30min"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="mb-4 mt-4 rounded-lg bg-primary-500 px-6 py-2 text-xl font-bold text-white transition-colors hover:bg-primary-600"
-                  onClick={onToggleNav}
-                >
-                  Book a Call
-                </a>
-              </nav>
-
-              <button
-                className="fixed right-4 top-7 z-80 h-16 w-16 p-4 text-gray-900 hover:text-primary-500 dark:text-gray-100 dark:hover:text-primary-400"
-                aria-label="Toggle Menu"
-                onClick={onToggleNav}
-              >
-                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor">
-                  <path
-                    fillRule="evenodd"
-                    d="M4.293 4.293a1 1 0 011.414 0L10 8.586l4.293-4.293a1 1 0 111.414 1.414L11.414 10l4.293 4.293a1 1 0 01-1.414 1.414L10 11.414l-4.293 4.293a1 1 0 01-1.414-1.414L8.586 10 4.293 5.707a1 1 0 010-1.414z"
-                    clipRule="evenodd"
-                  />
-                </svg>
-              </button>
-            </Dialog.Panel>
-          </Transition.Child>
-        </Dialog>
-      </Transition>
+      {hasOpened ? <MobileNavPanel open={navShow} onClose={() => setNavShow(false)} /> : null}
     </>
   );
 };

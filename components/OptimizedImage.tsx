@@ -6,7 +6,7 @@ interface OptimizedImageProps {
   width?: number;
   height?: number;
   className?: string;
-  priority?: boolean;
+  preload?: boolean;
   quality?: number;
   sizes?: string;
   fill?: boolean;
@@ -18,11 +18,13 @@ export function OptimizedImage({
   width,
   height,
   className = "",
-  priority = false,
+  preload = false,
   quality = 75,
   sizes,
   fill = false,
 }: OptimizedImageProps) {
+  const loadingPolicy = preload ? ({ preload: true } as const) : ({ loading: "lazy" } as const);
+
   return (
     <Image
       src={src}
@@ -30,11 +32,10 @@ export function OptimizedImage({
       width={width}
       height={height}
       className={className}
-      priority={priority}
       quality={quality}
       sizes={sizes}
       fill={fill}
-      {...(!priority && { loading: "lazy" })}
+      {...loadingPolicy}
     />
   );
 }

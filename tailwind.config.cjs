@@ -36,9 +36,9 @@ module.exports = {
         DEFAULT: {
           css: {
             a: {
-              color: theme("colors.primary.500"),
+              color: theme("colors.primary.700"),
               "&:hover": {
-                color: `${theme("colors.primary.600")}`,
+                color: `${theme("colors.primary.800")}`,
               },
               code: { color: theme("colors.primary.400") },
             },
@@ -57,11 +57,14 @@ module.exports = {
         invert: {
           css: {
             a: {
-              color: theme("colors.primary.500"),
+              color: theme("colors.primary.400"),
               "&:hover": {
-                color: `${theme("colors.primary.400")}`,
+                color: `${theme("colors.primary.300")}`,
               },
               code: { color: theme("colors.primary.400") },
+            },
+            code: {
+              color: theme("colors.indigo.400"),
             },
             "h1,h2,h3,h4,h5,h6": {
               color: theme("colors.gray.100"),

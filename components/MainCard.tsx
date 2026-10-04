@@ -8,13 +8,14 @@ const MainCard = ({ title, description, imgSrc, href }) => (
         <Image
           alt={title}
           src={imgSrc}
-          className="h-100 m-0 rounded-md object-cover object-center"
+          className="m-0 h-100 rounded-md object-cover object-center"
           width={2000}
           height={1000}
+          sizes="(max-width: 1119px) calc( 100vw - 2rem), 1088px"
         />
       </Link>
       <div className="p-6 text-center">
-        <h2 className="mb-3 mt-3 text-2xl font-bold leading-8 tracking-tight">
+        <h2 className="mt-3 mb-3 text-2xl leading-8 font-bold tracking-tight">
           {href ? (
             <Link href={href} aria-label={`Link to ${title}`}>
               {title}
@@ -27,7 +28,7 @@ const MainCard = ({ title, description, imgSrc, href }) => (
         {href && (
           <Link
             href={href}
-            className="text-base font-medium leading-6 text-primary-500 hover:text-primary-600 dark:hover:text-primary-400"
+            className="text-primary-700 hover:text-primary-800 dark:text-primary-400 dark:hover:text-primary-300 text-base leading-6 font-medium"
             aria-label={`Link to ${title}`}
           >
             Read the case study &rarr;

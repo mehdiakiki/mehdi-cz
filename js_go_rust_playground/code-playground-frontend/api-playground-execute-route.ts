@@ -13,15 +13,17 @@
 // ==============================================================
 
 import { NextRequest, NextResponse } from "next/server";
-import { createHash } from "crypto";
+import { createHash, createHmac } from "node:crypto";
 
-const SECRET = process.env.PLAYGROUND_SECRET || "change-me-in-production";
 const AXUM_URL = process.env.PLAYGROUND_AXUM_URL || "http://code-playground:3001";
 
-function sign(timestamp: number, body: string): string {
-  const hash = createHash("sha256");
-  hash.update(`${SECRET}:${timestamp}:${body}`);
-  return hash.digest("hex");
+function sign(secret: string, timestamp: number, body: string): string {
+  return createHmac("sha256", secret).update(`${timestamp}:${body}`).digest("hex");
+}
+
+// Temporary compatibility for an older backend during the rolling upgrade.
+function legacySign(secret: string, timestamp: number, body: string): string {
+  return createHash("sha256").update(`${secret}:${timestamp}:${body}`).digest("hex");
 }
 
 // --- Dev mock outputs keyed by example ID ---
@@ -66,19 +68,27 @@ export async function POST(request: NextRequest) {
   }
 
   // Production: sign and proxy to Axum on the private Docker network.
+  const secret = process.env.PLAYGROUND_SECRET;
+  if (!secret || secret === "change-me-in-production") {
+    return NextResponse.json(
+      { success: false, stdout: "", stderr: "Playground unavailable" },
+      { status: 503 }
+    );
+  }
   const timestamp = Math.floor(Date.now() / 1000);
-  const signature = sign(timestamp, body);
+  const signature = sign(secret, timestamp, body);
 
   // Server-to-server calls have no Origin header by default.
   // Axum's validate_origin blocks requests with no matching Origin,
   // so we set it explicitly here (we are the trusted caller).
   const origin = process.env.NEXT_PUBLIC_SITE_URL || "https://mehdi.cz";
 
-  const axumRes = await fetch(`${AXUM_URL}/execute`, {
+  const axumRes = await fetch(`${AXUM_URL}/api/playground/execute`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "X-Playground-Signature": signature,
+      "X-Playground-Signature-V2": signature,
+      "X-Playground-Signature": legacySign(secret, timestamp, body),
       "X-Playground-Timestamp": String(timestamp),
       "Origin": origin,
     },

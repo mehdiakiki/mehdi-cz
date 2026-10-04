@@ -7,7 +7,7 @@ const WorkCard = ({ title, subtitle, description, imgSrc, href, type }) => (
     <div
       className={`${
         imgSrc && "h-full"
-      } overflow-hidden rounded-md border-2 border-gray-200 border-opacity-60 dark:border-gray-700`}
+      } overflow-hidden rounded-md border-2 border-gray-200/60 dark:border-gray-700/60`}
     >
       <Link href={href} aria-label={`Link to ${title}`}>
         <Image
@@ -16,10 +16,11 @@ const WorkCard = ({ title, subtitle, description, imgSrc, href, type }) => (
           className="object-cover object-center md:h-36 lg:h-48"
           width={544}
           height={180}
+          sizes="(max-width: 767px) calc( 100vw - 2rem), (max-width: 1151px) calc( 50vw - 2rem), 512px"
         />
       </Link>
       <div className="p-6">
-        <h2 className="mb-3 text-2xl font-bold leading-8 tracking-tight">
+        <h2 className="mb-3 text-2xl leading-8 font-bold tracking-tight">
           {href ? (
             <Link href={href} aria-label={`Link to ${title}`}>
               {title}
@@ -36,7 +37,7 @@ const WorkCard = ({ title, subtitle, description, imgSrc, href, type }) => (
           <div className="text-right">
             <Link
               href={href}
-              className="text-base font-medium leading-6 text-primary-500 hover:text-primary-600 dark:hover:text-primary-400"
+              className="text-primary-700 hover:text-primary-800 dark:text-primary-400 dark:hover:text-primary-300 text-base leading-6 font-medium"
               aria-label={`Link to ${title}`}
             >
               Github's link &rarr;

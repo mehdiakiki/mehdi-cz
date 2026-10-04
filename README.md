@@ -106,6 +106,48 @@ This regenerates:
 - `public/search.json`
 - RSS feeds under `public/`
 
+### Drafts and scheduled publication
+
+Publication state is enforced across the article route, homepage, archives, tag pages, topic hubs,
+search index, sitemap, and RSS feeds.
+
+Keep a campaign article private with two explicit locks:
+
+```yaml
+date: "2026-09-10T09:00:00+01:00"
+draft: true
+reviewed: false
+cluster: "reliable-data-integrations"
+campaign: "authority-2026"
+opportunity: "DATA-005"
+```
+
+The campaign audit also requires validated search intent, an approved opportunity, and a
+content-bound review hash. Generate that hash only after the final technical, editorial, SEO, NDA,
+and owner reviews:
+
+```bash
+yarn content:review-hash -- --id DATA-005
+```
+
+Then add the returned `reviewedHash`, set `reviewed: true` and `draft: false`, and retain the full ISO
+8601 timestamp with its explicit UTC offset. Removing only `draft: true` is not sufficient.
+
+Draft and scheduled posts remain visible under `yarn dev` for local review. Production builds hide
+them until every gate passes and the timestamp is reached. The Docker workflow checks the live
+sitemap at 17 minutes past each hour, reports overdue articles and upgrades, and rebuilds only when
+a due approved article is not live. Publication can therefore be delayed by up to roughly one hour
+if no manual deployment occurs first.
+
+Inspect the current publication queue and run its tests with:
+
+```bash
+yarn publications:status
+yarn content:campaign
+yarn content:calendar -- --month 2026-09
+yarn test:publication
+```
+
 ## Deployment
 
 ### 1) GitHub Pages (Static Export)

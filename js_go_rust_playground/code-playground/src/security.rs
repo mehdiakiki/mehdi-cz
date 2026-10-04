@@ -1,10 +1,11 @@
 use axum::http::{HeaderMap, HeaderValue};
-use sha2::{Digest, Sha256};
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Request signature validation.
 ///
-/// The frontend signs each request with HMAC(secret, timestamp + body).
+/// The Next.js proxy signs each request with HMAC-SHA256(secret, timestamp:body).
 /// This ensures only YOUR frontend can call the execute endpoint.
 /// Without this, anyone could use your service as a free Rust playground proxy.
 ///
@@ -28,20 +29,17 @@ impl RequestSigner {
     /// Generate a signature for the frontend to use.
     /// In practice, the frontend calls a Next.js API route that generates this.
     pub fn sign(&self, timestamp: u64, body: &str) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(self.secret.as_bytes());
-        hasher.update(b":");
-        hasher.update(timestamp.to_string().as_bytes());
-        hasher.update(b":");
-        hasher.update(body.as_bytes());
-        hex::encode(hasher.finalize())
+        let mut mac = Hmac::<Sha256>::new_from_slice(self.secret.as_bytes())
+            .expect("HMAC accepts keys of any length");
+        mac.update(format!("{timestamp}:{body}").as_bytes());
+        hex::encode(mac.finalize().into_bytes())
     }
 
     /// Validate a request signature from the frontend.
     /// Returns Ok(()) if valid, Err(reason) if not.
     pub fn validate(&self, headers: &HeaderMap, body: &str) -> Result<(), &'static str> {
         let signature = headers
-            .get("x-playground-signature")
+            .get("x-playground-signature-v2")
             .and_then(|v| v.to_str().ok())
             .ok_or("Missing signature header")?;
 
@@ -50,9 +48,7 @@ impl RequestSigner {
             .and_then(|v| v.to_str().ok())
             .ok_or("Missing timestamp header")?;
 
-        let timestamp: u64 = timestamp_str
-            .parse()
-            .map_err(|_| "Invalid timestamp")?;
+        let timestamp: u64 = timestamp_str.parse().map_err(|_| "Invalid timestamp")?;
 
         // Check timestamp freshness — prevents replay attacks.
         let now = SystemTime::now()
@@ -64,7 +60,9 @@ impl RequestSigner {
             return Err("Request expired");
         }
 
-        // Verify HMAC.
+        // Require the versioned HMAC. The older secret-prefix hash is never
+        // accepted by this service, even while the Next.js proxy sends it to
+        // older deployments during the rolling upgrade.
         let expected = self.sign(timestamp, body);
         if !constant_time_eq(signature.as_bytes(), expected.as_bytes()) {
             return Err("Invalid signature");
@@ -212,12 +210,9 @@ pub fn cors_headers(allowed_origins: &[String]) -> Vec<(String, String)> {
         ),
         (
             "Access-Control-Allow-Headers".to_string(),
-            "Content-Type, X-Playground-Signature, X-Playground-Timestamp".to_string(),
+            "Content-Type, X-Playground-Signature-V2, X-Playground-Timestamp".to_string(),
         ),
-        (
-            "Access-Control-Max-Age".to_string(),
-            "86400".to_string(),
-        ),
+        ("Access-Control-Max-Age".to_string(), "86400".to_string()),
     ]
 }
 
@@ -237,7 +232,7 @@ mod tests {
 
         let mut headers = HeaderMap::new();
         headers.insert(
-            "x-playground-signature",
+            "x-playground-signature-v2",
             HeaderValue::from_str(&sig).unwrap(),
         );
         headers.insert(
@@ -246,6 +241,10 @@ mod tests {
         );
 
         assert!(signer.validate(&headers, body).is_ok());
+        assert_eq!(
+            signer.sign(1_700_000_000, "test"),
+            "1dabb219016e10041951c4bb01f6ac4620f46fe980b3e4706cb7428c789380a3"
+        );
     }
 
     #[test]
@@ -257,12 +256,35 @@ mod tests {
 
         let mut headers = HeaderMap::new();
         headers.insert(
-            "x-playground-signature",
+            "x-playground-signature-v2",
             HeaderValue::from_str(&sig).unwrap(),
         );
         headers.insert("x-playground-timestamp", HeaderValue::from_static("1000"));
 
         assert_eq!(signer.validate(&headers, body), Err("Request expired"));
+    }
+
+    #[test]
+    fn test_legacy_signature_is_rejected() {
+        let signer = RequestSigner::new("test-secret".to_string(), 60);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-playground-signature",
+            HeaderValue::from_static("legacy-digest"),
+        );
+        headers.insert(
+            "x-playground-timestamp",
+            HeaderValue::from_str(&now.to_string()).unwrap(),
+        );
+
+        assert_eq!(
+            signer.validate(&headers, "test"),
+            Err("Missing signature header")
+        );
     }
 
     #[test]
