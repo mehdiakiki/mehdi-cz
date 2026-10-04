@@ -12,15 +12,39 @@ import { filterWritingPosts } from "lib/content-format.mjs";
 export const metadata = genPageMetadata({
   title: "Mehdi Akiki",
   description:
-    "Engineering work across startup products, financial systems, distributed infrastructure, compilers, runtimes, and open-source systems.",
+    "Software engineer. Problems followed down through frameworks, runtimes, compilers and the machine, with the evidence for each.",
 });
+
+const descents = [
+  {
+    layer: "Compiler · rust-lang/rust",
+    title: "A linker question that changed what goes inside a Rust rlib",
+    description:
+      "rustc guessed which archive members were Rust object files from their names. Four merged pull requests added a late metadata member that the linker reads instead.",
+    href: "/work/rustc-late-metadata",
+  },
+  {
+    layer: "Framework · this site",
+    title: "A slow page that ended in the Next.js router's scheduler",
+    description:
+      "Making this site faster went through bundler settings, Flight payloads and the prefetch protocol, until I reproduced a scheduler bug in Next.js. Many faster-looking changes were rejected on the way.",
+    href: "/work/site-performance-lab",
+  },
+  {
+    layer: "Machine · Rust",
+    title: "One small value, followed down to the register",
+    description:
+      "One u8 through HIR, MIR, LLVM IR and assembly, to see which parts of a type survive compilation and which only exist for the checker.",
+    href: "/blog/does-a-type-exist-at-runtime-following-one-value-from-source-to-register",
+  },
+];
 
 const professionalEvidence = [
   {
     title: "Inferal",
-    label: "Founding engineering",
+    label: "Founding engineer",
     description:
-      "Worked across the core engine, ontology system, and the data-synchronization capability built from the ground up.",
+      "Working across the core engine, the ontology system, and Relay, the data-synchronization capability I built from the ground up.",
     href: "/work#inferal",
   },
   {
@@ -37,13 +61,6 @@ const professionalEvidence = [
       "Delivered latency-sensitive financial software and secure healthcare data-processing systems.",
     href: "/work#consulting-work",
   },
-];
-
-const proofPoints = [
-  { value: "Inferal", label: "Founding Engineer" },
-  { value: "MonitorMe", label: "Founder" },
-  { value: "10", label: "Merged Rust compiler PRs" },
-  { value: "Bitarena", label: "Creator" },
 ];
 
 export default function Home() {
@@ -65,9 +82,8 @@ export default function Home() {
           I turn difficult technical problems into dependable systems.
         </h1>
         <p className="mt-7 max-w-3xl text-xl leading-9 text-gray-600 dark:text-gray-300">
-          I work across startup products, distributed infrastructure, financial systems, and
-          developer tooling—from founding engineering and product ownership to accepted changes in
-          compilers and runtimes.
+          I am a software engineer. The work I value most started as an ordinary question and ended
+          a few layers lower than I expected. Here are three of them, with the evidence underneath.
         </p>
         <div className="mt-9 flex flex-wrap gap-4">
           <Link
@@ -86,18 +102,34 @@ export default function Home() {
       </section>
 
       <section
-        aria-label="Selected evidence"
-        className="grid border-y border-gray-200 sm:grid-cols-2 lg:grid-cols-4 dark:border-gray-800"
+        aria-labelledby="descents"
+        className="border-y border-gray-200 py-10 dark:border-gray-800"
       >
-        {proofPoints.map((point) => (
-          <div
-            key={point.value}
-            className="border-b border-gray-200 py-6 last:border-b-0 sm:border-r sm:border-b-0 sm:px-6 sm:first:pl-0 sm:last:border-r-0 lg:py-8 dark:border-gray-800"
-          >
-            <div className="text-xl font-bold text-gray-950 dark:text-gray-100">{point.value}</div>
-            <div className="mt-1 text-sm text-gray-500 dark:text-gray-400">{point.label}</div>
-          </div>
-        ))}
+        <h2 id="descents" className="sr-only">
+          Three problems followed down the stack
+        </h2>
+        <div className="grid gap-5 md:grid-cols-3">
+          {descents.map((descent) => (
+            <Link
+              key={descent.href}
+              href={descent.href}
+              className="group hover:border-primary-400 dark:hover:border-primary-500 flex flex-col rounded-lg border border-gray-200 p-6 transition-colors dark:border-gray-800"
+            >
+              <p className="text-primary-600 dark:text-primary-400 text-xs font-semibold tracking-wide uppercase">
+                {descent.layer}
+              </p>
+              <h3 className="group-hover:text-primary-600 dark:group-hover:text-primary-400 mt-3 text-xl leading-7 font-bold text-gray-950 dark:text-gray-100">
+                {descent.title}
+              </h3>
+              <p className="mt-3 leading-7 text-gray-600 dark:text-gray-400">
+                {descent.description}
+              </p>
+              <span className="text-primary-600 dark:text-primary-400 mt-auto pt-5 text-sm font-semibold">
+                See the evidence &rarr;
+              </span>
+            </Link>
+          ))}
+        </div>
       </section>
 
       <section className="py-16 md:py-24" aria-labelledby="selected-work">
@@ -161,15 +193,15 @@ export default function Home() {
               Compilers, runtimes, and original systems work
             </h2>
             <p className="mt-5 max-w-2xl text-lg leading-8 text-gray-600 dark:text-gray-400">
-              My open-source work includes ten merged changes to the Rust compiler, contributions to
-              Deno and rust-analyzer, and Bitarena, a data structure designed around sparse
+              My open-source work includes ten merged pull requests to rust-lang/rust, contributions
+              to Deno and rust-analyzer, and Bitarena, a data structure designed around sparse
               iteration, stable handles, and explicit performance tradeoffs.
             </p>
           </div>
           <div className="space-y-4 text-gray-700 dark:text-gray-300">
             <p>
-              <strong className="text-gray-950 dark:text-gray-100">Rust compiler:</strong> linker
-              metadata, language behavior, parser diagnostics, and tooling.
+              <strong className="text-gray-950 dark:text-gray-100">rust-lang/rust:</strong> linker
+              and crate metadata, a coherence crash fix, attribute parsing, and tooling.
             </p>
             <p>
               <strong className="text-gray-950 dark:text-gray-100">Deno and rust-analyzer:</strong>{" "}
@@ -177,7 +209,7 @@ export default function Home() {
             </p>
             <p>
               <strong className="text-gray-950 dark:text-gray-100">Bitarena:</strong> original Rust
-              systems design, benchmarked and validated with property tests and Miri.
+              systems design with documented invariants, benchmarks, and Miri in CI.
             </p>
             <Link
               href="/open-source"

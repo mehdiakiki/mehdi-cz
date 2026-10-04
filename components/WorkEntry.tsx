@@ -5,6 +5,12 @@ interface WorkEntryProps {
   item: WorkItem;
 }
 
+const rows: { key: "problem" | "depth" | "decision"; label: string }[] = [
+  { key: "problem", label: "Problem" },
+  { key: "depth", label: "How far down" },
+  { key: "decision", label: "What I changed or decided" },
+];
+
 export default function WorkEntry({ item }: WorkEntryProps) {
   return (
     <article
@@ -15,40 +21,34 @@ export default function WorkEntry({ item }: WorkEntryProps) {
         <h3 className="text-2xl font-bold tracking-tight text-gray-900 dark:text-gray-100">
           {item.title}
         </h3>
-        <p className="text-primary-600 dark:text-primary-400 mt-1 text-sm font-medium tracking-wide uppercase">
-          {item.role}
+        <p className="text-primary-600 dark:text-primary-400 mt-2 text-sm font-medium">
+          {item.context}
         </p>
       </header>
 
       <div>
-        <p className="text-lg leading-8 text-gray-700 dark:text-gray-300">{item.summary}</p>
-
-        <ul className="mt-5 space-y-3 text-gray-600 dark:text-gray-400">
-          {item.highlights.map((highlight) => (
-            <li key={highlight} className="flex gap-3 leading-7">
-              <span
-                aria-hidden="true"
-                className="bg-primary-500 mt-3 h-1.5 w-1.5 shrink-0 rounded-full"
-              />
-              <span>{highlight}</span>
-            </li>
+        <dl className="space-y-4">
+          {rows.map((row) => (
+            <div key={row.key}>
+              <dt className="text-xs font-semibold tracking-wide text-gray-500 uppercase dark:text-gray-400">
+                {row.label}
+              </dt>
+              <dd className="mt-1 text-lg leading-8 text-gray-700 dark:text-gray-300">
+                {item[row.key]}
+              </dd>
+            </div>
           ))}
-        </ul>
+        </dl>
 
-        <div className="mt-5 flex flex-wrap gap-2" aria-label={`${item.title} areas`}>
-          {item.areas.map((area) => (
-            <span
-              key={area}
-              className="rounded-full bg-gray-100 px-3 py-1 text-xs font-medium text-gray-600 dark:bg-gray-900 dark:text-gray-400"
-            >
-              {area}
-            </span>
-          ))}
-        </div>
+        {item.constrained && (
+          <p className="mt-4 border-l-2 border-gray-300 pl-4 leading-7 text-gray-600 dark:border-gray-700 dark:text-gray-400">
+            {item.constrained}
+          </p>
+        )}
 
-        {item.links && item.links.length > 0 && (
+        {item.evidence.length > 0 && (
           <div className="mt-5 flex flex-wrap gap-x-5 gap-y-2">
-            {item.links.map((link) => (
+            {item.evidence.map((link) => (
               <Link
                 key={link.href}
                 href={link.href}

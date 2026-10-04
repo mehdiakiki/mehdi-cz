@@ -1,12 +1,12 @@
 import { genPageMetadata } from "app/seo";
 import Link from "@/components/Link";
 import WorkEntry from "@/components/WorkEntry";
-import { consultingWork, earlierWork, featuredWork, independentWork } from "@/data/workData";
+import { deepWork, earlierWork, professionalWork } from "@/data/workData";
 
 export const metadata = genPageMetadata({
   title: "Work",
   description:
-    "Selected engineering work by Mehdi Akiki across startup products, financial and healthcare systems, distributed infrastructure, and open-source systems.",
+    "Engineering work by Mehdi Akiki, described by problem: how far down the stack each one went, what changed, and where the evidence is.",
 });
 
 export default function Work() {
@@ -17,66 +17,68 @@ export default function Work() {
           Work
         </h1>
         <p className="mt-5 text-xl leading-8 text-gray-600 dark:text-gray-400">
-          Selected engineering work, with the context, ownership, and decisions behind the systems I
-          helped bring into production.
+          Each entry starts with the problem, then how far down the stack it went, what I changed or
+          decided, and where you can check the evidence.
         </p>
       </div>
 
-      <section aria-labelledby="featured-work">
+      <section aria-labelledby="deep-work">
         <div className="max-w-3xl pb-4">
           <h2
-            id="featured-work"
+            id="deep-work"
             className="text-3xl font-bold tracking-tight text-gray-900 dark:text-gray-100"
           >
-            Featured professional work
+            Investigations and upstream work
           </h2>
           <p className="mt-3 text-lg leading-7 text-gray-600 dark:text-gray-400">
-            Product and systems work where the responsibility extended from technical decisions to
-            making the result usable in real environments.
+            Work where the evidence is public: merged compiler changes, retained experiments, and an
+            open-source crate.
           </p>
         </div>
 
-        {featuredWork.map((item) => (
-          <WorkEntry key={item.title} item={item} />
+        {deepWork.map((item) => (
+          <WorkEntry key={item.id} item={item} />
         ))}
       </section>
 
-      <section className="pt-14" aria-labelledby="consulting-work">
+      <section className="pt-14" aria-labelledby="professional-work">
         <div className="max-w-3xl pb-4">
           <h2
-            id="consulting-work"
+            id="professional-work"
             className="text-3xl font-bold tracking-tight text-gray-900 dark:text-gray-100"
           >
-            Selected consulting engagements
+            Professional work
           </h2>
           <p className="mt-3 text-lg leading-7 text-gray-600 dark:text-gray-400">
-            Systems delivered inside financial and healthcare environments with material
-            performance, reliability, privacy, and operational constraints.
+            Product and client systems. Where the code is proprietary, the entry stays with what can
+            be said publicly.
           </p>
         </div>
 
-        {consultingWork.map((item) => (
-          <WorkEntry key={item.title} item={item} />
+        {professionalWork.map((item) => (
+          <WorkEntry key={item.id} item={item} />
         ))}
       </section>
 
-      <section className="pt-14" aria-labelledby="independent-work">
-        <div className="max-w-3xl pb-4">
+      <section className="pt-14" aria-labelledby="smaller-upstream">
+        <div className="max-w-3xl">
           <h2
-            id="independent-work"
+            id="smaller-upstream"
             className="text-3xl font-bold tracking-tight text-gray-900 dark:text-gray-100"
           >
-            Independent systems and open source
+            Smaller upstream contributions
           </h2>
           <p className="mt-3 text-lg leading-7 text-gray-600 dark:text-gray-400">
-            Original systems work and accepted contributions to compilers, runtimes, and developer
-            tooling.
+            Front-end compiler fixes, a Deno runtime op, and rust-analyzer changes, each with the
+            problem it solved.
           </p>
+          <Link
+            href="/open-source"
+            className="text-primary-600 hover:text-primary-700 dark:text-primary-400 dark:hover:text-primary-300 mt-4 inline-block font-medium"
+          >
+            See all merged pull requests &rarr;
+          </Link>
         </div>
-
-        {independentWork.map((item) => (
-          <WorkEntry key={item.title} item={item} />
-        ))}
       </section>
 
       <section className="pt-14" aria-labelledby="earlier-work">
