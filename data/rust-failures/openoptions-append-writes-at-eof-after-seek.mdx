@@ -1,0 +1,89 @@
+---
+caseId: "RFA-203"
+title: "Why Rust Append Mode Writes at EOF After seek(0)"
+date: "2026-09-05T17:42:00+01:00"
+lastmod: "2026-09-05T17:42:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "60bc2008599b3258a46562df76f338890bbb3060c606f31d2ce4e310b9008866"
+area: "ffi-targets"
+symptom: "A write through an append-mode File lands at the end even after the handle was successfully seeked to byte zero."
+summary: "OpenOptions append mode positions every write at the current end of file. Seeking can still select a read position, but it does not turn an append write into an overwrite."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets with filesystem support; concurrency guarantees remain platform-dependent"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust append mode seek ignored write",
+    "OpenOptions append writes at EOF after seek",
+    "Rust overwrite file byte append false",
+  ]
+evidence: ["Rust 1.98.1 temporary file", "seek followed by EOF write", "write-mode repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/std/fs/struct.OpenOptions.html#method.append",
+    "https://doc.rust-lang.org/std/fs/struct.OpenOptions.html#method.write",
+    "https://doc.rust-lang.org/std/io/trait.Write.html#method.write_all",
+  ]
+---
+
+I opened a file for append, seeked to the beginning, and expected to patch its first byte. The seek returned successfully. The write still appeared at the end.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-203/fail.rs) starts with `abc`, seeks to byte zero, and writes `X`. The final bytes are `abcX`, not `Xbc`.
+
+Append mode controls write placement independently of the position I tried to choose.
+
+## Every append write targets the current EOF
+
+[`OpenOptions::append`](https://doc.rust-lang.org/std/fs/struct.OpenOptions.html#method.append) means writes append instead of overwriting. The documented guarantee is stronger and more precise: writes are positioned at the current end of the file, including when other processes or threads are appending.
+
+The seek was not necessarily meaningless. If the handle also has read permission, a seek can affect where a read begins. It simply does not select the offset of an append write.
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-203/fixed.rs) wants an overwrite, so it opens with ordinary write access and seeks to the desired byte before writing.
+
+## Append is not seek-to-end followed by write
+
+It is tempting to replace append mode with:
+
+```text
+seek to current end
+write record
+```
+
+Those are two separate operations. Another writer can append between them, leaving the first writer at an old end position. It could overwrite data instead of safely following it.
+
+Append mode asks the operating system for append semantics on each write. This closes that particular seek/write race. It does not make an entire application protocol atomic.
+
+The distinction matters for logs and journals. If the requirement is “never overwrite another writer merely because EOF moved,” append is the right primitive. If the requirement is “replace bytes at offset zero,” append is the wrong primitive even when seeking succeeds.
+
+## One logical record can become several writes
+
+The standard `Write` contract allows a call to write fewer bytes than provided. `write_all` repeats writes until the whole buffer is written or an error occurs. With concurrent appenders, separate underlying writes may allow parts of logical records to interleave, depending on operating-system and filesystem behaviour.
+
+I build a complete record in memory before asking the file to write it, because many small formatting writes widen the opportunity for interleaving. Even then, I do not claim portable record-level atomicity without a platform-specific guarantee or external coordination.
+
+For important logs, I define maximum record size, encoding, recovery after partial tails, rotation ownership, and sync policy. “Opened with append” answers only one part.
+
+## Read plus append has a second cursor surprise
+
+The append documentation warns that after opening, and after each write, the read position may be at the end. Code that alternates reads and append writes should save and restore the read position explicitly.
+
+This makes a single `File` used for both directions harder to reason about. Where practical, I use separate handles or a higher-level component with one clear ownership protocol.
+
+I do not write a test that depends on the read position staying unchanged after an append, because that would be stronger than the portable contract.
+
+## `.write(true).append(true)` does not enable two modes
+
+Setting both write and append has the same write-placement effect as append alone. It does not mean “allow either overwriting or appending depending on the last seek.”
+
+When I inspect a bug, I print every `OpenOptions` flag in one place. Builder calls spread across helper functions can hide that append was enabled later. The final operating-system mode, not the order in which I mentally read the code, controls the handle.
+
+I also distinguish `create`, `create_new`, and `truncate`. None of them changes the central append rule after the file is open. Combining flags without writing their intended policy is an easy route to data loss or unexpected growth.
+
+## My test uses full bytes
+
+The fixture asserts the complete file content after closing the handle. Checking only that `X` exists would pass in both the correct and mistaken designs. Checking the returned seek position would also miss where the next append write is placed.
+
+For concurrent code I add a stress fixture, but I keep the single-writer example because it isolates the contract without scheduler noise. The surprising result does not require a race.
+
+The core principle is that a cursor is not always authority over the next write. Append mode deliberately gives EOF that authority. I use append for append-only data, normal write plus seek for patching, and an explicit protocol when multiple writes must behave as one record.

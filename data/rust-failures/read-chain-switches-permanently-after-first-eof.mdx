@@ -1,0 +1,89 @@
+---
+caseId: "RFA-280"
+title: "Read::chain Leaves the First Reader After One EOF"
+date: "2026-09-06T01:00:00+01:00"
+lastmod: "2026-09-06T01:00:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "26be19a8789f75ecb42b128229f1d054a352e27e9bdeeb5cbd68bd3f687973ee"
+area: "ffi-targets"
+symptom: "After the first reader returns Ok(0) once, Read::chain switches to the second reader and never observes bytes the first reader could produce later."
+summary: "Read::chain treats the first Ok(0) as the boundary between readers. Use it only when that EOF is a permanent end for the first source; temporary availability needs another protocol or state machine."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust Read chain first reader returns zero", "Read chain temporary EOF loses later bytes", "when does io Chain switch readers Rust"]
+evidence: ["Rust 1.98.1 stateful custom reader", "zero-before-byte first source", "finite Cursor chain repair"]
+sources: ["https://doc.rust-lang.org/std/io/trait.Read.html#method.chain", "https://doc.rust-lang.org/std/io/struct.Chain.html", "https://doc.rust-lang.org/std/io/trait.Read.html#tymethod.read"]
+---
+
+I used `Read::chain` to put two byte sources behind one reader. I assumed the adapter might ask the first source again if that source later gained data. It does not: the first `Ok(0)` is the handover point.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-280/fail.rs) uses a controlled reader that returns zero on its first call and `A` on its second. It chains that reader with a source containing `B`. The combined output is only `B`.
+
+## Chain models concatenation of finite streams
+
+[`Read::chain`](https://doc.rust-lang.org/std/io/trait.Read.html#method.chain) returns an adapter that reads the first source until EOF and then produces the second source. Its logical data is:
+
+```text
+all bytes from first, then all bytes from second
+```
+
+To implement this, [`io::Chain`](https://doc.rust-lang.org/std/io/struct.Chain.html) keeps a state indicating whether it has crossed the first EOF. Once crossed, future reads go to the second source.
+
+Polling the first forever would make the order ambiguous. If new bytes arrived after some bytes from the second source, concatenation would no longer have one clean boundary.
+
+## Ok(0) has a contract, but some sources can later change
+
+For a non-empty destination buffer, `Read::read` uses `Ok(0)` to indicate EOF. Files, slices, and cursors normally make that a useful end condition for one reading session.
+
+The `Read` documentation also notes that zero does not mathematically guarantee a reader can never produce bytes again. A file at its end can later grow. A custom reader may expose temporary states. That wider possibility does not change `Chain` into an availability multiplexer.
+
+An adapter is allowed to build a stronger state transition from the signal it receives. Here, first EOF means first source completed.
+
+## WouldBlock is not EOF
+
+A nonblocking source with no data currently available should normally return `ErrorKind::WouldBlock`, not `Ok(0)`. The caller can then wait for readiness and retry the same source.
+
+Confusing these two states loses information:
+
+```text
+Ok(0)            -> this stream reached its current EOF
+Err(WouldBlock)  -> no progress now; readiness may change
+```
+
+For asynchronous I/O, readiness and end-of-stream belong to the async runtime's contracts. A synchronous `Read::chain` is not an async stream merge or retry mechanism.
+
+## The repair is to choose compatible sources
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-280/fixed.rs) chains two finite `Cursor` readers. Each has a stable end, so the result `AB` follows the intended concatenation.
+
+If my first source can temporarily stop, I do not hide it behind `chain` yet. I drive it with an explicit loop that understands its readiness signal, spool it to a finite buffer, or define a protocol event that says it has permanently completed.
+
+This is not repaired by repeatedly calling the chained reader. The adapter already remembers that it switched.
+
+## Empty buffers are a separate zero case
+
+`read` is allowed to return zero when the destination slice has length zero. Code diagnosing a transition should record buffer length as well as the returned count.
+
+Well-designed adapters should not accidentally treat a zero-length request as meaningful source EOF. Still, I avoid empty read buffers in tests of stream lifecycle because they add a second explanation for the same number.
+
+The fixture uses a non-empty buffer through `read_to_end`, keeping the observed zero tied to the source.
+
+## Errors do not complete the first stream automatically
+
+An I/O error is different from EOF. `chain` propagates errors from the active reader. A later call may succeed depending on the error kind and source behavior.
+
+High-level helpers retry `Interrupted` in documented places, but ordinary errors need application policy. I do not respond to every error by switching to the second reader because that could splice corrupted or incomplete data into an apparently successful stream.
+
+When fallback is desired, it should validate what was already consumed. A fallback after a partial header is not equivalent to choosing another complete source before reading.
+
+## What I test
+
+My matrix covers an empty first source, non-empty sources, short reads, an error before EOF, and a first source that violates my permanence assumption by producing data after zero.
+
+The last test is valuable even if the production source is expected to be finite. It proves what the adapter will do if that assumption changes.
+
+For framed inputs I assert both concatenated bytes and the exact transition position. For network code I test half-close, WouldBlock, and cancellation through the actual runtime abstraction instead of simulating all three as zero.
+
+The core principle is that EOF can become an irreversible adapter transition. `Read::chain` interprets the first source's `Ok(0)` as the boundary and continues with the second. It is excellent for finite concatenation, but temporary availability requires a protocol that can represent “not now” without pretending the source ended.

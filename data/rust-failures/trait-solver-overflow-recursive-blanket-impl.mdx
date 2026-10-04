@@ -1,0 +1,128 @@
+---
+caseId: "RFA-066"
+title: "E0275: When a Recursive Trait Bound Grows Instead of Reaching a Base Case"
+date: "2026-09-05T08:35:00+01:00"
+lastmod: "2026-09-05T08:35:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "054dec8586b6f75acc7ec389ffa3cf4a4130313d235fd743b862e8f3af7ab966"
+area: "diagnostics-macros"
+symptom: "Trait solving ends with E0275 and an enormous nested type after a recursive blanket implementation was added."
+summary: "A trait rule that proves Valid for T by requiring Valid for Vec<T> creates ever-larger obligations. Raising the recursion limit postpones the failure; redesign the rule so recursion follows smaller components toward explicit leaves."
+rustVersions: ["Rust 1.98.1"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust E0275 overflow evaluating requirement recursive trait",
+    "huge nested Vec trait solver overflow",
+    "recursion_limit does not fix trait overflow",
+  ]
+evidence: ["Rust 1.98.1 compile failure", "obligation expansion", "structurally decreasing repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/error_codes/E0275.html",
+    "https://doc.rust-lang.org/reference/items/implementations.html#trait-implementations",
+  ]
+---
+
+Some trait errors print a type nested so deeply that the compiler writes the full name into another file. A small implementation can create it:
+
+```rust
+trait Valid {}
+
+impl<T> Valid for T
+where
+    Vec<T>: Valid,
+{}
+
+fn require_valid<T: Valid>() {}
+
+fn main() {
+    require_valid::<u8>();
+}
+```
+
+Rust 1.98.1 reports E0275 while evaluating a requirement containing `Vec<Vec<Vec<...>>>`. The [failing fixture](/rust-failure-atlas/evidence/RFA-066/fail.rs) reproduces the exact overflow.
+
+The compiler suggestion mentions increasing `recursion_limit`. In this case that is diagnostic noise, not a repair. The logical rule never approaches an answer.
+
+## Expand the obligations by hand
+
+To prove `u8: Valid`, the only implementation requires:
+
+```text
+Vec<u8>: Valid
+```
+
+Using the same implementation requires:
+
+```text
+Vec<Vec<u8>>: Valid
+```
+
+The next step asks for `Vec<Vec<Vec<u8>>>: Valid`, and so on. Every proof obligation is larger than the previous one. There is no base implementation and no decreasing structural measure.
+
+The compiler stops after a bounded amount of work because continuing would consume unbounded resources. Increasing the limit only allows a larger nested type to be built before the same outcome.
+
+## Reverse the structural relationship
+
+A common intended rule is the opposite: a container is valid when its elements are valid.
+
+```rust
+trait Valid {}
+
+impl Valid for u8 {}
+
+impl<T: Valid> Valid for Vec<T> {}
+```
+
+Now proving `Vec<Vec<u8>>: Valid` produces smaller obligations:
+
+```text
+Vec<Vec<u8>>
+    requires Vec<u8>
+        requires u8
+            explicit base implementation
+```
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-066/fixed.rs) verifies both the base and nested vector on Rust 1.98.1.
+
+This “smaller component” model is the first thing I check for recursive trait design. Rust does not require every trait recursion to be literally based on memory size, but there must be a finite proof path for the types the program uses.
+
+## Why blanket implementations amplify the mistake
+
+`impl<T> Valid for T` applies to every possible `T` when its where-clause can be proven. That includes vectors, vectors of vectors, and all newly constructed types in the obligation chain. There is no narrower implementation to stop the expansion.
+
+In a larger library the loop may pass through several traits and associated types:
+
+```text
+T: Encode
+T::Buffer: Write
+Adapter<T::Buffer>: Encode
+...
+```
+
+The printed type then looks unrelated to the first bound. I follow the “required because of” notes and write one edge per obligation. A cycle that changes the type on each pass is easier to see as a graph than in the fully expanded diagnostic.
+
+## Legitimate deep proofs are different
+
+Generated tuples, type-level lists, and deeply nested parser combinators can have a real finite proof whose depth exceeds the default limit. In that case increasing `recursion_limit` may be appropriate after I demonstrate the decreasing structure and know the expected maximum depth.
+
+The discriminating question is: after several expansion steps, do I reach a smaller remainder or repeat a cycle, or do I keep manufacturing a larger type? A higher limit helps only the first case.
+
+## Adding a base impl may create coherence conflicts
+
+Putting `impl Valid for u8 {}` beside the original blanket implementation can trigger E0119 because the blanket may also apply to `u8` if its bound becomes satisfiable. Repairing termination can therefore require redesigning the blanket rule rather than merely adding leaves.
+
+Local wrapper types, sealed traits, or a type parameter on a container can narrow the implementation set. I decide which types the trait is intended to classify before writing the broadest possible `impl<T>`.
+
+## Runtime recursion is not involved
+
+No program from the failing fixture runs. The overflow happens while the compiler proves that a method or function is well typed. Increasing the thread stack, rewriting a runtime loop, or adding heap allocation cannot address it.
+
+Compile-time resource usage is therefore evidence too: I reduce the trait graph before experimenting with build-machine memory or parallelism.
+
+The official [E0275 explanation](https://doc.rust-lang.org/error_codes/E0275.html) shows the same growing-vector shape. The reusable diagnosis is to treat trait bounds as proof rules. Expand three steps, identify the measure that should decrease, and locate a reachable base implementation.
+
+Once the rule is structurally sound, the compiler's recursion limit becomes a safety boundary again instead of the only thing preventing an infinite type-level argument.

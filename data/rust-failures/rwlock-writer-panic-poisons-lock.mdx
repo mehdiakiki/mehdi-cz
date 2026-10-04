@@ -1,0 +1,88 @@
+---
+caseId: "RFA-328"
+title: "An RwLock Writer Panic Poisons the Lock"
+date: "2026-09-06T01:48:00+01:00"
+lastmod: "2026-09-06T01:48:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "16cb9d5a3239914cc873e82d74e14527e84398c2d43c158d797e1a4fe72eb605"
+area: "concurrency-memory"
+symptom: "A later reader receives PoisonError after another thread panics while mutating through an RwLock write guard, even though the data remains accessible."
+summary: "A panic while an RwLock is held exclusively can interrupt a logical mutation, so later read and write acquisitions report poison. Inspect and validate the guarded value before deliberately clearing that advisory flag."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["targets with std::sync::RwLock"]
+profiles: ["dev", "release with panic=unwind", "test"]
+searchTerms: ["Rust RwLock writer panic poisoned", "recover data from poisoned RwLock", "RwLock clear_poison after write panic"]
+evidence: ["Rust 1.98.1 writer thread panic", "partially changed protected integer", "PoisonError recovery and clear_poison"]
+sources: ["https://doc.rust-lang.org/std/sync/struct.RwLock.html#poisoning", "https://doc.rust-lang.org/std/sync/struct.RwLock.html#method.read", "https://doc.rust-lang.org/std/sync/struct.RwLock.html#method.clear_poison"]
+---
+
+The reader-side RwLock case in this Atlas shows that a panic under a read guard does not poison the lock. The complementary rule is just as important: a panic while a write guard is alive can poison it.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-328/fail.rs) changes a protected integer and panics before the write guard drops normally. A later `read()` returns `PoisonError`.
+
+## Poison follows interrupted exclusive access
+
+The [`RwLock` poisoning documentation](https://doc.rust-lang.org/std/sync/struct.RwLock.html#poisoning) states that the lock may become poisoned only when a panic occurs while it is locked exclusively in write mode. Safe code can mutate the protected `T` through that guard, so unwind may have interrupted a multi-step invariant.
+
+The lock is released during unwinding. Poison does not leave it permanently locked. Instead, later acquisition returns a result that asks the caller to make a recovery decision.
+
+This distinction prevents a silent return to business as usual after partial mutation.
+
+## The protected data is still there
+
+[`RwLock::read`](https://doc.rust-lang.org/std/sync/struct.RwLock.html#method.read) returns a `LockResult`. Its error contains the guard that would otherwise have been returned.
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-328/fixed.rs) uses `PoisonError::into_inner` to inspect the value. It sees the write performed before panic. This is why poison cannot automatically roll back state: the integer changed, and a more complex structure might contain only half of an intended transition.
+
+Recovering the guard is access, not proof of validity.
+
+## Repair the invariant before clearing poison
+
+After validation, the fixture calls [`clear_poison`](https://doc.rust-lang.org/std/sync/struct.RwLock.html#method.clear_poison). A later read then succeeds normally.
+
+In production, the order matters:
+
+1. acquire the poisoned guard;
+2. inspect or rebuild the protected state;
+3. make the domain invariant true;
+4. clear poison;
+5. allow ordinary operations to resume.
+
+Clearing first removes the warning before repair is complete. Blindly calling `unwrap_or_else(PoisonError::into_inner)` everywhere has the same problem: it converts an important signal into routine access.
+
+## Poison is advisory rather than transactional
+
+An `RwLock` does not know the semantic invariant of `T`. A writer may panic before changing anything, after completing all changes, or halfway through them. Poison records the guard and panic relationship, not the exact health of data.
+
+External effects are even less visible. A writer may have sent a message or updated a file before panic. Repairing only the in-memory value may not restore system consistency.
+
+For important transitions I prefer designs that construct a new valid state separately and swap it under a short write lock. This reduces the amount of fallible work performed while exclusive access is held.
+
+## Reader and writer failures belong in paired tests
+
+Rust's asymmetry is deliberate. A read guard ordinarily cannot mutate `T`, so reader panic alone does not indicate interrupted exclusive mutation. A write guard can.
+
+I keep paired tests because “panic under RwLock poisons” is too imprecise. The mode and lifetime of the guard decide whether the event is recorded.
+
+Interior mutability can make the application story more complex: a reader may cause effects through atomics or inner locks, but the outer `RwLock` still applies its documented rule. Those inner invariants need their own signals.
+
+## Guard lifetime must be visible in the reproduction
+
+A temporary guard may drop at the end of a statement before a later panic. Then the panic did not occur while the lock was held, and poison is not expected.
+
+The fixture binds the write guard, mutates through it, and panics in the same scope. The evidence therefore tests the guard relationship rather than merely placing a panic somewhere near a lock call.
+
+For asynchronous code I also remember that `std::sync::RwLock` guards and blocking acquisition have constraints different from async-aware lock types. I do not carry this poisoning rule onto every third-party lock without reading its contract.
+
+## Panic strategy and process boundaries matter
+
+This recovery path requires unwinding. With `panic=abort`, the whole process ends and no later reader observes in-memory poison. Recovery then comes from restart, persistence, or an upstream supervisor.
+
+Even under unwind, a panic crossing an FFI or task boundary may follow different rules. I test the real deployment profile and keep unsafe code from treating poison as a memory-safety guarantee.
+
+## My recovery checklist
+
+I ask which fields could have changed, what invariant joins them, whether side effects escaped, whether a known-good snapshot exists, and whether requests can wait during repair. If validation cannot prove safety, I fail the component rather than clear the flag optimistically.
+
+The core principle is that a lock protects access, while poison reports one kind of interrupted responsibility. An RwLock writer panic makes later callers stop and inspect. The data remains recoverable, but deciding it is trustworthy belongs to the application that understands the invariant.

@@ -1,0 +1,251 @@
+---
+title: "Cancellation Safety in Async Rust, Explained"
+date: "2026-09-06T14:00:00+01:00"
+tags: ["rust", "async rust", "tokio", "cancellation safety", "concurrency"]
+draft: false
+reviewed: true
+reviewedHash: "a866e1c7ab073969d3f92924640afa505d893abfa511713d779fc33b2d9b9cbf"
+cluster: "rust-under-the-hood"
+campaign: "authority-2026"
+opportunity: "RUST-028"
+summary: "Async cancellation usually means dropping a future after Pending. See how select loops lose partial progress and how to design restartable operations."
+---
+
+Cancellation in async Rust can sound like a special runtime event. Most of the time it is something simpler and more severe: a future returned `Poll::Pending`, and later its owner dropped it.
+
+The future does not resume to receive a polite cancellation exception. Its stored fields are dropped synchronously. Any async cleanup that was supposed to happen in the remaining lines does not happen.
+
+Once this model is clear, cancellation safety becomes less mysterious. I inspect where the state lives and ask if dropping it loses progress.
+
+## The exact boundary
+
+An async future makes progress only while it is polled. It can return:
+
+- `Poll::Ready(value)`: the operation completed;
+- `Poll::Pending`: the operation stopped at a suspension point and may be polled again.
+
+Cancellation by dropping can happen while the future is suspended. In source code, every `.await` is a possible place where the async function may stop and never continue.
+
+Consider this shape:
+
+```rust
+async fn transfer() -> Result<(), Error> {
+    reserve_inventory().await?;
+    charge_card().await?;
+    mark_order_complete().await?;
+    Ok(())
+}
+```
+
+If the future is dropped while `charge_card().await` is pending, the line that marks the order complete is never reached. Rust correctly drops local values, but it cannot invent a business rollback that was never designed.
+
+Memory safety is preserved. Business consistency may not be.
+
+## Why `select!` exposes the problem
+
+Race operators make cancellation frequent. Tokio's `select!` waits on several branches. When one completes, the futures in the other branches are dropped.
+
+```rust
+loop {
+    tokio::select! {
+        message = read_one_message(&mut socket) => {
+            handle(message?).await?;
+        }
+        _ = shutdown.cancelled() => {
+            break;
+        }
+    }
+}
+```
+
+If `shutdown` wins, `read_one_message` is dropped at its current await point. That may be correct. The dangerous case is when another branch wins repeatedly and the loop creates a fresh read future each time.
+
+The safety question is:
+
+> Can I drop this incomplete operation and create it again without losing data or violating an invariant?
+
+Tokio uses essentially this restartability definition in its documentation.
+
+## The classic partial-read bug
+
+Suppose a protocol message is exactly four bytes long:
+
+```rust
+async fn read_frame<R>(reader: &mut R) -> std::io::Result<[u8; 4]>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+
+    let mut frame = [0_u8; 4];
+    reader.read_exact(&mut frame).await?;
+    Ok(frame)
+}
+```
+
+`read_exact` can consume two bytes from the socket and then return `Pending` while waiting for two more. Those consumed bytes are stored in `frame`, which belongs to the `read_exact` future.
+
+If a competing `select!` branch wins now, that future and its buffer are dropped. The socket has already advanced by two bytes. Recreating `read_exact` starts with a fresh buffer and reads from byte three. The message boundary is broken.
+
+This is why `read_exact` is documented as not cancellation safe, while a single `read` call is cancellation safe with respect to data loss: if `read` reports `Pending`, it has not reported consumed bytes to its caller.
+
+The important distinction is not "read versus network." It is where partial progress is stored when the operation yields.
+
+## State inside the future is fragile
+
+I classify an async operation by the location of its progress.
+
+| Progress location              | What dropping the future does       | Restartable?     |
+| ------------------------------ | ----------------------------------- | ---------------- |
+| No progress before `Pending`   | Nothing is lost                     | Usually yes      |
+| Local fields inside the future | Drops partial progress              | Often no         |
+| Caller-owned state             | State survives recreation           | Can be           |
+| External durable system        | Depends on protocol and idempotency | Must be designed |
+
+This gives me a direct design technique: move resumable state out of the disposable future.
+
+For a framed reader, keep the buffer and cursor in a long-lived decoder object. Let each call perform one small step:
+
+```rust
+struct Decoder {
+    frame: [u8; 4],
+    filled: usize,
+}
+
+impl Decoder {
+    async fn read_step<R>(&mut self, reader: &mut R) -> std::io::Result<Option<[u8; 4]>>
+    where
+        R: tokio::io::AsyncRead + Unpin,
+    {
+        use tokio::io::AsyncReadExt;
+
+        let read = reader.read(&mut self.frame[self.filled..]).await?;
+        if read == 0 {
+            return Err(std::io::ErrorKind::UnexpectedEof.into());
+        }
+
+        self.filled += read;
+        if self.filled != self.frame.len() {
+            return Ok(None);
+        }
+
+        self.filled = 0;
+        Ok(Some(self.frame))
+    }
+}
+```
+
+If `read_step` is dropped while its single `read` is pending, `self.filled` and the bytes already collected remain in `Decoder`. A new call continues from the same state.
+
+Real protocol decoders need to handle EOF, variable lengths, invalid frames, and buffer limits. The ownership principle stays the same.
+
+## Side effects need a commit point
+
+Cancellation safety is not only an I/O buffering problem. It appears whenever one logical operation contains multiple effects:
+
+```text
+take item from queue
+        await
+write item to database
+        await
+acknowledge queue item
+```
+
+There are two dangerous gaps:
+
+- cancellation after taking but before writing can lose work;
+- cancellation after writing but before acknowledging can repeat work.
+
+No Rust type can decide the required business semantics. Common solutions are:
+
+- **Idempotency keys:** repeating the write produces the same result.
+- **Leases or visibility timeouts:** unacknowledged work becomes available again.
+- **Transactions:** related changes commit atomically where the storage system supports it.
+- **Caller-owned state machines:** the operation resumes from a recorded stage.
+- **Reservation then commit:** obtain a permit without consuming the resource, then make one non-awaiting commit step.
+
+In production, async design is often more about these boundaries than about the runtime API.
+
+## Queue fairness is also state
+
+Some operations are not cancellation safe even when no payload is partly consumed. Tokio's fair `Mutex`, `RwLock`, `Semaphore`, and some notification operations maintain a waiter queue.
+
+Dropping a pending acquisition removes the waiter. Recreating it joins at the back. The program may not lose bytes, but it loses its position and can starve under contention.
+
+So "cancellation safe" must be read against the property the operation must preserve:
+
+- no data loss;
+- no duplicate effect;
+- no broken invariant;
+- no lost fairness position;
+- no orphan child task.
+
+One yes/no label cannot replace this analysis.
+
+## Drop performs synchronous cleanup only
+
+When a future is dropped, destructors for its live fields run. This is useful for releasing memory, closing handles, or unlocking an RAII guard.
+
+But `Drop::drop` cannot `.await`. If cleanup requires a network round trip, waiting for a child task, or rolling back a remote transaction, an implicit abrupt drop is not enough.
+
+Prefer an explicit shutdown protocol for components with async cleanup:
+
+```rust
+impl Worker {
+    async fn shutdown(mut self) -> Result<(), ShutdownError> {
+        self.stop_accepting_work();
+        self.cancel_children();
+        self.join_children().await?;
+        self.flush().await?;
+        Ok(())
+    }
+}
+```
+
+`Drop` can remain a last-resort synchronous safety net, but the normal path is visible and awaitable.
+
+## Cooperative and abrupt cancellation are different
+
+A cancellation token asks code to stop. It gives the operation a chance to choose a safe checkpoint and run async cleanup.
+
+Dropping a future or aborting a task is abrupt from the future's perspective. Tokio will drop the task's future when cancellation takes effect. Code after the current await does not run.
+
+Cooperative cancellation is usually better for stateful services:
+
+1. signal the component;
+2. stop admitting new work;
+3. finish or roll back the current unit;
+4. join child tasks;
+5. return only when invariants are restored.
+
+You still need to consider abrupt drop because process shutdown, panic, or ownership mistakes can bypass the polite path.
+
+## How I review one async function
+
+For every `.await`, I ask four questions:
+
+1. What has already changed before this point?
+2. Where is the partial progress stored?
+3. What is dropped if this future never resumes?
+4. Can a retry distinguish "not started" from "partly completed" or "already completed"?
+
+If these answers are unclear, the function is not ready to sit inside a race, timeout, or abortable task.
+
+Then I test cancellation deliberately. A useful test controls the dependency so the future reaches a known `Pending` state, drops or aborts it, and asserts the surviving external state. Timing-based sleeps are weak tests here. A channel, barrier, or custom test future gives a precise suspension point.
+
+## A useful rule, with one warning
+
+The practical rule is simple:
+
+> An await point should behave like a boundary after which the function may never execute again.
+
+This does not mean every line before `.await` must be reversible. It means committed progress must be safe to leave behind, and uncommitted progress must live somewhere that cancellation does not silently erase.
+
+The warning is that cancelling an unsafe operation is sometimes intentional. During shutdown, I may accept losing a partial response buffer. During a financial transfer, I probably do not. Cancellation safety belongs to the operation's contract; it is not a universal label of quality.
+
+## Further reading
+
+- [Tokio `select!` cancellation-safety documentation](https://docs.rs/tokio/latest/tokio/macro.select.html#cancellation-safety)
+- [Blocking and cancellation in the Async Rust Book](https://rust-lang.github.io/async-book/part-guide/more-async-await.html#blocking-and-cancellation)
+- [Tokio task cancellation semantics](https://docs.rs/tokio/latest/tokio/task/index.html#cancellation)
+- [Structured concurrency and async cleanup](https://rust-lang.github.io/async-book/part-reference/structured.html)

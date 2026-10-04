@@ -1,0 +1,173 @@
+---
+title: "A Repair Queue Needs Ownership, Evidence, and an Exit"
+date: "2026-12-13T09:00:00+01:00"
+tags: ["repair queue", "data pipeline", "distributed systems", "dead-letter queue", "operations"]
+draft: false
+reviewed: true
+reviewedHash: "e714cde85a3bb2a4352aad08b3a3eff64a829983c150ed5d9ab6a75ce6d0a8df"
+cluster: "reliable-data-integrations"
+campaign: "authority-2026"
+opportunity: "DATA-082"
+summary: "A repair queue is not a place to hide failed records. I give each case an owner, evidence, bounded attempts, verification, and a terminal outcome so the backlog can actually converge."
+---
+
+I have seen failed-record queues introduced with good intentions and become permanent storage for things nobody understands. The dashboard says 40,000 messages are “waiting for retry”. Some are transient. Some can never succeed. Some already produced the external effect, and retrying them is the dangerous action.
+
+I no longer start with the queue. I start with the lifecycle of one repair case.
+
+## A repair case needs a state machine
+
+My basic lifecycle is:
+
+```text
+detected
+  -> ready
+  -> leased
+  -> repair attempted
+  -> verification pending
+  -> resolved
+
+or
+
+  -> needs review
+  -> abandoned with reason
+```
+
+`Failed` is not a useful final state. It says what happened to one attempt, not what should happen to the record.
+
+The system must distinguish retryable transport failure, permanent incompatibility, stale repair, ambiguous external outcome, and an invariant breach. Each class has a different next action.
+
+## The envelope carries the story
+
+A queue message containing only an entity ID forces the worker to rediscover why it exists. I retain a repair envelope:
+
+```json
+{
+  "repair_id": "repair_31c",
+  "entity_ref": "account/a-19",
+  "detected_at": "2026-12-13T08:14:00Z",
+  "reason": "PROJECTION_VERSION_BEHIND",
+  "authority_version": 81,
+  "observed_version": 78,
+  "mapping_version": "account-v7",
+  "attempt": 0,
+  "max_attempts": 5,
+  "owner": "data-integrations",
+  "verification": "READ_AFTER_WRITE"
+}
+```
+
+I do not put secrets or complete payloads in this envelope. It points to controlled evidence or safe hashes when deeper inspection is required.
+
+The authority version prevents an old repair from overwriting newer truth. The verification method prevents “request sent” from being counted as “record repaired”.
+
+## Ownership must be executable
+
+An `owner` label is useful only if it connects to an alert, dashboard, runbook, and escalation path.
+
+For every queue I want:
+
+```text
+team or service owner
+business/domain owner for semantic decisions
+maximum acceptable oldest-case age
+review schedule
+safe pause control
+escalation when backlog or age crosses its objective
+```
+
+Queue depth alone is misleading. A stable depth can hide one poisoned record waiting for six months. I monitor age by failure class and owner.
+
+## Delivery retries are not repair policy
+
+Message brokers can redeliver and can move messages to a dead-letter queue. AWS documents, for example, how an [SQS dead-letter queue](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-dead-letter-queues.html) receives messages after a configured receive count.
+
+That mechanism does not know whether a business repair remains safe. I keep broker delivery attempts separate from semantic repair attempts:
+
+```text
+delivery_attempt: worker did not finish processing the envelope
+repair_attempt: system deliberately tried the external or stored effect
+```
+
+A worker can crash after an external write but before acknowledging the message. The next delivery is not automatically permission to write again. It first queries by idempotency or operation identity.
+
+## Every retry spends a budget
+
+I bound attempts by more than a number:
+
+```text
+attempt count
+elapsed age
+provider request budget
+business deadline
+authority version
+```
+
+Exponential backoff reduces pressure during a short outage. It does not make an invalid enum value become valid. Permanent and semantic errors move to review immediately with a reason that a human can act on.
+
+If a repair loses relevance—for example, the entity was legitimately deleted—it exits as `superseded`, not as success and not as endless failure.
+
+## Leasing prevents two workers from becoming owners
+
+The repair store gives a worker a time-bounded lease. The update is conditional on the current state and version:
+
+```text
+READY -> LEASED(worker, lease_until)
+```
+
+If the worker dies, the lease expires and another worker may continue. The repair operation itself must still be idempotent because leases cannot prevent every duplicate around crashes and network partitions.
+
+I add jitter to scheduling and rate limits by downstream provider. A flood of repaired records should not take the live product down.
+
+## Verification is its own step
+
+After a write, I compare the observed state again. Possible results are:
+
+| Observation | Outcome |
+| --- | --- |
+| intended version present | resolved |
+| authority advanced | superseded; calculate new diff |
+| write accepted but not visible yet | verify again within bound |
+| incompatible data | needs review |
+| outcome unknown | reconcile by operation identity |
+| no convergence after budget | terminal escalation |
+
+This follows the larger [reconciliation loop](/blog/reconciliation-is-the-repair-loop-of-a-distributed-system): detect, classify, repair, and prove convergence.
+
+## A dead-letter queue is input, not an archive
+
+My earlier article calls [a dead-letter queue evidence, not a disposal bin](/blog/a-dead-letter-queue-is-evidence-not-a-disposal-bin). A repair queue adds an active lifecycle on top of that evidence.
+
+I may ingest selected dead-letter messages into repair cases, but I preserve the original failure identity and deduplicate them. Re-driving a whole dead-letter queue without classifying its contents can repeat poison messages and irreversible side effects.
+
+## The exit states matter most
+
+Every case finishes as one of:
+
+```text
+resolved and verified
+already correct
+superseded by newer authority
+rejected as unsafe
+abandoned by approved business decision
+escalated for manual correction
+```
+
+For manual actions I record who decided, what evidence they saw, and what follow-up remains. “Deleted from queue” is never the audit event.
+
+## Metrics that tell me whether repair works
+
+I look at:
+
+- oldest unresolved age by class;
+- detection-to-resolution time;
+- repair and verification success rate;
+- repeated cases for the same entity;
+- cases superseded before execution;
+- manual-review volume and wait time;
+- causes creating the most repair work;
+- live-path fixes that reduced new cases.
+
+A successful repair system should eventually make itself less busy by feeding causes back into normal engineering work.
+
+The principle I keep is that a queue gives storage and delivery, not responsibility. A real repair process needs a named owner, enough evidence to make a safe decision, a bounded attempt policy, verification of the result, and an exit that explains what became of every record.

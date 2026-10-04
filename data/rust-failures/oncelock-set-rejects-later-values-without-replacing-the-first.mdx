@@ -1,0 +1,77 @@
+---
+caseId: "RFA-680"
+title: "OnceLock::set Rejects Later Values Without Replacing the First"
+date: "2026-09-06T08:40:00+01:00"
+lastmod: "2026-09-06T08:40:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "e934e7cb4b7d368c8586fa308f67ba44f1b9b582a3b82971cf8d7c05326c6226"
+area: "concurrency-memory"
+symptom: "A second OnceLock::set returns Err with the rejected value and the cell continues to contain its first value."
+summary: "OnceLock publishes one winning initialization. Later setters recover their rejected input; they do not update configuration or replace the stored value."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["targets supporting std threads"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust OnceLock set twice Err value", "replace value in OnceLock", "OnceLock first initialization wins"]
+evidence: ["Rust 1.98.1 runtime assertion", "two sequential set attempts", "rejected replacement and retained primary value"]
+sources: ["https://doc.rust-lang.org/std/sync/struct.OnceLock.html#method.set", "https://doc.rust-lang.org/std/sync/struct.OnceLock.html#method.get", "https://doc.rust-lang.org/std/sync/struct.OnceLock.html#method.take"]
+---
+
+`OnceLock::set(value)` stores the value only when the cell is uninitialized. A later call returns `Err(value)` and keeps the original content. The [failing fixture](/rust-failure-atlas/evidence/RFA-680/fail.rs) treats the second call as an update and shows that this is not the contract.
+
+## Initialization is a one-way publication
+
+The [`OnceLock::set` documentation](https://doc.rust-lang.org/std/sync/struct.OnceLock.html#method.set) says `Ok(())` means this call initialized the cell. `Err(value)` means another initialization already won. The rejected value is returned because the cell does not take its ownership.
+
+After `set` returns, the cell contains a value, though under concurrent attempts it is not necessarily the one supplied by that caller. I distinguish “initialization completed” from “my candidate won.”
+
+This is a good fit for process-wide immutable configuration, derived lookup tables, and resources whose identity must remain stable after publication.
+
+## OnceLock is not reloadable configuration
+
+A service may need to refresh credentials, routing, or policy. Using a OnceLock and expecting later `set` calls to replace state creates a reload that reports failure or, worse, ignores its result.
+
+For updates, I use a lock, message-owned state, atomic snapshot mechanism, or purpose-built reload container. Readers then have a defined consistency and lifetime model. OnceLock remains for values that truly initialise once.
+
+Naming helps. A static called `INITIAL_SCHEMA` suggests stable publication; one called `CURRENT_CONFIG` implies mutation and deserves another type.
+
+## Handle the rejected owner
+
+The error contains the submitted `T`. For a string this is simple. For a connection, file, or registered resource, the losing caller may need cleanup. Writing `let _ = cell.set(candidate)` drops the rejected candidate immediately without recording which initialization won.
+
+I normally inspect the result. If multiple equal candidates are acceptable, I compare the published value. If different candidates indicate a startup race or inconsistent configuration, I return a specific error. If losing is expected, I retire the unused resource deliberately.
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-680/fixed.rs) asserts both `Err("replacement")` and the retained `"primary"`. Testing both sides captures ownership and state.
+
+## get does not wait
+
+[`OnceLock::get`](https://doc.rust-lang.org/std/sync/struct.OnceLock.html#method.get) returns `None` while uninitialized or being initialized and never blocks. If a reader must wait for initialization, `wait` communicates that behaviour. If absence is a normal startup state, `get` is appropriate.
+
+I avoid busy-polling `get`. Coordination uses the waiting API, a condition, or startup sequencing. Once-only storage does not decide how request traffic is gated before readiness.
+
+References returned from the cell remain tied to its lifetime. A static OnceLock can therefore provide static references without leaking a newly allocated value manually.
+
+## Resetting requires exclusive access
+
+[`OnceLock::take`](https://doc.rust-lang.org/std/sync/struct.OnceLock.html#method.take) takes `&mut self`, removes the value, and returns the cell to uninitialized state. The exclusive borrow proves no other active borrows or threads can be using that same cell through safe access.
+
+This is useful in owned test fixtures or resettable local objects, not as a concurrent reload switch for a shared static. A global static cannot normally be mutably borrowed safely.
+
+Tests should not share one mutable global OnceLock across cases expecting different values. Process order then affects results. Dependency injection or a per-test cell keeps isolation.
+
+## Publication needs a source of truth
+
+When several startup paths can call `set`, I record where the candidate came from and validate it before the race. First-wins is only a synchronization rule; it is not a precedence rule. Environment, file, and remote configuration should be resolved deterministically, then one reviewed value is published. Otherwise scheduler timing quietly becomes configuration policy.
+
+## My OnceLock set checklist
+
+- Is this value truly immutable after first publication?
+- Does the caller need to know whether its candidate won?
+- How is a rejected owned resource cleaned up?
+- Are different concurrent candidates an error?
+- Should readers get None, wait, or be held behind readiness?
+- Is ignored `set` output hiding failed configuration?
+- Does a reload requirement call for another state container?
+- Are tests isolated from one process-global initialization?
+
+The core principle is that one-time publication resolves a race by selecting one permanent value. `OnceLock::set` returns ownership of every loser. I handle that result and choose a different abstraction whenever replacement is part of the real lifecycle.

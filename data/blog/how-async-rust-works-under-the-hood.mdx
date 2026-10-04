@@ -1,0 +1,223 @@
+---
+title: "How Async Rust Works Under the Hood: Five Symptoms, One Model"
+date: "2026-09-09T06:10:00+01:00"
+lastmod: "2026-09-09T06:10:00+01:00"
+tags: ["rust", "async rust", "tokio", "futures", "concurrency"]
+draft: false
+reviewed: true
+reviewedHash: "cbbc62a2550547a10eeaf483b55464aa16f93b9e54463f3f18515d341b3ab70b"
+cluster: "rust-under-the-hood"
+campaign: "editorial"
+summary: "I started from a small tokio service and hit five classic async Rust problems: a huge future, a future that is not Send, one blocking call that stalls everything, a select! loop that loses data, and a shutdown that hangs. One small model of the compiler and the runtime explains all five."
+---
+
+An async function in Rust is compiled into a struct that stores every local variable that is still alive at an `.await`. The runtime does not run this struct. It only polls it, and only when something wakes it.
+
+Cancellation is not an event, it is a drop of that struct. Once I had this model in my head, five problems that looked unrelated became the same problem seen from five sides.
+
+This article is the entry point of my async Rust series. I did not want to write one more explanation of futures, wakers and executors from the theory side. So I did the opposite: I started from a small program, I broke it in the ways I usually see in production code, and I measured what happened. Each symptom then points to the article in the series that goes deeper into that one mechanism.
+
+## The small program I started from
+
+The program is not interesting on purpose. A tokio runtime, a few tasks, a ticker that must fire every 10 milliseconds, and a "source" that hands out data in two halves. Everything runs on a single worker thread when I want to see effects clearly, and on two workers when the question is about shutdown.
+
+All the measurements below come from that program. The numbers are from my laptop with rustc 1.95 nightly and tokio 1.53 on Linux. Your numbers will differ a bit, but the shape will not. The code is in the `async-symptoms` fixture of the site repository, one binary per symptom, with tests that pin the deterministic claims. The select experiment runs on tokio's paused clock, so its counts are exact and repeat on every run.
+
+## Symptom 1: the future is much bigger than the function looks
+
+The first thing I measured is the size of the future itself, with `std::mem::size_of_val`. Five variants of the same function:
+
+```rust
+async fn tiny() -> u8 {
+    tokio::task::yield_now().await;
+    1
+}
+
+async fn buffer_alive_across_await() -> u8 {
+    let buf = [7u8; 4096];
+    tokio::task::yield_now().await;
+    buf[0]
+}
+
+async fn buffer_finished_before_await() -> u8 {
+    let buf = [7u8; 4096];
+    let first = buf[0];
+    tokio::task::yield_now().await;
+    first
+}
+```
+
+And two callers, one that awaits the buffer function twice in a row, one that runs both at the same time with `tokio::join!`.
+
+| Future | Size |
+|---|---|
+| tiny | 24 bytes |
+| buffer alive across await | 4120 bytes |
+| buffer finished before await | 24 bytes |
+| two sequential calls | 4128 bytes |
+| two joined calls | 8280 bytes |
+| the same joined future behind `Box::pin` | 8 bytes on the stack |
+
+So the rule is not "a big local makes a big future". The rule is "a local that is still needed after an `.await` becomes a field of the future". In the third variant the array is dead before the await, and the future is back to 24 bytes.
+
+The sequential caller is the interesting line. Two calls, but only one buffer worth of space. The two inner futures are never alive at the same time, so the compiler gives them overlapping storage, the same way an enum stores one variant at a time. With `join!` both are alive together and the size doubles.
+
+This is why a deep chain of async calls can produce a future of several hundred kilobytes, and why boxing it moves the problem to the heap instead of removing it. I go through the layout rules and the compiler flags to inspect them in [Why Rust Async Futures Get So Large](/blog/rust-async-future-size).
+
+## Symptom 2: future cannot be sent between threads safely
+
+The second break is the error message everybody meets in the first week with tokio. I held a `std::sync::MutexGuard` across an await and spawned the task:
+
+```rust
+async fn bump_and_wait() {
+    let guard = COUNTER.lock().unwrap();
+    tokio::task::yield_now().await;
+    println!("{}", *guard);
+}
+```
+
+rustc answers with a message, trimmed here, that is in fact a very good description of the model:
+
+```text
+error: future cannot be sent between threads safely
+  = help: within `impl Future<Output = ()>`, the trait `Send`
+          is not implemented for `std::sync::MutexGuard<'_, u32>`
+note: future is not `Send` as this value is used across an await
+   |     let guard = COUNTER.lock().unwrap();
+   |         ----- has type `std::sync::MutexGuard<'_, u32>` which is not `Send`
+   |     tokio::task::yield_now().await;
+   |                              ^^^^^ await occurs here, with `guard` maybe used later
+```
+
+Read it with symptom 1 in mind. The guard is used after the await, so it is a field of the future struct. A struct with a non-`Send` field is not `Send`. And `tokio::spawn` requires `Send` because a multi-thread runtime may poll the future from another worker after it was woken.
+
+The fix is the same as in symptom 1. Make the value die before the await:
+
+```rust
+let value = {
+    let mut guard = COUNTER.lock().unwrap();
+    *guard += 1;
+    *guard
+};
+tokio::task::yield_now().await;
+```
+
+This compiles and prints `1`. No `Arc`, no async mutex, only a shorter scope. The full set of cases, including the ones where the compiler is more conservative than necessary, is in [Why a Rust Future Is Not Send Across .await](/blog/rust-future-send-across-await).
+
+## Symptom 3: one blocking call and every other task waits
+
+For the third break I gave the runtime a single worker thread and a ticker at 10 milliseconds. Then I spawned a task that calls `std::thread::sleep` for 300 milliseconds. I recorded the worst gap between two ticks.
+
+| Scenario | Worst gap between 10 ms ticks |
+|---|---|
+| no blocking work | 11.18 ms |
+| 300 ms `thread::sleep` inside `tokio::spawn` | 300.19 ms |
+| 300 ms `thread::sleep` inside `spawn_blocking` | 11.13 ms |
+
+The middle line is the important one. The ticker did not run late by a little. It ran late by exactly the length of the blocking call. The runtime could not do anything about it, because a worker thread is a plain loop that polls one future, and that poll did not return for 300 milliseconds.
+
+With more worker threads the damage is spread instead of removed. Any task that was queued on the blocked worker waits, and the other workers only take over after their own queue is empty and they steal. The one task sitting in the blocked worker's LIFO slot cannot be stolen at all. In practice you see this as tail latency that appears and disappears with load.
+
+The third line shows the fix. `spawn_blocking` moves the call to a separate thread pool, and the worker goes back to polling. The cost is one thread per blocking call in flight, which is a different capacity question. The article "How One Blocking Function Stalls an Async Rust Executor", later in this series, goes through the cases where the blocking call is hidden inside a library.
+
+## Symptom 4: select! throws away half a record
+
+This is the one I find in code review most often, and the one that convinced me to write this series.
+
+The source hands out a record in two halves, 15 milliseconds each. The read function awaits both halves and returns the pair. I ran it in a loop with `tokio::select!` against a ticker at 20 milliseconds, the usual "do work or handle a timer" shape:
+
+```rust
+async fn read_record_in_future(src: &mut Source) -> (u32, u32) {
+    let a = src.next_half().await;
+    let b = src.next_half().await;
+    (a, b)
+}
+
+loop {
+    tokio::select! {
+        record = read_record_in_future(&mut src) => { records += 1; }
+        _ = ticks.tick() => { /* periodic work */ }
+    }
+}
+```
+
+After 40 iterations:
+
+```text
+state inside the future:  39 halves consumed, 0 records produced, 39 halves lost
+```
+
+Not a single record was produced. The first tick of a tokio interval completes immediately, so iteration one consumed nothing, and every other iteration consumed exactly one half and lost it. A record needs 30 milliseconds, the tick fires every 20, so every single time the read future was 15 milliseconds in, holding one half in its local `a`, and then `select!` dropped it. The half was consumed from the source and gone. Then the loop started a fresh future that began again from zero.
+
+Nothing here is a bug in tokio, and the compiler cannot warn. Dropping a future is the only cancellation mechanism async Rust has, and the future was holding progress that only existed inside it.
+
+The fix is to keep the partial progress outside the future, in the source:
+
+```rust
+async fn read_record(&mut self) -> (u32, u32) {
+    if self.pending.is_none() {
+        self.pending = Some(self.inner.next_half().await);
+    }
+    let b = self.inner.next_half().await;
+    (self.pending.take().unwrap(), b)
+}
+```
+
+Same loop, same timer:
+
+```text
+state outside the future: 26 halves consumed, 13 records produced, 0 halves lost
+```
+
+The future is still dropped by the ticker, but now dropping it loses nothing, because the first half lives in `self`. This property has a name, cancellation safety, and the precise definition plus the review method I use is in [Cancellation Safety in Async Rust, Explained](/blog/rust-async-cancellation-safety).
+
+## Symptom 5: shutdown waits for what it cannot cancel
+
+The last break is about who owns a task. I created a runtime, spawned work, waited 100 milliseconds, and then dropped the runtime while timing the drop.
+
+| What was running | Time for the runtime to shut down |
+|---|---|
+| an async loop with `sleep(50ms).await` | 136 µs |
+| a `spawn_blocking` call sleeping 3 seconds | 2.90 s |
+| the same, with `shutdown_timeout(500ms)` | 500 ms |
+
+The async loop was cancelled almost instantly. It has an await point, so the runtime dropped the future at the next opportunity, and dropping a future is cheap.
+
+The blocking task could not be cancelled at all. There is no await inside a thread sleep, so the runtime had no choice but to wait for it, and the drop blocked my main thread for the remaining 2.9 seconds. `shutdown_timeout` does not cancel it either. It gives up waiting and lets the thread finish on its own.
+
+This is the same model again. The runtime owns futures, and it can only stop a future at a point where the future gives control back. Anything else is outside its reach: a blocking thread, a task nobody holds a handle to, a child task spawned from a task that was already dropped. Graceful shutdown in async Rust is mostly a question of making this ownership explicit, and that is the subject of the last article of this series.
+
+## The model I ended up with
+
+After the five experiments I can write the whole thing in four sentences.
+
+1. An async function is a struct. Every local that is alive across an `.await` is a field of it. That decides its size and whether it is `Send`.
+2. The struct makes progress only while it is polled, and only on the thread that polls it. A blocking call inside poll blocks that thread, and the runtime cannot interrupt it.
+3. Cancellation is drop. Whatever lived in the struct is destroyed, and whatever the struct had already consumed from the outside world is not given back.
+4. The runtime owns what it can poll. Anything it cannot poll it also cannot stop.
+
+The waker, the part that decides when a struct gets polled again, is the one piece I did not need for these five symptoms. It becomes important when you write your own future or channel, and I build one from a state machine in [Building an Async Oneshot Channel in Rust](/blog/oneshot-channel-rust). The runtime that `#[tokio::main]` builds around all of this is in [Behind #[tokio::main]: Peeling Back the Async Runtime](/blog/tokio-main-deep-dive), and the older comparison of runtimes is in [Rust Async Libraries](/blog/async-rust-libraries).
+
+Two more mechanisms sit slightly outside this model but come up in the same code reviews: why a `Pin` is needed to poll at all, in [Structural Pinning in Rust: Which Fields Are Actually Pinned?](/blog/rust-pin-projection-structural-pinning), and why you cannot `.await` inside `Iterator::map`, in [How to Use await Inside map in an async fn](/blog/await-rust-iterator).
+
+Two questions came out of these experiments that deserve their own measurement: what a `Box<dyn Future>` really costs when a trait method is async, and what to do when cleanup needs an `.await` but `Drop` cannot have one. Both are next in the series.
+
+## What I check before I approve an async change
+
+- Is any large local, guard, or borrow alive across an `.await`? If yes, does it need to be?
+- Does this task ever call something that does not return quickly? File IO, DNS, a sync client, a CPU loop? Then it belongs in `spawn_blocking`, or the task must yield.
+- If this future is dropped at its current await, what is lost? If the answer is "data I already consumed", the state must move out of the future.
+- Who holds the handle of every spawned task, and what stops it at shutdown?
+- On a multi-thread runtime, does every spawned future compile as `Send` without an `Arc<Mutex>` that only exists to make the compiler quiet?
+
+## Continue through the series
+
+The rest of the series is organised by mechanism, and new articles are added on the [async Rust tag page](/blog/tags/async-rust/page/1) as they go live. The full index of Rust articles is on [Rust Under the Hood](/blog/topics/rust-under-the-hood).
+
+## Sources
+
+- [Asynchronous Programming in Rust: the Future trait](https://rust-lang.github.io/async-book/02_execution/02_future.html)
+- [Tokio documentation: spawn_blocking](https://docs.rs/tokio/latest/tokio/task/fn.spawn_blocking.html)
+- [Tokio documentation: Runtime::shutdown_timeout](https://docs.rs/tokio/latest/tokio/runtime/struct.Runtime.html#method.shutdown_timeout)
+- [Tokio documentation: select! and cancellation safety](https://docs.rs/tokio/latest/tokio/macro.select.html)
+- [Oxide RFD 400: Dealing with cancel safety in async Rust](https://rfd.shared.oxide.computer/rfd/0400)

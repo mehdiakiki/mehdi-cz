@@ -1,0 +1,306 @@
+---
+title: "Provider Adapters Should Translate Behaviour, Not Only JSON"
+date: "2026-09-16T09:00:00+01:00"
+tags: ["adapter pattern", "third-party APIs", "data integration", "contract testing", "system design"]
+draft: false
+reviewed: true
+reviewedHash: "09b0a6063c333de533f8a625eda17c68a38e4b3e547daf8f7c0f5ebf9c29943a"
+cluster: "reliable-data-integrations"
+campaign: "authority-2026"
+opportunity: "DATA-016"
+summary: "An adapter contract and test suite for translating provider pagination, identity, nulls, versions, errors, retries, deletion, and capabilities—not only field names."
+---
+
+The first version of a provider adapter often looks like a JSON mapper:
+
+```text
+provider customer → product customer
+first_name        → firstName
+updated_at        → updatedAt
+```
+
+This is necessary, but it is not the hard part. Two APIs can expose identical JSON shapes and still behave differently under pagination, deletion, retries, null values, rate limits, or concurrent updates.
+
+When I build integrations, I make the adapter translate **behaviour** into an explicit internal contract. I do not let provider semantics leak as assumptions spread across jobs and controllers.
+
+## Shape translation is only one layer
+
+Suppose two providers return:
+
+```json
+{
+  "id": "42",
+  "email": null,
+  "updated_at": "2026-09-21T10:00:00Z"
+}
+```
+
+For provider A, `email: null` means the user explicitly cleared the address. For provider B, it means the caller lacks permission to read it. Replacing the local value with null is correct for A and data loss for B.
+
+The adapter must know the contract behind the field:
+
+```text
+Present(value)
+ExplicitlyCleared
+Unavailable(permission)
+NotReturned(partial_response)
+```
+
+Converting all four states to `string | null` removes information the product needs.
+
+The same issue appears with timestamps. One provider's `updated_at` changes for every relevant mutation. Another updates it only for user-facing fields. The strings have the same ISO format; their synchronization meaning is different.
+
+## I define the internal port first
+
+The core application should ask for capabilities it understands:
+
+```ts
+interface CustomerSource {
+  capabilities(): SourceCapabilities
+
+  listSnapshot(request: SnapshotRequest): AsyncIterable<SourcePage>
+  listChanges(request: ChangeRequest): AsyncIterable<ChangePage>
+  getCurrent(id: ExternalId): Promise<SourceObservation | NotFound>
+  apply(command: SourceCommand): Promise<CommandResult>
+}
+```
+
+The types returned by these methods describe guarantees, not raw HTTP responses.
+
+For example, a page can include:
+
+```ts
+type SourcePage = {
+  observations: SourceObservation[]
+  next: Checkpoint | null
+  consistency: "snapshot" | "moving-view"
+  completeScope: boolean
+  sourceHighWater?: string
+}
+```
+
+Now the caller does not assume that every cursor represents a snapshot. The provider adapter states whether absence can eventually prove deletion and whether a high-water mark exists.
+
+Microsoft describes this general boundary as an anti-corruption layer: an adapter translates between subsystems that do not share the same semantics so the external model does not shape the internal application. See the [Anti-Corruption Layer pattern](https://learn.microsoft.com/en-us/azure/architecture/patterns/anti-corruption-layer).
+
+## Translate identity explicitly
+
+An external ID belongs to a namespace. The adapter returns identity containing:
+
+```text
+provider
+provider account
+environment
+object type
+external ID
+generation, when IDs can be reused
+```
+
+I never let one provider's bare `id` become the product's primary identity. The [identity mapping table](/blog/identity-mapping-tables-the-small-data-structure-every-integration-needs) owns the relationship to the internal entity.
+
+The adapter also documents whether IDs are stable after merge, export/import, account reconnection, or deletion. If the provider can reuse an ID, the internal namespace needs another generation signal.
+
+## Pagination is behaviour
+
+The adapter owns details such as:
+
+- offset, keyset, opaque cursor, or sync token;
+- filters bound to the cursor;
+- cursor expiration;
+- stable or moving page membership;
+- tie-breaking order;
+- maximum and default page size;
+- empty final pages;
+- rate-limit cost per page;
+- restart behaviour after invalidation.
+
+The core sync engine receives a durable checkpoint and a consistency description. It does not know that provider X calls it `after`, provider Y returns a full `next_url`, and provider Z requires the original request body unchanged.
+
+If a cursor expires, the adapter returns a typed result:
+
+```text
+CheckpointExpired { full_snapshot_required: true }
+```
+
+It does not throw a generic `BadRequest` that the retry loop repeats forever.
+
+## Error translation drives recovery
+
+Raw status codes do not have consistent meaning across providers. I translate responses into a small internal taxonomy:
+
+```text
+Throttle { retry_after, scope }
+TransientUnavailable
+AuthenticationExpired
+AuthorizationDenied
+CheckpointExpired
+Conflict { current_version }
+ValidationRejected { fields }
+NotFound { permanence }
+ProviderContractViolation
+OutcomeUnknown
+```
+
+This taxonomy controls retry, credential refresh, reconciliation, and operator action.
+
+I preserve the provider request ID and a safe diagnostic code for investigation, but I do not expose raw secret-bearing response bodies everywhere.
+
+The translation is conservative. An unknown error does not become retryable because retrying feels helpful. It becomes a visible unknown until the contract is understood.
+
+## Retry hints belong to the adapter
+
+Some providers use `Retry-After`; others return reset epochs or quota headers. Some scopes apply per account, endpoint, resource, or credential.
+
+The adapter parses the provider format and returns:
+
+```text
+earliest retry time
+throttle scope key
+whether the operation outcome is known
+whether the same idempotency key must be reused
+```
+
+The shared retry policy then applies deadlines and budgets. This keeps provider parsing local while keeping reliability policy consistent. [Retries That Respect Retry-After, Deadlines, and a Retry Budget](/blog/retries-that-respect-retry-after-deadlines-and-a-retry-budget) covers the common control loop.
+
+## Writes need a capability contract
+
+I do not give every adapter the same optimistic `updateCustomer` method when providers offer different guarantees.
+
+Capabilities can state:
+
+```text
+supports idempotency keys
+supports conditional version writes
+returns committed version
+accepts partial patch or complete replacement
+distinguishes null from omission
+supports batch atomicity
+provides read-after-write consistency
+supports reversible delete
+```
+
+The application can then select a safe workflow. If a provider has no idempotency key and a write times out, the adapter returns `OutcomeUnknown`; it does not quietly retry a possibly committed effect.
+
+Capabilities are versioned and tested. They are not a marketing feature table.
+
+## Avoid the lowest-common-denominator trap
+
+One generic interface can become so small that it throws away valuable provider guarantees. Another can become a large union where every caller switches on provider name.
+
+I use a stable common core plus explicit optional capabilities:
+
+```text
+common: identity, observations, typed errors, checkpoints
+optional: ordered change feed, conditional writes, bulk export, tombstones
+```
+
+Core application code asks for a capability rather than a provider:
+
+```text
+if source supports ordered changes:
+    use durable incremental path
+else:
+    use overlapping poll plus reconciliation
+```
+
+This keeps behaviour visible without letting provider-specific names spread through the domain.
+
+Sometimes a provider genuinely requires a unique workflow. I represent it as an explicit extension instead of pretending the common abstraction fits.
+
+## Field ownership stays outside mapping code
+
+The adapter reports what the provider observed and what the provider can write. The domain decides which source is authoritative for a canonical field.
+
+For example, the adapter may translate provider status `paying` to a canonical subscription observation. The [field-ownership matrix](/blog/define-field-ownership-before-you-build-bidirectional-sync) decides whether that observation may replace current product state.
+
+This separation prevents adapters from silently embedding business policy that changes when a second provider is added.
+
+I keep transformations with real information loss explicit. If three provider states collapse into one canonical state, I record the original state or a lossiness reason when future round-trip behaviour may need it.
+
+## The adapter contract tests I run
+
+Every adapter implements the same behavioural suite using recorded or synthetic provider fixtures.
+
+### Identity namespace
+
+Return the same external ID from two connected accounts. Assert the canonical identities remain distinct.
+
+### Null versus omission
+
+Send a partial response without a field, an explicit null, and a permission-redacted value. Assert three different observations when the provider contract distinguishes them.
+
+### Page restart
+
+Crash after applying a page but before checkpoint commit. Assert replay gives idempotent observations and does not skip the page.
+
+### Mutation during pagination
+
+Insert and delete records between page requests. Assert the adapter reports its moving-view or snapshot guarantee accurately; it must not claim completeness it cannot prove.
+
+### Checkpoint expiration
+
+Return the provider's invalid-token response. Assert typed `CheckpointExpired`, not generic retry.
+
+### Rate limit
+
+Return every documented throttle form. Assert scope and earliest retry time are normalized correctly.
+
+### Timeout after write
+
+Simulate a committed write with a lost response. Assert the result preserves uncertainty and the next step follows provider idempotency or read-back support.
+
+### Unknown enum value
+
+Add a provider status the code has never seen. Assert it becomes an explicit unknown with raw provenance, not a default canonical state.
+
+### Delete and restore
+
+Exercise event tombstones, absence from a complete scan, soft delete, hard delete, and restored IDs according to the provider's documented lifecycle.
+
+### Contract fixture drift
+
+Replay sanitized real response shapes from supported API versions. Assert unknown fields are tolerated where appropriate and removed/changed required fields fail visibly.
+
+These tests are reusable because they express internal promises. Only the provider fixtures and expected capability set change.
+
+## Test against a provider sandbox, but do not depend only on it
+
+Recorded fixtures are fast and deterministic. They can become stale. Sandbox tests prove authentication, serialization, headers, and basic live behaviour, but sandboxes often have different rate limits or incomplete event support.
+
+I combine:
+
+- unit tests for pure transformations;
+- contract tests against fixtures and a fake provider;
+- scheduled sandbox smoke tests;
+- canary production checks with safe read-only operations;
+- monitoring for previously unseen response variants.
+
+When provider documentation changes, I update the declared capability and add a fixture before changing domain behaviour.
+
+## Observe semantics, not only request success
+
+An adapter dashboard should show:
+
+- observations by result category;
+- unknown enum and field states;
+- cursor expiration and full-sync recovery;
+- throttle scope and retry delay;
+- stale source versions ignored;
+- uncertain write outcomes;
+- null/omission translation counts;
+- provider contract violations;
+- reconciliation differences after apply.
+
+A 99.9% HTTP success rate can still hide wrong null semantics or silent missing deletes.
+
+## My practical adapter rule
+
+I ask one question for every external behaviour:
+
+> What must the rest of the application know to handle this safely without knowing the provider's name?
+
+The answer becomes a typed observation, capability, checkpoint, or error. Field renaming remains inside the adapter, but so do cursor expiration, error meaning, retry hints, identity namespace, deletion evidence, and write guarantees.
+
+This produces more code than a JSON mapper. It also gives the product one place where an external contract can be read, tested, and changed.
+
+The next design risk is information that no canonical type can preserve. That deserves its own lossiness ledger rather than another nullable field.

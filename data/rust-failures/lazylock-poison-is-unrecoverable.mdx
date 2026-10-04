@@ -1,0 +1,84 @@
+---
+caseId: "RFA-332"
+title: "LazyLock Poisoning Is Unrecoverable"
+date: "2026-09-06T01:52:00+01:00"
+lastmod: "2026-09-06T01:52:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "945b52f5e3d115487ef6f774213c5c579e2de3bfd151cc0ca191fcc5c2425370"
+area: "concurrency-memory"
+symptom: "After a LazyLock initializer panics once, every later dereference or force panics instead of retrying or exposing recoverable data."
+summary: "LazyLock permanently poisons after its FnOnce initializer panics. Use it for infallible lazy construction; use an explicit fallible startup path or a retry-capable state machine when transient failure is part of the design."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["targets with std::sync::LazyLock"]
+profiles: ["dev", "release with panic=unwind", "test"]
+searchTerms: ["Rust LazyLock poison unrecoverable", "LazyLock initializer panic retry", "LazyLock force always panics after poison"]
+evidence: ["Rust 1.98.1 local LazyLock", "first initializer panic", "second force poison panic and OnceLock contrast"]
+sources: ["https://doc.rust-lang.org/std/sync/struct.LazyLock.html#poisoning", "https://doc.rust-lang.org/std/sync/struct.LazyLock.html#method.force", "https://doc.rust-lang.org/std/sync/struct.OnceLock.html#method.get_or_init"]
+---
+
+I saw a lazy initializer fail because a test dependency was unavailable, fixed the dependency, and expected the next access to retry. A `LazyLock` does not have that recovery model.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-332/fail.rs) catches the first initializer panic and then forces the same lazy value again. The second access panics because the lock is poisoned.
+
+## The initializer is a one-shot closure
+
+`LazyLock<T, F>` owns an `FnOnce() -> T`. Successful first access consumes the closure and publishes one `T` for later readers. If that one-shot closure panics, there is no ordinary reusable initializer left inside the value.
+
+The [`LazyLock` poisoning section](https://doc.rust-lang.org/std/sync/struct.LazyLock.html#poisoning) states that poison is unrecoverable. Future dereferences and calls to [`force`](https://doc.rust-lang.org/std/sync/struct.LazyLock.html#method.force) panic.
+
+This differs from mutex poison, where the protected value exists and can be inspected through `PoisonError`. A failed lazy initializer may never have produced a `T` at all.
+
+## Lazy construction should be effectively infallible
+
+I use `LazyLock` for deterministic construction from trusted process state: a compiled regular expression, a lookup table, or a value whose allocation failure follows the process's general failure policy.
+
+I avoid hiding ordinary configuration, network, file, credential, or service-discovery errors inside a panicking lazy closure. Those failures need context, retry policy, observability, and often an asynchronous path.
+
+Turning `Result<T, E>` into `unwrap()` inside `LazyLock` removes that policy while making the permanent poison look surprising later.
+
+## OnceLock has a different panic behaviour
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-332/fixed.rs) uses [`OnceLock::get_or_init`](https://doc.rust-lang.org/std/sync/struct.OnceLock.html#method.get_or_init). Its first initializer panics; a later call supplies another closure and successfully stores `42`.
+
+This demonstrates a contract difference, not a recommendation to retry every operation through `OnceLock`. The caller still decides whether retry is safe. The closure may have left external side effects before panic.
+
+When initialization is naturally fallible, I often prefer an explicit startup function returning `Result` over panic-based retry.
+
+## Retry requires state, limits, and ownership
+
+A robust retry-capable initializer needs more than another closure call. I decide which errors are transient, how attempts are bounded, whether concurrent callers share one attempt, what backoff applies, and how permanent failure is reported.
+
+I also decide what happens to callers while an attempt is running. They may wait, receive the last error, or proceed with degraded capability. A single hidden lazy cell does not express all these states.
+
+For a service, startup orchestration can initialize dependencies before accepting traffic. For an optional feature, an explicit state machine can retain the error and allow a controlled refresh.
+
+## Catching the panic does not clear poison
+
+`catch_unwind` stops unwind from terminating the current outer operation when the captured state is unwind-safe. It does not make the `LazyLock` fresh again.
+
+The fixture catches both panics only so the evidence executable can inspect them. Production code should not use catch-and-force as a recovery loop; every force will panic after poison.
+
+With `panic=abort`, even the first catch path is unavailable because the process ends.
+
+## Static lifetime raises test concerns
+
+A poisoned static `LazyLock` remains poisoned for the rest of the test process. One test can affect every later test that touches it, making failures order-dependent.
+
+I keep fallible test dependencies in per-test state or inject them through a context. If a global truly must exist, its initializer should not depend on mutable test ordering or external availability.
+
+Running tests serially may hide contention but does not reset a static lazy value.
+
+## Reentrancy is another initialization hazard
+
+An initializer that indirectly accesses the same lazy value can deadlock or otherwise enter behaviour constrained by the primitive's contract. I keep initialization dependency graphs simple and acyclic.
+
+For a group of related globals, one explicit application context constructed in dependency order is easier to reason about than several lazy statics calling each other.
+
+## What I test
+
+I test successful first access, many concurrent accesses after success, initial panic under unwind, later access after poison, and any explicit alternative recovery component. I count construction calls without depending on thread timing.
+
+For a fallible startup dependency, tests cover transient failure, permanent failure, retry budget, concurrent callers, partial side effects, and shutdown during initialization.
+
+The core principle is that laziness is a scheduling choice, not an error strategy. `LazyLock` moves infallible one-time construction to first access and permanently poisons after panic. If failure is expected data, I keep it in `Result` and design recovery explicitly instead of asking a one-shot lazy value to become a supervisor.

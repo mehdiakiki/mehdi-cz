@@ -1,0 +1,72 @@
+---
+caseId: "RFA-234"
+title: "Barrier::wait Elects Exactly One Leader per Rendezvous"
+date: "2026-09-06T00:14:00+01:00"
+lastmod: "2026-09-06T00:14:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "99868cba4affb69d9cb8c3f54961f738cb100dcb72f5ea03f6ee8f615cdf3f6f"
+area: "concurrency-memory"
+symptom: "Three threads all leave a Barrier, but only one BarrierWaitResult reports is_leader as true."
+summary: "A barrier releases every participant after rendezvous but elects one arbitrary leader for that generation. Put once-per-round work behind is_leader and never attach identity or fairness assumptions to the elected thread."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets with std threads"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust Barrier is_leader exactly one thread", "BarrierWaitResult leader arbitrary", "run once after Barrier Rust"]
+evidence: ["Rust 1.98.1 three-thread rendezvous", "atomic leader count", "exactly-one invariant repair"]
+sources: ["https://doc.rust-lang.org/std/sync/struct.Barrier.html#method.wait", "https://doc.rust-lang.org/std/sync/struct.BarrierWaitResult.html#method.is_leader", "https://doc.rust-lang.org/std/sync/atomic/enum.Ordering.html"]
+---
+
+I first read `is_leader` as “this thread passed the barrier and may continue.” All participants pass once enough threads arrive. Only one participant receives a result whose `is_leader` is true.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-234/fail.rs) launches three participants and counts leader results. It expects three and observes one.
+
+## Release and election are separate outcomes
+
+[`Barrier::wait`](https://doc.rust-lang.org/std/sync/struct.Barrier.html#method.wait) blocks each participant until the configured number have rendezvoused. Then every participant can return from the wait.
+
+For each rendezvous, one arbitrary participant receives [`BarrierWaitResult::is_leader`](https://doc.rust-lang.org/std/sync/struct.BarrierWaitResult.html#method.is_leader) equal to true. All others receive false.
+
+The leader flag is useful for work that should happen once per completed round, such as swapping buffers, advancing a generation counter, or recording one aggregate marker. It is not the permission for normal post-barrier work.
+
+## The leader is arbitrary
+
+I do not assume the last arriving thread, first arriving thread, lowest thread ID, or coordinator becomes leader. The API promises one leader, not a selection policy.
+
+Attaching special thread-local state to the expected leader is therefore wrong. If once-per-round work must be done by a particular coordinator, participants should signal that coordinator through an explicit protocol rather than using the arbitrary flag as identity.
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-234/fixed.rs) asserts only the stable guarantee: exactly one true result among three waiters.
+
+## A barrier is reusable by generation
+
+After one rendezvous completes, the same barrier can coordinate another round. Each generation gets its own leader. The same thread may win repeatedly, or leadership may change.
+
+State associated with a round needs a generation boundary. A single global `leader_has_run` boolean would suppress work in later rounds. I use a generation counter or keep the once-per-round action between the relevant barrier phases.
+
+For iterative algorithms, a common shape is compute, rendezvous, one participant performs a small transition, then a second rendezvous prevents others from reading halfway-updated shared state. Whether two barriers are necessary depends on the ownership and synchronization around that state.
+
+## The flag is not a lock
+
+Being elected does not by itself grant exclusive access to arbitrary shared memory. The other threads have also returned and may run concurrently. Shared mutation still needs ownership through a mutex, atomics, disjoint borrowing, or another correct design.
+
+The fixture increments an `AtomicUsize` because each thread writes to one shared count. It uses a strong ordering for an easy-to-audit test; production code should select ordering from the actual synchronization proof rather than copy it blindly.
+
+If the leader action must complete before other participants proceed, `is_leader` alone is insufficient. I add another synchronization point or perform the action while holding the shared state mechanism that readers also respect.
+
+## Wrong participant counts deadlock rather than elect differently
+
+A barrier created for three participants waits for three calls in the same generation. If only two arrive, they block. If a fourth participates accidentally, three may complete one generation while the fourth waits for two more calls in the next.
+
+This can look like random scheduling failure. I count participant ownership and trace generation numbers before tuning thread timing. Dynamic membership is usually better served by another coordination primitive or an explicit coordinator.
+
+Panics before `wait` can also strand peers. A barrier is not automatically canceled when one participant disappears.
+
+## My regression measures the promised cardinality
+
+Asserting which numbered thread becomes leader would create a flaky and invalid test. The fixture instead joins all participants and asserts a leader count of exactly one.
+
+Application tests repeat several generations, verify one action per generation, and ensure readers do not observe the leader's transition early. Failure-path tests arrange one missing participant under a timeout or controlled harness so a deadlock cannot stall the complete suite.
+
+I also label threads only for diagnostics, never for selecting the expected leader. If a test asserts a particular label, it has accidentally tested one scheduler history instead of the barrier contract.
+
+The core principle is that synchronization primitives can return asymmetric roles after a symmetric rendezvous. A Rust barrier releases everyone and elects one arbitrary leader. I use the flag only for work whose identity does not matter, and I add another boundary when that work must finish before the others continue.

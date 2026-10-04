@@ -1,0 +1,227 @@
+---
+title: "Cargo Resolver 3: How MSRV Changes Dependency Selection"
+date: "2026-09-25T17:00:00+01:00"
+tags: ["rust", "cargo", "msrv", "dependency resolution", "rust 2024"]
+draft: false
+reviewed: true
+reviewedHash: "dc1d7f9f254bfa4001e3189fcad018ff486271875040370d204c2b2d77321acf"
+cluster: "rust-under-the-hood"
+campaign: "authority-2026"
+opportunity: "RUST-014"
+summary: "Cargo resolver 3 prefers dependency releases compatible with your declared rust-version. See where fallback helps, where it cannot, and how workspaces change the result."
+---
+
+Two projects can declare the same dependency requirement and receive different dependency versions because they declare different minimum supported Rust versions.
+
+This is intentional with Cargo resolver 3.
+
+Rust 2024 implies `resolver = "3"`. Resolver 3 changes the default treatment of dependencies whose own `rust-version` is newer than the Rust version supported by the consuming package. Cargo prefers a compatible release when one exists.
+
+The word **prefers** is essential. This is a fallback policy, not a proof that the complete graph supports the minimum toolchain.
+
+## Three versions must not be mixed together
+
+I keep these values separate:
+
+```text
+current compiler:     rustc used for this command
+package rust-version: minimum toolchain the package claims to support
+dependency version:  crate release selected by Cargo
+```
+
+For example:
+
+```toml
+[package]
+name = "report-cli"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+
+[dependencies]
+some-library = "4.0"
+```
+
+Running Cargo 1.98 does not mean the package is free to resolve dependencies that require Rust 1.98. The manifest claims the package supports 1.85, so resolver 3 tries to choose dependency releases compatible with 1.85.
+
+This helps maintainers develop on a recent toolchain without accidentally raising their MSRV only because `cargo update` selected a newer compatible-by-SemVer crate release.
+
+## What resolver 3 changes
+
+Resolver 3 makes this Cargo setting default to `fallback`:
+
+```toml
+[resolver]
+incompatible-rust-versions = "fallback"
+```
+
+With fallback, Cargo prefers the newest dependency release satisfying both:
+
+1. the dependency's semantic version requirement;
+2. a `rust-version` compatible with the consuming package's Rust version context.
+
+If no release satisfies both, Cargo can still select a Rust-version-incompatible release. It does not make dependency resolution fail merely because the preferred set is empty.
+
+That behaviour keeps resolution possible, but compilation on the declared MSRV can still fail. CI remains necessary.
+
+The [Cargo resolver documentation](https://doc.rust-lang.org/cargo/reference/resolver.html#rust-version) gives a concrete `clap` example. I reduce it to this fixture table:
+
+| Package MSRV | Dependency requirement | Available compatible release | Newer release requires | Resolver 3 result |
+| ---: | --- | --- | ---: | --- |
+| 1.62 | `clap = "4.0"` | 4.0.32 needs 1.60 | 4.5.20 needs 1.74 | 4.0.32 |
+| 1.62 | `clap = "4.2"` | none in requested range | 4.5.20 needs 1.74 | 4.5.20 fallback |
+
+In the second row, the version requirement excludes the older compatible release. Resolver 3 cannot invent a valid dependency version.
+
+## Semantic versioning and Rust version are different axes
+
+This requirement:
+
+```toml
+clap = "4.0"
+```
+
+usually accepts later `4.x` releases under Cargo's caret rules. A crate can raise its `rust-version` in a SemVer-minor release. The [Cargo SemVer guidance](https://doc.rust-lang.org/cargo/reference/semver.html#tooling-and-environment-compatibility) treats an MSRV increase as a possibly breaking tooling change, while generally recommending it be handled as a minor change.
+
+Resolver 3 adds Rust-version information to selection so broad, normal SemVer requirements can still work for consumers with an older toolchain.
+
+It does not replace precise lower bounds. If my code uses an API introduced in dependency 4.3, I must declare a requirement beginning at the actual minimum, not `4.0` and hope the lockfile stays new.
+
+## The lockfile wins before new selection
+
+Cargo gives an existing `Cargo.lock` high priority. Enabling resolver 3 does not necessarily rewrite every locked package immediately.
+
+The meaningful tests are:
+
+```bash
+cargo generate-lockfile
+cargo tree
+cargo +1.85 check --locked
+```
+
+I test both a fresh lockfile and the committed lockfile:
+
+| Scenario | Question answered |
+| --- | --- |
+| existing lockfile, `--locked` | Can today's pinned graph build? |
+| fresh resolution under resolver 3 | What would a new user or update select? |
+| `cargo update -p dependency` | What changes inside the allowed requirement? |
+| MSRV toolchain check | Does the selected graph actually compile on the claim? |
+| current stable check | Does the project also work with today's compiler? |
+
+Testing only the committed lockfile can hide that a new consumer resolves a different graph. Testing only a fresh lockfile can hide a broken pinned application deployment.
+
+## Edition 2024 packages get resolver 3 implicitly
+
+For a normal package, this is enough:
+
+```toml
+[package]
+edition = "2024"
+rust-version = "1.85"
+```
+
+The edition implies resolver 3. This does not mean the edition and resolver are the same concept. The edition selects language and ecosystem migration behaviour; the resolver is a workspace-global dependency policy.
+
+I often write the resolver explicitly in complex workspaces because it makes the shared decision visible.
+
+## Virtual workspaces need an explicit resolver
+
+A virtual workspace has no root `[package]` from which Cargo can infer an edition:
+
+```toml
+[workspace]
+members = ["old-api", "new-cli"]
+resolver = "3"
+```
+
+The resolver declared inside a dependency is ignored. Only the top-level package or workspace controls resolution.
+
+This is a common reason a migration appears to work in one crate alone and behave differently from the workspace root.
+
+The [Rust 2024 Edition Guide](https://doc.rust-lang.org/edition-guide/rust-2024/cargo-resolver.html) calls out both facts: Edition 2024 implies resolver 3, and virtual workspaces must set it in `[workspace]`.
+
+## Mixed-MSRV workspaces are heuristic
+
+Suppose a workspace contains:
+
+```text
+old-api: rust-version = 1.70
+new-cli: rust-version = 1.95
+```
+
+Both depend on compatible SemVer ranges of the same crate. Cargo normally tries to unify that dependency version. The older member can pull selection downward even when the newer member could use a later release.
+
+The opposite can also happen. If `new-cli` requires a minimum dependency release whose MSRV is above 1.70, unification can select that release for the shared graph and make `old-api` fail on its claimed compiler.
+
+Cargo's documentation describes this as a “good enough” heuristic because the resolver does not always know every future transitive path when it selects a package version.
+
+I do not infer package-level MSRV correctness from one successful workspace resolution. I test the supported package and feature combinations on their declared toolchains.
+
+## Resolver 3 can expose hidden policy disagreements
+
+When a dependency remains older than expected, I ask:
+
+- Which workspace member has the lowest `rust-version`?
+- Is the version held by `Cargo.lock`?
+- Does the dependency release declare its own `rust-version` correctly?
+- Does another requirement force a higher minimum release?
+- Is the root actually using resolver 3?
+- Are multiple SemVer-incompatible copies involved?
+
+Useful commands include:
+
+```bash
+cargo tree --workspace --all-features --target all
+cargo tree --invert some-library
+env CARGO_LOG=cargo::resolver=trace cargo update -p some-library
+```
+
+Cargo notes that resolver log targets can change, so I use trace output for diagnosis rather than build automation.
+
+## `--ignore-rust-version` is an experiment, not a support policy
+
+Cargo can ignore Rust-version checks:
+
+```bash
+cargo check --ignore-rust-version
+```
+
+This may show that a dependency happens to compile on an older compiler despite declaring a newer requirement. It may also fail later through syntax, standard-library APIs, build scripts, examples, or a feature not exercised in that command.
+
+I use it to investigate an overly conservative declaration, not to claim support. The package author's `rust-version` is part of their compatibility contract.
+
+## Library and application workflows differ
+
+For an application, the committed `Cargo.lock` is a deployment input. I can control updates and verify the exact graph.
+
+For a library, downstream users resolve the graph together with many other dependencies. A lockfile in the library repository does not constrain their build. The manifest requirement and accurate `rust-version` declarations matter more.
+
+My library CI therefore includes:
+
+1. the declared MSRV with a freshly resolved compatible graph when practical;
+2. current stable with normal features;
+3. all supported features and targets relevant to the compatibility promise;
+4. a scheduled dependency update check.
+
+## A migration checklist
+
+When moving a workspace to resolver 3, I do this:
+
+1. Set accurate `rust-version` values for published members.
+2. Set `resolver = "3"` explicitly at a virtual workspace root.
+3. Save the current lockfile diff separately from manifest edits.
+4. Generate a fresh lockfile and inspect changed dependency versions.
+5. Run the declared MSRV in CI with `--locked`.
+6. Test current stable too.
+7. Inspect mixed-MSRV members that share dependencies.
+8. Confirm dependency lower bounds match APIs actually used.
+9. Document when and how the project's MSRV may increase.
+
+## What the resolver can and cannot promise
+
+Resolver 3 makes dependency choice aware of the minimum Rust version the package claims to support. This closes an important gap between SemVer-compatible and toolchain-compatible releases.
+
+It remains a selection preference inside a workspace-wide, unified graph. It cannot repair impossible version requirements, inaccurate dependency metadata, untested features, or conflicting MSRV policies.
+
+I use resolver 3 to choose a better candidate graph. I use explicit manifests, lockfile inspection, and real MSRV CI to prove the compatibility claim.

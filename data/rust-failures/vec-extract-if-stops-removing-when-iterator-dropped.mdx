@@ -1,0 +1,105 @@
+---
+caseId: "RFA-187"
+title: "Why Dropping Vec::extract_if Stops Further Removal"
+date: "2026-09-05T17:26:00+01:00"
+lastmod: "2026-09-05T17:26:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "da28099e92b5b01fb75120e94f2759b2ad81d0667bc9d175980bfc55efe2a7b6"
+area: "concurrency-memory"
+symptom: "After one item is taken from Vec::extract_if and the iterator is dropped, later matching values remain in the original vector."
+summary: "extract_if removes elements lazily as iteration reaches them. Dropping or short-circuiting the iterator retains unvisited values, so exhaust it for complete extraction or use retain_mut when removed values are not needed."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets with alloc"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust Vec extract_if iterator not exhausted",
+    "dropping ExtractIf keeps elements",
+    "Vec extract_if only removes first match",
+  ]
+evidence:
+  ["Rust 1.98.1 partial iteration", "unvisited even values retained", "collect-to-exhaust repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/std/vec/struct.Vec.html#method.extract_if",
+    "https://doc.rust-lang.org/std/vec/struct.Vec.html#method.retain_mut",
+    "https://doc.rust-lang.org/std/vec/struct.Vec.html#method.drain",
+  ]
+---
+
+An iterator can describe work that has not happened yet. With `Vec::extract_if`, this is visible because advancing the iterator mutates the original vector.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-187/fail.rs) starts with `[1, 2, 4, 6]`, takes the first extracted even value, and drops the iterator. The vector becomes `[1, 4, 6]`, not `[1]`. Only the visited matching value was removed.
+
+## Extraction happens during iteration
+
+[`Vec::extract_if`](https://doc.rust-lang.org/std/vec/struct.Vec.html#method.extract_if) creates an iterator over a selected range. As the iterator visits values, it calls the predicate. A true result removes and yields that value; a false result keeps it.
+
+If the iterator is not exhausted, the unvisited elements remain. Creating the iterator alone does not eagerly filter the vector.
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-187/fixed.rs) collects the iterator. Collection drives it to completion, producing `[2, 4, 6]` and leaving `[1]` behind.
+
+## Short-circuiting intentionally means partial mutation
+
+Methods such as `next`, `find`, `take`, `any`, and `nth` may stop before exhaustion. That can be useful when I want to extract only one matching item while preserving the rest.
+
+It is dangerous when I use a short-circuiting consumer only to ask a question:
+
+```rust
+let removed_any = values.extract_if(.., predicate).next().is_some();
+```
+
+This removes at most the first match. The name `removed_any` should not later be interpreted as “all invalid values were cleaned.”
+
+I make partial extraction a named operation and test the remaining order when it is intentional.
+
+## Dropping differs from `drain`
+
+[`Vec::drain`](https://doc.rust-lang.org/std/vec/struct.Vec.html#method.drain) selects a range eagerly for removal. Dropping its iterator removes and drops the remaining values from that range even when they were not yielded to the caller.
+
+`extract_if` cannot know which unvisited elements match without calling the predicate, and it does not continue calling user code during ordinary drop. It retains the remainder instead.
+
+These two iterator types both remove values but have different drop contracts. I check the documentation rather than generalizing from one draining iterator to another.
+
+## Use `retain_mut` when removed values are irrelevant
+
+If I only need to keep values that satisfy a condition, [`Vec::retain_mut`](https://doc.rust-lang.org/std/vec/struct.Vec.html#method.retain_mut) is more direct. Its predicate describes retained values, so removing evens requires the negated condition.
+
+This avoids creating an extracted-value stream that must be exhausted only for side effects. The standard documentation also suggests `extract_if(...).for_each(drop)` when I need its range semantics but do not need removed items.
+
+API choice should reveal whether removed values are data or merely discarded state.
+
+## The predicate can mutate values that remain
+
+The predicate receives `&mut T`. It may modify an element and return false, leaving the mutation in the vector. If it panics, the current element remains and is not yielded.
+
+This means `extract_if` is not automatically transactional. A partially consumed or panicking pass can leave visited elements mutated, some matches removed, and unvisited values untouched.
+
+I keep predicates small and infallible where possible. For complex validation, I first compute decisions from shared references, then perform a simpler mutation pass.
+
+## Range restriction adds another boundary
+
+Only values inside the supplied range are examined. Values outside remain even when they satisfy the predicate. Combined with early iterator drop, there are two reasons a matching value may survive: it was outside the range or never visited.
+
+Diagnostics and tests should record the range, number of predicate calls, yielded values, and final vector. Looking only at the extracted output loses half the state transition.
+
+## Order remains useful evidence
+
+The vector preserves the relative order of retained elements. My fixture uses several consecutive even values so the surviving `[4, 6]` clearly identifies where iteration stopped.
+
+A test with only one match would pass under both eager and lazy mental models. Good failure fixtures need values that discriminate between plausible behaviours.
+
+## My lazy-mutation checklist
+
+When extraction removes fewer values than expected, I ask:
+
+1. Was the iterator driven to completion?
+2. Did a consumer short-circuit after one or several items?
+3. What does dropping this specific iterator do?
+4. Was extraction limited to a subrange?
+5. Can the predicate mutate retained elements or panic?
+6. Are removed values actually needed, or would `retain_mut` state the goal better?
+7. Do tests include several later matching elements?
+
+The core principle is that iterator construction does not imply eager execution. `extract_if` couples iteration progress with vector mutation. Dropping it stops that progress and deliberately preserves everything it has not yet examined.

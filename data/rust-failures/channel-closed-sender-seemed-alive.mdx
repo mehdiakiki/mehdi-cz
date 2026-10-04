@@ -1,0 +1,131 @@
+---
+caseId: "RFA-035"
+title: "A Rust Channel Closed While a Sender Still Seemed Alive"
+date: "2026-09-04T21:00:00+01:00"
+lastmod: "2026-09-07T10:45:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "228539d908aa4bb44b6a67ee7bd3f1dce3d39ac01d16d225571bf5a07e1676e2"
+area: "async-runtime"
+symptom: "A Rust channel receiver reports closure while a sender still appears to exist in the application."
+summary: "Tokio receivers end after their own channel closes and drains. Give channel generations identities and trace sender ownership to distinguish a live handle from the handle the receiver actually needs."
+rustVersions: ["stable Rust", "Tokio 1.x"]
+targets: ["all Tokio runtime targets"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust channel closed sender still exists",
+    "tokio mpsc receiver closed unexpectedly",
+    "channel sender ownership drop trace",
+  ]
+evidence: ["generation-labelled ownership trace", "sender-count checkpoints", "replacement fixture"]
+sources:
+  [
+    "https://docs.rs/tokio/latest/tokio/sync/mpsc/struct.Receiver.html#method.recv",
+    "https://docs.rs/tokio/latest/tokio/sync/mpsc/struct.Sender.html",
+  ]
+---
+
+For Tokio's multi-producer channel, `recv().await` returns `None` when the channel is closed and its buffer has no remaining messages. Closure happens when all strong senders for that channel are gone, or when the receiver itself is explicitly closed.
+
+So how can a sender still be visible? Usually it is not a sender for the same channel generation, or the receiver was closed intentionally somewhere else.
+
+## Channels need identities during diagnosis
+
+This replacement pattern is enough to confuse logs:
+
+```rust
+use tokio::sync::mpsc;
+
+let (old_tx, mut old_rx) = mpsc::channel::<u64>(16);
+let (new_tx, _new_rx) = mpsc::channel::<u64>(16);
+
+drop(old_tx);
+
+// `new_tx` is alive, but it has no relationship with `old_rx`.
+assert_eq!(old_rx.recv().await, None);
+drop(new_tx);
+```
+
+A type name and variable name do not identify a channel. I assign a monotonically increasing generation or random diagnostic identifier when constructing each pair. Every sender clone, owner move, close, send failure, and receiver termination carries that ID.
+
+The first discriminating check is simple: compare the generation printed by the live sender with the generation printed by the receiver returning `None`.
+
+The identity mistake does not depend on an async runtime. The [minimal Atlas failure](/rust-failure-atlas/evidence/RFA-035/fail.rs) uses standard-library channels so the proof has no external dependency: generation two accepts a send while generation one's receiver is already disconnected. The [repaired program](/rust-failure-atlas/evidence/RFA-035/fixed.rs) keeps matching endpoints inside one generation object. Tokio-specific buffering, permits, and explicit receiver closure remain separate checks described below.
+
+## Trace ownership, not only messages
+
+Logging successful sends misses the event which closes a channel: the final sender drop. I want events like:
+
+```text
+channel=17 sender_clone owner=retry_worker strong=3
+channel=17 sender_drop owner=request_task strong=2
+channel=17 receiver_close owner=coordinator
+channel=17 sender_drop owner=retry_worker strong=1
+```
+
+Tokio's `Sender` exposes strong and weak counts for diagnostics. A `WeakSender` does not keep the channel open. An `OwnedPermit` can also affect shutdown details, so I trace outstanding reservations when the receiver has called `close`.
+
+Counts are observations, not synchronization. Another task can clone or drop immediately after the count is read. They help reconstruct ownership; they should not decide correctness by themselves.
+
+## Explicit receiver closure is different
+
+The receiver can call `close()`. New sends then fail even if strong senders remain. Buffered messages can still be drained, and outstanding permits obtained before closure must be released before `recv` finally returns `None`.
+
+This is a clean-shutdown feature:
+
+```rust
+rx.close();
+while let Some(message) = rx.recv().await {
+    finish(message).await;
+}
+```
+
+If `None` is surprising, I search for `close`, wrapper shutdown methods, and a dropped receiver owner before hunting sender leaks.
+
+A successful `send` also does not guarantee later processing. Tokio documents that the receiver can close immediately after `send` returns `Ok`. If delivery needs acknowledgment, the message protocol must include one.
+
+## Hidden moves make handles disappear
+
+A sender can be moved into a future which is then dropped:
+
+```rust
+async fn run_worker(tx: tokio::sync::mpsc::Sender<Event>) {
+    // owns tx
+}
+
+let future = run_worker(tx);
+drop(future); // drops the sender stored inside it
+```
+
+Or a `select!` losing branch can drop a future which owns the last clone. The source variable may still look conceptually “configured,” while ownership moved earlier.
+
+I let the compiler help by naming owner structs and avoiding deep anonymous async blocks for long-lived resources. An explicit `Worker { tx, ... }` with start and stop events is much easier to audit.
+
+## Restart logic needs one owner of truth
+
+Channel generation bugs often appear during restart:
+
+1. A supervisor creates a replacement pair.
+2. Producers receive the new sender.
+3. The consumer task accidentally keeps the old receiver.
+4. Old senders disappear, so the old receiver ends.
+5. Logs show that producers still own “a sender.”
+
+I update both ends through one transition or store them in a generation object which is swapped atomically at the control-plane level. Mixing endpoints from two generations should be impossible by construction.
+
+## Repair choices
+
+- If the receiver is intentionally closing, propagate an explicit shutdown reason instead of treating `None` as an unexplained error.
+- If producers and consumers use different generations, replace them through one owned session object.
+- If a task accidentally owns the final sender, keep its lifecycle handle and join it.
+- If weak senders were expected to keep the channel open, use a strong sender or revise the lifecycle contract.
+- If delivery matters after `send`, add application acknowledgment or durable storage.
+
+Keeping a “sentinel” sender forever can suppress `None`, but it may also prevent legitimate shutdown. I use it only when an explicit owner truly defines the channel's lifetime.
+
+## The regression proof
+
+My fixture creates generation one, replaces it with generation two, and forces delayed tasks from generation one to finish after replacement. I assert that each receiver sees only its matching senders and that shutdown reports a reason and generation.
+
+I also test `Receiver::close`, buffered draining, and final sender drop separately. The symptom looks the same at `recv`: eventually `None`. The proof must preserve which lifecycle event produced it.

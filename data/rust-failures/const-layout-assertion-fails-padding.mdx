@@ -1,0 +1,93 @@
+---
+caseId: "RFA-124"
+title: "Why a Rust Const Size Assertion Fails Because of Struct Padding"
+date: "2026-09-05T10:24:00+01:00"
+lastmod: "2026-09-05T10:24:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "acdb69dbfac2ae08d9eb40671b37219da8f6895551b616953591938468e979d5"
+area: "ffi-targets"
+symptom: "A compile-time assertion expects a repr(C) u8-plus-u32 struct to occupy five bytes, but alignment padding makes it eight bytes on the verified target."
+summary: "Field payload sizes do not simply add to a struct's size. Alignment can insert internal and trailing padding; verify the target ABI, but parse wire formats as bytes instead of equating them with memory layout."
+rustVersions: ["Rust 1.98.1"]
+targets: ["x86_64-unknown-linux-gnu evidence; layout is target-aware"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust const size_of assertion failed padding", "repr C struct u8 u32 size 8", "E0080 struct layout assert"]
+evidence: ["Rust 1.98.1 E0080 const-evaluation failure", "repr(C) padding example", "target layout assertion repair"]
+sources: ["https://doc.rust-lang.org/reference/type-layout.html#reprc-structs", "https://doc.rust-lang.org/reference/const_eval.html"]
+---
+
+Adding field sizes gives five bytes in the [failing program](/rust-failure-atlas/evidence/RFA-124/fail.rs): one `u8` and one `u32`. Its compile-time assertion expects `size_of::<WireHeader>() == 5`. Rust 1.98.1 evaluates the constant, finds the assertion false, and reports E0080.
+
+On the verified x86-64 target, the `repr(C)` struct occupies eight bytes because the `u32` needs alignment.
+
+## Layout includes padding
+
+The [repr(C) struct layout reference](https://doc.rust-lang.org/reference/type-layout.html#reprc-structs) describes the algorithm. Fields retain declaration order. Before each field, the current offset is rounded up to the field's alignment. The final size is rounded up to the structure's alignment.
+
+For this shape:
+
+```text
+offset 0: kind       u8   1 byte
+offset 1: padding         3 bytes
+offset 4: sequence   u32  4 bytes
+total:                    8 bytes
+```
+
+Trailing padding also matters in arrays: every element must begin at a valid alignment. `size_of` therefore describes the stride as well as payload bytes.
+
+## Const evaluation makes the assumption executable
+
+The [constant evaluation reference](https://doc.rust-lang.org/reference/const_eval.html) defines expressions rustc can evaluate during compilation. A const `assert!` that fails becomes a compilation error, catching ABI drift before a program runs.
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-124/fixed.rs) asserts size eight and alignment four for the target used by the evidence pack. This proves the concrete example. It does not declare that every target must have the same ABI.
+
+For portable crates, I gate target-specific assertions or test a property that truly holds across supported targets. A hard-coded x86-64 result can incorrectly reject another legitimate layout.
+
+## A wire header is not automatically a Rust struct
+
+The type name `WireHeader` exposes a deeper issue. A five-byte network or file header may indeed contain an eight-bit kind followed immediately by a 32-bit sequence. Mapping those bytes onto a padded Rust struct reads a different layout.
+
+`repr(C)` follows a C ABI layout for the target; it does not mean packed bytes, network order, or stable serialization. I parse the buffer explicitly:
+
+```text
+kind     = bytes[0]
+sequence = u32::from_be_bytes(bytes[1..5])
+```
+
+Real code must check the length before slicing. Explicit parsing also handles endianness and validates fields.
+
+Using `repr(packed)` can remove padding, but it creates unaligned field access concerns. Taking a reference to a packed `u32` can already be undefined behavior. A byte parser is usually safer at untrusted wire boundaries.
+
+## Field reordering changes Rust layout strategy
+
+For the default Rust representation, field order is not a stable serialized contract. Even with `repr(C)`, manually reordering fields can reduce padding but changes C-visible offsets and may break an established ABI.
+
+I optimize layout only after measuring memory impact and checking the public contract. A few padding bytes in one control structure rarely justify unsafe parsing. Millions of elements may justify a different internal representation such as structure-of-arrays, while the boundary format remains explicit.
+
+## Size equality does not prove compatibility
+
+Two types with equal `size_of` and `align_of` can have different valid bit patterns, field offsets, endianness, or ownership rules. Layout assertions are necessary for some FFI contracts but not sufficient.
+
+I pair them with offset checks where needed, C-side static assertions, generated bindings, and round-trip tests. For external input I validate values instead of transmuting bytes into a Rust type.
+
+Pointers make this more important: their size may match an integer while provenance and validity rules do not.
+
+## Padding bytes are not ordinary payload
+
+Padding may contain unspecified bytes. Comparing a raw memory dump, hashing every byte, or sending the structure directly can expose nondeterminism or uninitialized data even when all fields were initialized. I serialize fields rather than copying the complete object representation into a protocol.
+
+For FFI, the other language must agree on padding and initialization too. A C function that compares structures with `memcmp` can observe padding that Rust code never treated as a field. Field-by-field comparison and explicit zeroed transport buffers make the intended data visible without assigning meaning to incidental bytes.
+
+## My debugging sequence
+
+When a const layout assertion fails, I do this:
+
+1. Record the exact target triple and compiler version.
+2. Calculate each field offset using alignment rounding.
+3. Check representation attributes and macro-generated fields.
+4. Decide whether the contract is an in-memory ABI or an external byte format.
+5. Use explicit parsing for wire data; use target-aware layout assertions for ABI data.
+6. Verify size, alignment, offsets, endianness, and valid values on supported targets.
+
+The five-byte sum counted payload but ignored where the CPU may legally place the `u32`. Const assertions are valuable because they turn assumptions into evidence. The next step is making sure the asserted contract is the one the system actually needs.

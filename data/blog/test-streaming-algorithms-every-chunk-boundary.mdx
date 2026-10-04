@@ -1,0 +1,162 @@
+---
+title: "How to Test a Rust Streaming Algorithm at Every Chunk Boundary"
+date: "2026-10-31T16:05:00+01:00"
+lastmod: "2026-09-05T12:00:00+01:00"
+tags: ["rust", "aho-corasick", "testing", "streaming", "property testing", "correctness"]
+draft: false
+reviewed: true
+reviewedHash: "7c54638d58d608aa6b9bf185b57ec56f8d5af6c29486e629898b0f09b55ed7e3"
+cluster: "rust-under-the-hood"
+campaign: "editorial"
+summary: "Chunk bugs hide because normal reads use friendly boundaries. I build a reusable oracle method for split matches, offsets, UTF-8, empty chunks, errors, and end-of-stream."
+---
+
+A streaming implementation can pass thousands of tests while still failing whenever a two-byte token is split after its first byte.
+
+Normal file and network reads rarely exercise every boundary in a small fixture. They return whatever sizes happen to be convenient on that run. I prefer to turn the boundary into an explicit test dimension.
+
+The method is simple: define a trusted one-shot oracle, feed identical bytes through many partitions, and require identical logical output.
+
+## Start with one split point
+
+For an input of length `n`, there are `n + 1` places for one split, including before the first byte and after the last.
+
+```rust
+fn every_two_part_split(input: &[u8]) -> impl Iterator<Item = (&[u8], &[u8])> {
+    (0..=input.len()).map(|at| input.split_at(at))
+}
+```
+
+The empty-side cases matter. They catch code that assumes every update receives at least one byte or mistakes an empty chunk for end-of-stream.
+
+For the pattern `failure`, I use inputs with matches at the start, middle, and end, plus a partial prefix at end-of-stream:
+
+```text
+failure!
+xxfailureyy
+xxfailure
+xxfail
+```
+
+Every split should preserve matches and absolute offsets. The partial `fail` should not become a match merely because the stream ended.
+
+## Use one-shot behavior as the oracle
+
+I define the logical output independently of chunks:
+
+```rust
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Hit {
+    pattern: usize,
+    start: usize,
+    end: usize,
+}
+```
+
+The one-shot matcher returns `Vec<Hit>`. The streaming version consumes slices and returns the same type after a final `finish()` call. The test asserts exact vector equality.
+
+`finish()` deserves separate attention. An incremental parser may have a pending token, an incomplete UTF-8 sequence, or buffered replacement bytes. End-of-stream is an event, not just another empty chunk.
+
+If the production library accepts `Read`, I use a reader that intentionally limits every read. [How to Search Across Chunk Boundaries in Rust](/blog/search-across-chunk-boundaries-rust-without-missing-matches) contains a complete Aho–Corasick example.
+
+## Two pieces are necessary but not sufficient
+
+One split finds many bugs. Multiple consecutive boundaries reveal state that is incorrectly reset after an empty or tiny update:
+
+```text
+f | a | i | l | u | r | e
+fa | "" | il | u | re
+"" | failure | ""
+```
+
+Enumerating every partition grows exponentially, so I exhaustively test short inputs and sample partitions for longer inputs. Useful deterministic partitions include:
+
+- every byte separately;
+- fixed sizes 1, 2, 3, 7, and a typical production size;
+- boundaries immediately before and after every expected match;
+- boundaries inside every multi-byte token or character;
+- alternating empty and non-empty chunks if empties are permitted.
+
+Then property testing can generate additional byte strings, pattern sets, and partitions.
+
+## Offsets deserve their own assertions
+
+A scanner may find the correct pattern but report a chunk-local offset. I never compare only matched text because repeated text can hide the wrong occurrence.
+
+The oracle contains pattern ID, start, and end in one documented coordinate system. For text systems, I say explicitly whether these are bytes, Unicode scalar values, or line and column positions.
+
+For streams larger than memory, I test offset arithmetic near type boundaries with a configurable starting base. I do not create an exabyte fixture; I initialize the scanner's base close to the limit and feed a small chunk.
+
+Overflow behavior should be an error or documented wider arithmetic, not a release-mode wrap that changes match positions.
+
+## UTF-8 must be split inside characters
+
+If the contract accepts text over arbitrary byte chunks, I split within every multi-byte UTF-8 encoding in the fixture. Decoding each chunk independently is incorrect because a valid character can cross reads.
+
+I include composed and combining forms when normalization matters. The byte-exact oracle and normalized-text oracle are different contracts; I do not compare one against the other.
+
+[Bytes Are Not Text](/blog/rust-bytes-are-not-text-utf8-scanners) explains why byte offsets cannot automatically become string-slice boundaries.
+
+## Inject reader failures after partial progress
+
+Real streams can return an error after earlier reads succeeded. I use a controlled reader that returns:
+
+```text
+2 bytes -> 1 byte -> Interrupted -> 3 bytes -> EOF
+```
+
+The expected behavior depends on the API. `Interrupted` is commonly retried by higher-level reading logic; another error may terminate while preserving already emitted results. The test should state whether the scanner can resume after an error or must be discarded.
+
+I also test a reader returning fewer bytes than requested. `Read` never promises to fill the supplied buffer in one call.
+
+## Replacement needs a second oracle
+
+For streaming replacement, match equality is not enough. I compare the complete output bytes with a trusted one-shot replacement for every partition.
+
+This catches duplicated overlap, dropped unmatched bytes, and output released before a longer match was ruled out. Patterns sharing prefixes are especially useful:
+
+```text
+app
+apple
+application
+```
+
+I run the test separately for every supported match kind. If streaming deliberately supports only standard semantics, the unsupported combinations should return the documented error rather than silently choose different matches.
+
+## Random tests need reproducible failures
+
+When property testing finds a failure, I print or store:
+
+- random seed;
+- exact pattern bytes and their order;
+- input bytes;
+- partition lengths;
+- match configuration;
+- expected and actual outputs.
+
+Shrinking should preserve the partition because the boundary may be the cause. A beautiful minimal input without its chunk schedule is not a reproducible regression.
+
+I keep every discovered case as a named deterministic test. Random exploration finds the bug; the small permanent fixture prevents its return.
+
+## This method applies far beyond search
+
+The oracle-and-partitions approach works for:
+
+- UTF-8 and protocol decoders;
+- checksums and hashes;
+- compression and decompression;
+- CSV and JSON streaming parsers;
+- framed network messages;
+- line readers handling `\r\n` splits;
+- incremental tokenizers;
+- upload validation.
+
+The core property is always the same:
+
+> Equivalent input bytes must produce equivalent logical output regardless of transport partitioning.
+
+Some algorithms intentionally expose flush boundaries or records. In that case the boundary is part of the contract and belongs in the oracle. I do not pretend it is invisible.
+
+Boundary tests are cheap evidence. They do not prove the implementation is fast, but they prevent performance work from rewarding an implementation that quietly does less.
+
+For the performance half, continue with [How to Benchmark a Streaming Scanner in Rust](/blog/benchmark-streaming-scanner-rust). The complete cluster begins at [Zero-Copy Does Not Mean Zero Memory Access](/blog/zero-copy-does-not-mean-zero-memory-access-aho-corasick-rust).

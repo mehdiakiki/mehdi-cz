@@ -1,0 +1,146 @@
+---
+title: "The ManuallyDrop<Box<T>> Rule Rust 1.98 Finally Documents"
+date: "2026-12-02T09:00:00+01:00"
+tags: ["rust", "ManuallyDrop", "unsafe Rust", "Box", "Miri"]
+draft: false
+reviewed: true
+reviewedHash: "b704bb5c62e987f9ef8eb402b851fc97210e9e6e43a27ec294c9cd4d145dffcf"
+cluster: "rust-under-the-hood"
+campaign: "authority-2026"
+opportunity: "RUST-060"
+summary: "Rust 1.98 documents a subtle fix: moving a ManuallyDrop containing an already-dropped Box was undefined before Rust 1.96. The historical rule is gone, but unsafe wrappers still have sharper problems."
+---
+
+When I read a Rust release, I do not only search for new syntax. I look for one sentence that changes how I review old code. Rust 1.98 has such a sentence: the release notes say that the `ManuallyDrop` interaction with `Box` has been fixed.
+
+The wording is easy to misunderstand. The behaviour did not suddenly change in Rust 1.98. The current [`ManuallyDrop` documentation](https://doc.rust-lang.org/std/mem/struct.ManuallyDrop.html#pre-196-interaction-with-box) says the restriction applied **before Rust 1.96.0**. Rust 1.98 made that history visible in the standard documentation and release notes.
+
+This detail matters to me because unsafe code is full of rules that survive in blog posts after the language model has changed. I want to know which rule belongs to today's Rust, which one belongs to an older compiler, and which danger never went away.
+
+## The old example was surprisingly small
+
+The historical problem looked like this:
+
+```rust
+use std::mem::ManuallyDrop;
+
+let mut value = ManuallyDrop::new(Box::new(42));
+
+unsafe {
+    ManuallyDrop::drop(&mut value);
+}
+
+let moved = value;
+```
+
+Before Rust 1.96, the last move was considered undefined behaviour. The inner `Box` had already been dropped, and moving the surrounding `ManuallyDrop` copied a value whose `Box` bytes no longer represented a live allocation.
+
+From Rust 1.96 onward, this specific move is no longer undefined for that reason. The [Rust 1.98 release notes](https://doc.rust-lang.org/releases.html#version-1980-2026-08-20) record the documentation change, not a licence to use the dropped value again.
+
+That distinction is the whole article in one line:
+
+```text
+moving the wrapper is now allowed
+accessing the dropped value is still wrong
+```
+
+## `ManuallyDrop` does not track state for me
+
+`ManuallyDrop<T>` prevents Rust from calling `T::drop` automatically. It does not remember whether I called `ManuallyDrop::drop`, and its type does not become different afterward.
+
+I can therefore create an object that looks ordinary to safe code but contains a dead value:
+
+```rust
+use std::mem::ManuallyDrop;
+
+#[derive(Debug)]
+struct Slot<T> {
+    value: ManuallyDrop<T>,
+    live: bool,
+}
+```
+
+If unsafe code drops `value` and sets `live` to false, the derived `Debug` implementation does not inspect that flag. It tries to format `value`. The standard documentation calls out the same class of hazard for derived `Debug`, `Clone`, `Hash`, and other traits that may read the field.
+
+This is why I do not review such a wrapper by looking only at its destructor. I review every safe operation exposed after the manual drop.
+
+## The generic public wrapper is the dangerous shape
+
+A private wrapper around one known type can have a small, auditable state machine. A public generic wrapper is different. Its caller may choose `Box<U>`, a type containing references, or a type with a destructor I did not expect.
+
+The risky API usually has this shape:
+
+```rust
+pub struct OptionalValue<T> {
+    value: ManuallyDrop<T>,
+    live: bool,
+}
+
+impl<T> OptionalValue<T> {
+    pub fn clear(&mut self) {
+        if self.live {
+            unsafe { ManuallyDrop::drop(&mut self.value) };
+            self.live = false;
+        }
+    }
+}
+```
+
+The `clear` method is not enough. I must prevent safe access when `live` is false, prevent an automatic trait implementation from reading the field, make `Drop` handle the state exactly once, and consider panic paths. If the type crosses a public boundary, these obligations are imposed on every future method too.
+
+In normal product code, I prefer `Option<T>`:
+
+```rust
+pub struct OptionalValue<T> {
+    value: Option<T>,
+}
+
+impl<T> OptionalValue<T> {
+    pub fn clear(&mut self) {
+        let _ = self.value.take();
+    }
+}
+```
+
+It costs me much less reasoning. The empty state exists in the type, safe code cannot borrow a missing value, and ordinary drop glue does the correct thing.
+
+## How I check the historical rule
+
+For a rule like this, I use two forms of evidence.
+
+First, I pin the documentation to releases. The current docs identify the pre-1.96 boundary, while the 1.98 release notes explain why the paragraph appears now. This avoids saying “changed in 1.98” because a recent release note mentioned it.
+
+Second, I keep the smallest reproduction as a Miri fixture:
+
+```rust
+fn main() {
+    use std::mem::ManuallyDrop;
+
+    let mut value = ManuallyDrop::new(Box::new(42_u32));
+    unsafe { ManuallyDrop::drop(&mut value) };
+    let _moved = value;
+}
+```
+
+I run the fixture with a current nightly using `cargo +nightly miri run`. Miri is useful evidence for executions it rejects, but a clean run is not a proof that all unsafe code is sound. For historical comparison I keep the compiler/Miri commit beside the result; “nightly” without a date is not reproducible.
+
+## What I still reject in review
+
+The fixed move rule does not make these operations valid:
+
+- dereferencing the inner `Box` after manual drop;
+- dropping the same value twice;
+- deriving a trait that reads a manually dropped field;
+- returning a safe reference without first proving the field is live;
+- using a boolean state that can disagree with the actual initialization state;
+- assuming Miri acceptance replaces a written safety argument.
+
+If I truly need manual initialization rather than manual destruction, `MaybeUninit<T>` may communicate the state more accurately. If I need ordinary optional ownership, `Option<T>` is almost always clearer. My article on [initializing arrays with `MaybeUninit`](/blog/initializing-arrays-with-maybeuninit-without-leaking-partial-progress) shows how much care is needed even when that type is the right choice.
+
+## The lesson I keep
+
+Rust's unsafe-code rules become more precise over time. That is good, but it creates a documentation archaeology problem. A once-correct warning can become historical, while a nearby warning remains fully current.
+
+So I do not repeat “`ManuallyDrop<Box<T>>` cannot be moved after drop” anymore. I say the precise thing: this move was considered undefined before 1.96, Rust 1.98 finally documents that it was fixed, and reading or dropping the dead value remains unsound.
+
+That sentence is longer. It is also the kind of precision I want when a few lines of unsafe Rust carry the safety of a much larger system.

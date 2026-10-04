@@ -1,0 +1,297 @@
+---
+title: "Lending Async Callbacks With Rust's AsyncFn Traits"
+date: "2026-09-08T09:00:00+01:00"
+tags: ["rust", "async rust", "asyncfn", "closures", "lifetimes"]
+draft: false
+reviewed: true
+reviewedHash: "1c0984c166ea532636e97883e82a01eb123ad31d528226435a82d67fde011e67"
+cluster: "rust-under-the-hood"
+campaign: "authority-2026"
+opportunity: "RUST-030"
+summary: "The usual Fn(&T) -> Fut bound cannot describe a future borrowing from each call. See how AsyncFn enables lending callbacks on stable Rust."
+---
+
+Passing a synchronous callback in Rust is comfortable:
+
+```rust
+fn visit<F>(items: &[String], callback: F)
+where
+    F: Fn(&str),
+{
+    for item in items {
+        callback(item);
+    }
+}
+```
+
+The first async translation used for many years adds a future type:
+
+```rust
+async fn visit<F, Fut>(items: &[String], mut callback: F)
+where
+    F: FnMut(&str) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    for item in items {
+        callback(item).await;
+    }
+}
+```
+
+This works for many callbacks. Then it fails exactly when the returned future needs to borrow the `&str`, or when an async closure needs to borrow its own captured state.
+
+The error can look like a compiler limitation around "not general enough." The real issue is that `Fut` means one type, while a lending callback needs a family of future types indexed by the lifetime of each call.
+
+## One call, one short borrow
+
+Each loop iteration creates a new borrow:
+
+```text
+iteration 1: &'call_1 str -> Future<'call_1>
+iteration 2: &'call_2 str -> Future<'call_2>
+iteration 3: &'call_3 str -> Future<'call_3>
+```
+
+The future must be allowed to contain the reference until that call is awaited. The next iteration can use a different lifetime.
+
+The old two-parameter bound says something less flexible:
+
+```text
+F:   FnMut(&str) -> Fut
+Fut: Future<Output = ()>
+```
+
+There is one selected `Fut` type for the entire generic function. It has no lifetime parameter connected to the particular input borrow.
+
+I can make the function bound higher-ranked:
+
+```rust
+F: for<'a> FnMut(&'a str) -> Fut
+```
+
+But `Fut` is still outside `for<'a>`. It cannot become `Fut<'a>`. The bound quantified the input and forgot to quantify the output family.
+
+## `AsyncFnMut` connects the call to its future
+
+On stable Rust, use the async-aware call traits:
+
+```rust
+use std::ops::AsyncFnMut;
+
+async fn visit<F>(items: &[String], mut callback: F)
+where
+    F: AsyncFnMut(&str),
+{
+    for item in items {
+        callback(item).await;
+    }
+}
+```
+
+The elided reference in the bound is higher-ranked for the calls the function makes. More importantly, `AsyncFnMut` has a call-future family that may borrow from the callback and its arguments for the lifetime of each call.
+
+An async function works directly:
+
+```rust
+async fn print_length(value: &str) {
+    std::future::ready(()).await;
+    println!("{} has {} bytes", value, value.len());
+}
+
+async fn example() {
+    let values = vec![String::from("rust"), String::from("borrow")];
+    visit(&values, print_length).await;
+}
+```
+
+No boxing and no invented `'static` lifetime are needed.
+
+## The closure can lend its own captured state
+
+The bigger improvement appears with mutable captures:
+
+```rust
+use std::ops::AsyncFnMut;
+
+async fn visit<F>(items: &[String], mut callback: F)
+where
+    F: AsyncFnMut(&str),
+{
+    for item in items {
+        callback(item).await;
+    }
+}
+
+async fn collect_lengths(items: &[String]) -> Vec<usize> {
+    let mut lengths = Vec::new();
+
+    visit(items, async |item| {
+        std::future::ready(()).await;
+        lengths.push(item.len());
+    })
+    .await;
+
+    lengths
+}
+```
+
+The async closure borrows `lengths` mutably. Each call returns a future that keeps a reborrow of that capture until the call completes. After `.await`, the borrow ends and the next call can begin.
+
+A regular closure returning an async block often cannot express this:
+
+```rust
+// This shape commonly fails because a captured reference escapes the FnMut
+// closure body inside the returned future.
+visit_old(items, |item| async {
+    lengths.push(item.len());
+}).await;
+```
+
+The ordering of the keywords matters:
+
+- `async |item| { ... }` is an async closure with lending call semantics;
+- `|item| async { ... }` is a regular closure returning an async block.
+
+They can behave differently even when they look almost identical.
+
+## Why this is called lending
+
+An ordinary `FnMut` call cannot return a value borrowing from the closure itself in a way that outlives the call to `call_mut`. Its associated `Output` type has no lifetime parameter tied to that temporary borrow of `&mut self`.
+
+Conceptually, `AsyncFnMut` can do this:
+
+```rust
+trait RoughAsyncFnMut<Arg> {
+    type Output;
+    type CallFuture<'a>: Future<Output = Self::Output>
+    where
+        Self: 'a;
+
+    fn call<'a>(&'a mut self, argument: Arg) -> Self::CallFuture<'a>;
+}
+```
+
+The real standard-library trait uses compiler-supported calling conventions and details that application code should not implement manually. The sketch shows the important part: `CallFuture<'a>` may borrow `self` for `'a`.
+
+The callback lends access to its state to the returned future. The state comes back, in the borrow-checker sense, when that future is dropped after completion or cancellation.
+
+## Choosing `AsyncFn`, `AsyncFnMut`, or `AsyncFnOnce`
+
+The family follows the familiar closure traits:
+
+| Bound         | Calls allowed                     | Typical capture behavior  |
+| ------------- | --------------------------------- | ------------------------- |
+| `AsyncFn`     | Repeated through shared access    | Reads captures            |
+| `AsyncFnMut`  | Repeated through exclusive access | Mutates captures          |
+| `AsyncFnOnce` | One consuming call                | Moves captured values out |
+
+Choose the weakest promise your algorithm needs.
+
+My sequential `visit` accepts `AsyncFnMut` because it may update callback state between calls. An operation that invokes the callback concurrently usually needs shared callable access plus additional `Send` and `Sync` requirements, or it must create independent owned callbacks.
+
+Changing `AsyncFnMut` to `AsyncFn` is not only a nicer bound. It changes what captures and concurrency patterns are possible.
+
+## Lending also creates a concurrency limit
+
+This loop is sequential:
+
+```rust
+for item in items {
+    callback(item).await;
+}
+```
+
+Each `AsyncFnMut` call borrows the callback mutably until its future finishes. I cannot create several of those call futures and keep them alive together, because that would require overlapping mutable borrows of the callback.
+
+This is a feature of the contract. If callbacks must run concurrently, their state cannot be one ordinary mutable capture lent to all in-flight calls.
+
+Possible designs include:
+
+- use `AsyncFn` with shared, synchronised state;
+- clone an owned callback or owned per-call state;
+- have each call return data and combine it after concurrent execution;
+- keep the sequential API when ordering and mutation are intentional.
+
+Do not add a mutex automatically. First decide whether concurrency is part of the operation.
+
+## The returned future can still have missing bounds
+
+An `AsyncFn` bound tells me the callback is async-callable and may lend. It does not automatically promise that every returned call future is `Send`.
+
+This matters when an API wants to pass the call future to a multithreaded executor instead of awaiting it locally. Expressing additional bounds on the call-future family has historically required unstable return-type notation or a different API shape.
+
+The simple `visit` function avoids this problem because it polls the callback future inside its own task. Whether the enclosing `visit` future is `Send` then depends on all state it holds across await, including the callback and its call future.
+
+If a public API promises spawning, document and test the `Send + 'static` requirements separately. Do not assume they follow from the word async.
+
+## Dynamic dispatch is another separate choice
+
+The async call traits are not dyn-compatible. This does not affect ordinary generic use:
+
+```rust
+async fn run<F: AsyncFn()>(callback: F) {
+    callback().await;
+}
+```
+
+It does affect APIs wanting `Box<dyn AsyncFn()>`. They need type erasure through a boxed future, a purpose-built object-safe trait, or another adapter. That may introduce allocation and explicit lifetime bounds.
+
+Static generic dispatch and lending solve one problem. Runtime polymorphism solves another. Keeping them separate makes the API easier to reason about.
+
+## A stable spelling detail
+
+You may see proposals and RFC text using this elegant syntax:
+
+```rust
+F: async FnMut(&str)
+```
+
+On current stable Rust, the `async` modifier on an `Fn` bound remains unstable. The stable spelling is the desugared trait name:
+
+```rust
+use std::ops::AsyncFnMut;
+
+F: AsyncFnMut(&str)
+```
+
+Async closures themselves, written `async |args| { ... }`, and the `AsyncFn*` bounds have been stable since Rust 1.85. Low-level associated methods and some ways of naming the returned future remain restricted. This is one place where checking the current compiler matters more than copying old examples.
+
+## A practical migration
+
+When an older API has this shape:
+
+```rust
+async fn apply<F, Fut>(callback: F)
+where
+    F: FnMut(&Record) -> Fut,
+    Fut: Future<Output = Result<(), Error>>,
+```
+
+and borrowed async callbacks fail, try this shape:
+
+```rust
+use std::ops::AsyncFnMut;
+
+async fn apply<F>(mut callback: F)
+where
+    F: AsyncFnMut(&Record) -> Result<(), Error>,
+```
+
+Then call it with an async function or `async |record| { ... }` closure.
+
+Before changing a public library API, consider minimum supported Rust version and semver. Removing the explicit `Fut` generic parameter changes the signature and can affect callers that name generic arguments.
+
+## The model to keep
+
+The classic `Fn(Arg) -> Fut` pattern chooses one future type. A lending async callback needs a future type connected to the borrow lifetime of each call—and sometimes to a borrow of the callback itself.
+
+`AsyncFn`, `AsyncFnMut`, and `AsyncFnOnce` carry that connection. They remove many boxes and lifetime workarounds, but they do not erase real constraints around mutation, concurrency, `Send`, or dynamic dispatch.
+
+The model is simple when written out: every call borrows, returns a future carrying that borrow, and gives the borrow back when the future is finished or dropped.
+
+## Further reading
+
+- [`AsyncFn` in the standard library](https://doc.rust-lang.org/std/ops/trait.AsyncFn.html)
+- [Async closure types in the Rust Reference](https://doc.rust-lang.org/reference/types/closure.html#async-closure-traits)
+- [RFC 3668: async closures and lending callbacks](https://rust-lang.github.io/rfcs/3668-async-closures.html)
+- [Higher-ranked trait bounds in the Rust Reference](https://doc.rust-lang.org/reference/trait-bounds.html#higher-ranked-trait-bounds)

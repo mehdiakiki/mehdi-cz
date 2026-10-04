@@ -1,0 +1,113 @@
+---
+caseId: "RFA-067"
+title: "E0119: Why a Rust Blanket Impl Conflicts With a Specific Impl That Does Not Match Yet"
+date: "2026-09-05T08:35:00+01:00"
+lastmod: "2026-09-05T08:35:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "cd0c6acb9df1206b28f4d728b22c839d5c877615c111a85a0fe2e03b3a8a97ba"
+area: "diagnostics-macros"
+symptom: "A concrete trait implementation conflicts with a blanket implementation even though its current where-clause is not satisfied."
+summary: "Coherence protects programs from overlap created by future upstream implementations. A local newtype closes the part of the type relationship your crate controls and provides a stable place for specialized behavior."
+rustVersions: ["Rust 1.98.1"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust E0119 conflicting implementations upstream crates may add impl",
+    "blanket impl conflicts with specific impl future",
+    "Rust coherence newtype overlap",
+  ]
+evidence: ["Rust 1.98.1 compile failure", "future-overlap proof", "local-newtype repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/error_codes/E0119.html",
+    "https://doc.rust-lang.org/reference/items/implementations.html#trait-implementation-coherence",
+  ]
+---
+
+This pair looks disjoint with today's standard library:
+
+```rust
+use std::fmt::Display;
+
+trait Encode {}
+
+impl<T: Display> Encode for T {}
+impl Encode for Vec<u8> {}
+```
+
+`Vec<u8>` does not currently implement `Display`, but Rust 1.98.1 reports E0119: conflicting implementations of `Encode` for `Vec<u8>`. The diagnostic adds an important note:
+
+```text
+upstream crates may add a new impl of trait `Display` for type `Vec<u8>`
+in future versions
+```
+
+The [failing fixture](/rust-failure-atlas/evidence/RFA-067/fail.rs) records this exact future-overlap check.
+
+## Coherence must survive compatible dependency evolution
+
+`Display` and `Vec` are both defined by the standard library, an upstream crate from the perspective of this program. That crate owns both the trait and type, so a future Rust release is allowed to add `impl Display for Vec<u8>`.
+
+If that happened, the blanket implementation would start applying to `Vec<u8>`. The compiler would then have two `Encode` implementations for the same type and no stable rule for choosing one. Rust rejects the ambiguity now so an ordinary dependency update cannot silently change trait selection.
+
+The [Reference coherence rules](https://doc.rust-lang.org/reference/items/implementations.html#trait-implementation-coherence) cover both direct overlap and orphan restrictions. E0119 is not only comparing the implementations available in the current build; it preserves uniqueness under implementations that another owning crate is allowed to add.
+
+## A local newtype closes the future-overlap hole
+
+I can give the byte-vector behavior a local identity:
+
+```rust
+struct Bytes(Vec<u8>);
+
+impl Encode for Bytes {}
+```
+
+The blanket `impl<T: Display> Encode for T` remains. But upstream crates cannot implement their foreign `Display` trait for my local `Bytes` type because they own neither side. Only this crate can later add `Display for Bytes`, and the conflict would be visible where that change is made.
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-067/fixed.rs) proves that `Bytes` satisfies `Encode` while preserving the blanket implementation on Rust 1.98.1.
+
+The wrapper is also a good place to enforce byte-specific invariants and expose only intended conversions. It is more than a coherence trick when bytes have domain meaning.
+
+## Removing the where-clause does not specialize the blanket
+
+Stable Rust does not generally choose a “more specific” implementation in the style of languages with overlapping instance priorities. The trait system needs one unambiguous implementation. Reordering the impl blocks or placing the specific impl first has no effect.
+
+Nightly specialization features have their own restrictions and stability story. I do not make a public library depend on them merely to repair an overlap that a clearer trait boundary can avoid.
+
+## Narrow the blanket when the domain is actually narrow
+
+`impl<T: Display> Encode for T` says that every displayable type has one natural encoding. That may already be too broad. Display text is designed for user-facing formatting and does not promise a stable machine representation.
+
+An explicit local marker trait can define the supported set:
+
+```rust
+trait TextValue: Display {}
+impl TextValue for String {}
+impl TextValue for u64 {}
+
+impl<T: TextValue> Encode for T {}
+```
+
+Because the local crate controls `TextValue`, its future implementation surface is deliberate. This can produce a better API than wrapping every exception.
+
+## Negative reasoning is limited on purpose
+
+The source author may reason, “Vec does not implement Display, so the blanket cannot match.” In an open ecosystem, absence of an implementation is not always a permanent fact. Rust's coherence model allows safe separate compilation by restricting which negative assumptions one crate can make about another crate's future.
+
+This also explains why changing a foreign dependency can surface a conflict in code that did not change. The dependency may have added an implementation it owns, expanding one blanket set.
+
+## My overlap worksheet
+
+For each impl I write its possible self-type set:
+
+```text
+blanket: every T where T: Display
+specific: exactly Vec<u8>
+possible intersection: Vec<u8> if Display is added upstream
+```
+
+Then I mark who owns the trait and each nominal type. If another crate owns enough pieces to make the intersection real later, I avoid relying on its current emptiness.
+
+The official [E0119 explanation](https://doc.rust-lang.org/error_codes/E0119.html) introduces conflicting implementations with an unconditional blanket. This case is harder because the overlap is only possible in the future. The compiler's upstream note is the key: the program must have one trait implementation not just today, but across changes that Rust's ownership rules permit dependencies to make.

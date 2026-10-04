@@ -1,0 +1,111 @@
+---
+caseId: "RFA-174"
+title: "Why OnceLock::get Returns None During Initialization"
+date: "2026-09-05T17:13:00+01:00"
+lastmod: "2026-09-05T17:13:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "a410a92bd0e6d4ee613e84e0262b70092d67b2e301190a824a3267eae5ca25c4"
+area: "concurrency-memory"
+symptom: "OnceLock::get returns None while another thread is inside get_or_init, although the value will become initialized moments later."
+summary: "OnceLock::get is an observation that never blocks, so initialization in progress still appears unavailable. Use wait when blocking is intended, or get_or_init when the caller owns the initialization path."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets with std threading"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust OnceLock get None during initialization",
+    "OnceLock get does not wait get_or_init",
+    "OnceLock wait for another thread initializer",
+  ]
+evidence:
+  ["Rust 1.98.1 channel-coordinated initialization", "non-blocking get", "OnceLock::wait repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/std/sync/struct.OnceLock.html#method.get",
+    "https://doc.rust-lang.org/std/sync/struct.OnceLock.html#method.wait",
+    "https://doc.rust-lang.org/std/sync/struct.OnceLock.html#method.get_or_init",
+  ]
+---
+
+`OnceLock<T>` gives me one value that can be initialized once and read many times. The surprising part is that “being initialized” and “available from `get`” are not the same state.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-174/fail.rs) starts initialization on another thread and pauses inside the initializer using channels. At that exact point, the main thread calls `get()`. It receives `None`, even though initialization is actively running and will soon produce a value.
+
+No sleep is involved, so the case tests a known state instead of hoping the scheduler creates the right timing.
+
+## `get` is deliberately non-blocking
+
+[`OnceLock::get`](https://doc.rust-lang.org/std/sync/struct.OnceLock.html#method.get) returns `Some(&T)` only after the cell is initialized. Its documentation explicitly says it never blocks. While initialization is in progress, it returns `None`.
+
+I find it useful to model three observations:
+
+```text
+uninitialized   get() -> None
+initializing    get() -> None
+initialized     get() -> Some(&T)
+```
+
+The first two states are intentionally indistinguishable through `get`. This keeps a read-only probe cheap and prevents an innocent status check from unexpectedly parking a thread.
+
+## `wait` expresses the blocking contract
+
+If another part of the program is responsible for initialization and my thread must not proceed without the value, [`OnceLock::wait`](https://doc.rust-lang.org/std/sync/struct.OnceLock.html#method.wait) says that directly.
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-174/fixed.rs) releases the coordinated initializer and calls `wait()`. The call returns a shared reference after the value has been installed.
+
+This is clearer than polling `get()` in a loop. Polling either burns CPU, adds arbitrary sleeping, or recreates a notification mechanism badly. `wait` provides the synchronization operation intended for this state transition.
+
+Of course, blocking forever remains possible if no thread completes initialization. The ownership of startup and its failure policy must still be designed.
+
+## `get_or_init` has a different responsibility
+
+[`OnceLock::get_or_init`](https://doc.rust-lang.org/std/sync/struct.OnceLock.html#method.get_or_init) is appropriate when the caller can supply the initializer. It returns the existing value or performs initialization itself.
+
+This can simplify lazy global data:
+
+```rust
+let configuration = CELL.get_or_init(load_configuration);
+```
+
+It is not interchangeable with waiting for a separate owner. Passing a second initializer changes the responsibility model and may duplicate side-effect planning, even though only one value is finally stored.
+
+I choose the method from the caller's role:
+
+- `get` when absence is an acceptable immediate observation;
+- `wait` when another owner must publish the value;
+- `get_or_init` when this caller may initialize it.
+
+## Recursive initialization is not a safe shortcut
+
+An initializer should not try to obtain the same cell again. Depending on the exact operation, this can deadlock or otherwise violate the intended initialization flow. I keep the initializer's dependency graph acyclic and pass required inputs directly when possible.
+
+A hidden cycle is more likely when several global cells initialize one another. For startup-heavy systems, one explicit construction phase often gives clearer failure handling than many independently lazy globals.
+
+## Panic and retry need a deliberate policy
+
+If initialization panics, the value is not published. Unlike a poisoned mutex mental model, the cell does not simply expose a partially initialized `T`. A later initialization attempt can occur.
+
+That behaviour preserves memory safety, but retry may be wrong for a side-effecting initializer. It may already have opened a resource, written external state, or registered something before panicking. I keep fallible work outside the final publication step when I need transactional behaviour.
+
+For recoverable initialization errors, an API and type that can represent the error explicitly is usually clearer than panicking inside `get_or_init`.
+
+## This is also a latency decision
+
+Replacing `get` with `wait` is semantically correct only if blocking is acceptable on that thread. A request handler, async executor worker, or event loop may require a different architecture: initialize before serving traffic, propagate readiness asynchronously, or keep an explicit unavailable state.
+
+The standard-library method tells me what the thread does; it cannot choose the service-level latency policy for me.
+
+## My concurrency checklist
+
+When a `OnceLock` read unexpectedly returns `None`, I ask:
+
+1. Is the cell uninitialized or currently initializing?
+2. Is this caller observing, waiting, or allowed to initialize?
+3. Which thread guarantees that initialization completes?
+4. What happens if the initializer panics or never returns?
+5. Is blocking acceptable at this call site?
+6. Does the initializer depend directly or indirectly on the same cell?
+7. Are tests coordinated with channels instead of timing sleeps?
+
+The broad principle is that observation and synchronization are separate operations. `get` observes only a completed value and promises not to wait. `wait` participates in the state transition. Choosing between them makes the concurrency contract visible in the code.

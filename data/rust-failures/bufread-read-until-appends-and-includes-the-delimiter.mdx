@@ -1,0 +1,98 @@
+---
+caseId: "RFA-408"
+title: "BufRead::read_until Appends and Includes the Delimiter"
+date: "2026-09-06T03:48:00+01:00"
+lastmod: "2026-09-06T03:48:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "aab381a56ffc1b4781358bd10ddd74621dfba61267f56106462ae8680f5571de"
+area: "ffi-targets"
+symptom: "read_until leaves the destination's existing exclamation mark and appends ab plus the newline delimiter, returning three newly read bytes."
+summary: "BufRead::read_until does not clear its Vec destination, and when it finds the delimiter that byte is included in both the appended data and returned count. Track the starting length or clear deliberately before parsing a record."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust BufRead read_until appends includes delimiter", "read_until does not clear Vec Rust", "read_until returned count delimiter byte"]
+evidence: ["Rust 1.98.1 Cursor input", "prepopulated destination Vec", "delimiter-inclusive append and remaining suffix"]
+sources: ["https://doc.rust-lang.org/std/io/trait.BufRead.html#method.read_until", "https://doc.rust-lang.org/std/io/trait.BufRead.html#method.skip_until", "https://doc.rust-lang.org/std/io/trait.BufRead.html#method.read_line"]
+---
+
+I passed a non-empty vector to `read_until` and expected the method to replace it with the next record without the separator. Both expectations were wrong.
+
+The [failing fixture](/rust-failure-atlas/evidence/RFA-408/fail.rs) starts the destination with `!` and reads from `ab\ncd`. The result is `!ab\n`, while the returned count is three.
+
+## The destination is an accumulator
+
+[`BufRead::read_until`](https://doc.rust-lang.org/std/io/trait.BufRead.html#method.read_until) appends bytes into the supplied `Vec<u8>`. It does not clear or replace existing contents.
+
+This matches other read-to-buffer APIs that let callers reuse allocation and accumulate pieces. It also means the caller owns record boundaries.
+
+If I want one fresh record per iteration, I call `buffer.clear()` before the read. `clear` removes logical contents while usually retaining capacity, which is useful for repeated lines or frames.
+
+If I intentionally append, I record `start = buffer.len()` and inspect only `&buffer[start..]` as the newly read segment.
+
+## The delimiter is part of the returned data
+
+When the delimiter is found, `read_until` includes it in the buffer. The returned number counts bytes appended by this call, including that delimiter.
+
+For `ab\n`, the count is three, not two. The old `!` is not included in the count because it was present before the call.
+
+These independent quantities are useful:
+
+```text
+old length       = 1
+newly read count = 3
+final length     = 4
+```
+
+On success without concurrent mutation of the vector, `final_len - old_len` should match the returned count.
+
+## EOF can return data without a delimiter
+
+If the reader reaches EOF after reading bytes but before seeing the delimiter, those bytes are returned and counted. A zero count means no bytes were read because EOF was encountered immediately.
+
+Therefore `count > 0` does not prove that the record was terminated. I check whether the newly appended segment ends with the delimiter when the protocol requires complete framing.
+
+This distinction matters for a final text line, truncated network frame, or malformed input. The product policy decides whether an unterminated final segment is accepted.
+
+## Remove the separator only after recognizing it
+
+For a one-byte delimiter, I can test `segment.last() == Some(&delimiter)` and then remove or exclude it. I do not unconditionally pop the last byte, because EOF may have produced an unterminated segment whose final payload byte is meaningful.
+
+For text lines, [`read_line`](https://doc.rust-lang.org/std/io/trait.BufRead.html#method.read_line) provides UTF-8 validation and similar accumulating behavior. It also retains line termination according to its contract. Binary protocols should stay with bytes unless text validity is genuinely required.
+
+## The method can block without a size limit
+
+`read_until` continues until delimiter, EOF, or error. An untrusted peer can send an unlimited record without ever sending the separator.
+
+I place a size policy around external input. Depending on the protocol, I use a limited reader, inspect bounded chunks with `fill_buf`, or reject as soon as accumulated bytes exceed the maximum.
+
+Allocation reuse is not a defense against unbounded growth. A retained vector can also keep the high-water capacity after one exceptional record, so long-lived services may need a shrink or replacement policy.
+
+## Cancellation and partial progress need attention
+
+The documentation discusses error behavior and bytes that may already have been appended. In async equivalents, cancellation can add another boundary. I never assume an error means the destination stayed untouched.
+
+I record the starting length before the operation. On failure, the application can decide whether to retain partial evidence, truncate back to the starting length, or terminate the stream because framing is no longer trustworthy.
+
+That rollback is a domain action, not something implied by the `Result` type.
+
+## skip_until answers a different question
+
+[`BufRead::skip_until`](https://doc.rust-lang.org/std/io/trait.BufRead.html#method.skip_until) consumes through a delimiter without storing the bytes in a caller buffer. Its returned count also includes the delimiter when found.
+
+I use it when discarded framing data is genuinely unnecessary. I use `read_until` when the bytes must be parsed, logged safely, checksummed, or returned to the caller.
+
+Switching to `skip_until` can reduce storage, but it also destroys access to skipped evidence.
+
+## The repaired evidence checks the remainder
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-408/fixed.rs) asserts the complete accumulated vector and then calls `fill_buf` to observe `cd` still unread.
+
+This proves that the operation consumed exactly through the delimiter. It did not pre-consume the next record merely because the underlying Cursor already held those bytes.
+
+My framing tests include delimiter at the start, delimiter at the end, no delimiter before EOF, empty input, a prepopulated destination, and a record longer than the buffer's internal capacity.
+
+## The core principle
+
+A buffered read has several outputs: bytes appended, count returned, delimiter status, and source cursor position. `read_until` appends rather than replaces and includes the delimiter when found. Once I track the starting length and termination state explicitly, record parsing becomes predictable and allocation reuse remains safe.

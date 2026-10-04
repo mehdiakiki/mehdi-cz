@@ -1,0 +1,247 @@
+---
+title: "Null, Missing, Empty, and Default Are Four Different Data States"
+date: "2026-11-16T09:00:00+01:00"
+tags: ["null", "field presence", "API design", "Protobuf", "data contracts"]
+draft: false
+reviewed: true
+reviewedHash: "2140fb30db525b8a974d44e15136551a9426cad2c11f10c32b49564e01283e9e"
+cluster: "reliable-data-integrations"
+campaign: "authority-2026"
+opportunity: "DATA-065"
+summary: "A field can be omitted, explicitly null, empty, or set to its domain default. Collapsing these states causes destructive patches, false history, and lossy format conversions."
+---
+
+For a data field, “there is no useful value” can mean several different things.
+
+```text
+missing: the sender did not provide the field
+null: the sender explicitly provided no value
+empty: the sender provided a value with zero contents
+default: the sender provided or the reader assumed a domain value
+```
+
+These states sometimes produce the same screen. They do not produce the same update, audit record, or migration.
+
+I decide their meaning at the contract boundary before mapping everything into one nullable language field.
+
+## One profile update shows the difference
+
+Assume a stored profile contains:
+
+```json
+{ "display_name": "Mehdi", "marketing_email": true }
+```
+
+These patch requests should not be treated alike:
+
+```json
+{}
+```
+
+```json
+{ "display_name": null }
+```
+
+```json
+{ "display_name": "" }
+```
+
+```json
+{ "marketing_email": false }
+```
+
+My contract might define:
+
+| Input state | Meaning |
+| --- | --- |
+| field missing | leave stored value unchanged |
+| explicit null | clear the value |
+| empty string | invalid, or a meaningful empty label |
+| false | explicitly disable; never treat as missing |
+
+Without this table, a generic truthiness check can turn `false`, `0`, and `""` into accidental omission.
+
+## JSON null is a value; absence is syntax
+
+[RFC 8259](https://www.rfc-editor.org/rfc/rfc8259) defines `null` as one of JSON's values. It does not define application-level patch meaning.
+
+These objects are observably different:
+
+```json
+{}
+{ "middle_name": null }
+```
+
+Many programming-language decoders map both to `Option::None`, `null`, or `nil`. That model has already lost presence.
+
+For updates, I use a three-state wrapper:
+
+```rust
+enum Patch<T> {
+    Missing,
+    Null,
+    Value(T),
+}
+```
+
+An empty string remains a possible `Value(String::new())`, so the domain validator can accept or reject it deliberately.
+
+## GraphQL makes the distinction visible
+
+GraphQL input coercion distinguishes an omitted input field from a field explicitly supplied as `null`. The [GraphQL specification's input-object rules](https://spec.graphql.org/September2025/#sec-Input-Objects) describe this difference because defaults and non-null types depend on it.
+
+An optional argument may have three useful states:
+
+```text
+argument omitted
+argument present with null
+argument present with value
+```
+
+The generated resolver type must retain these states if the operation is a patch. A framework that gives the resolver only one nullable value may need a presence-aware input wrapper.
+
+## Protobuf can collapse absent into default
+
+In proto3 implicit-presence scalar fields, reading an absent number returns its default, zero. The API cannot tell whether a writer sent zero or omitted the field.
+
+```proto
+message RetryPolicy {
+  int32 max_attempts = 1;
+}
+```
+
+Does `max_attempts == 0` mean:
+
+```text
+not specified; apply service default
+disable retries
+invalid input
+```
+
+The bytes alone may not answer. Protobuf's [field-presence guidance](https://protobuf.dev/programming-guides/field_presence/) recommends explicit presence for proto3 basic types when presence matters.
+
+```proto
+message RetryPolicy {
+  optional int32 max_attempts = 1;
+}
+```
+
+Repeated fields still generally do not distinguish absent from empty. If “not supplied” and “replace with empty list” are different operations, I use a patch envelope or `FieldMask` rather than depending on the repeated field alone.
+
+## Database null adds another contract
+
+SQL `NULL` is not automatically the same as API `null`.
+
+A database column may be null because:
+
+```text
+the fact is unknown
+the fact is not applicable
+the record predates the field
+the migration has not completed
+the user explicitly cleared it
+an ingestion error discarded it
+```
+
+One bit cannot explain all of these causes. When the distinction affects business decisions, I add a status or provenance field:
+
+```text
+phone_number
+phone_number_state = unprovided | verified | invalid | cleared
+phone_number_observed_at
+```
+
+This is more verbose and much easier to audit.
+
+## Defaults belong to a version and a layer
+
+Defaults can be applied by:
+
+```text
+client form
+API gateway
+schema decoder
+domain service
+database
+read-time presentation
+```
+
+Applying the same-looking default in two layers can change meaning. A client may omit `page_size`, the server chooses 50 today, and a stored request later replays after the default becomes 100.
+
+I materialize behaviour-affecting defaults when accepting the operation and record the policy version:
+
+```json
+{
+  "requested_page_size": null,
+  "effective_page_size": 50,
+  "policy_version": "pagination-3"
+}
+```
+
+I do not rewrite historical absence as if the old producer explicitly chose the current default. [Why Semantic Versioning Does Not Describe Data Compatibility](/blog/why-semantic-versioning-does-not-describe-data-compatibility) explains why this is a semantic change even when every payload parses.
+
+## Empty collections deserve an operation verb
+
+For a full replacement endpoint, an empty array can mean replace the relationship set with nothing:
+
+```json
+{ "members": [] }
+```
+
+For a merge patch, omission may mean no change. For an append endpoint, the same empty array may be a no-op.
+
+I name the operation:
+
+```text
+replace_members([])
+add_members([])
+remove_members([])
+leave_members_unchanged
+```
+
+This is clearer than asking every consumer to infer intent from one field shape.
+
+## A cross-format matrix
+
+Before connecting two systems, I fill this table for each important field:
+
+| State | JSON | GraphQL input | Protobuf scalar | SQL | Domain meaning |
+| --- | --- | --- | --- | --- | --- |
+| missing | key absent | field omitted | absent, maybe implicit | no write | leave unchanged |
+| null | `null` | explicit `null` | usually unset in ProtoJSON | `NULL` | clear or unknown |
+| empty | `""`, `[]`, `{}` | concrete value | default/empty representation | stored empty | valid empty or invalid |
+| default | explicit value or absent | schema/resolver default | implicit getter value | column default | policy decision |
+
+The table exposes lossy bridges. ProtoJSON, for example, accepts `null` for fields and generally leaves them unset; a round trip may erase the sender's distinction.
+
+## Round-trip and patch tests
+
+For each state I test:
+
+```text
+decode -> domain -> encode
+API patch -> persisted value
+JSON -> Protobuf -> JSON
+old writer -> new reader
+new writer -> old reader
+store -> change default -> replay
+```
+
+Assertions cover presence, value, and effect—not only successful parsing.
+
+My destructive-update test starts with every field populated, sends an empty object, and proves that nothing was cleared. Then it sends explicit null for one clearable field and proves that only this field changed.
+
+## My contract checklist
+
+For every optional-looking field, I ask:
+
+- Is absence observable?
+- Does null mean clear, unknown, not applicable, or invalid?
+- Is empty a valid domain value?
+- Where is the default applied and which version owns it?
+- Can every transport and storage layer preserve the distinction?
+- Is this a full replacement, merge, or command?
+- What happens when an older client cannot express one state?
+- Which state appears in audit and replay?
+
+Nullability is a type property. Presence and intent are protocol properties. When I model all four states explicitly, updates stop deleting data by accident and migrations stop inventing facts about the past.

@@ -1,0 +1,179 @@
+---
+title: "Retry Topics Change Ordering: Decide Whether That Is Acceptable"
+date: "2026-10-08T09:00:00+01:00"
+tags: ["kafka retry topic", "event ordering", "message retries", "distributed systems", "event streaming"]
+draft: false
+reviewed: true
+reviewedHash: "883420d149a92aa367b5e794c3cf44ad257a30abdaaa3f41124b185e95400953"
+cluster: "reliable-data-integrations"
+campaign: "authority-2026"
+opportunity: "DATA-044"
+summary: "Moving a failed event to a delayed retry topic lets later events overtake it. Trace the sequence, then choose blocking, key-aware, or order-independent recovery deliberately."
+---
+
+A retry topic solves one problem: a failed message does not block its source partition while waiting for the next attempt.
+
+It creates another problem: later messages can overtake it.
+
+This is not a rare broker edge case. It is the normal consequence of moving one record onto a different timeline.
+
+## Follow three events
+
+Suppose one order produces:
+
+```text
+offset 80: OrderCreated
+offset 81: PaymentAccepted
+offset 82: OrderShipped
+```
+
+The consumer applies `OrderCreated`. `PaymentAccepted` reaches a temporarily unavailable dependency, so the retry framework publishes it to a five-minute retry topic and commits source offset 81.
+
+The source consumer is now free to process offset 82:
+
+```text
+09:00 source: OrderCreated      -> applied
+09:01 source: PaymentAccepted   -> moved to retry-5m
+09:02 source: OrderShipped      -> applied or rejected
+09:06 retry:  PaymentAccepted   -> applied
+```
+
+The broker preserved order inside each partition. The application split one business history across two partitions or topics, so the original sequence no longer controls processing order.
+
+Spring Kafka's [non-blocking retry documentation](https://docs.spring.io/spring-kafka/reference/retrytopic/how-the-pattern-works.html) describes this pattern as forwarding the record to a retry topic and notes the loss of Kafka's ordering guarantee. The framework did what it promised.
+
+## Name the order that the business needs
+
+Before selecting a retry pattern, I write the invariant:
+
+```text
+OrderShipped(version 3) must not apply
+before PaymentAccepted(version 2)
+for the same order.
+```
+
+This is not the same as “the topic must be ordered.” Events for two unrelated orders may proceed independently.
+
+The correct recovery design depends on whether operations commute, whether stale versions can be rejected, and how long one entity may wait.
+
+## Option 1: block the partition
+
+The consumer keeps retrying offset 81 and does not advance the partition position until it succeeds or reaches a terminal decision.
+
+```text
+80 applied
+81 retrying
+82 waiting
+```
+
+This preserves partition sequence. It also creates head-of-line blocking: every unrelated key sharing that partition waits behind one failure.
+
+I use this when ordering is strict, failures are expected to recover quickly, and the maximum blocking time is bounded. An infinite retry is not an ordering strategy; it is a stopped partition.
+
+## Option 2: park one entity, not the whole partition
+
+A key-aware consumer can quarantine `order-17` while continuing other orders. Later events for that key wait in a per-key buffer or durable parking store.
+
+```text
+order-17 v2 failed -> key parked
+order-82 v5       -> continue
+order-17 v3       -> wait behind v2
+```
+
+This preserves entity order with more concurrency, but it is a real stateful subsystem. It needs:
+
+- durable buffered events;
+- per-key sequence and gap detection;
+- memory and storage limits;
+- recovery when the key owner crashes;
+- fairness so one hot key does not starve others;
+- an operational way to inspect and release parked keys.
+
+Calling this “just pause the key” hides most of the work.
+
+## Option 3: let events overtake and make consumers safe
+
+Some domains can accept out-of-order arrival. The consumer may use versions:
+
+```sql
+update orders
+set status = :status,
+    version = :incoming_version
+where order_id = :order_id
+  and version = :expected_previous_version;
+```
+
+If version 3 arrives while the row is still version 1, the update affects zero rows. The consumer records a gap and retries after version 2 appears.
+
+Other safe operations are commutative or naturally idempotent. Adding an element to a set may be independent of arrival order. Replacing an absolute value with “latest timestamp wins” is safe only when that conflict rule matches the business.
+
+This option moves complexity from broker scheduling into state semantics, where it is sometimes easier to reason about.
+
+## Retrying only the failed call can still be wrong
+
+A handler often performs more than one step:
+
+```text
+write database
+call provider
+emit event
+acknowledge input
+```
+
+If the database write commits and the provider call fails, sending the original message to a retry topic may repeat the database effect. Ordering protection does not provide idempotency.
+
+I record which effect completed and give each intended effect a stable identity. Otherwise an ordered duplicate is still a duplicate.
+
+## Preserve identity and key across retry lanes
+
+Every retry record should carry:
+
+```text
+original stream, partition, and position
+original message ID and business key
+attempt number and first-failure time
+next eligible time
+failure classification
+payload hash and schema version
+```
+
+The retry topic should use the same business key when per-key ordering or load distribution depends on it. A framework default that generates a different key can quietly scatter one entity.
+
+Matching the key does **not** restore order between two different topics. It only preserves the intended grouping within each lane.
+
+## A sequence test catches the real bug
+
+I test with a small controlled history:
+
+```text
+v1 succeeds
+v2 fails on first attempt
+v3 arrives while v2 waits
+v2 succeeds on retry
+```
+
+Then I assert the domain outcome for each supported policy:
+
+| Policy | Expected observation |
+| --- | --- |
+| partition blocking | apply v1, v2, v3 |
+| key parking | apply v1; hold v3; apply v2, then v3 |
+| version guard | apply v1; reject/hold v3; apply v2; reconcile v3 |
+| order-independent | final state correct under v1, v3, v2 |
+
+I also crash after retry publication but before committing the source position. The duplicate route must not create two business effects.
+
+## Monitor overtaking, not only retries
+
+Retry counts show pain but not semantic damage. I add signals for:
+
+- sequence gaps by business key;
+- stale versions rejected;
+- parked-key age and buffered-event count;
+- source-to-retry and retry-to-success latency;
+- records reaching a terminal dead-letter state;
+- duplicate effects prevented by the inbox or idempotency layer.
+
+A retry topic is useful when availability of unrelated work matters more than immediate order. It is unsafe when the team assumes both properties remain free.
+
+I choose explicitly: block a partition, coordinate one key, or make the state machine tolerate overtaking. The retry configuration comes after that decision.

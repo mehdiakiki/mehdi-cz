@@ -1,0 +1,75 @@
+---
+caseId: "RFA-674"
+title: "A Valid String Byte Range Becomes Stale After Mutation"
+date: "2026-09-06T08:34:00+01:00"
+lastmod: "2026-09-06T08:34:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "e1c75ac75934bfb5e2dd04b0b92b1ea47a2d400d91230ae7939f69f139ebb294"
+area: "concurrency-memory"
+symptom: "A byte range that was valid for éclair makes replace_range panic after one ASCII character is inserted before it."
+summary: "UTF-8 byte ranges belong to one String revision. A length-changing edit shifts later boundaries, so cache ranges with source identity, apply independent edits from the end, or recompute before mutation."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["String stale byte range after insert replace_range panic", "Rust UTF-8 offsets invalid after mutation", "apply multiple String edits reverse byte order"]
+evidence: ["Rust 1.98.1 runtime panic", "previously valid range shifted inside accented scalar", "current-revision char_indices repair"]
+sources: ["https://doc.rust-lang.org/std/string/struct.String.html#method.replace_range", "https://doc.rust-lang.org/std/primitive.str.html#method.char_indices", "https://doc.rust-lang.org/std/primitive.str.html#method.is_char_boundary"]
+---
+
+`String::replace_range` accepts byte indexes, and each range endpoint must lie on a UTF-8 character boundary for the current value. The [failing fixture](/rust-failure-atlas/evidence/RFA-674/fail.rs) stores `0..2`, a valid range for the first scalar in `éclair`. It then inserts ASCII `A` at the front. Reusing `0..2` now ends inside `é`, so the method panics.
+
+## String indexing is byte-based
+
+Rust guarantees that a `String` contains valid UTF-8. A range mutation cannot leave half of an encoded scalar behind. The [`replace_range` documentation](https://doc.rust-lang.org/std/string/struct.String.html#method.replace_range) therefore rejects ranges whose endpoints are not character boundaries.
+
+Byte indexing keeps slicing constant-time once offsets are known and matches I/O representation. It does not claim that user-visible positions are bytes.
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-674/fixed.rs) performs the insertion first, then uses [`char_indices`](https://doc.rust-lang.org/std/primitive.str.html#method.char_indices) on the new revision to find and replace `é`.
+
+## Character can mean several things
+
+Rust `char` represents a Unicode scalar value. What a user perceives as one visible character can contain several scalars: a base letter plus combining marks, an emoji sequence, or a flag made from regional indicators.
+
+Replacing the first `char` is therefore not always replacing the first grapheme cluster. Display columns are another measurement because some characters occupy two columns and combining marks may occupy none.
+
+I name limits and offsets with units: `byte_end`, `scalar_count`, `grapheme_index`, or `display_columns`. A variable named `position` is too easy to feed into the wrong API.
+
+The standard library handles bytes and scalars. Grapheme segmentation needs a Unicode-aware library and a chosen Unicode version. That dependency is domain logic, not a flaw in String.
+
+## A range needs source provenance, not only two numbers
+
+Protocol offsets and parser spans often are already byte indexes. Before replacement, I validate range order, bounds, and [`is_char_boundary`](https://doc.rust-lang.org/std/primitive.str.html#method.is_char_boundary) for both endpoints. I also verify that the span belongs to the current source revision. Untrusted or stale input should return an error rather than trigger a panic.
+
+If offsets were produced from the same unchanged string by `char_indices`, they are valid. If the string was mutated, cached offsets may be stale even when still in bounds. Each replacement can change later byte positions.
+
+For many edits, I apply non-overlapping ranges from the end toward the beginning or build a new string in one pass. This avoids repeatedly shifting suffixes and invalidating later coordinates.
+
+## Replacement text may change byte length
+
+The new string slice can have a different byte length from the removed range. `String` grows or shrinks and may reallocate. Existing references prevent mutation in safe code, but stored numeric offsets receive no automatic adjustment.
+
+When spans belong to a parser or editor, I associate them with a source revision. Applying a span to another revision should fail explicitly. For small transformations, iterator-based reconstruction can be simpler than maintaining an offset map.
+
+Capacity planning can reduce allocation when the output size is predictable. It does not relax UTF-8 boundary rules or make old indexes stable.
+
+## ASCII-only tests hide this failure
+
+Replacing `a` in `apple` with range `0..1` works because ASCII scalars use one byte. A test suite containing only English ASCII cannot detect character-count confusion.
+
+I include a two-byte scalar, a four-byte emoji, combining text when graphemes matter, empty input, and end-of-string ranges. Properties verify that the output remains valid UTF-8 and the intended semantic unit was changed.
+
+Panic tests are suitable for trusted internal preconditions. Public parsing and editing functions should normally return a specific invalid-range error with the original units.
+
+## My replacement checklist
+
+- Are range values bytes, scalars, graphemes, or display columns?
+- Are both endpoints ordered, in bounds, and character boundaries?
+- Were offsets derived from this exact source revision?
+- Does replacement change the length and invalidate later offsets?
+- Should multiple edits run backwards or rebuild once?
+- Is grapheme-aware behaviour required beyond standard `char` iteration?
+- Does public untrusted input return an error instead of panic?
+- Do tests include non-ASCII and combining examples?
+
+The core principle is that valid text needs boundaries as well as bounds. A byte index can be inside the allocation yet invalid for UTF-8 mutation. I derive offsets from the semantic unit the product uses, then cross into String's byte API with an explicit validated boundary.

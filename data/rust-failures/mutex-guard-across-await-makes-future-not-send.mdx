@@ -1,0 +1,101 @@
+---
+caseId: "RFA-087"
+title: "Why MutexGuard Across await Makes a Future Not Send"
+date: "2026-09-05T09:07:00+01:00"
+lastmod: "2026-09-05T09:07:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "4251f83cac8affed0339309a39bbe4d7b812813b88978cb3dd24fe6982ead6a3"
+area: "async-runtime"
+symptom: "Holding std::sync::MutexGuard across await makes the enclosing future fail a Send requirement."
+summary: "The standard MutexGuard is not Send and a blocking lock should rarely survive a suspension point. Extract the required state inside a lexical scope, unlock, and only then await."
+rustVersions: ["Rust 1.98.1"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust MutexGuard across await future not Send",
+    "std sync mutex guard Tokio spawn",
+    "future cannot be sent MutexGuard",
+  ]
+evidence: ["Rust 1.98.1 compile failure", "suspension-state inspection", "pre-await unlock repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/std/sync/struct.MutexGuard.html",
+    "https://doc.rust-lang.org/std/sync/struct.Mutex.html",
+  ]
+---
+
+This async function looks like it only holds a lock for two lines:
+
+```rust
+use std::sync::Mutex;
+
+async fn read_after_yield(lock: &Mutex<u32>) -> u32 {
+    let guard = lock.lock().unwrap();
+    std::future::ready(()).await;
+    *guard
+}
+```
+
+But those lines cross a suspension point. Requiring the returned future to be `Send` produces a focused error: `std::sync::MutexGuard` is not Send and is used across an await. The [failing fixture](/rust-failure-atlas/evidence/RFA-087/fail.rs) captures the Rust 1.98.1 diagnostic.
+
+## The guard becomes part of the future
+
+An await can pause the function. Everything still needed afterward is stored in the future state. Because `guard` is dereferenced after await, the guard and its locked state must survive suspension.
+
+The standard-library [`MutexGuard` documentation](https://doc.rust-lang.org/std/sync/struct.MutexGuard.html) explains that the guard is not Send. On platforms using POSIX mutexes, a lock may need to be released on the same thread that acquired it. Making the guard Send would permit an executor to move the suspended future and later drop the guard on another thread.
+
+The [`Mutex` documentation](https://doc.rust-lang.org/std/sync/struct.Mutex.html) describes the RAII guard: the lock is released when the guard is dropped. Awaiting while it is alive therefore also means keeping the mutex locked while unrelated async work can run.
+
+## Unlock before suspension
+
+The strongest repair usually copies or extracts the required data inside a lexical block:
+
+```rust
+async fn read_after_yield(lock: &Mutex<u32>) -> u32 {
+    let copied = {
+        let guard = lock.lock().unwrap();
+        *guard
+    };
+
+    std::future::ready(()).await;
+    copied
+}
+```
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-087/fixed.rs) proves the future is Send. More importantly, the lock is released before control returns to the executor.
+
+For larger data I may clone a small snapshot, take ownership with `mem::take`, or record an operation to perform after the lock. Each choice has a semantic cost, so I avoid cloning an entire structure just to silence a bound.
+
+## An async mutex is not permission to hold longer
+
+Runtime-provided async mutex guards are often designed to cross await and may be Send. That can be necessary when the protected operation itself contains awaits. It can also create long lock duration, queueing, and deadlocks that the compiler will not diagnose.
+
+I use an async mutex when waiting for the lock must not block an executor thread and when the protected protocol genuinely spans asynchronous operations. I do not switch mutex types solely to make this example compile. If the critical section can be synchronous, keeping it short is simpler.
+
+## The hidden performance failure
+
+`std::sync::Mutex::lock` blocks the operating-system thread during contention. In an async executor, one blocked worker cannot poll other tasks. A low-contention standard mutex can still be appropriate for a very short, non-awaiting critical section. The dangerous combination is contention plus long ownership plus suspension.
+
+A compiler Send error sometimes catches this architecture early. On a single-thread executor the same code might compile and still hold a lock while another task waits forever for it.
+
+## Explicit drop versus lexical scope
+
+Writing `drop(guard)` before await is shorter. I prefer a block for critical sections because it prevents later code from accidentally extending the guard's lifetime. A debug statement added below `drop` cannot use the guard; a statement inserted above it can silently make the critical section larger.
+
+The scope visually groups the protected operations and gives reviewers a clear unlock boundary.
+
+## Poisoning is a separate decision
+
+The sample uses `unwrap`, which turns a poisoned lock into a panic. That policy is independent of Send. Production code may recover the inner value, propagate an error, or stop because an invariant could be broken. Changing the lock type or scope does not answer the poisoning policy.
+
+I keep these two diagnoses separate: first establish when the guard is alive; then decide how failure while holding the lock should affect the data.
+
+## My debugging sequence
+
+When a spawn call produces a large “future cannot be sent” error, I add a local Send assertion around the smallest future. I follow the compiler note to the guard and await point. Then I list exactly which data is needed after suspension.
+
+If only a number, ID, or immutable snapshot is needed, I extract it and close the scope. If the asynchronous operation must update shared state afterward, I often await first and reacquire the lock to commit, checking that the state has not changed or using a version number.
+
+The key distinction is not merely synchronous versus asynchronous mutex. It is whether a lock guard belongs in suspended future state. Most of the time it does not, and making the unlock point explicit fixes both the Send error and a potential runtime bottleneck.

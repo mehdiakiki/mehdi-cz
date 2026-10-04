@@ -1,0 +1,81 @@
+---
+caseId: "RFA-306"
+title: "Reusing a Command Builder Accumulates Arguments"
+date: "2026-09-06T01:26:00+01:00"
+lastmod: "2026-09-06T01:26:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "2456f11d45c709978f67e67afef2b378fb9a9b0843d181a2f4d87f9b3e7dffae"
+area: "ffi-targets"
+symptom: "A second use of the same process Command receives arguments configured for the first use in addition to the newly appended argument."
+summary: "Command is a reusable mutable process configuration. Calling arg adds to its existing argument list; it does not replace a prior invocation's values. Build a fresh command or reset only the state the API explicitly lets you clear."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust Command reuse arguments accumulate", "Command arg replace existing args", "std process Command builder reused state"]
+evidence: ["Rust 1.98.1 Command inspection", "first and second arg mutations", "fresh-builder repair without process launch"]
+sources: ["https://doc.rust-lang.org/std/process/struct.Command.html", "https://doc.rust-lang.org/std/process/struct.Command.html#method.arg", "https://doc.rust-lang.org/std/process/struct.Command.html#method.get_args"]
+---
+
+I cached a `Command` builder because the executable and environment were common across several calls. For the first operation I added `first`; for the next I added `second`. The second process received both arguments. I had reused a configuration object as if it represented only the next invocation.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-306/fail.rs) does not need to launch a process. It inspects the builder after two `arg` calls and finds `first, second`, not only `second`.
+
+## Command is mutable configuration, not a consumed request
+
+[`std::process::Command`](https://doc.rust-lang.org/std/process/struct.Command.html) is a process builder. Its setters generally take `&mut self` and retain configuration. The same builder can be used to spawn multiple processes.
+
+[`Command::arg`](https://doc.rust-lang.org/std/process/struct.Command.html#method.arg) appends one argument. It does not mean “set the argument for the next spawn,” and spawning does not consume or automatically reset the builder.
+
+This reuse can be helpful. A test may run the same fully configured command several times. A supervisor may retain stable environment and working-directory settings. The failure comes from mixing stable base configuration with per-invocation mutation and assuming the latter disappears.
+
+## Different setters have different replacement rules
+
+Not every builder property accumulates in the same way. Adding arguments grows the list. Setting the current directory replaces the previous directory. Environment methods can set, remove, or clear selected state according to their own contracts. Standard stream configuration replaces the corresponding stream policy.
+
+I do not infer a universal “last setter wins” rule from the builder syntax. I read each method's mutation semantics and inspect the finished configuration where accessors exist.
+
+[`get_args`](https://doc.rust-lang.org/std/process/struct.Command.html#method.get_args) returns the explicitly configured arguments. Similar inspection methods exist for program, current directory, and environment changes. They are useful for tests and diagnostic logs before crossing the process boundary.
+
+## A fresh builder makes invocation ownership clear
+
+My usual repair is a function that constructs a new command for each logical invocation:
+
+```rust
+fn tool_command(task: &str) -> Command {
+    let mut command = Command::new("tool");
+    apply_common_configuration(&mut command);
+    command.arg(task);
+    command
+}
+```
+
+The common configuration remains centralized, but temporary arguments belong to one builder. This also reduces accidental leakage of environment overrides, piped handles, and working directories between operations.
+
+I avoid cloning a `Command` as an imagined reset mechanism; the type does not provide ordinary `Clone`. An explicit factory is easier to audit.
+
+## Shell command strings are a separate abstraction
+
+`Command::new("tool").arg("a b")` passes one argument containing a space. It does not ask a shell to split or interpret that text. This is normally safer and more predictable than concatenating a shell command.
+
+Builder accumulation is about the argument vector, not string parsing. Logging only a reconstructed shell-like string can make the bug hard to see because quoting rules differ between platforms. I log the program and each `OsStr` argument as separate structured fields, with careful redaction for secrets.
+
+If a shell is genuinely required, I treat the script text and its injection rules as a different security boundary.
+
+## Reuse can leak more than arguments
+
+A command may contain environment variables, removals, a current directory, standard I/O policies, creation flags, and platform extensions. A cached mutable builder becomes shared history for all of them.
+
+This is particularly risky in a long-lived service processing requests with different credentials or tenants. Even if arguments are cleared through a newer API or custom wrapper, a forgotten environment mutation may remain.
+
+I prefer an immutable application configuration from which a short-lived `Command` is derived. Request-specific secrets live only in that local object and are never printed in full.
+
+## What I test
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-306/fixed.rs) creates one builder per argument and verifies each configuration independently through `get_args`. No external executable behavior can obscure the state transition.
+
+In integration tests I use a helper child program that prints a structured view of its argument vector and selected environment. I cover spaces, empty arguments, non-Unicode operating-system strings where supported, inherited versus cleared environment, current directory, exit status, stdin, and output limits.
+
+When repeated spawning from one builder is intentional, I configure it fully before the loop and perform no per-iteration mutation. If mutation is necessary, I assert the complete state before each spawn rather than testing only the newly added value.
+
+The core principle is that builders retain history according to each method's contract. `Command::arg` appends, and using the builder does not reset it. A fresh builder per logical process request is a small allocation of clarity that prevents old invocation state from crossing a system boundary.

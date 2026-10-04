@@ -1,0 +1,78 @@
+---
+caseId: "RFA-298"
+title: "Command::output Closes Child Stdin by Default"
+date: "2026-09-06T01:18:00+01:00"
+lastmod: "2026-09-06T01:18:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "d19a279188e3ee624c54a38e68e59d5da69012cf932b39a09d37d9ce80b02144"
+area: "ffi-targets"
+symptom: "A child started with Command::output reads immediate EOF from stdin instead of inheriting or receiving the parent's input."
+summary: "Command::output captures stdout and stderr but does not inherit stdin; child reads see a closed stream unless stdin is configured. Use piped stdin with spawn when input must be written, and close the pipe before waiting."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["targets supporting std processes"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust Command output stdin closed", "send stdin with Command output", "Command spawn piped stdin wait_with_output Rust"]
+evidence: ["Rust 1.98.1 self-spawned child", "default immediate stdin EOF", "explicit piped input repair"]
+sources: ["https://doc.rust-lang.org/std/process/struct.Command.html#method.output", "https://doc.rust-lang.org/std/process/struct.Command.html#method.stdin", "https://doc.rust-lang.org/std/process/struct.Stdio.html#method.piped"]
+---
+
+I used `Command::output` because I wanted a child's result in memory. I also expected the child to read input normally. It received EOF immediately and printed nothing.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-298/fail.rs) launches its own executable in a child mode. That child copies stdin to stdout. With `output()`, the collected stdout is empty.
+
+## `output` chooses defaults for capture
+
+[`Command::output`](https://doc.rust-lang.org/std/process/struct.Command.html#method.output) runs the child, waits for completion, and collects stdout and stderr. To make this convenient, those two output streams are captured by default.
+
+Stdin has a different default: it is not inherited. A child read observes the stream closing immediately.
+
+This differs from `spawn()` and `status()`, whose standard streams are inherited by default. Changing only the execution method can therefore change I/O behavior even when the program and arguments remain the same.
+
+## Capturing output does not provide an input channel
+
+The `Output` result contains status, stdout bytes, and stderr bytes after the child has finished. It has no place to provide request bytes before or during execution.
+
+When a child needs input, I configure [`Command::stdin`](https://doc.rust-lang.org/std/process/struct.Command.html#method.stdin) with [`Stdio::piped`](https://doc.rust-lang.org/std/process/struct.Stdio.html#method.piped), call `spawn`, take the `ChildStdin` handle, write the bytes, close that handle, and then call `wait_with_output`.
+
+The repaired fixture follows exactly this sequence.
+
+## Closing the pipe is part of the protocol
+
+Many command-line programs read until EOF. Writing `payload` without closing the parent's pipe leaves the child waiting for more input. If the parent waits for the child while still holding the open writer, both can wait forever.
+
+Taking the handle out of `child.stdin`, writing, and letting it drop signals EOF. For interactive protocols, I keep it open intentionally and use framing rather than EOF, but then I need concurrent reading and a complete shutdown design.
+
+This is not a Rust-specific deadlock. Rust's owned handles make the lifetime visible, which helps locate it.
+
+## Large bidirectional traffic needs concurrency
+
+A child can block writing stdout when the OS pipe buffer fills. A parent can simultaneously block writing a large stdin. Sequentially writing everything and only then reading everything can deadlock.
+
+For bounded small input, the simple sequence can be adequate. For large or streaming input, I drain output concurrently, use threads or asynchronous process I/O, redirect to files, or apply a protocol with bounded messages.
+
+`wait_with_output` handles collecting configured output after the child is running, but my input-writing plan still has to avoid filling one pipe while neglecting another.
+
+## Inheritance can be dangerous too
+
+Explicitly using `Stdio::inherit()` would let a child share the parent's stdin. This is useful for interactive commands but can accidentally let a subprocess consume bytes intended for the parent, hang in a background service, or access an unexpected terminal.
+
+For automation I configure all three standard streams deliberately. Null stdin is suitable for commands that must never prompt. Piped stdin is suitable for controlled bytes. Inherited stdin is a user interaction policy, not a neutral default.
+
+Secrets passed through stdin also need log and lifetime rules. Avoiding command-line arguments can reduce exposure, but it does not make pipe contents automatically secure from every observer on the system.
+
+## Process start success and program success are separate
+
+`output()` returning `Ok(Output)` means the process was started and its result collected. A nonzero exit remains inside `Output::status`, as covered by RFA-173.
+
+I check status before treating stdout as a valid response, and I preserve bounded stderr for diagnostics. An empty stdout might mean closed stdin, program failure, or a legitimate empty result; status and protocol validation distinguish them.
+
+Timeout and cancellation policy also belongs outside `output`, which waits for completion. Long-running or hostile children need a supervised `Child` handle.
+
+## What I test
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-298/fixed.rs) pipes stdin, writes `payload`, closes the writer, waits, and asserts both successful status and exact output. It uses the current executable, so the proof does not depend on a shell or platform-specific utility.
+
+My larger tests cover no input, empty piped input, non-UTF-8 bytes, child failure, large output, stderr, early child exit while writing, and a timeout. I cap collected data when subprocesses are not fully trusted.
+
+The core principle is that process convenience methods bundle I/O policy. `Command::output` is optimized for collecting outputs and deliberately closes default stdin. If input is part of the protocol, I choose `spawn`, configure the pipe, and own its complete write-and-close lifecycle.

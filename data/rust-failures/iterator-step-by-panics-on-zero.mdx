@@ -1,0 +1,80 @@
+---
+caseId: "RFA-252"
+title: "Why Iterator::step_by(0) Panics"
+date: "2026-09-06T00:32:00+01:00"
+lastmod: "2026-09-06T00:32:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "4937317af49c9f10a746ad768f837099592884201aa893c7cd9fc2a77ea67e60"
+area: "concurrency-memory"
+symptom: "Iterator::step_by panics for a dynamic step of zero instead of repeating the current element or returning an empty iterator."
+summary: "A step must be positive so each yielded element advances through the source. Validate dynamic input or carry a nonzero step type, and remember that step_by yields the first element before skipping."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust Iterator step_by zero panic", "step_by step must be nonzero Rust", "validate dynamic iterator stride"]
+evidence: ["Rust 1.98.1 integer range", "captured zero-step panic", "positive-step repair"]
+sources: ["https://doc.rust-lang.org/std/iter/trait.Iterator.html#method.step_by", "https://doc.rust-lang.org/std/iter/struct.StepBy.html", "https://doc.rust-lang.org/std/num/struct.NonZero.html"]
+---
+
+A zero stride sometimes means “do not move” in coordinate code. It cannot have that meaning for Rust's `Iterator::step_by`.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-252/fail.rs) calls `(0..4).step_by(0)` and catches the panic. [`Iterator::step_by`](https://doc.rust-lang.org/std/iter/trait.Iterator.html#method.step_by) requires its step to be greater than zero.
+
+## Zero cannot define a finite traversal
+
+`step_by(n)` yields one item and advances through the underlying iterator by the requested stride. A zero step would either yield the same logical position forever or require the API to invent “disabled iteration” behavior.
+
+An iterator cannot clone or repeat an arbitrary item by default, and returning empty would hide a likely input error. Rust rejects zero as an invalid adapter configuration.
+
+Like zero-sized chunks, this is a progress invariant. Each produced item must correspond to movement through the source.
+
+## The first item is not skipped
+
+For `(0..6).step_by(2)`, the output is `0, 2, 4`. The step describes the distance between yielded items, not how many items to discard before the first yield.
+
+If I need to start after an offset, I combine `skip(offset)` with `step_by(step)` and state both values. Mixing phase and stride in one variable creates indexing errors.
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-252/fixed.rs) rejects zero and proves the positive sequence. In production I return a named validation error rather than `None` when the step came from a user.
+
+## Side effects can occur in skipped elements
+
+The adapter advances the underlying iterator. Depending on the iterator and implementation path, advancing may call `next` on elements that are not yielded. If `next` performs I/O, logging, decoding, or mutation, skipped output does not mean skipped work.
+
+The documentation also leaves room for when advancement work happens, such as during adapter construction or the first call. I do not build correctness around an exact timing of side effects unless the underlying contract guarantees it.
+
+For random-access data, indexing may make cost more predictable. For a general iterator, stride filters output positions, not necessarily source computation.
+
+## Validate before doing expensive setup
+
+If a dynamic zero step is discovered only after opening a file or starting a transaction, the panic may leave avoidable cleanup work. I parse and validate stride at the boundary before constructing the input pipeline.
+
+A [`NonZero`](https://doc.rust-lang.org/std/num/struct.NonZero.html) wrapper can carry the invariant through internal code. The standard method still takes `usize`, so the call extracts `.get()` at one obvious point.
+
+## Repeating is a different operation
+
+If the application truly wants to repeat a value, `iter::repeat`, `repeat_n`, or a generator expresses that policy. Repeating references or owned values has different cloning and lifetime behavior.
+
+Trying to encode repetition as `step_by(0)` confuses traversal with generation. The source iterator may not even be able to reproduce an item once it has moved it out.
+
+## Sampling needs an aliasing policy
+
+Using every nth item is a form of deterministic sampling. It can systematically miss periodic events when the data has the same cycle as the step. This is not a Rust bug, but it is a system-level assumption worth documenting.
+
+For metrics or monitoring, I test different starting offsets or use another sampling method when periodic bias matters. Correct iterator mechanics do not guarantee representative statistics.
+
+## Overflow and size hints remain separate
+
+Large steps may exhaust the input after one item. The adapter's size hint can help allocation, but it is not a promise about side effects or a reason to trust an unbounded configuration.
+
+I cap strides according to the domain when extremely large values likely indicate parsing or unit errors. Nonzero is the library minimum, not necessarily the product maximum.
+
+## What I test
+
+The regression includes zero, one, two, a step larger than input length, empty input, and an iterator whose `next` calls are counted. It asserts values and underlying work separately.
+
+For a mutable or stateful source, I also inspect the remainder after a bounded number of stepped yields. This catches assumptions about how many underlying elements were consumed. Exact-size ranges may be optimized differently from general iterators, so I use a custom counted iterator when the consumption contract itself is under test.
+
+If callers can change stride while processing, I avoid reconstructing adapters over the same source without tracking its current position. The new stride begins from the next remaining item, not from the original index zero.
+
+The core principle is that traversal parameters must allow progress. `step_by(0)` cannot move through a general iterator and cannot safely repeat its values, so Rust panics. Validate the stride, keep starting offset separate, and treat output sampling as distinct from the cost of advancing the source.

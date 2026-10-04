@@ -1,0 +1,122 @@
+---
+title: "When Aho–Corasick Prefilters Help—and When They Hurt"
+date: "2026-09-25T18:10:00+01:00"
+lastmod: "2026-09-05T12:00:00+01:00"
+tags: ["rust", "aho-corasick", "prefilter", "simd", "performance"]
+draft: false
+reviewed: true
+reviewedHash: "8c6f6417b5f77f87e0c03a46712da0a03c3caaa20dbe58dadc73ec78f53f0c33"
+cluster: "rust-under-the-hood"
+campaign: "editorial"
+summary: "A prefilter can skip most automaton work, but it is heuristic rather than free. I show how candidate frequency and pattern shape decide whether it helps a Rust search."
+---
+
+An Aho–Corasick prefilter sounds like an obviously good switch. It searches quickly for a byte or small literal that could belong to a match. If it finds no candidate, the full automaton can skip that region.
+
+The difficult word is “could.” Every candidate must still be verified. When candidates are rare, this is excellent. When candidates appear everywhere, the scanner pays for the prefilter and repeatedly returns to the automaton.
+
+This is why Rust's `aho-corasick` crate enables prefilters heuristically and also allows them to be disabled.
+
+## A prefilter changes the question
+
+Without a prefilter, the searcher advances its automaton through the input. With one, the fast path asks a cheaper question first:
+
+```text
+Is there a byte nearby that makes any pattern possible?
+```
+
+For patterns `Sherlock`, `Moriarty`, and `Watson`, searching for the distinct starting bytes can jump between candidate locations. For another pattern set, the implementation can choose bytes at other positions, preferring bytes estimated to be rare.
+
+The crate's [design document](https://github.com/BurntSushi/aho-corasick/blob/master/DESIGN.md#prefilters) explains these strategies and the fallback to packed multi-substring algorithms for suitable small sets. The SIMD-accelerated byte search comes through the `memchr` ecosystem.
+
+This means “Aho–Corasick performance” may actually include two engines: a candidate finder and the automaton used for verification.
+
+## Candidate frequency predicts useful work
+
+Imagine every pattern contains `z`, and `z` appears once per megabyte in the haystack. A fast byte search can reject large areas without touching the full transition logic for each byte.
+
+Now scan compressed-looking binary data where every byte value occurs frequently, or text where the selected candidate is the space character. The candidate finder stops continually. Each stop adds verification work and control flow.
+
+I therefore measure a candidate-rate approximation beside throughput. Even if the library does not expose its chosen prefilter as a stable public contract, I can construct inputs where likely candidate bytes are rare or common and observe whether the benefit is robust.
+
+I avoid publishing a rule such as “prefilters are always faster for three patterns.” Pattern count is only one input. Length, shared bytes, alphabet, and haystack distribution also matter.
+
+## The default is a good starting point, not evidence
+
+The builder exposes the experiment directly:
+
+```rust
+use aho_corasick::AhoCorasick;
+
+fn build(patterns: &[&str], prefilter: bool) -> AhoCorasick {
+    AhoCorasick::builder()
+        .prefilter(prefilter)
+        .build(patterns)
+        .unwrap()
+}
+
+fn main() {
+    let patterns = ["Sherlock", "Moriarty", "Watson"];
+    let normal = build(&patterns, true);
+    let plain = build(&patterns, false);
+    let haystack = "A quiet page with Watson near its end.";
+
+    assert_eq!(normal.find_iter(haystack).collect::<Vec<_>>(),
+               plain.find_iter(haystack).collect::<Vec<_>>());
+}
+```
+
+I first assert identical matches, then benchmark both variants. The official [`prefilter` builder documentation](https://docs.rs/aho-corasick/latest/aho_corasick/struct.AhoCorasickBuilder.html#method.prefilter) says the optimization can make performance less predictable or suboptimal in some cases. That is exactly why the paired measurement is valuable.
+
+I do not copy a benchmark input into memory inside only one timed branch. Setup, construction, and result collection must be symmetrical.
+
+## Pattern updates can invalidate an old result
+
+Suppose a service begins with three rare signatures and a prefilter wins clearly. Six months later, users add common short patterns. Search slows down even though the code and crate version are unchanged.
+
+The workload changed the useful strategy.
+
+For dynamic dictionaries I keep a small benchmark corpus or production-derived telemetry that can run when a new matcher is built. I record pattern statistics and reject configurations that cross a documented memory or latency budget. I do not expect an old microbenchmark to predict a new pattern set forever.
+
+This is especially important when patterns are tenant-controlled. One customer can supply a corpus whose common bytes generate many candidates. Limits protect construction memory; representative tests protect search latency.
+
+## Prefilters move other costs into view
+
+A successful prefilter can make automaton work much cheaper on mostly negative input. Costs that were previously hidden become significant:
+
+- copying each chunk into an internal staging buffer;
+- function-call and iterator overhead on tiny chunks;
+- emitting or serializing matches;
+- acquiring a lock around shared results;
+- reading from the source;
+- calculating offsets and retaining boundary bytes.
+
+This is not a reason to avoid the optimization. It is a reason to re-profile after applying it. Bottlenecks move.
+
+This also explains why removing a memory copy might show only a modest improvement before the prefilter and a larger relative improvement after it. The copy did not become slower; the rest of the scanner became faster.
+
+## A workload matrix I trust
+
+For each realistic pattern set, I run:
+
+| Input | What it reveals |
+| --- | --- |
+| No candidates | Best opportunity for skipping |
+| Rare candidates, no matches | Verification overhead |
+| Sparse real matches | Normal production shape |
+| Frequent candidates | Prefilter stress case |
+| Dense true matches | Output and reporting cost |
+
+I test at least two haystack sizes so fixed costs do not masquerade as per-byte costs. I record automatic automaton kind, matcher memory, compiler version, CPU, and whether construction is inside the timed region.
+
+The [`memchr` crate documentation](https://docs.rs/memchr/latest/memchr/) also matters when interpreting results: available SIMD routines and runtime CPU feature detection depend on target and crate features. A benchmark from one architecture is not a portable constant.
+
+## My decision rule
+
+I leave prefilters enabled when realistic negative and sparse-match inputs improve without unacceptable regression on candidate-heavy input. I disable them only for a measured, stable workload where the heuristic consistently loses.
+
+If the workload changes often, automatic behavior is usually safer than a permanent assumption. I keep the measurement so a dependency or corpus change can be evaluated again.
+
+The principle is broader than string search: a filter is useful when it rejects enough expensive work to pay for itself. Selectivity, not the attractiveness of the word “SIMD,” decides the result.
+
+The publication-aware [Aho–Corasick article collection](/blog/tags/aho-corasick/page/1) continues from filter choice into pattern-shape experiments. The full zero-copy context is in [Zero-Copy Does Not Mean Zero Memory Access](/blog/zero-copy-does-not-mean-zero-memory-access-aho-corasick-rust).

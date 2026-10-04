@@ -1,0 +1,230 @@
+---
+title: "What Happens When API Data Changes While You Paginate"
+date: "2026-09-12T14:00:00+01:00"
+tags: ["API pagination", "data integration", "cursor pagination", "consistency", "distributed systems"]
+draft: false
+reviewed: true
+reviewedHash: "3d0673c4c7ee56e3bf8db5de676b58a93b66a838f36f0e5adcf863cce456a19a"
+cluster: "reliable-data-integrations"
+campaign: "authority-2026"
+opportunity: "DATA-011"
+summary: "Mutation simulations showing how offset, keyset, and cursor pagination behave when records are inserted, deleted, or updated during a long API scan."
+---
+
+Pagination examples normally use data that stays still:
+
+```text
+request page 1
+request page 2
+request page 3
+done
+```
+
+Production data does not wait for the loop. Records are inserted, deleted, and updated while a long scan moves through pages. The client may finish every request successfully and still duplicate or miss objects.
+
+When I review an API integration, I ask two separate questions:
+
+1. How does the client move to the next page?
+2. What consistency does the provider promise across those pages?
+
+A cursor answers the first question. It does not automatically answer the second.
+
+## Offset pagination can shift underneath the reader
+
+Start with records ordered newest first:
+
+```text
+[A, B, C, D, E, F]
+```
+
+The page size is two. The first request is `offset=0&limit=2`, so the client receives:
+
+```text
+[A, B]
+```
+
+Before the second request, a new record X is inserted at the front:
+
+```text
+[X, A, B, C, D, E, F]
+```
+
+The client asks for `offset=2&limit=2` and receives:
+
+```text
+[B, C]
+```
+
+B is duplicated. The position moved even though B did not.
+
+Deletion creates the opposite problem. Starting again after `[A, B]`, delete A:
+
+```text
+[B, C, D, E, F]
+```
+
+Offset 2 now returns `[D, E]`. C was never observed.
+
+Retries and deduplication can handle the duplicate B. They cannot reconstruct the missing C unless another recovery scan finds it.
+
+## Keyset pagination removes positional shifting
+
+With a stable sort key, the next request can say “continue after the last value” rather than “skip two rows.”
+
+For records ordered by `(created_at, id)`, the condition is conceptually:
+
+```sql
+where (created_at, id) > ($last_created_at, $last_id)
+order by created_at, id
+limit 100
+```
+
+The ID breaks ties when several rows have the same timestamp. Inserts before the last key no longer move the next position.
+
+This is much stronger than offset pagination, but it still has rules:
+
+- the ordering must be total and deterministic;
+- the cursor must include every sort component;
+- filters and sort direction must remain unchanged;
+- null ordering must be defined;
+- the provider must explain what happens when the sort key changes.
+
+If an existing row changes from an old `updated_at` to a new value, it can move from behind the cursor to ahead of it and appear again. Duplicates are expected. If a mutable sort value moves in the other direction, the record can move behind the cursor before being read and may be missed.
+
+I prefer immutable keys for walking a snapshot and a separate change feed for later updates.
+
+## Opaque cursors are contracts, not magic
+
+An API may return:
+
+```json
+{
+  "items": [/* ... */],
+  "next_cursor": "eyJwYWdlIjoyfQ..."
+}
+```
+
+The cursor might contain the last key, a database snapshot identifier, a server-side session, or only an encoded offset. I cannot infer its consistency from its appearance.
+
+I look for explicit documentation:
+
+- Does the cursor represent a consistent snapshot?
+- How long is it valid?
+- Is it bound to the filters and page size?
+- Can pages be requested in parallel?
+- What error indicates expiration?
+- Do new or updated records appear during this traversal?
+- Is a repeated item possible?
+
+I store opaque cursors without decoding or editing them. I also store the account, endpoint, and filter identity they belong to. [A Durable Cursor for Incremental API Synchronization](/blog/a-durable-cursor-for-incremental-api-synchronization) covers crash-safe checkpointing.
+
+## A consistent snapshot is the strongest scan contract
+
+The clearest API contract gives all pages from one logical snapshot. Mutations after the snapshot boundary do not change membership or ordering for that traversal.
+
+Kubernetes provides an instructive example. For a paginated list, the `continue` token carries enough state for the server to continue from a consistent resource version. The documentation says objects created, modified, or deleted after the first request are not reflected in later pages of that snapshot. Its [API concepts](https://kubernetes.io/docs/reference/using-api/api-concepts/) also describe token expiration and how clients recover.
+
+This produces a stable baseline, but it does not remove new changes. The client must continue from the snapshot's resource version through a watch or later incremental read.
+
+I think of it as:
+
+```text
+consistent list = state at boundary P
+change stream   = events after boundary P
+```
+
+That pair is stronger than either pagination or webhooks alone.
+
+## A high-water mark can bound a changing scan
+
+When an API has stable `updated_at` values but no snapshot cursor, I sometimes establish a high-water mark H before the scan:
+
+```text
+scan where updated_at <= H
+order by (updated_at, id)
+then incrementally read updated_at around and after H
+```
+
+The upper bound prevents newly updated records from continuously extending the scan. An overlap around H helps with timestamps that share precision, delayed indexing, or uncertain clocks.
+
+This works only if the API applies the filter consistently and update timestamps change for every relevant mutation. I do not claim snapshot isolation when the provider has not promised it.
+
+## Mutation simulation: four cases
+
+Before trusting a pagination design, I simulate mutations between page requests.
+
+### Insert before the cursor
+
+With offset pagination, this can duplicate a record. With stable keyset pagination, the new record sits before the cursor and is not part of the remaining traversal. It must be collected by a later incremental pass.
+
+### Insert after the cursor
+
+Keyset pagination may include it in the current scan unless a high-water mark or snapshot boundary excludes it. This is not automatically wrong, but it means the scan has no single point-in-time meaning.
+
+### Delete an unread record
+
+Offset pagination may skip another record because positions shift. Keyset pagination continues from the last stable key but never observes the deleted record. If the local system already contains it, absence from this incomplete traversal is not enough to create a tombstone.
+
+### Update the sort key
+
+A record can cross the cursor. It may appear twice or not at all depending on direction and timing. A provider snapshot prevents movement inside the traversal; otherwise an incremental overlap and version-aware apply path must repair it.
+
+These cases make the consistency semantics visible without needing production traffic.
+
+## De-duplicate by source identity and version
+
+Even with a good cursor, I make application idempotent. Networks retry, pages may be fetched again after a crash, and overlap windows intentionally repeat records.
+
+The useful key is not only “have I seen ID 42?” An object can appear again with a newer value. I use provider-scoped identity plus source version when available:
+
+```text
+(provider account, object type, object ID, source version)
+```
+
+Applying the same version again is a no-op. A newer version advances state. An older version cannot overwrite it.
+
+When the provider exposes no version, I compare stable content hashes and keep arrival ordering only as a weaker fallback. Periodic reconciliation becomes more important.
+
+## Never infer deletion from a partial traversal
+
+A very expensive bug is:
+
+```text
+local IDs - IDs observed so far = deleted IDs
+```
+
+This is valid only after a complete, successful scan of the same scope. A rate-limit error, expired token, changed filter, or worker crash makes the observed set incomplete.
+
+I mark every observed object with a scan generation. Only after all pages and partitions finish can the generation authorize absence-based deletion. If any part fails, the previous live state remains and the scan resumes or restarts.
+
+## The test harness I use
+
+A useful fake API supports:
+
+- offset, keyset, and opaque snapshot modes;
+- deterministic insert, delete, and update after request N;
+- cursor expiration;
+- repeated and empty pages;
+- one page that times out after the server produced a response;
+- several rows sharing the same timestamp.
+
+For each strategy, I assert both the final identity set and the latest version per identity. A count is not enough: one missing record and one duplicate can preserve the same count.
+
+I also restart the client after receiving a page but before committing its cursor. A correct client may re-read records, but it does not advance past unapplied data.
+
+## My practical rule
+
+When API data changes during pagination, I do not ask only whether the endpoint uses offset or cursor pagination. I write down the membership, ordering, and expiration contract for the whole traversal.
+
+My preferred order of strength is:
+
+```text
+consistent snapshot cursor + change position
+stable keyset + high-water mark + incremental overlap
+stable keyset + reconciliation
+offset + aggressive deduplication and reconciliation
+```
+
+Sometimes the weakest option is all a provider offers. Then I lower the guarantee honestly and invest in repair. A successful sequence of HTTP 200 responses does not prove that a changing dataset was completely observed.
+
+For the transition from a stable baseline to live changes, see [How to Combine Full Snapshots and Incremental Deltas Safely](/blog/how-to-combine-full-snapshots-and-incremental-deltas-safely).

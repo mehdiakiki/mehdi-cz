@@ -1,0 +1,134 @@
+---
+caseId: "RFA-033"
+title: "Why a Rust Test Hangs Only in the Full Test Suite"
+date: "2026-09-04T21:00:00+01:00"
+lastmod: "2026-09-07T10:45:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "828e8a4c01bfdfa696692c653bc87339f304dbedc67ac93602aa3e8a8c4afe2e"
+area: "async-runtime"
+symptom: "A Rust test passes alone but hangs when the full test suite runs with normal parallelism."
+summary: "Rust tests run concurrently by default. Reduce a suite-only hang to the smallest interfering test set, then remove shared process state instead of hiding it with serial execution."
+rustVersions: ["stable Rust", "libtest"]
+targets: ["host test target"]
+profiles: ["test"]
+searchTerms:
+  [
+    "Rust test passes alone hangs suite",
+    "cargo test parallel deadlock",
+    "Rust tests interfere shared state",
+  ]
+evidence: ["test-set bisection", "thread and task dump", "serialized comparison"]
+sources:
+  [
+    "https://doc.rust-lang.org/book/ch11-02-running-tests.html#running-tests-in-parallel-or-consecutively",
+    "https://doc.rust-lang.org/cargo/commands/cargo-test.html#test-options",
+  ]
+---
+
+A test which passes alone but hangs in the full suite is giving useful information. The test body is not the complete system. Another test, shared process state, or limited external resource changes its environment.
+
+Rust's standard test harness runs tests in parallel by default. Unit tests in one test binary share a process. They can also share environment variables, the current directory, static values, ports, files, clocks, and background threads. Integration-test binaries are separate processes, but those processes can still compete for the same operating-system resources.
+
+I treat “passes alone” as a controlled difference, not proof that the test is correct.
+
+The Atlas has a [two-test failure package](/rust-failure-atlas/evidence/RFA-033/fail/Cargo.toml) which makes this difference deterministic. Each filtered test passes in its own process. In one complete test process, the first test leaves a detached worker holding shared state and the second waits until the verifier's deadline. The [repaired package](/rust-failure-atlas/evidence/RFA-033/fixed/Cargo.toml) joins the worker and releases the state. I run the full pair with one test thread in this fixture to freeze the order; real parallel execution adds more possible interleavings but is not needed to prove the leaked-process-state mechanism.
+
+## Confirm that concurrency is the trigger
+
+I begin with two commands:
+
+```bash
+cargo test the_hanging_test -- --nocapture
+cargo test -- --test-threads=1
+```
+
+If both complete while the normal suite hangs, parallel interference becomes likely. Serial execution is a diagnostic at this stage. It is not automatically the final repair because it can hide an undeclared dependency and make the suite slower forever.
+
+The `--` matters. Options before it belong to Cargo; options after it go to the test executable. Cargo's `--jobs` controls build concurrency, not the number of threads used by the test harness.
+
+## Find the smallest interfering set
+
+A full suite may contain hundreds of tests, but normally one small combination is enough. I divide the companion tests into halves while always keeping the hanging test selected. If one half reproduces the hang, I divide that half again.
+
+The result I want is not merely a flaky test name. It is a pair or small set such as:
+
+```text
+starts_global_worker + waits_for_global_worker_shutdown
+```
+
+Run each test alone, then both repeatedly and in both orders. This exposes whether the problem needs overlap, order, or leaked state from an earlier test.
+
+Filtering can select more tests than expected because libtest matches names by substring. I inspect the test list and actual output rather than trusting the filter phrase.
+
+## Shared state that often survives unnoticed
+
+I check these boundaries first:
+
+- A fixed filename under `/tmp` or the repository.
+- A fixed TCP port.
+- `std::env::set_var`, current-directory changes, or process-wide logging setup.
+- `OnceLock`, lazy statics, global registries, and singleton runtimes.
+- A worker thread or Tokio task which the test starts but never joins.
+- A mutex guard held while waiting for a signal produced by code needing the same mutex.
+- A semaphore or connection pool whose permits are leaked on one path.
+
+A unique temporary directory fixes a filename collision. Binding to port `0` lets the operating system select an available port. Passing configuration as data avoids process-global environment mutation. Explicit component ownership makes shutdown joinable.
+
+These repairs improve the production design too. Tests often reveal globals which were already difficult to isolate in the application.
+
+## Capture the hang while it exists
+
+A timeout tells me the suite is stuck, but not why. Before killing it, I capture evidence:
+
+- thread backtraces or a debugger thread dump;
+- Tokio task instrumentation when the runtime is involved;
+- stable events for lock acquisition, channel send/receive, worker start, and worker finish;
+- process and child-process identifiers;
+- the random seed or repeated test order if a custom runner changes ordering.
+
+I avoid logging every loop iteration. The useful trace describes ownership transitions. “Worker 7 acquired shutdown lock” and “test B waits for worker 7” can reveal a cycle; thousands of “still waiting” lines cannot.
+
+## A small deadlock shape
+
+The suite-only version often looks like this:
+
+```rust
+static STATE: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
+
+fn stop_worker() {
+    let mut stopped = STATE.lock().unwrap();
+    signal_worker_to_stop();
+    wait_for_worker(); // Worker needs STATE before it can finish.
+    *stopped = true;
+}
+```
+
+The repair is to update protected state, release the guard, and only then wait:
+
+```rust
+fn stop_worker() {
+    {
+        let mut stopped = STATE.lock().unwrap();
+        *stopped = true;
+    }
+    signal_worker_to_stop();
+    wait_for_worker();
+}
+```
+
+The real code may hide the wait inside `Drop`, a channel send, or a runtime shutdown. The thread dump should connect it back to the held resource.
+
+## When serialization is legitimate
+
+Some tests intentionally exercise a process-global contract which cannot be isolated, for example installing a unique global panic hook. Serializing that narrow group can be honest. I document the shared resource and keep the lock or runner configuration close to the tests.
+
+Serializing the entire suite because two tests use the same filename is too expensive and too broad. The scope of the control should match the scope of the resource.
+
+## The regression proof
+
+After the repair, I repeatedly run the smallest interfering set with normal parallelism. I also run the complete suite with a wall-clock deadline and require all started workers to report completion.
+
+The proof is stronger when it forces overlap with barriers instead of hoping the scheduler finds the old timing. A deterministic interleaving turns a flaky production-shaped hang into a normal test.
+
+The key lesson is that a test suite is concurrent software. Each test needs ownership boundaries just as much as the code it checks.

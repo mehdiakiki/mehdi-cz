@@ -1,0 +1,197 @@
+---
+title: "Where Backpressure Goes When a Stream Processor Cannot Keep Up"
+date: "2026-10-21T09:00:00+01:00"
+tags: ["backpressure", "stream processing", "bounded queue", "consumer lag", "distributed systems"]
+draft: false
+reviewed: true
+reviewedHash: "122328d1561be84f317734762e77415e85da5cdcba1b6ca6059480d992ee0971"
+cluster: "reliable-data-integrations"
+campaign: "authority-2026"
+opportunity: "DATA-050"
+summary: "When arrival rate exceeds processing capacity, pressure becomes producer delay, broker lag, memory, disk, rejection, or data loss. Choose the boundary and bound it explicitly."
+---
+
+Backpressure does not remove excess work. It decides where excess work waits, who slows down, and when the system refuses more.
+
+If records arrive at 1,200 per second and the processor completes 900 per second, the missing capacity becomes backlog:
+
+```text
+backlog growth = (arrival rate - service rate) × time
+               = (1,200 - 900) × 600 seconds
+               = 180,000 records after ten minutes
+```
+
+A larger queue changes how long the system can hide this difference. It does not change the rate equation.
+
+## Pressure always lands somewhere
+
+When the processor cannot keep up, one or more of these happens:
+
+```text
+producer waits
+request is rejected
+broker lag grows
+memory queue grows
+disk buffer grows
+old data expires or is dropped
+work is sampled or degraded
+downstream becomes overloaded
+```
+
+The dangerous design is not “no backpressure.” It is pressure with an unnamed location and no bound.
+
+## A bounded queue turns memory into a contract
+
+Suppose each queued record uses 8 KiB including object and bookkeeping overhead. A 100,000-record in-memory queue can require about 781 MiB:
+
+```text
+100,000 × 8 KiB = 800,000 KiB ≈ 781 MiB
+```
+
+The exact overhead needs measurement. The calculation shows why “keep buffering” can become an out-of-memory restart, after which the upstream redelivers and creates more load.
+
+I set a queue capacity and define what `full` means:
+
+```text
+block the producer
+pause source partitions
+reject with a retryable response
+spill to a durable bounded store
+drop an explicitly disposable class
+```
+
+Silently allocating more is not a policy.
+
+## Push and pull systems expose different controls
+
+In a pull-based stream, the consumer can request or poll less work. Reactive Streams formalises demand so a publisher should not send more elements than requested; the [Reactive Streams specification](https://github.com/reactive-streams/reactive-streams-jvm) is a primary reference for this contract.
+
+In a webhook or synchronous API, the sender is already pushing. The receiver may respond with a retryable status, apply admission control, or durably accept the request before returning success.
+
+In a retained broker such as Kafka, pausing consumption moves waiting work into broker lag. This is often safer than process memory, but broker retention and disk are finite. The producer may continue at full rate unless broker quotas or upstream control eventually push pressure back.
+
+## Concurrency has a knee
+
+Increasing worker count helps while useful parallel capacity remains. Beyond that point, more concurrency can reduce throughput through database contention, provider throttling, cache misses, context switching, or connection exhaustion.
+
+I measure a curve:
+
+| In-flight work | Throughput/s | p95 latency | Error rate |
+| ---: | ---: | ---: | ---: |
+| 10 | 420 | 90 ms | 0.0% |
+| 25 | 810 | 160 ms | 0.1% |
+| 50 | 920 | 410 ms | 1.2% |
+| 100 | 870 | 1.4 s | 8.0% |
+
+These numbers are illustrative. In this shape, choosing 100 because it is “more parallel” makes capacity worse. I place the concurrency limit before saturation and adapt only with measured signals.
+
+## Latency exposes hidden backlog
+
+Little's Law gives a useful steady-state relationship:
+
+```text
+items in system ≈ throughput × average time in system
+```
+
+If throughput is 900 records/s and an average record spends 20 seconds from arrival to completion, roughly 18,000 records are in the system.
+
+I measure end-to-end age, not only handler duration. A handler can complete in 30 ms while each record waited 45 minutes in broker lag.
+
+Useful timestamps are:
+
+```text
+produced_at
+broker_position/time
+consumer_received_at
+processing_started_at
+effect_committed_at
+```
+
+## Partitioning can hide one hot lane
+
+Aggregate input may be below aggregate capacity while one partition is overloaded:
+
+```text
+partition 0: 700/s arrival, 300/s capacity
+partitions 1-7: 50/s arrival, 300/s capacity each
+```
+
+Total capacity looks ample. Ordering requires partition 0 to remain one serial lane, so its lag grows.
+
+I monitor lag, age, throughput, and processing cost per partition and top business key. A partition-key change or key-aware design may be needed; adding unrelated consumers cannot split one partition's ordered work.
+
+## Backpressure must cross internal stages
+
+A pipeline may be:
+
+```text
+broker poll -> decode -> enrich API -> database -> publish
+```
+
+If the database slows, only bounding the final write queue is insufficient. The poller must eventually pause or reduce demand. Otherwise every earlier stage keeps filling its own queue.
+
+I connect capacity signals backwards:
+
+```text
+database saturation
+  -> reduce write permits
+  -> enrichment output queue fills
+  -> reduce enrichment concurrency
+  -> input queue fills
+  -> pause broker partitions
+```
+
+This is propagation, not one global lock. Each boundary has a maximum and a clear signal.
+
+## Decide what can be shed
+
+Some work is mandatory, some can be recomputed, and some becomes useless when late.
+
+Examples:
+
+| Work | Possible overload policy |
+| --- | --- |
+| payment state change | retain and alert; never sample |
+| derived search index | coalesce repeated updates by entity |
+| periodic full refresh | skip an older run when a newer one exists |
+| live UI presence | drop stale intermediate updates |
+| analytics sample | sample according to an explicit statistical policy |
+
+Shedding must preserve business meaning. Dropping arbitrary queue entries because they are old can remove a create event while keeping its update.
+
+## Recovery can overload the system again
+
+After a dependency returns, a large backlog competes with live work. Consuming at maximum speed may cause a second outage.
+
+I define catch-up controls:
+
+```text
+live-versus-backlog capacity allocation
+maximum downstream concurrency
+provider quota budget
+oldest acceptable data age
+estimated catch-up time
+stop threshold when errors or latency rise
+```
+
+For arrival `λ`, recovery capacity `μ`, and existing backlog `B`, an idealised catch-up time is:
+
+```text
+B / (μ - λ), only when μ > λ
+```
+
+If live arrivals are 900/s, processing is 1,000/s, and backlog is 180,000, ideal catch-up already takes 30 minutes. Any retries or throttling increase it.
+
+## Test overload as a state transition
+
+My load test includes:
+
+1. normal rate below capacity;
+2. a burst that fills the internal queue;
+3. sustained arrival above capacity;
+4. downstream latency increasing tenfold;
+5. recovery while backlog and live traffic coexist.
+
+I assert memory and disk bounds, rejection semantics, producer behaviour, data loss policy, and catch-up time.
+
+Backpressure is a placement decision for waiting and refusal. Once I quantify arrival, service, queue capacity, retention, and recovery, overload becomes a designed state rather than a surprise hidden inside memory.

@@ -1,0 +1,90 @@
+---
+caseId: "RFA-272"
+title: "from_str_radix Can Panic Before Returning ParseIntError"
+date: "2026-09-06T00:52:00+01:00"
+lastmod: "2026-09-06T00:52:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "1dc0ae876495954a8626dd66f9083d15c481dbb259f3874f3bdadee4a24d45f7"
+area: "ffi-targets"
+symptom: "u32::from_str_radix panics for radix one even though malformed digits and overflow are returned through ParseIntError."
+summary: "from_str_radix returns Result for text parsing failures but requires the radix itself to be within 2 through 36. Validate a dynamic base before parsing so external input cannot unwind the process."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust from_str_radix invalid radix panic", "from_str_radix radix 1 ParseIntError", "validate dynamic integer base Rust"]
+evidence: ["Rust 1.98.1 caught radix-one panic", "ordinary invalid digit ParseIntError", "2-through-36 validation wrapper"]
+sources: ["https://doc.rust-lang.org/std/primitive.u32.html#method.from_str_radix", "https://doc.rust-lang.org/std/num/struct.ParseIntError.html", "https://doc.rust-lang.org/std/primitive.str.html#method.parse"]
+---
+
+I had a parser returning `Result`, and I assumed this made it safe for every request value. Then a request supplied base one. The process entered a panic path before `ParseIntError` could be returned.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-272/fail.rs) calls [`u32::from_str_radix("10", 1)`](https://doc.rust-lang.org/std/primitive.u32.html#method.from_str_radix) inside `catch_unwind`. The caught result proves the parser panics for a radix outside its supported interval.
+
+## The text is fallible; the radix is a precondition
+
+`from_str_radix` separates two kinds of invalid input:
+
+```text
+radix outside 2..=36 -> panic
+bad text in valid radix -> Err(ParseIntError)
+```
+
+The text can fail because it is empty, contains a digit not accepted by the base, contains whitespace, includes an underscore, or represents a value too large for the integer type. These are parsing outcomes.
+
+The radix selects the grammar itself. Rust treats an unsupported grammar parameter as a violated precondition. A `Result` return does not include that condition.
+
+## A valid-looking string does not protect the call
+
+The string `"10"` is valid in many bases, but radix one is rejected before its digits matter. Sanitizing only the text is therefore incomplete.
+
+This often happens when an API receives `{ value, base }`. The value gets careful validation because it looks like user data, while the base is trusted as a small integer. Both fields cross the same trust boundary.
+
+I validate structural parameters before handing them to a standard-library operation. Radix, allocation length, chunk size, and index are common examples. They may configure how an operation runs rather than become its ordinary data, but they are still inputs.
+
+## The supported interval is inclusive
+
+For integer parsing, the documented bases are 2 through 36. Base two uses binary digits, base ten the decimal set, and base 36 extends through alphabetic digits.
+
+The upper bound follows the provided digit alphabet. Supporting base 64 requires a separate codec; it is not achieved by passing 64 here. Supporting unary notation also requires a different parser rather than radix one.
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-272/fixed.rs) checks `2..=36` first. Unsupported bases become an application error string in the small fixture. Real code benefits from a typed error that preserves the supplied base.
+
+## ParseIntError still matters after validation
+
+Once the radix is valid, [`ParseIntError`](https://doc.rust-lang.org/std/num/struct.ParseIntError.html) reports why the textual integer could not be produced. I do not replace that useful result with a blanket “bad request.”
+
+For a public interface I may map its stable error kind to my own protocol error. I avoid depending on the display text as a machine-readable value because error messages are intended for people and can evolve.
+
+The wrapper can preserve two layers:
+
+```text
+unsupported parser configuration
+invalid number inside supported configuration
+```
+
+This distinction improves logs. A sudden wave of unsupported bases points to clients or schema enforcement. A wave of overflows may point to a changed data range.
+
+## Whitespace and Rust literal syntax are not accepted automatically
+
+The parser expects an optional plus sign followed by digits from the selected base. Leading or trailing whitespace is an error. Underscores accepted inside Rust source literals are also an error in this string API.
+
+I decide whether trimming is part of my external format before parsing. Automatically trimming may be friendly for a command line, but wrong for a canonical identifier or signed payload. Removing underscores can be even more dangerous when they were not part of the written grammar.
+
+[`str::parse`](https://doc.rust-lang.org/std/primitive.str.html#method.parse) is convenient for base ten, but it does not accept a dynamic base. Choosing between the APIs begins from the input specification, not convenience.
+
+## Do not use panic catching as validation
+
+The failing fixture uses `catch_unwind` only to make the failure observable. It is not the repair I recommend.
+
+Panic hooks can still print output, not every panic configuration unwinds, and catching programmer failures can leave surrounding logic in an unexpected state. A simple range check is clearer and cheaper.
+
+At a server boundary, returning a normal validation error keeps one malformed request from becoming a task or process failure. Inside a trusted parser combinator, a newtype such as `Radix` can make the valid range impossible to forget.
+
+## What I test
+
+My matrix includes radices 2, 10, 16, and 36; the invalid neighbors 1 and 37; an empty string; a digit outside the base; whitespace; and a value just above the target integer maximum.
+
+I assert the result category, not only that “something failed.” Bases 1 and 37 must be rejected by my wrapper without unwinding. Invalid digits in a valid base must remain parse errors. A valid boundary value must round-trip.
+
+The core principle is that `Result` does not erase documented preconditions. `from_str_radix` represents failures in the text, while the radix must already be inside 2 through 36. Validate dynamic parser configuration first, then preserve the useful parsing error that follows.

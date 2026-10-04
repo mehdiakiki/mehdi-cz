@@ -1,0 +1,128 @@
+---
+caseId: "RFA-060"
+title: "Why Two Valid Iterators Cannot Share One `impl Iterator` Return"
+date: "2026-09-05T08:30:00+01:00"
+lastmod: "2026-09-05T08:30:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "6c5e1118a147b50c9c2c87afd826317a468ef1ef341f7208b0730da5affa39b0"
+area: "diagnostics-macros"
+symptom: "A function returning impl Iterator rejects if branches that each return a valid iterator with the same item type."
+summary: "Return-position impl Trait hides one concrete type, not any runtime value implementing the trait. Use one adapter shape, an enum, or deliberate dynamic dispatch according to the API."
+rustVersions: ["Rust 1.98.1"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust impl Iterator if else incompatible types E0308",
+    "impl Trait different concrete types branches",
+    "expected Range found IntoIter Rust",
+  ]
+evidence: ["Rust 1.98.1 compile failure", "concrete-type comparison", "boxed iterator repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/error_codes/E0308.html",
+    "https://doc.rust-lang.org/reference/types/impl-trait.html#abstract-return-types",
+  ]
+---
+
+Both branches of this function produce an iterator of `u32`:
+
+```rust
+fn values(compact: bool) -> impl Iterator<Item = u32> {
+    if compact {
+        0..3
+    } else {
+        vec![10, 20, 30].into_iter()
+    }
+}
+```
+
+Still, Rust 1.98.1 reports E0308 and says the `if` and `else` branches have incompatible types. One is `Range<u32>` and the other is `std::vec::IntoIter<u32>`. The [failing fixture](/rust-failure-atlas/evidence/RFA-060/fail.rs) preserves that exact comparison.
+
+The mistake is reading `impl Iterator` as “return any iterator.” Return-position `impl Trait` means “this function returns one concrete type which implements Iterator, but callers do not get to name that type.”
+
+## Hidden does not mean dynamic
+
+For a simple function:
+
+```rust
+fn values() -> impl Iterator<Item = u32> {
+    0..3
+}
+```
+
+the hidden concrete type is `Range<u32>`. The caller can rely on the trait interface while the compiler still knows the exact size and can statically dispatch `next`. No vtable or heap allocation is required by `impl Trait` itself.
+
+Adding the second branch would require the hidden type to be both `Range<u32>` and `IntoIter<u32>`. Sharing `Item = u32` is not enough. Two structs implementing the same trait do not become the same concrete type.
+
+The [Reference section on abstract return types](https://doc.rust-lang.org/reference/types/impl-trait.html#abstract-return-types) states that each possible return value must resolve to the same concrete type.
+
+## Box the iterator when runtime choice is the real requirement
+
+The direct repair erases both iterators behind a trait object:
+
+```rust
+fn values(compact: bool) -> Box<dyn Iterator<Item = u32>> {
+    if compact {
+        Box::new(0..3)
+    } else {
+        Box::new(vec![10, 20, 30].into_iter())
+    }
+}
+```
+
+Both branches now return the same concrete outer type: `Box<dyn Iterator<Item = u32>>`. Inside that box, runtime metadata selects the appropriate `next` implementation. The [repaired fixture](/rust-failure-atlas/evidence/RFA-060/fixed.rs) compiles, executes both branches, and asserts their values on Rust 1.98.1.
+
+This introduces allocation and dynamic dispatch. In many request, configuration, or command paths that cost is negligible. In a hot iterator pipeline, I consider alternatives.
+
+## Make both branches one adapter type
+
+Sometimes the branch can move inside an adapter rather than selecting two iterator structures:
+
+```rust
+fn values(compact: bool) -> impl Iterator<Item = u32> {
+    [0, 1, 2]
+        .into_iter()
+        .map(move |value| if compact { value } else { (value + 1) * 10 })
+}
+```
+
+There is one array iterator and one closure type regardless of the Boolean. This only works when both behaviors can honestly share one pipeline and ownership model. Forcing unrelated sources into a complicated chain can be worse than a box.
+
+An iterator of optional iterators combined with `flatten`, or two chained ranges where one becomes empty, can also produce one concrete adapter shape. I inspect the resulting readability and do not optimize only for removing one allocation.
+
+## Use an enum for a closed, performance-sensitive choice
+
+An enum can store either concrete iterator:
+
+```rust
+enum Values {
+    Compact(std::ops::Range<u32>),
+    Expanded(std::vec::IntoIter<u32>),
+}
+```
+
+Its `Iterator` implementation matches on the variant and delegates `next`. The return type is one concrete enum, no allocation is required, and the branch remains at runtime. A helper crate can provide an equivalent “either” iterator, but a small local enum may communicate the closed choice more directly.
+
+This approach adds implementation code and exposes or hides a new type depending on the API. I use it when profiling or allocation constraints justify the complexity.
+
+## Returning a trait object reference has another lifetime question
+
+If the iterators borrow input, `Box<dyn Iterator<Item = T> + 'a>` may need an explicit lifetime. Omitting it can produce a different diagnostic involving an implicit static object lifetime. That is not evidence that boxing was conceptually wrong; it means the erased iterator still borrows data which must be represented at the boundary.
+
+I solve one axis at a time: first unify the branch types, then state how long borrowed input remains valid.
+
+## A decision table I use
+
+| Requirement                         | Return strategy                           |
+| ----------------------------------- | ----------------------------------------- |
+| One pipeline shape                  | `impl Iterator`                           |
+| Runtime choice, simple API          | `Box<dyn Iterator>`                       |
+| Closed choice without allocation    | enum implementing `Iterator`              |
+| Caller should choose implementation | generic parameter                         |
+| Small materialized result           | return `Vec<T>` and iterate at the caller |
+
+Materializing a small vector is sometimes clearer than preserving laziness through a large abstraction. It changes allocation and evaluation timing, so I make it deliberately.
+
+The official [E0308 explanation](https://doc.rust-lang.org/error_codes/E0308.html) describes mismatched types broadly. For `impl Trait`, the discriminating check is to write down the concrete type of every return path. If the names differ, I choose whether the program needs one static shape, one explicit enum, or dynamic erasure. The compiler is enforcing the choice that the return signature currently leaves contradictory.

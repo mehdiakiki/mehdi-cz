@@ -1,0 +1,177 @@
+---
+title: "assert_matches! in Rust 1.96: Better Failure Output for Pattern Tests"
+date: "2026-12-15T09:00:00+01:00"
+tags: ["Rust 1.96", "assert_matches", "Rust testing", "pattern matching", "debugging"]
+draft: false
+reviewed: true
+reviewedHash: "9747f4560152ad06dc0f560994f9800165096426690310f011b411983e417146"
+cluster: "rust-under-the-hood"
+campaign: "authority-2026"
+opportunity: "RUST-065"
+summary: "Rust 1.96 stabilizes assert_matches!, which shows the actual Debug value and expected pattern. I compare it with matches!, guards, let-else, and custom assertions."
+---
+
+I have written this test many times:
+
+```rust
+assert!(matches!(result, Err(ParseError::UnexpectedToken { .. })));
+```
+
+It is compact. When it fails in CI, the message is not very helpful. I learn that the expression was false, but not whether the result was `Ok`, another error variant, or the right variant with the wrong details.
+
+Rust 1.96 stabilized `assert_matches!` for exactly this gap.
+
+## The direct replacement
+
+```rust
+use std::assert_matches;
+
+#[derive(Debug)]
+enum ParseError {
+    UnexpectedToken { position: usize },
+    EndOfInput,
+}
+
+let result: Result<(), ParseError> = Err(ParseError::UnexpectedToken { position: 7 });
+
+assert_matches!(
+    result,
+    Err(ParseError::UnexpectedToken { position: 7 })
+);
+```
+
+If the pattern does not match, the macro prints the debug representation of the actual value and the expected pattern. The [`assert_matches!` documentation](https://doc.rust-lang.org/stable/std/macro.assert_matches.html) explicitly contrasts this with `assert!(matches!(...))`, which can only report that the boolean expectation failed.
+
+This is a small API, but it makes a failed test tell more of its own story.
+
+## The expression is evaluated once
+
+The macro expands conceptually to a match on the supplied expression, with a fallback arm that borrows the mismatched value for formatting.
+
+That matters when a helper has state or cost:
+
+```rust
+use std::assert_matches;
+
+let mut calls = 0;
+
+assert_matches!(
+    {
+        calls += 1;
+        Some(calls)
+    },
+    Some(1)
+);
+
+assert_eq!(calls, 1);
+```
+
+I still prefer side-effect-free assertions. The single-evaluation rule prevents a diagnostic feature from calling the operation again.
+
+## Guards make the pattern more precise
+
+The macro accepts the same optional guard shape as a match arm:
+
+```rust
+use std::assert_matches;
+
+let result = Ok::<u32, &str>(204);
+assert_matches!(result, Ok(code) if (200..300).contains(&code));
+```
+
+On failure, the reported expected text includes the guard. This is useful for ranges or relationships that a pattern alone cannot express.
+
+I keep guards readable. If the condition becomes a long business rule, I calculate a named value or use a domain-specific assertion. A panic saying “expected `Ok(x) if complicated_expression`” can become as opaque as the boolean assertion it replaced.
+
+## The value must implement `Debug`
+
+Better failure output needs a printable actual value. This means the type must implement `Debug`:
+
+```rust,compile_fail
+use std::assert_matches;
+
+struct SecretHandle;
+
+let value = Some(SecretHandle);
+assert_matches!(value, Some(_));
+```
+
+Even though the example would match at runtime, the fallback diagnostic must type-check. I do not derive `Debug` blindly for types containing secrets. A redacted manual implementation or a different assertion may be the correct choice.
+
+Diagnostic convenience should not leak tokens, credentials, or sensitive payloads into CI logs.
+
+## `debug_assert_matches!` has another contract
+
+Rust 1.96 also stabilizes `debug_assert_matches!`.
+
+```rust
+use std::debug_assert_matches;
+
+debug_assert_matches!(cache.peek(), Some(entry) if entry.is_valid());
+```
+
+Like other debug assertions, it is disabled by default in optimized builds unless debug assertions are enabled. The official documentation notes that the expansion remains type-checked.
+
+I use `assert_matches!` for test expectations and invariants that must always run. I reserve `debug_assert_matches!` for expensive development checks whose removal in release is intentional.
+
+## It does not give me the binding afterward
+
+Sometimes I want to verify the variant and continue testing the inner value. `assert_matches!` does not export pattern bindings from the macro.
+
+I use `let else`:
+
+```rust
+let Err(ParseError::UnexpectedToken { position }) = result else {
+    panic!("expected UnexpectedToken, got {result:?}");
+};
+
+assert_eq!(position, 7);
+```
+
+This is longer but puts `position` in scope for the next assertions. The choice is based on what the test needs after the shape check.
+
+## Failure output is evidence, not a snapshot API
+
+I avoid tests that match the complete panic string from `assert_matches!`. Formatting can change, file paths differ, and the goal is to diagnose the domain value rather than freeze standard-library wording.
+
+To compare the tools, I run two intentionally failing tests:
+
+```rust,should_panic
+let value = Some(3);
+assert!(matches!(value, None));
+```
+
+```rust,should_panic
+use std::assert_matches;
+
+let value = Some(3);
+assert_matches!(value, None);
+```
+
+The second failure includes `Some(3)` and the `None` pattern. That is the evidence I care about.
+
+## A good pattern says how strict the contract is
+
+The wildcard choices inside the pattern deserve review. This assertion permits every field value:
+
+```rust
+# use std::assert_matches;
+# #[derive(Debug)]
+# enum ParseError { UnexpectedToken { position: usize, token: char } }
+# let result: Result<(), ParseError> = Err(ParseError::UnexpectedToken { position: 7, token: ';' });
+assert_matches!(result, Err(ParseError::UnexpectedToken { .. }));
+```
+
+That is correct when the test owns only the error category. It is too weak when position is part of the behaviour under test. I make the pattern as strict as the public promise and no stricter.
+
+This avoids two bad extremes: exact equality over incidental diagnostic fields, and a broad variant check that lets a regression pass. If a field is unstable but useful on failure, I can match the stable fields and include a redacted custom message describing the test case.
+
+I also keep one assertion responsibility per line. A large or-pattern covering many unrelated success shapes produces an impressive failure message but a vague test. Several named cases usually explain the contract better.
+
+## Where I do not use it
+
+I keep `assert_eq!` when exact equality is the real contract; its left/right comparison is more direct. I use a property assertion when many variants can be valid but must share behaviour. For complex domain failures I often write a custom helper that prints redacted, named fields.
+
+The [Rust 1.96 release notes](https://doc.rust-lang.org/releases.html#version-1960-2026-05-28) list both matching macros among stabilized APIs. Their value is not new pattern power. It is better evidence when existing patterns reject an unexpected result.
+
+That is why I will replace many `assert!(matches!(...))` calls, but not mechanically. I want each failure to show the smallest safe piece of information that helps the next engineer understand what the program actually returned.

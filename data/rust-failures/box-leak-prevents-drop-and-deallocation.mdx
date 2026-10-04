@@ -1,0 +1,82 @@
+---
+caseId: "RFA-255"
+title: "What Box::leak Really Promises: No Drop and No Automatic Reclamation"
+date: "2026-09-06T00:35:00+01:00"
+lastmod: "2026-09-06T00:35:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "2e32a0c7b03559bf1a2747f6684c2c82d72ed258c262e7783cc3e99ea9d1b6eb"
+area: "concurrency-memory"
+symptom: "A value passed to Box::leak never runs its Drop implementation even after the returned reference is no longer used."
+summary: "Box::leak consumes ownership and returns a long-lived mutable reference while deliberately removing automatic destruction and deallocation. Reserve it for bounded process-lifetime state, not convenient lifetime extension."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets with alloc"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust Box leak does Drop run", "Box::leak memory reclaimed", "create static reference Box leak safely"]
+evidence: ["Rust 1.98.1 tracked destructor", "zero observed drops", "ordinary Box ownership repair"]
+sources: ["https://doc.rust-lang.org/std/boxed/struct.Box.html#method.leak", "https://doc.rust-lang.org/std/boxed/struct.Box.html#method.from_raw", "https://doc.rust-lang.org/std/mem/fn.forget.html"]
+---
+
+`Box::leak` can solve a lifetime error in one line. It does so by changing the ownership policy for the rest of the program.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-255/fail.rs) puts a tracked value in a `Box`, leaks it, and stops using the returned reference. The destructor count remains zero. [`Box::leak`](https://doc.rust-lang.org/std/boxed/struct.Box.html#method.leak) deliberately prevents automatic destruction and deallocation.
+
+## The function consumes the owner
+
+A normal `Box<T>` uniquely owns `T` and its allocation. When the box is dropped, Rust drops `T` and releases the allocation.
+
+`Box::leak` consumes that box and returns `&mut T` with a lifetime chosen from the contained type and allocator constraints. For data with no shorter borrowed references, callers commonly choose `'static`.
+
+There is now no owning `Box` left to drop at scope exit. Letting the reference go out of scope does not recreate ownership. References never deallocate their referent.
+
+## Dropping a reference is not dropping the value
+
+Calling `drop(reference)` only consumes the reference value. It does not run `T::drop` and cannot free the allocation. This is one reason compiler warnings often point out that dropping a reference does nothing to the referent.
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-255/fixed.rs) retains ordinary box ownership and drops the box. The tracked destructor runs exactly once.
+
+This fixture measures destruction, not process memory. Allocators can retain freed pages, so resident-set size is a poor unit test for whether ownership was released.
+
+## Leaking can be a deliberate bounded design
+
+Process-wide immutable tables, interned configuration loaded once, or a small registry that must outlive every worker can reasonably live until process exit. Operating systems reclaim process memory afterward.
+
+I still bound and document the number of leaked objects. “One per process” is different from “one per request.” A leak inside a reload loop, tenant creation path, or unbounded cache grows forever even if each individual allocation is small.
+
+The strongest question is not “will the operating system reclaim it eventually?” It is “can the process lifetime and allocation count make this resource unbounded?”
+
+## Resources inside T also remain alive
+
+The missing destructor may hold more than heap bytes. A leaked value can keep file descriptors, sockets, temporary-file cleanup, tracing guards, reference counts, or foreign resources alive.
+
+Some resources are closed by the operating system at process exit, while application-level cleanup and flush behavior may be lost. I inspect `T` and every field's `Drop` responsibility before calling a leak harmless.
+
+For a global read-only value, leaking a pure data allocation is easier to justify than leaking an object with active external ownership.
+
+## The mutable reference needs a sharing policy
+
+`Box::leak` returns `&mut T`, not automatically a safely shared global. Turning it into a `'static` mutable reference and handing it to multiple threads would still violate aliasing rules unless access is synchronised through appropriate types.
+
+Often I immediately coerce it to `&'static T` when mutation is not needed. For shared mutable process state, `Mutex`, `RwLock`, atomics, or a different ownership architecture must provide the concurrency contract.
+
+Lifetime extension does not solve thread safety.
+
+## Reconstructing the Box is an unsafe ownership proof
+
+The documentation notes that a leaked allocation can be recovered through a pointer and [`Box::from_raw`](https://doc.rust-lang.org/std/boxed/struct.Box.html#method.from_raw). This is unsafe because the caller must prove the pointer came from the compatible allocator and box layout, no references will be used afterward, and reconstruction occurs exactly once.
+
+If planned reclamation is required, discarding typed ownership and later rebuilding it unsafely is usually worse than storing the original `Box` in an owner with a clear shutdown path.
+
+## It resembles forget, but communicates intent
+
+[`mem::forget`](https://doc.rust-lang.org/std/mem/fn.forget.html) also consumes a value without running its destructor. `Box::leak` additionally gives access to the allocation through a reference, making its process-lifetime use case explicit.
+
+Neither function is memory-unsafe by itself because Rust does not guarantee destructors always run. Unsafe code must remain sound even when callers forget values. Resource correctness can still be broken.
+
+## What I test
+
+My regression counts drops for ordinary ownership and the leak path. A system test repeats the owning operation and verifies resource counts return to baseline; a deliberate global leak test verifies initialization happens once.
+
+I avoid asserting that leaked data is reclaimed at process exit from inside the same process. That event occurs after the test can observe it.
+
+The core principle is that lifetimes and ownership are connected but not interchangeable. `Box::leak` obtains a long-lived reference by intentionally abandoning automatic ownership cleanup. It is a valid tool for small bounded process-lifetime state, not a general way to make the borrow checker stop asking who destroys the value.

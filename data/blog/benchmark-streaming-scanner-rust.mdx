@@ -1,0 +1,140 @@
+---
+title: "How to Benchmark a Streaming Scanner in Rust Without Lying to Yourself"
+date: "2026-10-10T14:15:00+01:00"
+lastmod: "2026-09-05T12:00:00+01:00"
+tags: ["rust", "benchmarking", "streaming", "aho-corasick", "performance engineering"]
+draft: false
+reviewed: true
+reviewedHash: "6628e1a31801211c3d445213cf552f7234585f3746a120dd4f789c85669dc209"
+cluster: "rust-under-the-hood"
+campaign: "editorial"
+summary: "Scanner benchmarks are easy to make fast by changing the work. I use a reproducible matrix for construction, chunks, matches, prefilters, cache state, and result validation."
+---
+
+The easiest way to make a scanner benchmark faster is to accidentally benchmark less work.
+
+One version omits construction while another includes it. One counts matches while another stores them. A zero-copy path receives an existing slice while the buffered path also opens and reads the file. A compiler notices that nobody uses the answer and removes useful work.
+
+These mistakes produce precise numbers for an unfair comparison. I begin with a written contract before opening the profiler.
+
+## First prove that both scanners do the same job
+
+For every variant I collect the same logical result:
+
+```rust
+#[derive(Debug, PartialEq, Eq)]
+struct Found {
+    pattern: usize,
+    start: usize,
+    end: usize,
+}
+```
+
+I compare the complete ordered vector, not only a checksum or count. A count misses reordered results and incorrect offsets. After equivalence is established, a benchmark can replace storage with a stable checksum or `black_box` if result allocation is outside the question.
+
+Chunk boundaries need their own proof. I compare one-shot search with one-byte reads, boundary-aligned reads, and many generated partitions. A scanner that misses split matches is not a fast scanner.
+
+## Decide whether construction belongs inside the measurement
+
+For a service that builds one matcher at startup and searches continuously, I report construction separately from steady-state search. For a command that builds patterns and scans one short input, end-to-end time is the honest user experience.
+
+I often publish both:
+
+```text
+build only
+search only with a reused matcher
+build + search end to end
+```
+
+Rust's [`AhoCorasick` documentation](https://docs.rs/aho-corasick/latest/aho_corasick/struct.AhoCorasick.html#resource-usage) recommends reuse because construction can have high constant costs, especially for a DFA. Hiding this cost is acceptable only when the production architecture also amortizes it.
+
+## Keep setup symmetrical
+
+Suppose I compare these paths:
+
+```text
+A: copy every caller chunk into an owned buffer, then scan
+B: scan caller chunks directly
+```
+
+Both need the same input bytes, chunk schedule, matcher, match semantics, and result handling. The timed section for A includes the intended staging copy, but it should not also include unrelated file loading or allocation that B prepared earlier.
+
+I can preallocate A's buffer if production reuses capacity. I must say so. If production creates a new buffer for each request, the allocation belongs in an end-to-end benchmark too.
+
+I keep data generation outside the timed loop and use the same immutable corpus for all variants.
+
+## A single friendly haystack is not a workload
+
+My minimum matrix contains:
+
+- no matches;
+- rare candidates but no complete matches;
+- sparse realistic matches;
+- dense true matches;
+- short and long patterns;
+- shared-prefix and unrelated patterns;
+- chunks smaller than, close to, and larger than the longest pattern;
+- automatic, contiguous NFA, and DFA where construction succeeds;
+- prefilters enabled and disabled.
+
+I do not run every Cartesian combination forever. I use a broad diagnostic suite to find sensitive dimensions, then preserve a smaller regression set representing them.
+
+The upstream project keeps a substantial [Aho–Corasick benchmark suite](https://github.com/BurntSushi/aho-corasick/tree/master/benchmarks). I treat that as a good reference for library engineering, while still adding application-specific corpora for my own decision.
+
+## Record hidden configuration
+
+At minimum, I store:
+
+```text
+Rust and crate versions
+target triple and CPU model
+release/profile settings
+automaton kind and memory_usage()
+prefilter setting
+match kind
+pattern corpus hash and statistics
+haystack hash and byte length
+chunk sizes
+matches emitted
+benchmark command
+```
+
+Without the corpus hashes, a future run can carry the same label while testing different bytes.
+
+I record whether the machine was otherwise busy and avoid comparing results collected under obviously different frequency or thermal conditions. I prefer repeated samples and a distribution over a single best run.
+
+## Prevent the optimizer from erasing the question
+
+Rust provides [`std::hint::black_box`](https://doc.rust-lang.org/stable/std/hint/fn.black_box.html) as a best-effort barrier against some compiler optimizations. The documentation is careful: it is not a correctness or cryptographic boundary, and its behavior is intentionally limited.
+
+Benchmark frameworks such as [Criterion.rs](https://bheisler.github.io/criterion.rs/book/index.html) handle sampling, warm-up, and statistical comparison. They reduce measurement mistakes, but they cannot decide whether my two closures perform equivalent work.
+
+I still inspect the result and sometimes the generated assembly. A framework is not a substitute for understanding the measured region.
+
+## Warm cache and cold input answer different questions
+
+Repeatedly scanning the same small haystack can keep both input and automaton hot in cache. This is useful for measuring a tight lower-level loop. It can overstate throughput for a service processing large unrelated payloads.
+
+I label the hot microbenchmark and add a larger rotating corpus for end-to-end behavior. For very large automatons, I vary pattern-set size because transition data may be the cache-sensitive part rather than the haystack.
+
+I do not try to manufacture a perfectly cold cache with an unrelated memory sweep inside every iteration unless that resembles the application. Cache state is a workload property, not dirt to remove from every experiment.
+
+## Separate scanning from reporting
+
+A dense-match input can spend more time creating results than finding them. I measure:
+
+1. detection with a consumed checksum;
+2. collection into the required result representation;
+3. downstream serialization or callbacks when they are part of production.
+
+The first isolates the searcher. The third tells me whether improving the searcher will matter to users. This separation also reveals when match reporting, rather than recognition, has become the dominant cost.
+
+## Report what changed, not a universal percentage
+
+I publish a result as “on this corpus, machine, configuration, and chunk distribution.” If direct scanning improves a workload by a range, I keep the range and its conditions. I do not turn it into “zero-copy makes Rust scanners X% faster.”
+
+The lasting artifact is the runnable harness plus input hashes. A graph without enough information to recreate its axes is weaker evidence than a plain table with the complete command.
+
+My rule is: correctness equality first, workload description second, timing third, explanation fourth. This order makes performance work slower for one hour and much faster for the following week.
+
+The memory-copy question behind this benchmark is explained in [Zero-Copy Does Not Mean Zero Memory Access](/blog/zero-copy-does-not-mean-zero-memory-access-aho-corasick-rust).

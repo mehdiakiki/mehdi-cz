@@ -1,0 +1,113 @@
+---
+caseId: "RFA-080"
+title: "E0133: Why an Unsafe Rust Function Still Needs an Unsafe Block"
+date: "2026-09-05T08:40:00+01:00"
+lastmod: "2026-09-05T08:40:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "0195d02c8d3494a983a345449198d1ba33d48972714834aa3c6b1a96192d9827"
+area: "concurrency-memory"
+symptom: "Rust 2024 code denies a raw-pointer dereference inside unsafe fn until the operation receives its own unsafe block."
+summary: "Unsafe fn describes obligations imposed on callers; an unsafe block marks where the implementation relies on those obligations. Keep blocks narrow and connect each one to a concrete safety argument."
+rustVersions: ["Rust 1.98.1"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust E0133 unsafe op in unsafe fn 2024",
+    "raw pointer dereference requires unsafe block inside unsafe function",
+    "unsafe_op_in_unsafe_fn deny migration",
+  ]
+evidence:
+  ["Rust 1.98.1 edition-2024 failure", "unsafe-boundary audit", "documented unsafe block repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/error_codes/E0133.html",
+    "https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html",
+  ]
+---
+
+An `unsafe fn` and an `unsafe` block answer different questions. This function is unsafe to call, but its body still receives E0133 when the lint is denied:
+
+```rust
+#![deny(unsafe_op_in_unsafe_fn)]
+
+unsafe fn read(pointer: *const u8) -> u8 {
+    *pointer
+}
+```
+
+Rust 1.98.1, compiled as edition 2024, reports that dereferencing the raw pointer requires an unsafe block. The [failing fixture](/rust-failure-atlas/evidence/RFA-080/fail.rs) pins both the lint and edition so the boundary is reproducible.
+
+## The function signature talks to the caller
+
+Marking `read` unsafe means callers must establish requirements that Rust's type system cannot check. For this function, a useful contract would require `pointer` to be non-null, aligned, point to one initialized `u8`, remain live for the read, and be accessed consistently with aliasing and concurrency rules.
+
+The caller acknowledges those obligations:
+
+```rust
+let value = unsafe { read(pointer) };
+```
+
+But the function body can contain a large amount of safe logic. The signature should not silently approve every unsafe operation added anywhere inside it later.
+
+## The block talks to the implementation reviewer
+
+The repair marks the exact operation:
+
+```rust
+unsafe fn read(pointer: *const u8) -> u8 {
+    // Safety: the caller provides a valid, aligned pointer to one live u8.
+    unsafe { *pointer }
+}
+```
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-080/fixed.rs) creates a pointer from a live reference, calls the function in an unsafe block, and verifies the byte on Rust 1.98.1.
+
+The inner block does not perform a runtime check and does not make a bad pointer safe. It identifies where the implementation relies on the caller's contract, giving the safety comment a concrete operation to justify.
+
+## Rust 2024 strengthens this separation
+
+The [Rust 2024 Edition Guide](https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html) explains that `unsafe_op_in_unsafe_fn` is warn-by-default in the 2024 edition. Projects can deny it explicitly, as the fixture does, to make violations build errors.
+
+Earlier edition code may compile with a warning or with the lint allowed. The raw dereference was never automatically memory-safe; only the lint enforcement and migration experience differ. I record the edition before assuming the compiler changed the underlying pointer rule.
+
+## Keep the unsafe block as small as the proof
+
+Wrapping the entire body compiles:
+
+```rust
+unsafe {
+    validate_header();
+    parse_length();
+    *pointer
+}
+```
+
+It also makes future unsafe calls inside that region less visible. I prefer safe validation outside and one small block around the operation requiring the proof. If several operations share one invariant and separating them would obscure it, one documented block can still be appropriate.
+
+The goal is an auditable boundary, not the smallest possible brace count.
+
+## Safety comments must match the operation
+
+“Pointer is valid” is too vague. Valid for how many bytes, with what alignment, for which lifetime, and under what mutation or concurrency conditions? A `*const T` read and `slice::from_raw_parts` require related but different facts. A foreign pointer may also require allocator or provenance guarantees.
+
+I write the comment from the callee's documented preconditions and link each assumption to a check or caller obligation. If the body derives a new pointer through arithmetic, the comment must cover the derived range, not only the original address.
+
+## Safe wrappers move, not remove, the proof
+
+A safe public function may validate a length or enum value and call a private unsafe helper. That can be a strong design: callers use a checked interface, while one module owns the raw invariant. The unsafe block remains inside because the implementation still performs an operation the compiler cannot prove.
+
+Conversely, making a function unsafe because its implementation is inconvenient is wrong. An unsafe signature is justified only when every correct call must satisfy extra-language obligations.
+
+## My migration procedure
+
+For this lint, I do not add one block around each entire unsafe function mechanically. I inventory raw dereferences, unsafe calls, mutable statics, union field accesses, and inline assembly. For each operation I identify:
+
+1. The precise preconditions.
+2. Which checks establish them locally.
+3. Which obligations must be passed to callers.
+4. The smallest region sharing that proof.
+5. A test or dynamic tool that can exercise boundary cases.
+
+The official [E0133 explanation](https://doc.rust-lang.org/error_codes/E0133.html) lists operations requiring unsafe context. The edition lint adds review discipline: `unsafe fn` declares the caller contract, while `unsafe { ... }` marks the implementation site where that contract is consumed. Keeping both explicit makes later changes much harder to approve accidentally.

@@ -1,0 +1,103 @@
+---
+caseId: "RFA-148"
+title: "Why Mutex::get_mut Still Returns PoisonError"
+date: "2026-09-05T15:48:00+01:00"
+lastmod: "2026-09-05T15:48:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "df00b2bfadea53bf574c8548927c6438c223e4915868ad28697dda75330a02d1"
+area: "concurrency-memory"
+symptom: "Mutex::get_mut returns PoisonError even with an exclusive mutable reference and no competing thread, because an earlier panic left the mutex poisoned."
+summary: "An exclusive borrow proves that locking is unnecessary; it does not prove the protected value is valid. Mutex poison is persistent state about an earlier panic and must be inspected, repaired, and explicitly cleared."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["targets with std::sync"]
+profiles: ["dev", "release with panic=unwind", "test"]
+searchTerms: ["Rust Mutex get_mut PoisonError exclusive reference", "get_mut does not clear mutex poison", "clear_poison after Mutex get_mut repair"]
+evidence: ["Rust 1.98.1 caught panic", "persistent poison flag", "validate-and-clear repair"]
+sources: ["https://doc.rust-lang.org/std/sync/struct.Mutex.html#method.get_mut", "https://doc.rust-lang.org/std/sync/struct.Mutex.html#method.clear_poison", "https://doc.rust-lang.org/std/sync/struct.PoisonError.html"]
+---
+
+At first this result feels redundant. If I own `&mut Mutex<T>`, nobody else can access the mutex. Why should `get_mut` return a lock-related error?
+
+Because `PoisonError` is not reporting present contention. It is reporting history.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-148/fail.rs) holds a mutex guard, changes a vector, and then panics. The panic is caught so the process continues. Later, with exclusive access to the mutex, `get_mut` still returns `Err`. Rust 1.98.1 reproduces this deterministically.
+
+## Exclusive access answers only one question
+
+[`Mutex::get_mut`](https://doc.rust-lang.org/std/sync/struct.Mutex.html#method.get_mut) takes `&mut self`. That borrow proves no other code can access the mutex through a competing reference during the call. Therefore it can expose the protected value without operating the platform lock.
+
+But the method returns a `LockResult<&mut T>`, not a plain `&mut T`. The mutex carries a poison flag set when a thread panics while holding its guard. An exclusive borrow does not erase this flag.
+
+These are separate facts:
+
+```text
+&mut Mutex<T> -> no concurrent accessor exists now
+poisoned      -> a previous protected operation ended during panic
+```
+
+The first is about aliasing and synchronization. The second is evidence that the value's logical invariant may be incomplete.
+
+## Poison is a warning, not proof of corruption
+
+In the fixture, the vector contains one pushed byte. Is that invalid? The mutex cannot know. A panic might happen before mutation, halfway through a multi-field update, or after the invariant was fully restored.
+
+Poisoning is intentionally conservative. It asks the next accessor to choose a recovery policy instead of silently trusting the value.
+
+[`PoisonError`](https://doc.rust-lang.org/std/sync/struct.PoisonError.html) still contains the guard or mutable reference. I can call `into_inner` to inspect and repair the data. That operation means “I accept responsibility for this state,” not “the state was definitely fine.”
+
+Blindly writing `unwrap_or_else(|e| e.into_inner())` everywhere removes the signal while preserving the risk. Sometimes that is correct for disposable caches or monotonic counters. It is not a general poison repair.
+
+## Repair the invariant, then clear the record
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-148/fixed.rs) follows an explicit sequence:
+
+1. Obtain the value from the poison error.
+2. Restore the fixture's invariant by clearing the incomplete vector.
+3. Call [`Mutex::clear_poison`](https://doc.rust-lang.org/std/sync/struct.Mutex.html#method.clear_poison).
+4. Verify both `get_mut().is_ok()` and `is_poisoned() == false`.
+
+In a real system the repair may rebuild an index, roll back a staged update, reload durable state, or mark a job for reconciliation. I want that policy near the data invariant. A generic lock helper usually lacks enough information to decide.
+
+Clearing poison before validation is the wrong order. It removes the warning that tells other accessors recovery is still unfinished.
+
+## Keep the guard alive when testing poison
+
+The first version of my fixture did this:
+
+```rust
+state.lock().unwrap().push(1);
+panic!("stop");
+```
+
+That does **not** poison the mutex. The temporary guard drops at the semicolon, before the panic. The panic happens with no guard held.
+
+The correct reproduction binds the guard:
+
+```rust
+let mut guard = state.lock().unwrap();
+guard.push(1);
+panic!("stop while guard is alive");
+```
+
+This small correction matters. It separates a real poison event from a panic that merely happens after locked work. It is also a good example of why I run every Atlas fixture instead of writing from memory.
+
+## Panic strategy changes the available recovery
+
+The example assumes unwinding, because `catch_unwind` resumes control and guard destruction records poison. With `panic=abort`, the process terminates at the panic. No caller remains to use `get_mut` or clear anything.
+
+I record the panic strategy when diagnosing poison behaviour. Tests generally unwind, while some production binaries choose abort. A recovery design that exists only under one strategy should be stated honestly.
+
+Poisoning also is not a complete safety boundary. The standard documentation notes that detection can be skipped in some unusual panic contexts. Unsafe code must not depend on poison as its only protection against invalid memory.
+
+## How I handle this in application code
+
+I write down one of three policies for each protected value:
+
+- **Propagate:** return the poison error because a higher layer owns recovery.
+- **Rebuild:** inspect durable or redundant data, reconstruct the value, then clear poison.
+- **Accept:** document why any intermediate state is still valid, take the inner value, and clear the flag.
+
+Then I test a panic at more than one mutation point. This is important when the invariant spans a map and a secondary index, a balance and ledger entry, or a queue and its counter.
+
+The core principle goes beyond mutexes: exclusive access proves nobody can race me now; it says nothing about whether an earlier owner finished its work. Rust keeps both facts visible. `get_mut` avoids locking, while `PoisonError` keeps the unfinished-history signal until my code deliberately resolves it.

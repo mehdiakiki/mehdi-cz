@@ -1,0 +1,128 @@
+---
+title: "Bytes Are Not Text: UTF-8 Rules for High-Performance Rust Scanners"
+date: "2026-10-20T17:25:00+01:00"
+lastmod: "2026-09-05T12:00:00+01:00"
+tags: ["rust", "utf-8", "text processing", "aho-corasick", "correctness"]
+draft: false
+reviewed: true
+reviewedHash: "f8433063097795a9fa3580f5c877060455edbf960f0f82f983895fbda21cdb72"
+cluster: "rust-under-the-hood"
+campaign: "editorial"
+summary: "Rust string search often operates on bytes, while users think in characters. I explain valid boundaries, byte offsets, case folding, normalization, and safe result APIs."
+---
+
+High-performance string search in Rust often works on `&[u8]`. Human requirements speak about text, characters, words, and case. These are not interchangeable units.
+
+I decide which layer owns the semantics before optimizing. A byte scanner can be perfectly correct while a user-facing feature built on it is wrong for Unicode text.
+
+## A Rust string is valid UTF-8
+
+An `&str` is a UTF-8 string slice. Its length is measured in bytes, not Unicode scalar values or user-perceived characters. Rust does not permit indexing a string by one integer because the nth byte is not necessarily the nth character.
+
+The standard library's [`str` documentation](https://doc.rust-lang.org/stable/std/primitive.str.html) explains this representation and the requirement that string slice boundaries fall on valid UTF-8 boundaries.
+
+```rust
+fn main() {
+    let text = "café";
+    assert_eq!(5, text.len());       // bytes
+    assert_eq!(4, text.chars().count());
+}
+```
+
+The final `é` uses two UTF-8 bytes. Neither count tells us the number of visible grapheme clusters for all languages; that is yet another layer.
+
+## Aho–Corasick returns byte offsets
+
+The `aho-corasick` crate accepts both strings and byte slices through its input APIs. Match positions are byte offsets.
+
+When both the pattern and haystack are ordinary valid UTF-8 strings, exact pattern matches begin and end at compatible UTF-8 boundaries. Slicing the original string by those offsets is then appropriate.
+
+But the matcher also allows arbitrary byte patterns. A byte pattern can match inside the multi-byte encoding of a character. Those offsets must not be used to slice an `&str` without checking boundaries.
+
+```rust
+use aho_corasick::AhoCorasick;
+
+fn main() {
+    let text = "café";
+    let continuation_byte = [0xA9_u8];
+    let matcher = AhoCorasick::new([continuation_byte]).unwrap();
+    let found = matcher.find(text.as_bytes()).unwrap();
+
+    assert!(!text.is_char_boundary(found.start()));
+    assert!(text.get(found.start()..found.end()).is_none());
+}
+```
+
+The byte match is real. It is not a valid text substring boundary.
+
+I return a distinct type or document the unit clearly: `ByteRange`, not a vague `Position`.
+
+## ASCII-insensitive is not Unicode-insensitive
+
+`AhoCorasickBuilder::ascii_case_insensitive(true)` performs simple ASCII case-insensitive matching. It does not implement full Unicode case folding.
+
+This is often exactly right for protocol headers, ASCII identifiers, log markers, or controlled syntax. It is incomplete for natural-language search.
+
+The [`ascii_case_insensitive` documentation](https://docs.rs/aho-corasick/latest/aho_corasick/struct.AhoCorasickBuilder.html#method.ascii_case_insensitive) names the contract precisely. I keep the same precision in my API. I do not label an ASCII rule merely “case insensitive.”
+
+Full case handling can change length and does not always map one scalar value to one scalar value. Lowercasing the haystack into a new string may also break offsets back into the original input. If original positions matter, normalization needs an offset-mapping design rather than one convenient preprocessing call.
+
+## Visually equal text can have different bytes
+
+Unicode permits multiple code-point sequences that can render the same way. A precomposed character and a base character followed by a combining mark do not have identical UTF-8 bytes.
+
+A byte-exact matcher will distinguish them. That is not a bug when scanning a binary protocol or source code. It may surprise users searching names or prose.
+
+I choose among three contracts:
+
+1. **byte exact:** patterns match exact byte sequences;
+2. **Unicode scalar aware:** operations work on decoded scalar values;
+3. **normalized user text:** input and patterns follow a documented normalization and case policy.
+
+The third often needs a separate transformed representation and a way to map results to original text. Calling that transformation zero-copy would be misleading.
+
+## Chunk boundaries can split UTF-8 too
+
+A reader may end a chunk after the first byte of a multi-byte sequence. If the scanner treats data as arbitrary bytes, this is fine for matching byte patterns. If a decoder converts every chunk independently with `from_utf8`, a valid stream can appear invalid.
+
+An incremental text decoder must retain the incomplete UTF-8 prefix or use an API designed for streaming validation. The invariant is the same as cross-chunk pattern matching: transport boundaries do not define text boundaries.
+
+I test splits inside every multi-byte example, not only between characters.
+
+## Word boundaries are a product rule
+
+“Match complete words” is not solved by checking for ASCII spaces. Punctuation, scripts without spaces, combining marks, and language-specific segmentation make the rule domain-dependent.
+
+For an ASCII protocol, an explicit set such as `[A-Za-z0-9_]` can be correct. For user prose, I use a Unicode-aware segmentation design and document its version. The Aho–Corasick automaton can find candidate byte ranges, while another layer validates semantic boundaries.
+
+This layered approach keeps the hot search simple without pretending it understands more text semantics than it does.
+
+## My result API says what it measures
+
+I prefer a result like:
+
+```rust
+struct ByteMatch {
+    pattern_id: usize,
+    byte_start: u64,
+    byte_end: u64,
+}
+```
+
+For an in-memory `&str`, a helper can return `Option<&str>` after checking `get(range)`. For streams, byte offsets remain stable even when the original chunk is gone. If callers need line, column, scalar, or grapheme positions, those are explicit derived operations with their own costs.
+
+## The review questions
+
+Before shipping a text scanner, I ask:
+
+1. Are patterns bytes or valid UTF-8 strings?
+2. Are offsets bytes, scalar values, or visible graphemes?
+3. Is case handling ASCII-only or Unicode-aware?
+4. Is normalization required?
+5. Can chunks split encoded characters?
+6. Must results map back to original unmodified input?
+7. What exactly counts as a word boundary?
+
+Bytes are a strong common layer for systems programming. They make zero-copy borrowing and SIMD search possible. They are not a complete definition of human text.
+
+The publication-aware [Aho–Corasick article collection](/blog/tags/aho-corasick/page/1) gathers the related input and ownership work as it becomes public. The underlying scanning model is [Zero-Copy Does Not Mean Zero Memory Access](/blog/zero-copy-does-not-mean-zero-memory-access-aho-corasick-rust).

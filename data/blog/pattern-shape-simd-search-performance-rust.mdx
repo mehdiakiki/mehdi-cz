@@ -1,0 +1,103 @@
+---
+title: "How Pattern Shape Changes SIMD Search Performance in Rust"
+date: "2026-09-30T12:35:00+01:00"
+lastmod: "2026-09-05T12:00:00+01:00"
+tags: ["rust", "simd", "string search", "aho-corasick", "benchmarking"]
+draft: false
+reviewed: true
+reviewedHash: "5f54260e556ba8140069d47bf699200c7db7d19e0bc9156e7ef299f717f5214f"
+cluster: "rust-under-the-hood"
+campaign: "editorial"
+summary: "Pattern count alone cannot predict fast string search. I show how rare bytes, short literals, prefixes, alphabet size, and candidate density shape SIMD-assisted Rust performance."
+---
+
+When somebody gives me a string-search benchmark with “1,000 patterns,” I still know very little about it.
+
+The patterns may share one rare byte. They may all begin with a space. They may be two bytes long or two hundred. They may look like English words, binary signatures, URLs, or generated identifiers. These shapes can lead a search library toward different optimizations and very different hardware behavior.
+
+Pattern count is useful metadata. It is not a workload description.
+
+## Rare bytes create good candidate filters
+
+Suppose every pattern contains `z`, while the haystack is ordinary English where `z` is uncommon. A SIMD byte-search routine can inspect a wide region for `z`. Only near a hit does the more expensive matcher need to verify a full pattern.
+
+Now replace `z` with a space. The same candidate strategy wakes up between almost every word. It still produces correct results, but it rejects much less work.
+
+Rust's Aho–Corasick [design document](https://github.com/BurntSushi/aho-corasick/blob/master/DESIGN.md#prefilters) describes a rare-byte heuristic for pattern sets whose starting bytes do not give a useful small filter. This is not a promise that a particular byte will always be chosen. It is a reason to include byte distribution in the experiment.
+
+I create at least two haystacks for a candidate byte: one where it is rare and one where it is frequent. If the performance claim survives both, it is more useful than a benchmark tuned for a single happy case.
+
+## Short patterns reduce room for filtering
+
+A one-byte pattern matches wherever that byte appears. There is no cheaper internal test that can skip the candidate and still remain correct. Very short patterns can also make true matches dense, moving cost into result reporting.
+
+Longer patterns provide more positions from which a selective candidate byte might be chosen. But length alone does not help if all bytes are common in the haystack.
+
+I record minimum, median, and maximum length instead of only an average. A corpus with 999 long patterns and one one-byte pattern has a very different constraint from 1,000 medium patterns, even when their average lengths look similar.
+
+The `AhoCorasick` API provides `min_pattern_len()` and `max_pattern_len()`. I calculate the rest before construction.
+
+## Shared prefixes change the automaton
+
+Patterns such as these share substantial structure:
+
+```text
+connect
+connected
+connection
+connection_error
+```
+
+Compare them with unrelated strings of the same lengths. A trie-based automaton can share prefix states for the first group. The second group may create more branches close to the start state.
+
+Shared prefixes also create more competing matches. With leftmost-first semantics, pattern order can decide which prefix wins. With leftmost-longest, the matcher may need to continue far enough to rule out a longer completion.
+
+This is why I keep semantics identical while benchmarking pattern shape. Changing both the corpus and match kind makes the result hard to interpret.
+
+## The alphabet is part of memory usage
+
+Text restricted to a small set of bytes offers different compression opportunities from binary patterns using nearly all 256 byte values. Rust's implementation uses byte equivalence classes in its automata so bytes with identical transition behavior can share a class.
+
+The [crate design](https://github.com/BurntSushi/aho-corasick/blob/master/DESIGN.md#byte-classes) explains this transformation. Fewer useful classes can shrink dense transition structures substantially. A benchmark using lowercase ASCII words may therefore understate memory for arbitrary binary signatures.
+
+For Unicode text, Aho–Corasick still searches bytes. UTF-8 changes the byte distribution and makes character-level assumptions dangerous. Byte offsets and human text positions therefore need an explicit contract of their own.
+
+## Pattern order can be semantic input
+
+With leftmost-first matching, the order of patterns is a priority rule. Reordering the corpus to improve locality or deduplicate input can change results.
+
+I hash the ordered pattern corpus used by a benchmark. If the match kind does not depend on order, I can test normalized variants, but I never silently sort a leftmost-first set.
+
+Duplicates deserve a declared policy too. They can create multiple pattern IDs for the same bytes. Removing them may reduce construction cost and output, but only if downstream code does not care which ID matched.
+
+## Five corpora reveal more than one random generator
+
+For a serious comparison, I use these shapes:
+
+1. **Rare-byte words:** patterns share an uncommon candidate byte.
+2. **Common-byte words:** likely candidates appear frequently in the haystack.
+3. **Prefix family:** many patterns extend the same beginning.
+4. **Wide binary set:** patterns cover much of the byte alphabet.
+5. **Short mixed set:** one- to four-byte patterns create frequent candidates and matches.
+
+I keep a realistic sixth corpus derived from the application domain. Synthetic inputs explain mechanisms; realistic input decides whether the mechanism matters.
+
+For each corpus I report build time, `kind()`, `memory_usage()`, scan throughput, and emitted match count. I test prefilters both enabled and disabled. The [`AhoCorasickBuilder::prefilter`](https://docs.rs/aho-corasick/latest/aho_corasick/struct.AhoCorasickBuilder.html#method.prefilter) switch makes that comparison explicit.
+
+## SIMD availability is not identical everywhere
+
+The `memchr` crate supplies highly optimized byte search used by many Rust text-search components. Its [feature documentation](https://docs.rs/memchr/latest/memchr/#crate-features) explains that runtime SIMD feature detection depends on the `std` feature, with architecture-specific behavior when it is absent.
+
+I record target triple and CPU features. A result from an AVX2-capable x86-64 machine should not be presented as a constant for AArch64, WebAssembly, or a binary compiled with different features.
+
+I also avoid hand-writing an unsafe SIMD loop before comparing the maintained library implementation. Correct tail handling, feature dispatch, and small-input paths are part of the work.
+
+## The practical lesson
+
+The question is not “does this algorithm use SIMD?” It is “what cheap signal allows this workload to skip expensive work, and how often is that signal present?”
+
+Pattern shape supplies the signal. Haystack distribution decides its selectivity. Automaton representation and CPU decide the cost of verification.
+
+That explanation is more durable than one throughput number. It also lets another engineer construct the input that might disprove my conclusion.
+
+For deciding whether to enable the filter, see [When Aho–Corasick Prefilters Help—and When They Hurt](/blog/when-aho-corasick-prefilters-help-or-hurt). The cluster's central memory model is [Zero-Copy Does Not Mean Zero Memory Access](/blog/zero-copy-does-not-mean-zero-memory-access-aho-corasick-rust).

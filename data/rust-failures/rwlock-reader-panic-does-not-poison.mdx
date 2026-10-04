@@ -1,0 +1,111 @@
+---
+caseId: "RFA-168"
+title: "Why a Panic Under an RwLock Read Guard Does Not Poison It"
+date: "2026-09-05T17:07:00+01:00"
+lastmod: "2026-09-05T17:07:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "029cc69b4548634aba13b54245d242f134d2d96b681a74ee727dfd92b1bdebfe"
+area: "concurrency-memory"
+symptom: "RwLock::is_poisoned remains false after a panic while a read guard is alive, because only writer panics poison the standard lock."
+summary: "RwLock poisoning tracks interrupted exclusive mutation, not every failure inside a read-side critical section. Reader panics leave the lock unpoisoned; application invariants using interior mutability need their own recovery signal."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["targets with std::sync::RwLock"]
+profiles: ["dev", "release with panic=unwind", "test"]
+searchTerms:
+  [
+    "Rust RwLock reader panic not poisoned",
+    "RwLock poisoning only writer panic",
+    "is_poisoned false after read guard panic",
+  ]
+evidence: ["Rust 1.98.1 caught reader panic", "shared read guard", "non-poison expectation repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/std/sync/struct.RwLock.html#poisoning",
+    "https://doc.rust-lang.org/std/sync/struct.RwLock.html#method.is_poisoned",
+    "https://doc.rust-lang.org/std/sync/struct.RwLockReadGuard.html",
+  ]
+---
+
+`Mutex` taught many of us that panic while holding a guard poisons the lock. `RwLock` has two guard modes, and only one poisons.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-168/fail.rs) acquires a read guard, panics, and catches the unwind. It then expects `is_poisoned()` to be true. Rust 1.98.1 returns false.
+
+## Poison protects interrupted exclusive mutation
+
+The [`RwLock` poisoning documentation](https://doc.rust-lang.org/std/sync/struct.RwLock.html#poisoning) states that the lock may become poisoned only when a panic occurs while it is locked exclusively in write mode. A panic while it is locked non-exclusively for reading does not poison it.
+
+This matches the usual invariant model. A read guard gives shared access to `T`, so ordinary safe code cannot mutate `T` through that guard. A reader panic may abandon computation, but it does not imply a write to the protected value stopped halfway.
+
+A writer guard provides mutable access. Panic during that mutation can leave a logical invariant incomplete, so later lock acquisition returns a poison error.
+
+## The repaired case accepts the documented state
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-168/fixed.rs) verifies that the lock is not poisoned and that a later read succeeds with the original vector.
+
+This is an expectation repair, not a request to suppress a useful error. The reader failure still needs application handling; it simply is not represented by the lock's poison flag.
+
+If the panic means a request failed, the thread join, task result, or surrounding error boundary should carry that information. Poison is about protected data consistency, not a general thread-health signal.
+
+## Interior mutability changes the application story
+
+A read guard can expose `T` containing atomics, mutexes, cells allowed by thread-safety rules, external resources, or other independently mutable state. A reader may therefore cause side effects without holding the outer write guard.
+
+The outer `RwLock` cannot understand those effects and still does not poison on a reader panic. If application correctness depends on completing such an update, I need an explicit state machine, transaction marker, or poison signal at the layer that owns it.
+
+Using interior mutability to perform writes under an outer read lock can also make the locking model misleading. I consider whether the outer operation should take a write guard instead.
+
+## Poison is advisory, not memory safety
+
+Even writer poisoning does not prove corruption, and absence of poison does not prove semantic health. The flag records a specific panic circumstance.
+
+The standard documentation warns that poison detection is not a complete safety mechanism in every unusual panic context. Unsafe code cannot rely on it as the only guard against invalid memory.
+
+I treat poison as evidence requiring a recovery decision:
+
+```text
+poisoned -> exclusive work may have stopped during unwind
+not poisoned -> that particular event was not recorded
+```
+
+Neither line replaces domain validation.
+
+## Compare reader and writer fixtures
+
+When poisoning behaviour is unclear, I reproduce both modes with `catch_unwind`:
+
+1. bind a read guard and panic while it remains live;
+2. bind a write guard, perform a partial mutation, and panic;
+3. inspect `is_poisoned` after each isolated case;
+4. decide how the protected invariant is repaired.
+
+Binding the guard is important. As the Atlas `Mutex::get_mut` case shows, a temporary guard can drop before the panic if its statement has ended. Then no poisoning event occurred at all.
+
+The guard type and its exact lifetime are both part of the evidence.
+
+## Panic strategy also matters
+
+The fixture assumes unwinding so the panic can be caught and guards can run their destructors. Under `panic=abort`, the process terminates and no later code inspects the lock.
+
+I record the panic strategy when testing recovery. A design that depends on poison handling is relevant only when execution continues after unwinding.
+
+For services using abort, durable recovery happens at process boundaries, usually from persisted data, not through an in-memory lock flag.
+
+## Lock fairness is a different concern
+
+Poisoning says nothing about reader/writer scheduling priority or fairness. Those policies can vary by platform. A healthy, unpoisoned lock can still suffer writer starvation or excessive contention.
+
+I measure wait time separately and avoid mixing performance diagnosis with invariant recovery. The same type carries synchronization and poison information, but they answer different questions.
+
+## My review checklist
+
+When code expects an `RwLock` to poison, I ask:
+
+- Was a read or write guard alive?
+- Did the panic begin before that guard dropped?
+- Which protected fields could have changed?
+- Does interior mutability bypass the outer write mode?
+- Where is worker failure reported if not through poison?
+- What validates or rebuilds state after a writer poison?
+
+The core principle is that failure signals have scope. `RwLock` poison records interrupted exclusive mutation. A reader panic is real, but it belongs to the reader's operation result rather than the lock's consistency flag. Reliable code handles both channels without expecting one boolean to describe every failure.

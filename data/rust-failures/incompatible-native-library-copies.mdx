@@ -1,0 +1,117 @@
+---
+caseId: "RFA-043"
+title: "Two Rust Dependencies Linked Incompatible Copies of One Native Library"
+date: "2026-09-04T21:00:00+01:00"
+lastmod: "2026-09-07T13:50:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "35924dc8467d1ecaa937a43ee641107b0d71177dada8c71ff7f2cdc38fdc8dc7"
+area: "cargo-dependencies"
+symptom: "A Rust binary fails to link or crashes because two dependencies bring incompatible copies of one native library."
+summary: "Cargo's links key prevents many duplicate native-library graphs, but not every manual or dynamic path. Map Rust packages to actual linked and loaded objects before unifying versions."
+rustVersions: ["stable Rust", "Cargo stable"]
+targets: ["affected native target"]
+profiles: ["dev", "release"]
+searchTerms:
+  [
+    "Rust two versions native library link",
+    "Cargo links duplicate C library",
+    "links field conflict sys crate",
+  ]
+evidence: ["Cargo dependency graph", "final link map", "runtime loader trace"]
+sources:
+  [
+    "https://doc.rust-lang.org/cargo/reference/build-scripts.html#the-links-manifest-key",
+    "https://doc.rust-lang.org/cargo/commands/cargo-tree.html",
+  ]
+---
+
+Cargo can compile two versions of an ordinary Rust crate into one dependency graph because their symbols are namespaced and mangled. Native libraries often live in a more global world. They may export the same symbol names, maintain singleton process state, install callbacks, or require memory to return to the same runtime.
+
+Cargo's `package.links` key gives it some knowledge of this boundary. Only one package per `links` value is allowed in a graph. This prevents many duplicate native links, but only when sys crates declare the relationship consistently.
+
+## Begin with both graphs
+
+I inspect the Rust packages and features:
+
+```bash
+cargo tree -d
+cargo tree -e features
+```
+
+Then I inspect what the final artifact actually links and loads. A Cargo tree can show two sys crates, but not every manually added archive or shared object. A dynamic loader can also select a different file at runtime.
+
+The first useful table is:
+
+| Rust package | `links` value | emitted library      | final loaded file        |
+| ------------ | ------------- | -------------------- | ------------------------ |
+| wrapper-a    | `nativefoo`   | `foo`                | `/usr/lib/libfoo.so.2`   |
+| wrapper-b    | absent        | `/opt/foo1/libfoo.a` | statically inside binary |
+
+This reveals why Cargo did not reject the graph: the second wrapper never declared the shared native identity.
+
+## Failure modes differ
+
+Duplicate native copies can produce:
+
+- link-time duplicate symbol errors;
+- an undefined symbol when one version wins lookup but lacks another API;
+- types allocated or registered in one copy and passed to another;
+- two independent global registries when the application expected one;
+- callbacks entering the wrong runtime;
+- shutdown order failures.
+
+A successful link is not proof of compatibility. Static archives may contribute only selected object files, and dynamic symbol interposition can make the winner depend on order and platform.
+
+The Atlas fixture avoids depending on whichever duplicate-symbol policy the host linker happens to use. It gives two deliberately isolated native copies versioned symbol prefixes, while each keeps a different owner marker inside its opaque handles. The [failing Rust consumer](/rust-failure-atlas/evidence/RFA-043/fail.rs) creates a handle in [native v1](/rust-failure-atlas/evidence/RFA-043/native/v1.c) and sends it to [native v2](/rust-failure-atlas/evidence/RFA-043/native/v2.c). Version 2 detects the foreign owner and returns `-1`; version 1 still destroys its own allocation, so the fixture demonstrates the ownership error without invoking undefined behavior.
+
+The evidence runner also reads the final GNU link map and requires both archives in the failing process. The [repaired consumer](/rust-failure-atlas/evidence/RFA-043/fixed.rs) creates, reads, and destroys through v1, and its link map must contain only the v1 archive. This tests the stronger invariant—one handle, one native owner—instead of accepting whichever same-named symbol wins by accident.
+
+The versioned prefixes are an observation tool, not the claimed repair for every system. Real duplicate libraries may use identical symbols and fail at link time, become interposed at load time, or remain isolated by a platform mechanism. The owner rule remains the same across those manifestations.
+
+## Use `links` to state native identity
+
+A sys crate manifest can declare:
+
+```toml
+[package]
+name = "nativefoo-sys"
+links = "nativefoo"
+build = "build.rs"
+```
+
+Its build script emits the link library and can pass metadata to dependent build scripts. Cargo then refuses two packages claiming the same `links` value in one graph.
+
+The key names the native library identity, not merely the Rust package. Forks wrapping the same process-global native library should coordinate that identity rather than choosing unique strings to evade Cargo's check.
+
+## Unify at the owning wrapper
+
+The clean repair is normally to make high-level dependencies accept one compatible sys crate version. Cargo patches, feature choices, or upstream upgrades can converge the graph, but I inspect semver and native ABI separately. Two Rust wrappers with compatible Rust APIs can still target incompatible native ABIs.
+
+If two native versions truly must coexist, they need isolation designed by the native library: symbol versioning, renamed symbols, separate processes, or a documented namespace mechanism. Merely changing Rust crate names is not isolation.
+
+Separate processes are often the clearest boundary for libraries with global state or allocator coupling.
+
+## Link order is diagnostic, not the contract
+
+Cargo notes that build-script instruction order can affect linker argument order. Reordering libraries may fix a static-link resolution error where one archive depends on another. It does not make two incompatible copies safe.
+
+I retain the link map before and after changes. It shows which archive member supplied each symbol and prevents a lucky order from being mistaken for version unification.
+
+## Dynamic loading needs runtime evidence
+
+On systems with shared libraries, I inspect the final dependency table and loader trace inside the deployed image. Development machines often have more versions and search paths than production.
+
+Plugins are especially risky: the host and plugin can each bring a native runtime into one process. Their Cargo graphs were built separately, so Cargo never had a chance to enforce one `links` identity.
+
+The plugin ABI must state whether native objects cross the boundary. Opaque handles should return to the component which created them.
+
+## False repairs
+
+Allowing multiple Rust versions with a resolver setting does not solve a global C symbol conflict. Renaming one `.so` file does not rename its exported symbols. Hiding duplicate-symbol errors with linker flags can leave ambiguous runtime behavior.
+
+## The regression proof
+
+I gate the dependency graph to one expected `links` identity, inspect the release link map, and run a fixture which creates, reads, and destroys native objects through the intended wrapper. For plugins, the test loads host and plugin together.
+
+The result I want is one explainable native owner. If two copies remain, their isolation and non-crossing ownership rules must be demonstrated rather than assumed.

@@ -1,0 +1,81 @@
+---
+caseId: "RFA-685"
+title: "RwLock Reader-Side Interior Mutation Does Not Trigger Poison"
+date: "2026-09-06T08:45:00+01:00"
+lastmod: "2026-09-06T08:45:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "10f357e4dae64597f9d94359facf75e1de6a9ebed697b22a7f81082fb894c9da"
+area: "concurrency-memory"
+symptom: "A reader mutates an AtomicU8 behind an RwLock read guard and then panics, but the outer RwLock remains unpoisoned."
+summary: "RwLock poison observes the outer guard mode, not logical writes through atomics or nested synchronization. Interior-mutable state needs its own transaction and recovery signal."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["targets supporting std threads"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["RwLock interior mutability reader panic no poison", "Atomic inside RwLock read guard panic", "outer RwLock poison does not track atomic mutation"]
+evidence: ["Rust 1.98.1 runtime assertion", "AtomicU8 changed under shared read guard", "mutation survives while outer lock stays unpoisoned"]
+sources: ["https://doc.rust-lang.org/std/sync/struct.RwLock.html#poisoning", "https://doc.rust-lang.org/std/sync/struct.RwLock.html#method.is_poisoned", "https://doc.rust-lang.org/std/sync/struct.RwLock.html#method.read"]
+---
+
+A standard `RwLock` is poisoned when a panic occurs under an exclusive write lock, not when a thread panics under a read lock. The [failing fixture](/rust-failure-atlas/evidence/RFA-685/fail.rs) makes the harder case visible: it stores `9` into an `AtomicU8` through the read guard and then panics. The outer lock remains unpoisoned even though logical state changed.
+
+## Poison tracks mutation risk
+
+The [`RwLock` poisoning documentation](https://doc.rust-lang.org/std/sync/struct.RwLock.html#poisoning) makes the guard-mode distinction explicit. A write guard permits mutation of protected state, so interrupted execution may leave an invariant incomplete. A read guard exposes `&T`, but `T` can itself contain atomics, another lock, or other synchronization that permits changes through shared access.
+
+The reader operation itself still failed. Its thread panic should be joined and handled. The outer lock simply has no evidence about the multi-step invariant implemented through the inner atomic.
+
+I separate task failure from shared-state integrity. They are related operationally but not identical.
+
+## Interior mutability deserves separate review
+
+An RwLock read guard yields `&T`. If `T` contains atomics, another lock, or other interior mutability, code can cause changes while holding a read guard. The outer RwLock's poison policy does not automatically understand those inner mutations.
+
+This is a sign to review the synchronization model. A read lock that performs logically exclusive mutation through interior state can mislead maintainers and may not preserve the intended invariant.
+
+Sometimes atomics inside read-mostly data are legitimate for metrics or caches. Their own ordering and recovery rules remain independent from outer poison.
+
+## is_poisoned is only a snapshot
+
+[`RwLock::is_poisoned`](https://doc.rust-lang.org/std/sync/struct.RwLock.html#method.is_poisoned) reports current poison state, but another thread may poison after the check. Code cannot safely check then assume a later `read().unwrap()` must succeed.
+
+I handle the result of the actual acquisition. The predicate is useful for diagnostics and tests, not as a synchronization gate.
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-685/fixed.rs) confirms false and then reads the changed value `9`. It repairs the expectation, while the engineering repair is to avoid treating outer poison as validation for interior state.
+
+## A panicking reader can still block progress briefly
+
+During unwinding, its read guard is dropped and releases shared access. Until then, a waiting writer remains blocked. Destructors and panic hooks can lengthen that interval.
+
+Panics should not be normal control flow. Worker boundaries catch or join them according to service policy, and critical systems may restart the failed component. The absence of poison does not mean the request succeeded or no resources leaked outside the lock.
+
+If a reader performed external side effects before panic, those effects are not rolled back. Poison only concerns the lock's own advisory state.
+
+## Other lock implementations may differ
+
+Poison is a policy of Rust's standard synchronization types. Third-party async and parking locks may omit poison or expose different behaviour. I read the chosen type's documentation rather than transferring expectations by name.
+
+Changing lock libraries can therefore change error handling as well as performance. An `unwrap` removed during migration may have represented a real recovery decision, not boilerplate.
+
+Async readers can also be cancelled at await points depending on the lock and future. That is a different failure mechanism from thread unwinding.
+
+## Test both guard modes
+
+One test for “a panic poisons RwLock” is incomplete. I include writer and reader cases, assert worker join failure, inspect poison, and verify the selected recovery path.
+
+For interior mutable fields, tests target their own invariants. The outer reader test should not imply those nested changes are automatically safe.
+
+Read-side code can still starve or overload a service even with intact state. I monitor read-lock hold time and panic rate separately from poison. Integrity, availability, and successful work are three signals, and the absence of one warning cannot stand in for the others.
+
+## My reader-panic checklist
+
+- Was the panic under a read or write guard?
+- Did interior mutability permit logical mutation under the reader?
+- Is task failure handled independently from lock poison?
+- Is is_poisoned being used as a racy pre-check?
+- Did external side effects occur before the panic?
+- Does the actual lock implementation use the same poison policy?
+- Can unwinding destructors delay waiting writers?
+- Do tests distinguish reader and writer failure?
+
+The core principle is that poisoning records a specific risk: interrupted exclusive mutation. A reader panic remains a serious failed operation, but std RwLock does not label its protected value poisoned solely for that event.

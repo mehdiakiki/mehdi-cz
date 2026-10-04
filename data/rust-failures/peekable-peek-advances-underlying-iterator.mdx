@@ -1,0 +1,112 @@
+---
+caseId: "RFA-158"
+title: "Why Peekable::peek Advances the Underlying Iterator"
+date: "2026-09-05T16:48:00+01:00"
+lastmod: "2026-09-05T16:48:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "f2c41ebea427a8784c868a7d6bc40533482ab4784821dbd3ea0e03903094f71e"
+area: "concurrency-memory"
+symptom: "Calling Peekable::peek increments the underlying iterator's next-call counter even though the item remains available to the Peekable consumer."
+summary: "peek is non-consuming at the adapter boundary, but Peekable must call the source iterator once to fill its cache. Repeated peeks and the next call reuse that cached result."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust Peekable peek advances underlying iterator", "peek calls next side effects Rust iterator", "Peekable first peek fills cache"]
+evidence: ["Rust 1.98.1 counted next calls", "first-peek cache fill", "cache-aware repair"]
+sources: ["https://doc.rust-lang.org/std/iter/struct.Peekable.html#method.peek", "https://doc.rust-lang.org/std/iter/trait.Iterator.html#method.peekable", "https://doc.rust-lang.org/std/iter/trait.Iterator.html#tymethod.next"]
+---
+
+“Peek without advancing” is true from one point of view and false from another. The adapter does not give up the item, but it has to obtain that item from somewhere.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-158/fail.rs) wraps a tiny iterator whose `next` method increments a counter. Before peeking, the count is zero. The first `peek()` returns `10` and the count becomes one. The assertion expecting no source pull fails.
+
+## Peekable inserts a one-item cache
+
+[`Iterator::peekable`](https://doc.rust-lang.org/std/iter/trait.Iterator.html#method.peekable) creates an adapter able to look at the next item without consuming it from the adapter. To implement this, the adapter stores the result of one underlying `next` call.
+
+The first [`Peekable::peek`](https://doc.rust-lang.org/std/iter/struct.Peekable.html#method.peek) may therefore advance the source iterator. Its documentation calls this out directly.
+
+The ownership path looks like this:
+
+```text
+source iterator --next()--> Peekable cache --next()--> caller
+                              ^
+                              peek() borrows here
+```
+
+After the first peek, the item belongs to the adapter's cache. It has not been yielded to the caller, but the source has already moved past it.
+
+## Repeated peeks do not keep pulling
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-158/fixed.rs) asserts the complete call sequence:
+
+1. First `peek` returns `&10`; source pull count becomes one.
+2. Second `peek` returns the same cached value; count stays one.
+3. `next` returns owned `10` from the cache; count still stays one.
+4. A later request would pull `20` from the source.
+
+This is the contract I use when building parsers. Peekable gives one-token lookahead without losing the token to the parser consumer. It does not promise that upstream observation or I/O has not occurred.
+
+## Side-effectful iterators expose the distinction
+
+Many iterators read an in-memory collection, so an underlying pull has no surprising visible effect. Custom iterators may:
+
+- increment metrics;
+- read from a buffered source;
+- advance a decoder;
+- update internal line and byte positions;
+- log requests;
+- receive from a channel-like abstraction;
+- run a closure with application side effects.
+
+With these sources, calling `peek` is real work. It may block if `next` blocks. It may return an error value wrapped as an item. It may trigger one expensive computation earlier than expected.
+
+I avoid describing peek as a pure query unless the underlying iterator itself makes that true.
+
+## Dropping after peek drops the cached item
+
+Another consequence follows from ownership. Once the adapter has cached an owned item, dropping the `Peekable` drops that item. The original iterator cannot recover it unless I recover or retain the adapter itself.
+
+This matters when I borrow an iterator with `by_ref`:
+
+```rust
+let mut source = make_iterator();
+{
+    let mut lookahead = source.by_ref().peekable();
+    lookahead.peek();
+} // cached item is dropped here
+```
+
+The source has already advanced. Returning to `source` starts after the item that was only peeked. If preserving the boundary item matters, I keep the `Peekable` as the shared iterator state rather than creating a temporary adapter.
+
+That lifecycle issue is easy to miss because the call site never invoked `next` on `lookahead`.
+
+## Peek on references adds another reference layer
+
+If the source yields references, `peek` returns a reference to the cached item, producing shapes such as `Option<&&T>`. This is not duplicate data. One reference belongs to the iterator item and the other borrows the cache.
+
+Pattern matching and `.copied()` can make the intended level clearer. I avoid adding dereferences until it compiles; I write down what the iterator's `Item` type is, then what `peek` must borrow.
+
+The cached borrow also prevents mutable operations on the adapter while that borrow remains in use. That is normal aliasing protection around the cached item.
+
+## Parser design should own the lookahead state
+
+For token parsers, I usually create `Peekable` once and pass `&mut Peekable<I>` through parsing functions. Each function sees one coherent cache. Rewrapping the raw iterator can make one parser stage drop a token another stage expected.
+
+For richer lookahead, rollback, or diagnostics, a one-item cache may be too small. I use a token buffer with explicit positions. The same principle remains: observation moves information from the producer into consumer-owned state.
+
+## My debugging method
+
+When a source appears to advance during a peek, I instrument boundaries:
+
+1. Count calls to the source's `next` method.
+2. Count values yielded by the adapter separately.
+3. Call `peek` twice and then `next`.
+4. Test dropping the adapter after a peek.
+5. Check whether the adapter borrows the source with `by_ref`.
+6. Decide which layer owns the cached item between parser stages.
+
+This produces a more useful trace than printing only returned values. The returned sequence can be correct while source-side effects occur earlier.
+
+The broader systems principle is that non-consuming observation often needs buffering. A network protocol parser, message broker, or stream processor may read ahead and hold data locally. “Not consumed” must name the boundary. For `Peekable`, the caller has not consumed the item, but the underlying iterator has already supplied it.

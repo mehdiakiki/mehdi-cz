@@ -1,0 +1,212 @@
+---
+title: "Unknown Fields Are the Quiet Engine of Protobuf Evolution"
+date: "2026-11-07T09:00:00+01:00"
+tags: ["Protocol Buffers", "unknown fields", "schema evolution", "data contracts", "serialization"]
+draft: false
+reviewed: true
+reviewedHash: "eac3d710bcb50ad6f51cac7a25910efa3e4b60f8da747f0527d61eb906d56bcc"
+cluster: "reliable-data-integrations"
+campaign: "authority-2026"
+opportunity: "DATA-061"
+summary: "An old Protobuf reader can preserve fields it does not understand when it parses and reserializes binary messages. JSON conversion and field-by-field copying can quietly destroy that protection."
+---
+
+Protocol Buffers can let an old service receive a message containing a field added by a newer producer, then serialize the message again without deleting that field.
+
+The old generated code cannot name the field. It preserves the raw unknown field in the message's unknown-field set.
+
+This quiet behaviour is a major reason additive Protobuf changes can survive mixed-version deployments.
+
+## Field numbers carry wire identity
+
+Start with:
+
+```proto
+message Account {
+  string id = 1;
+  bool active = 2;
+}
+```
+
+Version 2 adds:
+
+```proto
+message Account {
+  string id = 1;
+  bool active = 2;
+  string region = 3;
+}
+```
+
+On the wire, field number 3 and its wire type identify the new value. A V1 parser does not have a generated `region` accessor, but modern Protobuf runtimes retain the unknown field data in the parsed message.
+
+If the V1 service serializes that same message, field 3 can travel onwards for a V2 reader to recover.
+
+The official [Proto3 unknown-fields guide](https://protobuf.dev/programming-guides/proto3/#unknowns) documents preservation and lists operations that can lose unknown fields.
+
+## Preservation requires the same message object or unknown set
+
+This path preserves more information:
+
+```text
+V2 binary bytes
+  -> parse into V1 generated Account
+  -> update active on that message
+  -> serialize the V1 Account
+  -> V2 parser still sees region
+```
+
+This path often loses it:
+
+```text
+V2 binary bytes
+  -> parse V1 Account
+  -> copy known fields into a fresh domain object
+  -> build a new V1 Account from known fields
+  -> serialize
+  -> region is gone
+```
+
+The schema format cannot preserve bytes the application chooses not to carry.
+
+I test the real adapter and transformation path, not only parser behaviour.
+
+## JSON is not the Protobuf wire format
+
+Converting a message to JSON and back can discard unknown fields because the JSON representation needs field names that the old schema does not know.
+
+```text
+new Protobuf binary
+  -> old parser keeps unknown field 3
+  -> old Protobuf JSON output has no known name for field 3
+  -> parse JSON back
+  -> unknown binary field is absent
+```
+
+The Protobuf guide explicitly warns that serializing to JSON can lose unknown fields.
+
+This affects gateways, debug stores, queues that standardize on JSON, and audit pipelines that later expect a lossless replay.
+
+## Deliberately discarding unknown fields is a contract change
+
+Runtimes expose APIs to inspect or discard unknown fields. Discarding can reduce retained data or remove fields the service intentionally refuses to forward.
+
+I make the decision at a named boundary:
+
+```text
+transparent relay: preserve unknown fields
+security boundary: parse allowed fields into a new outbound message intentionally
+long-term archive: preserve original bytes and schema identity
+domain projection: store only governed fields, without claiming lossless relay
+```
+
+Preserving everything is not always safer. An old service should not forward unreviewed privileged commands merely because they are unknown. The point is to choose, document, and test the boundary.
+
+## Never reuse a field number
+
+If field 3 is removed, a future version must not assign number 3 to a different meaning. Old stored messages still contain those bytes, and old writers may return.
+
+I reserve removed numbers and usually names:
+
+```proto
+message Account {
+  reserved 3;
+  reserved "region";
+
+  string id = 1;
+  bool active = 2;
+}
+```
+
+The [Protobuf updating-a-message-type guidance](https://protobuf.dev/programming-guides/proto3/#updating) calls reserving deleted field numbers essential because number reuse can create wire-incompatible interpretation.
+
+Unknown-field preservation keeps the old bytes alive, making number reuse especially dangerous.
+
+## Wire type compatibility is not semantic compatibility
+
+Some scalar changes share a compatible wire encoding, but the values may have different meaning, range, or signed interpretation.
+
+Changing:
+
+```text
+duration_ms = 3
+```
+
+into:
+
+```text
+duration_seconds = 3
+```
+
+without a new field number is a semantic break even if both are integers.
+
+Unknown fields help when an old reader truly does not know a new field. They cannot repair reusing a known number with a changed contract.
+
+## `oneof` evolution has an observation gap
+
+An old reader receiving a new `oneof` alternative can preserve its bytes as unknown while reporting that none of its known alternatives is set.
+
+Application logic that interprets “no known case” as “the producer sent no choice” can make a wrong decision. Reserializing may preserve bytes, but the old service's business action already happened under incomplete knowledge.
+
+I include unknown variants in application state machines:
+
+```text
+known case A
+known case B
+no value sent
+value present but unknown to this version
+```
+
+Whether the generated API exposes this distinction varies, so a security-sensitive old consumer may need version gating or an envelope contract.
+
+## Unknown enums also need tolerant code
+
+An enum can receive a numeric value added by a new producer. Generated runtimes commonly preserve the unknown numeric value, but application code may still use an exhaustive conversion that returns an error or falls back to a dangerous default.
+
+I store or report the raw numeric value and treat unsupported as an explicit state. Mapping every future status to `ACTIVE` is structurally convenient and semantically unsafe.
+
+## Verify mixed-version round trips
+
+My fixture test is:
+
+```text
+1. build V2 message with region = "eu"
+2. serialize using V2
+3. parse using V1
+4. change only active using V1
+5. serialize using V1
+6. parse using V2
+7. assert region is still "eu"
+```
+
+Then I repeat through every real intermediary:
+
+```text
+binary queue
+database blob
+JSON gateway
+field-by-field domain mapper
+logging/redaction transform
+message clone or merge helper
+```
+
+The expected result may be preservation or deliberate removal. It must not be accidental.
+
+## Observe unknown data without leaking it
+
+Unknown fields can contain sensitive or large payloads. Logging their raw bytes is not a safe default.
+
+I record bounded metadata:
+
+```text
+message type
+schema/build version
+unknown field numbers and wire types
+total unknown byte count
+source producer identity
+whether the boundary preserved or discarded them
+```
+
+This helps detect producer/consumer drift without copying unclassified values into logs.
+
+Unknown fields do not make every schema change compatible. They provide a precise preservation property: an older binary parser can carry newer fields it does not understand. That property survives only when application transformations, JSON bridges, security policy, and field-number discipline allow it.

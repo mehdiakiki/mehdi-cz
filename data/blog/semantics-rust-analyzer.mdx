@@ -1,307 +1,233 @@
 ---
-title: "Rust Analyzer: Source to Definiton Deep Dive"
-date: "2025-02-20"
-tags: ["rust", "macros", "declarative", "procedural", "derive"]
-draft: true
-summary: Rust provides powerful macros that allow for metaprogramming, enabling developers to write code that generates other code.
+title: "How rust-analyzer Finds a Definition Through Macros and Modules"
+date: "2026-09-10T19:00:00+01:00"
+tags: ["rust", "rust-analyzer", "compiler internals", "ide", "source mapping"]
+draft: false
+reviewed: true
+reviewedHash: "873b7986e9d67899a57bdb81a98bcc6163a6d2b9b10127db1d7919faa5b683af"
+cluster: "rust-under-the-hood"
+campaign: "authority-2026"
+opportunity: "RUST-004"
+summary: "Trace go to definition from a cursor token through syntax, macro expansion, name resolution, semantic identity, and finally back to an editable source range."
 ---
 
-The algorithm described in this module is used to map syntax nodes to their corresponding semantic definitions. This is a crucial part of IDE functionality, allowing features like "go to definition" to work correctly.
+Pressing go to definition looks like a text-search feature. The cursor is on `Client`, another file contains `struct Client`, so perhaps the editor searches for the same word.
 
-## Algorithm Steps
+That model fails quickly in Rust. A name can be renamed by `use`, re-exported through several modules, created inside a macro expansion, disabled by `cfg`, or present in the same source file under more than one crate configuration.
 
-- Find the syntactic container for the syntax node.
-- Recursively get the definition (def) corresponding to the container.
-- Ask the container def for all child defs.
-- For each child def, ask for its source.
-- The child def whose source matches the original syntax node is the answer.
+While contributing around compiler tooling, I found a more useful model:
 
-## Key Points
+> Go to definition is a round trip from source syntax to semantic identity and back to source.
 
-The algorithm is recursive.
-It uses an inverse approach (what is the syntax for this def?).
-The recursion stops at the file syntax node, which doesn't have a syntactic parent.
+The return trip matters. A compiler can stop after it knows what a name means. An IDE must also find the file and range a person can open.
 
-## Real-life Code Example
+## One small example already needs semantics
 
-Let's look at a simplified version of how this algorithm might be implemented in rust-analyzer:
+Consider this workspace:
 
 ```rust
-use syntax::{AstNode, SyntaxNode};
-use hir_def::{ModuleId, DefWithBodyId};
+// src/model.rs
+#[derive(Default)]
+pub struct Client;
 
-struct SourceToDefCtx<'db> {
-    db: &'db dyn HirDatabase,
-    // ... other fields ...
-}
-
-impl<'db> SourceToDefCtx<'db> {
-    fn source_to_def(&mut self, node: &SyntaxNode) -> Option<DefWithBodyId> {
-        // Step 1: Find the syntactic container
-        let container = self.find_container(node)?;
-
-        // Step 2: Recursively get the def for the container
-        let container_def = self.container_to_def(container)?;
-
-        // Step 3: Get all child defs from the container
-        let child_defs = self.db.child_defs(container_def);
-
-        // Steps 4 & 5: Find the child def whose source matches our node
-        child_defs.into_iter().find(|&child_def| {
-            let child_source = self.db.lookup_source(child_def);
-            child_source.syntax() == node
-        })
-    }
-
-    fn find_container(&self, node: &SyntaxNode) -> Option<SyntaxNode> {
-        node.ancestors().find(|n| self.is_container(n))
-    }
-
-    fn container_to_def(&mut self, container: SyntaxNode) -> Option<DefWithBodyId> {
-        if let Some(function) = ast::Fn::cast(container.clone()) {
-            self.fn_to_def(function)
-        } else if let Some(module) = ast::Module::cast(container) {
-            self.module_to_def(module).map(DefWithBodyId::from)
-        } else {
-            // Handle other types of containers...
-            None
-        }
-    }
-
-    fn fn_to_def(&mut self, func: ast::Fn) -> Option<DefWithBodyId> {
-        // Implementation to convert ast::Fn to FunctionId
-        // ...
-    }
-
-    fn module_to_def(&mut self, module: ast::Module) -> Option<ModuleId> {
-        // Implementation to convert ast::Module to ModuleId
-        // ...
-    }
-
-    // Other helper methods...
-}
-```
-
-In this example:
-
-1. `source_to_def` is the main entry point, implementing the algorithm.
-2. `find_container` finds the syntactic container for a given node.
-3. `container_to_def` converts a container syntax node to its corresponding def.
-4. Helper methods like `fn_to_def` and `module_to_def` handle specific conversions.
-
-This implementation demonstrates how the algorithm recursively navigates the syntax tree, converts containers to defs, and ultimately finds the specific def that corresponds to the original syntax node.
-
-The actual implementation in rust-analyzer is more complex, handling various edge cases, caching results for performance, and dealing with macro expansions. However, this simplified version captures the essence of the algorithm described in the module.
-
-## Example Output of `file_to_def` Function
-
-Let's consider the following project structure:
-
-```
-my_project/
-├── Cargo.toml
-└── src/
-    ├── lib.rs
-    ├── main.rs
-    └── utils.rs
-```
-
-With the following content:
-
-```rust
-// src/lib.rs
-mod utils;
-
-pub fn library_function() {
-    utils::helper_function();
-}
+// src/api.rs
+pub use crate::model::Client as ApiClient;
 
 // src/main.rs
-use my_project::library_function;
-mod utils;
+mod api;
+mod model;
+
+macro_rules! construct {
+    ($ty:path) => {
+        $ty::default()
+    };
+}
 
 fn main() {
-    library_function();
-    utils::helper_function();
-}
-
-// src/utils.rs
-pub(crate) fn helper_function() {
-    println!("Helper function called");
+    let _client = construct!(crate::api::ApiClient);
 }
 ```
 
-Now, let's consider what `file_to_def` might return when called with the `FileId` corresponding to `utils.rs`:
+Ask for the definition of `ApiClient` at the call site. A useful answer may be the re-export in `api.rs`, or the underlying `Client` definition in `model.rs`, depending on the navigation command. The token also sits inside a macro invocation whose expansion contains another path.
+
+A string search cannot decide any of this. rust-analyzer needs the crate graph, module tree, imports, macro expansion, and the meaning of the path at this exact location.
+
+## The five-stage trace I use
+
+I reduce the operation to five stages:
+
+```text
+cursor position
+    ↓
+syntax token and enclosing construct
+    ↓
+source or expanded syntax context
+    ↓
+resolved semantic definition
+    ↓
+original file and navigation range
+```
+
+This is not a literal list of five function calls. Internal APIs evolve. It is a stable way to reason about the work.
+
+### 1. Turn an offset into syntax
+
+The editor sends a document and byte or character position. rust-analyzer parses each file into a lossless syntax tree. Whitespace, comments, malformed code, and incomplete constructs remain representable because an IDE must work while I am typing.
+
+The token at the cursor is only the beginning. `Client` may be:
+
+- a name being declared;
+- a path segment being referenced;
+- a field or method;
+- part of a `use` tree;
+- an associated type;
+- a token passed to a macro.
+
+The enclosing syntax tells the IDE which semantic question to ask. This separation is important: the syntax layer knows the shape of one file, but it intentionally does not store name resolution or type information.
+
+### 2. Keep the file context with the node
+
+A syntax node is not globally unique enough for semantic work. The same physical file can participate in more than one crate or module context. Different `cfg` settings can also change which items exist.
+
+Conceptually, semantic lookup needs both pieces:
+
+```text
+(file or expansion identity, syntax node)
+```
+
+rust-analyzer uses file-aware wrappers and semantic APIs for this job. This prevents a common mental mistake: assuming that one source file always maps to one module definition.
+
+For example, a shared source file can be included from two crate roots. The text is identical, but a path beginning with `crate::` has different meaning in each crate. Source-to-definition mapping can therefore be one-to-many at the file boundary.
+
+### 3. Cross the syntax-to-definition boundary
+
+For a declaration node, rust-analyzer needs to discover its semantic owner. Its architecture guide describes the core `source_to_def` idea as a recursive lookup:
+
+1. find a containing syntax item whose semantic definition is known;
+2. resolve that parent definition;
+3. ask the parent for its semantic children;
+4. map those children back to source;
+5. select the child whose source matches the node.
+
+The direction feels inverted at first. Why not store a direct pointer from every syntax node to a definition?
+
+Because syntax is cheap, local, and replaceable after an edit. Semantic definitions are derived from crate-wide facts. Keeping them separate lets the syntax tree remain a value and lets incremental queries recompute only the affected meaning.
+
+The parent-first search also gives the child a context. A function named `parse` means little by itself. A `parse` item inside a resolved module has a stable semantic owner.
+
+### 4. Resolve references, not only declarations
+
+Most go-to-definition requests start on a reference, not on the declaration itself. The IDE classifies the syntax and asks the semantic model what it resolves to.
+
+For `crate::api::ApiClient`, resolution uses facts such as:
+
+- which crate owns this file context;
+- which module contains the expression;
+- what `crate` means there;
+- which names the `api` module exports;
+- whether `ApiClient` is a definition, import, or re-export;
+- which conditional items are active.
+
+Methods add type inference and trait lookup. An operator such as `+` can navigate to an implementation of `Add`. The `?` operator can involve `From` conversion. This is why rust-analyzer's go-to-definition feature is better understood as semantic navigation than identifier lookup.
+
+## Macros create virtual code with real meaning
+
+The macro in the example expands roughly into:
 
 ```rust
-let file_id = FileId::new(/* some internal ID for utils.rs */);
-let module_ids = source_to_def_ctx.file_to_def(file_id);
+crate::api::ApiClient::default()
 ```
 
-The `file_to_def` function would return a `&SmallVec<[ModuleId; 1]>` containing two `ModuleId`s:
+The expanded expression must participate in parsing, name resolution, and type inference. But there is no editable `.rs` file containing that exact generated expression.
 
-1. A `ModuleId` representing the `utils` module in the context of the library crate (defined in `lib.rs`).
-2. A `ModuleId` representing the `utils` module in the context of the binary crate (defined in `main.rs`).
+I think about expanded code as a virtual file with a source map:
 
-In pseudo-code, the result might look something like this:
+```text
+real call-site token ──expand──> virtual token
+real macro definition ──expand──> virtual generated syntax
+virtual result         ──map────> original source range
+```
+
+Tokens captured from `$ty` have an origin at the call site. Tokens written by the macro have an origin around the macro definition. Procedural macros make this mapping harder because generated tokens carry spans, and those spans determine how diagnostics and navigation relate back to source.
+
+Navigation through a macro therefore needs two answers:
+
+1. What does the token mean in the expanded program?
+2. Which original source range is the best place to show?
+
+If a token has no precise editable origin, the IDE has to choose a useful fallback. This is also why preserving meaningful spans in procedural macros improves much more than error underlines.
+
+## Modules are not folders with nicer syntax
+
+The file tree helps rust-analyzer build the module tree, but the two are not identical.
+
+```text
+filesystem path  ≠  module identity  ≠  crate identity
+```
+
+`mod payments;` can resolve to one of Rust's supported module-file layouts. A file can be reached from a crate root only when module declarations connect it. A dependency source file belongs to another crate even if it is visible in the editor. Generated code and macro expansions have file identities without ordinary filesystem paths.
+
+For go to definition, the important structure is the semantic module tree derived from the crate graph and active configuration. Treating directories as namespaces gives plausible but wrong answers around multiple targets, build scripts, integration tests, and conditional modules.
+
+## Re-exports make “the definition” a product choice
+
+Suppose a library intentionally exposes:
 
 ```rust
-SmallVec[
-    ModuleId {
-        crate_id: CrateId(0), // Assuming 0 represents the library crate
-        local_id: LocalModuleId(2) // Assuming 2 is the local ID for utils in the library crate
-    },
-    ModuleId {
-        crate_id: CrateId(1), // Assuming 1 represents the binary crate
-        local_id: LocalModuleId(1) // Assuming 1 is the local ID for utils in the binary crate
-    }
-]
+pub use internal::v2::Client;
 ```
 
-Each `ModuleId` uniquely identifies the `utils` module in its respective crate context. The `CrateId` distinguishes between the library and binary crates, while the `LocalModuleId` identifies the specific module within that crate.
+There are now at least two useful destinations:
 
-This result allows rust-analyzer to understand that `utils.rs` defines a module that exists in two different contexts (the library and binary crates). When performing operations like "Go to Definition" or code completion, rust-analyzer can use this information to provide accurate results regardless of whether the user is working in the context of the library or the binary crate.
+- the public re-export that explains the supported API;
+- the original struct that explains the implementation.
 
-# Rust File Relationship Algorithm in rust-analyzer
+Go to declaration and go to definition can make different choices here. Navigation may also skip a blanket standard-library implementation when a more specific destination is useful. The semantic model supplies possible identities; the IDE feature still applies a product policy to choose the navigation target.
 
-## Complex Scenario
+This distinction matters when debugging. A correct resolver can still produce an unhelpful jump if the final target-selection policy is wrong.
 
-Consider the following project structure:
+## Why edits do not require full recomputation
 
-```
-my_project/
-├── Cargo.toml
-├── src/
-│   ├── lib.rs
-│   ├── main.rs
-│   ├── module_a/
-│   │   ├── mod.rs
-│   │   └── submodule.rs
-│   └── module_b.rs
-└── tests/
-    └── integration_test.rs
-```
+rust-analyzer holds source and project structure as input and derives semantic facts on demand. An edit replaces syntax for the changed file and invalidates dependent queries. Unrelated crate facts can remain reusable.
 
-## File Contents
+The syntax/semantics split is what makes this practical:
 
-```rust
-// src/lib.rs
-mod module_a;
-mod module_b;
+- syntax answers what text structure exists here;
+- the crate and module model answers where the node lives;
+- name resolution answers which definition a name denotes;
+- type inference answers method and associated-item questions;
+- source maps answer where the result came from.
 
-pub use module_a::submodule::public_function;
+I avoid saying that go to definition “walks an AST until it finds the name.” The expensive and interesting work is not tree walking. It is moving between these identities without losing context.
 
-// src/main.rs
-use my_project::public_function;
+## A debugging checklist for wrong navigation
 
-fn main() {
-    public_function();
-}
+When navigation fails, I test the layers in order:
 
-// src/module_a/mod.rs
-pub mod submodule;
+1. **Project loading:** Is the correct Cargo target and crate graph loaded?
+2. **Configuration:** Are the expected features, target, and `cfg` flags active?
+3. **Syntax:** Is the code parsed as the construct I think it is?
+4. **Macro expansion:** Does the macro expand, and do captured tokens keep useful origins?
+5. **Name resolution:** Does the path resolve in this module and hygiene context?
+6. **Type inference:** Is enough type information available for a method or associated item?
+7. **Source mapping:** Does the semantic result map to an original editable range?
+8. **Target policy:** Is the IDE choosing the declaration, re-export, impl, or underlying definition I expect?
 
-// src/module_a/submodule.rs
-pub fn public_function() {
-    println!("Called public_function");
-}
+This checklist is more effective than beginning inside the LSP handler. The protocol usually transports a location request and returns locations. The hard problem lives in the semantic layers beneath it.
 
-// src/module_b.rs
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn internal_test() {
-        assert!(true);
-    }
-}
+## What I learned from compiler-tooling work
 
-// tests/integration_test.rs
-use my_project::public_function;
+The useful lesson is larger than one IDE feature. Syntax and meaning should not be fused too early, but every derived fact needs a path back to user-visible evidence.
 
-#[test]
-fn test_public_function() {
-    public_function();
-}
-```
+That pattern appears in compilers, data systems, and developer tools: preserve the origin, compute a stable internal identity, and make the reverse mapping explicit. When the reverse mapping is missing, the system may know the answer and still be unable to explain it.
 
-## Algorithm for Determining File Relationships
+The examples here are deliberately small and do not describe private project code. They reflect the same kind of source-to-semantics boundary I have had to understand when working in Rust tooling.
 
-1. **Crate Structure Analysis**:
+## Further reading
 
-   - rust-analyzer first determines the crate structure by analyzing `Cargo.toml` and the presence of `lib.rs` and `main.rs`.
-   - In this case, it identifies both a library crate (`lib.rs`) and a binary crate (`main.rs`).
+- [rust-analyzer architecture](https://rust-analyzer.github.io/book/contributing/architecture.html)
+- [rust-analyzer syntax design](https://rust-analyzer.github.io/book/contributing/syntax.html)
+- [Go to Definition feature notes](https://rust-analyzer.github.io/book/features.html#go-to-definition)
+- [Current `Semantics` implementation](https://github.com/rust-lang/rust-analyzer/blob/master/crates/hir/src/semantics.rs)
 
-2. **Module Tree Construction**:
-
-   - Starting from `lib.rs` and `main.rs`, rust-analyzer constructs the module tree by following `mod` declarations.
-   - It identifies `module_a` and `module_b` as submodules of the library crate.
-
-3. **File Resolution**:
-
-   - For each `mod` declaration, rust-analyzer resolves the corresponding file:
-     - `module_a` resolves to `src/module_a/mod.rs`
-     - `module_b` resolves to `src/module_b.rs`
-   - Inside `module_a/mod.rs`, it resolves `submodule` to `src/module_a/submodule.rs`
-
-4. **Use Declaration Analysis**:
-
-   - rust-analyzer analyzes `use` declarations to understand cross-module relationships.
-   - It sees that `lib.rs` re-exports `public_function` from `module_a::submodule`.
-
-5. **Test Module Identification**:
-
-   - rust-analyzer identifies test modules, including the `#[cfg(test)]` module in `module_b.rs` and the integration test in `tests/integration_test.rs`.
-
-6. **Conditional Compilation Consideration**:
-
-   - It takes note of any `#[cfg()]` attributes, like the one in `module_b.rs`, to understand which parts of the code are conditionally compiled.
-
-7. **Dependency Graph Construction**:
-   - Based on all this information, rust-analyzer constructs a dependency graph showing how files and modules relate to each other.
-
-## What `file_to_def` Would Return
-
-Now, let's look at what `file_to_def` might return for different files:
-
-1. For `src/module_a/submodule.rs`:
-
-   ```rust
-   SmallVec[
-       ModuleId {
-           crate_id: CrateId(0), // library crate
-           local_id: LocalModuleId(3) // submodule of module_a
-       },
-       ModuleId {
-           crate_id: CrateId(2), // test crate (for integration tests)
-           local_id: LocalModuleId(1) // root module of test crate
-       }
-   ]
-   ```
-
-   This file is part of both the library crate and the integration test crate.
-
-2. For `src/module_b.rs`:
-
-   ```rust
-   SmallVec[
-       ModuleId {
-           crate_id: CrateId(0), // library crate
-           local_id: LocalModuleId(2) // module_b
-       }
-   ]
-   ```
-
-   This file is only part of the library crate.
-
-3. For `src/main.rs`:
-   ```rust
-   SmallVec[
-       ModuleId {
-           crate_id: CrateId(1), // binary crate
-           local_id: LocalModuleId(0) // root module of binary crate
-       }
-   ]
-   ```
-   This file defines the root module of the binary crate.
-
-The algorithm ensures that rust-analyzer understands the complex relationships between files, modules, and crates, allowing it to provide accurate information for IDE features like go-to-definition, find all references, and code completion.
+Go to definition is fast because the architecture keeps layers separate. It is accurate because the request carries context through them. And it is useful because the final semantic identity can still be mapped back to the source a developer can inspect.

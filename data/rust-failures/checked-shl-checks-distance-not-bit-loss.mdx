@@ -1,0 +1,94 @@
+---
+caseId: "RFA-223"
+title: "Rust checked_shl Checks the Shift Distance, Not Lost High Bits"
+date: "2026-09-06T00:03:00+01:00"
+lastmod: "2026-09-06T00:03:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "d1d6f033935e5c2f73538a14a4ea7f3a4b83ade13e3be92938d5040e32c10782"
+area: "concurrency-memory"
+symptom: "u8::MAX.checked_shl(1) returns Some(254) although the mathematical result does not fit in u8."
+summary: "checked_shl returns None only when the shift count is at least the integer width. Detecting discarded high bits requires widening, a range check, or a domain-specific precondition."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust checked_shl still overflows value",
+    "checked shift left lost high bits Rust",
+    "u8 checked_shl Some 254",
+  ]
+evidence: ["Rust 1.98.1 u8 maximum", "valid shift distance with discarded bit", "widen-and-convert repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/std/primitive.u8.html#method.checked_shl",
+    "https://doc.rust-lang.org/std/primitive.u8.html#method.overflowing_shl",
+    "https://doc.rust-lang.org/std/convert/trait.TryFrom.html",
+  ]
+---
+
+The `checked_` prefix led me to expect `u8::MAX.checked_shl(1)` to return `None`. Mathematically, 255 shifted left once is 510, which cannot fit in eight bits. Rust returns `Some(254)`.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-223/fail.rs) isolates this expectation. The operation is checked, but it checks a different kind of invalid input.
+
+## The checked condition is the right-hand operand
+
+[`u8::checked_shl`](https://doc.rust-lang.org/std/primitive.u8.html#method.checked_shl) returns `None` when the shift amount is greater than or equal to the number of bits in the type. For a `u8`, shifting by eight is invalid under this contract. Shifting by one is a valid shift distance.
+
+Bits leaving the left side are discarded. The low eight bits of 510 are 254, so that is the returned value.
+
+This differs from `checked_mul(2)`, which checks whether the arithmetic product fits. A left shift often corresponds to multiplication by a power of two, but the shift API describes bit movement and shift-count validity.
+
+## “Overflow” names more than one event
+
+There are at least two possible failures:
+
+1. the shift count is outside the type width;
+2. significant bits are lost even though the shift count is valid.
+
+`checked_shl` detects the first. My application cared about the second.
+
+[`overflowing_shl`](https://doc.rust-lang.org/std/primitive.u8.html#method.overflowing_shl) reinforces the distinction: its boolean reports whether the shift amount overflowed the width, not whether non-zero high bits were discarded. Choosing another shift method without reading its boolean contract would reproduce the mistake.
+
+## I widen when I mean mathematical multiplication
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-223/fixed.rs) shifts after converting the value to `u16`, then uses [`TryFrom`](https://doc.rust-lang.org/std/convert/trait.TryFrom.html) to test whether the result fits back into `u8`.
+
+This makes both widths visible:
+
+```rust
+let wide = u16::from(value) << amount;
+let narrow = u8::try_from(wide)?;
+```
+
+For generic integer code, I cannot always assume that doubling the width is available or enough. Another valid check is that `value <= MAX >> amount`, after first validating the amount. If the domain operation is multiplication, `checked_mul` communicates the intention more directly.
+
+## Shifts in masks may want the bit contract
+
+Discarding high bits is not always an error. Hash functions, packed protocols, circular transformations, and low-level masks can deliberately keep a fixed-width result. In those cases, `checked_shl` can be exactly right when the untrusted part is the shift count.
+
+I avoid adding a mathematical-overflow check by habit. It can reject valid bit manipulation and imply a guarantee the algorithm does not need.
+
+The name of the value helps: `bit_mask` suggests fixed-width semantics, while `item_count_times_two` suggests arithmetic range semantics.
+
+## Debug and release do not rescue the assumption
+
+Ordinary arithmetic overflow can behave differently depending on overflow checks. An explicit method exists to choose behaviour consistently. Here, `checked_shl` itself consistently returns `Some(254)` for a shift of one. This is not a release-mode surprise.
+
+Tests should not rely on a debug panic from the `<<` operator to detect lost bits. The explicit contract must match the invariant in every profile.
+
+## Signed values add another semantic question
+
+Left-shifting a signed integer moves its two's-complement bit representation. If the code intends multiplication over signed mathematical integers, negative values and the sign bit deserve explicit bounds. Widening before the operation and converting back is easier to audit than reasoning from a truncated result.
+
+For serialization, I usually work with unsigned types and document field widths. For domain quantities, I prefer checked arithmetic on the domain type.
+
+## My boundary table covers both failure axes
+
+The regression checks a small value that fits, a maximum value that loses a bit, a shift of width minus one, a shift equal to the width, and a shift larger than the width. The repaired assertion proves that widening detects 510 as outside `u8`.
+
+This table prevents one successful `checked_shl` call from being misread as a general no-overflow proof.
+
+When the shift amount comes from input, I keep rejection of an invalid distance separate from rejection of an unrepresentable mathematical result. Distinct error variants make logs and caller recovery much less ambiguous.
+
+The core principle is that “checked” is incomplete without the checked condition. Rust checks the shift distance here. If my invariant is that no significant bit disappears, I must express and test that separate invariant before accepting the fixed-width result.

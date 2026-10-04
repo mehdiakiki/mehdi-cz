@@ -1,0 +1,81 @@
+---
+caseId: "RFA-244"
+title: "Why f64::clamp Panics on a NaN Bound"
+date: "2026-09-06T00:24:00+01:00"
+lastmod: "2026-09-06T00:24:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "52f2ebc419f43567b56c56d0f6505dec110f1daeb0d7e90558584737e88d60f7"
+area: "upgrades-compatibility"
+symptom: "f64::clamp panics when the minimum bound is NaN, while a NaN value being clamped is returned as NaN."
+summary: "clamp accepts NaN as the value but rejects NaN bounds and reversed bounds because they cannot define an ordered interval. Validate configuration separately from measurement data."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust f64 clamp NaN panic", "float clamp returns NaN or panics Rust", "validate floating point clamp bounds"]
+evidence: ["Rust 1.98.1 NaN lower bound", "captured invalid-interval panic", "checked-boundary repair"]
+sources: ["https://doc.rust-lang.org/std/primitive.f64.html#method.clamp", "https://doc.rust-lang.org/std/primitive.f64.html#method.is_nan", "https://doc.rust-lang.org/std/primitive.f64.html#method.total_cmp"]
+---
+
+There are three floating-point inputs in `value.clamp(min, max)`. I used to think NaN would behave uniformly in all three positions. Rust gives the value and the bounds different roles.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-244/fail.rs) uses NaN as the lower bound. [`f64::clamp`](https://doc.rust-lang.org/std/primitive.f64.html#method.clamp) panics. By contrast, clamping a NaN value between valid bounds returns NaN.
+
+## Bounds must describe an ordered interval
+
+`min` and `max` are configuration for the operation. The method requires `min <= max`, and neither bound may be NaN. A NaN bound cannot participate in the ordinary partial order needed to define “below the minimum” or “above the maximum.”
+
+The value is data. When that data is NaN, `clamp` preserves it. This lets an unknown or invalid measurement remain visible rather than silently converting it to one endpoint.
+
+So the behavior is not “clamp panics whenever it sees NaN.” It is “the interval must be valid; a NaN payload remains NaN.”
+
+## Validate policy before applying it repeatedly
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-244/fixed.rs) checks both bounds with [`is_nan`](https://doc.rust-lang.org/std/primitive.f64.html#method.is_nan) and rejects a reversed interval. It then calls `clamp` only with a proven interval.
+
+For configuration loaded once and applied to millions of values, I validate at construction and store a range type whose invariant is already established. This avoids repeated branches and, more importantly, prevents invalid configuration from travelling through the system.
+
+An `Option<f64>` is enough for the fixture. Production errors should identify which bound was NaN or whether minimum exceeded maximum. Those are different operator mistakes.
+
+## Do not erase NaN unless the domain says so
+
+It can be tempting to turn every NaN into zero before clamping. That makes dashboards look tidy while hiding missing sensors, invalid calculations, or absent samples.
+
+I choose an explicit data policy:
+
+- preserve NaN for later diagnosis;
+- reject it at ingestion;
+- convert it to `None` in a domain type;
+- replace it with a documented fallback when the product requires one.
+
+The bounds policy and value policy remain separate. Validating bounds does not require normalising the observed value.
+
+## Partial ordering is the mechanism
+
+Floating-point NaN makes ordinary comparisons return false in ways that surprise integer-trained intuition. `NaN < 1.0`, `NaN > 1.0`, and `NaN == NaN` are all false.
+
+`clamp` cannot simply run two comparisons and call any resulting interval valid. It checks the precondition and panics when that configuration does not form the required order.
+
+When I need a total deterministic ordering for sorting or keys, [`total_cmp`](https://doc.rust-lang.org/std/primitive.f64.html#method.total_cmp) answers a different question. It does not turn NaN into an acceptable business bound. A total storage order and a valid numerical interval are separate contracts.
+
+## Signed zero deserves attention too
+
+Floating point has positive and negative zero. They compare equal, but their sign bit can affect later operations. The `clamp` documentation notes subtle zero-sign results for bounds containing zeros of different signs.
+
+If the sign of zero matters to serialization, reciprocal calculations, or a numerical algorithm, equality-only tests are insufficient. I add `is_sign_negative` or compare bit representations where the contract truly requires it.
+
+This is not usually important for UI percentages, but it can be important in reproducible numerical pipelines.
+
+## Catching the panic is only evidence here
+
+The fixture catches the library panic so it can emit a stable explanatory assertion. In application code, catching unwinds around every clamp is the wrong level. It mixes programmer configuration errors with recoverable data flow and may not work under aborting panic settings.
+
+Validate the interval once. Then let the hot path use a contract it can trust.
+
+## What I test
+
+My table includes a value below, inside, and above the interval; NaN as the value; NaN as each bound; reversed bounds; equal bounds; infinity; and both signed zeros. The expected output states whether the case is invalid configuration or valid data propagation.
+
+If bounds come from JSON, a database, or an environment variable, I test that ingestion path too. Some formats reject NaN before Rust sees it, while others permit non-finite values through custom parsing. A perfect `checked_clamp` does not help if configuration is silently coerced earlier. I keep parsing, validation, and application as three observable steps so an operator can see where the bad bound entered.
+
+The core principle is that the same representation can have different semantic roles in one function. In `clamp`, bounds define the operation and must form an interval. The value is the payload and may remain NaN. Treating configuration and observation separately produces better errors and avoids hiding failures behind an arbitrary number.

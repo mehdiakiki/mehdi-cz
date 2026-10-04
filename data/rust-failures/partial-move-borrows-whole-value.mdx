@@ -1,0 +1,128 @@
+---
+caseId: "RFA-051"
+title: "Why Rust Cannot Borrow a Struct After One Field Was Moved"
+date: "2026-09-05T08:30:00+01:00"
+lastmod: "2026-09-05T08:30:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "0f50406c4ae84188537a25f32bb045e6edb0ce1d657ab846354d3b355fd441de"
+area: "diagnostics-macros"
+symptom: "Rust reports a borrow of a partially moved value after one owned field was extracted from a struct."
+summary: "Moving one non-Copy field does not destroy every field, but it prevents borrowing the complete struct. Follow the field states and choose borrowing, full destructuring, or replacement deliberately."
+rustVersions: ["Rust 1.98.1"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust borrow of partially moved value E0382",
+    "use struct after moving field Rust",
+    "partial move borrow whole value",
+  ]
+evidence: ["Rust 1.98.1 compile failure", "field-state table", "borrowed-field repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/error_codes/E0382.html",
+    "https://doc.rust-lang.org/rust-by-example/scope/move/partial_move.html",
+  ]
+---
+
+I often see E0382 described only as “Rust moved the value.” This is correct, but it hides an important detail when the value is a struct. Rust can move one field and leave the other fields available. The struct is then **partially moved**. It is not completely dead, but it is no longer one complete value that can be borrowed.
+
+The distinction becomes clear in this reduced program:
+
+```rust
+#[derive(Debug)]
+struct Account {
+    name: String,
+    retries: u32,
+}
+
+fn main() {
+    let account = Account {
+        name: String::from("worker"),
+        retries: 3,
+    };
+
+    let name = account.name;
+    println!("account after extraction: {account:?}");
+    println!("extracted name: {name}");
+}
+```
+
+On Rust 1.98.1, the formatter line fails with:
+
+```text
+error[E0382]: borrow of partially moved value: `account`
+```
+
+The [failing source](/rust-failure-atlas/evidence/RFA-051/fail.rs) is the exact program used for this case.
+
+## Track fields instead of treating the struct as one switch
+
+`String` does not implement `Copy`. The assignment to `name` therefore transfers ownership of `account.name`. The `u32` field does implement `Copy`, so `account.retries` can still be read. This gives us a more precise state:
+
+| Place              | State after the assignment                   |
+| ------------------ | -------------------------------------------- |
+| `account.name`     | moved                                        |
+| `account.retries`  | still available                              |
+| complete `account` | incomplete and cannot be borrowed as a whole |
+| local `name`       | owns the original string                     |
+
+The generated `Debug` implementation needs `&account`. That borrow covers the complete struct, including the field which is no longer present. Rust rejects the borrow instead of inventing a placeholder value for the moved field.
+
+This explains a result which can feel inconsistent at first: reading `account.retries` after the move is allowed, while printing `account` is not. The compiler is tracking places more precisely than a simple “alive or moved” flag.
+
+## The first discriminating check
+
+I change only the extraction from a move to a borrow:
+
+```rust
+let name = &account.name;
+println!("account after borrowing: {account:?}");
+println!("borrowed name: {name}");
+```
+
+Now the `String` remains inside the account and `name` is a reference to it. The complete account still exists, so `Debug` can borrow it. The [repaired source](/rust-failure-atlas/evidence/RFA-051/fixed.rs) compiles and runs under the recorded toolchain.
+
+This is a useful diagnostic change because it keeps everything else constant. If the program still failed, I would know that the cause was not the field move alone.
+
+## Three valid repairs with different meanings
+
+Borrowing is right when I only need to inspect the field. Sometimes I really need to take ownership. Then I choose one of two other models.
+
+I can destructure the whole value:
+
+```rust
+let Account { name, retries } = account;
+println!("{name} may retry {retries} times");
+```
+
+There is no later attempt to use `account` as a complete value. Its ownership is intentionally divided into locals.
+
+Or I can replace the field while keeping the struct complete:
+
+```rust
+let mut account = account;
+let name = std::mem::take(&mut account.name);
+println!("account now contains an empty name: {account:?}");
+```
+
+`mem::take` moves the original string out and writes `String::default()` back. This is not a trick to silence the borrow checker. It changes the data model: after extraction, the account genuinely contains an empty name. I only use it when that state is valid.
+
+## A pattern can make the move less visible
+
+Partial moves also happen in patterns:
+
+```rust
+let Account { name, ref retries } = account;
+```
+
+Here `name` is moved while `retries` is borrowed. Rust by Example documents this mixed pattern in its [partial-move example](https://doc.rust-lang.org/rust-by-example/scope/move/partial_move.html). The syntax is compact, so I check whether each binding is by value, by shared reference, or by mutable reference before diagnosing the later error.
+
+## What does not repair the ownership state
+
+Adding `clone()` can compile, but it creates another allocation and changes the cost. Deriving `Copy` is not possible for a struct containing `String`, and changing all strings to references transfers the lifetime problem elsewhere. Adding a lifetime annotation also cannot restore a field which was moved.
+
+The durable rule is simpler: decide whether the operation needs to observe a field, consume the whole record, or extract one field while leaving a defined replacement. The compiler error is then not an obstacle. It is showing that the source currently mixes two of these ownership models.
+
+The official [E0382 explanation](https://doc.rust-lang.org/error_codes/E0382.html) covers moved values generally. For a partial move, the extra step is to write down the state of each field. That small table normally reveals why one later access works and another one cannot.

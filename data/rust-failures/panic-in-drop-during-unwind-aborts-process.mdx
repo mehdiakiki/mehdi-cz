@@ -1,0 +1,92 @@
+---
+caseId: "RFA-145"
+title: "Why a Panic in Drop During Unwinding Aborts the Process"
+date: "2026-09-05T14:45:00+01:00"
+lastmod: "2026-09-05T14:45:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "7c10a3d09b65ac412c28ac9c3b0c1e5852ef28f126a834040bd809a65871bf81"
+area: "concurrency-memory"
+symptom: "A process aborts while cleaning up an original panic because a destructor panics too, producing panic in a destructor during cleanup instead of reaching a catch boundary."
+summary: "With unwinding enabled, live values are dropped while the first panic crosses stack frames. A second panic from Drop cannot continue as another unwind and terminates the process; keep destructors infallible and move fallible completion into explicit Result-returning methods."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["verified on x86_64-unknown-linux-gnu", "targets supporting panic unwinding"]
+profiles: ["dev", "release with panic=unwind", "test"]
+searchTerms: ["Rust panic in destructor during cleanup abort", "thread caused non-unwinding panic Drop", "double panic while unwinding Rust process abort"]
+evidence: ["Rust 1.98.1 subprocess abort", "original panic plus destructor panic", "infallible Drop repair"]
+sources: ["https://doc.rust-lang.org/reference/panic.html#unwinding", "https://doc.rust-lang.org/std/ops/trait.Drop.html", "https://doc.rust-lang.org/std/thread/fn.panicking.html"]
+---
+
+The [failing program](/rust-failure-atlas/evidence/RFA-145/fail.rs) creates a value whose destructor panics, then triggers an ordinary panic in `main`. While Rust unwinds the first panic, it drops the value. The destructor starts a second panic, and the runtime aborts the process with “panic in a destructor during cleanup.”
+
+This is stronger than one thread returning an error. A surrounding `catch_unwind` cannot recover after the process has aborted.
+
+## Unwinding runs destructors
+
+The [Rust panic reference](https://doc.rust-lang.org/reference/panic.html#unwinding) describes the default unwind strategy on supported targets. As the panic moves out through stack frames, live values are dropped so their resources can be cleaned up.
+
+This is an important property of RAII. Mutex guards unlock, vectors release allocations, and custom guards restore state even when normal control flow does not reach the end of the block.
+
+The cleanup path is still executing Rust code. A custom [`Drop::drop`](https://doc.rust-lang.org/std/ops/trait.Drop.html) can index, allocate, lock, format, call user code, or unwrap a result. Any of those operations may panic.
+
+## A second unwind cannot pass through the first
+
+The runtime already has one active panic crossing the stack. If a destructor reached during that process panics again without containing it, Rust cannot continue two independent unwinds through the same frames. It aborts.
+
+The fixture runs as a subprocess in the Atlas verifier. That is necessary because the expected outcome terminates the process. The verifier checks both the diagnostic and the non-success status, then separately runs the repaired program.
+
+I do not test this by triggering it inside the main test runner. An abort would take down unrelated tests and could hide their results.
+
+`std::thread::panicking()` can tell a destructor whether its thread is already unwinding, but I do not use it to make important cleanup randomly disappear. It is sometimes useful to suppress a secondary assertion or best-effort report. The resource invariant should still have a safe path.
+
+## Keep Drop infallible
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-145/fixed.rs) uses a destructor that only records completion in an atomic flag. The original panic is caught, and the program verifies that cleanup ran without creating another panic.
+
+In production, “infallible” often means handling fallible operations inside `drop` without `unwrap` or `expect`. A close or flush error may be logged best-effort, counted, or intentionally ignored according to a documented policy.
+
+If callers must act on an error, I expose an explicit method:
+
+```rust
+fn finish(self) -> Result<(), FinishError>
+```
+
+The destructor remains a fallback for resource release, while successful completion has a real result channel. This is the same distinction that matters for buffered writers and transactional guards.
+
+## Common panic sources hide in convenient code
+
+I audit destructors for:
+
+- `unwrap` and `expect` on locks or I/O;
+- array and slice indexing;
+- assertions about external state;
+- user-provided callbacks;
+- formatting implementations that can panic;
+- recursive cleanup that can overflow the stack;
+- acquiring a poisoned lock with `unwrap`;
+- code paths tested only during normal return.
+
+A destructor may look safe because its happy path is tiny. The dangerous path appears precisely when another component is already failing, so poisoned state and unavailable resources are more likely.
+
+Logging is not guaranteed infallible either. A logger can allocate, lock, format custom values, or invoke a backend. I keep emergency reporting small and avoid making process survival depend on it.
+
+## panic=abort is a different first-panic path
+
+With `panic=abort`, the original panic terminates without stack unwinding, so destructors on the stack do not run. The double-panic sequence does not occur because cleanup never begins.
+
+This does not repair a panicking destructor. It changes the process's global failure and cleanup policy. Services using abort must accept that ordinary panic cleanup, buffered output, and guard restoration may not happen.
+
+I record the panic strategy when reproducing a lifecycle bug. Debug, release, tests, and dependencies may not always use the assumptions I had in mind.
+
+## My debugging sequence
+
+When a process reports a panic during destructor cleanup, I do this:
+
+1. Preserve both panic messages; the earlier one triggered unwinding and the later one triggered abort.
+2. Identify every live value dropped between the original panic and the abort.
+3. Search their destructors for all implicit and explicit panic paths.
+4. Move fallible completion into a method returning `Result`.
+5. Keep `Drop` limited to non-panicking release and best-effort fallback.
+6. Verify the failure in a subprocess under the intended panic strategy.
+
+The broad principle is that failure paths need stronger engineering than happy paths. Destructors run when invariants may already be damaged. Making cleanup unable to start a second panic preserves Rust's useful unwinding behaviour and gives higher layers a real chance to recover or report the original cause.

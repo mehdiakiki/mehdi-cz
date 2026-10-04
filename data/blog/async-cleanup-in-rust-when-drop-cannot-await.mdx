@@ -1,0 +1,176 @@
+---
+title: "Async Cleanup in Rust When Drop Cannot Await"
+date: "2026-09-09T07:10:00+01:00"
+lastmod: "2026-09-09T07:10:00+01:00"
+tags: ["rust", "async rust", "tokio", "drop", "resource cleanup"]
+draft: false
+reviewed: true
+reviewedHash: "7509514a8b86da0baf9ad57c623fbd32a35153a0efc1726c4719066a809558d2"
+cluster: "rust-under-the-hood"
+campaign: "editorial"
+summary: "Drop is synchronous, and a lease or session often needs an await to be released. I tried four ways to do the cleanup and measured which ones actually ran, including during runtime shutdown."
+---
+
+`Drop::drop` is a synchronous function and there is no stable async version of it. So cleanup that needs an `.await`, such as releasing a lease on a remote server, cannot live in `Drop`. I tried the four approaches people use and counted how many cleanups actually ran.
+
+Blocking inside `Drop` panics. Spawning inside `Drop` works while the runtime is alive and silently does nothing during shutdown. The two that work are an explicit `async fn close(self)` with `Drop` as a detector of forgotten calls, and a `Drop` that hands the work to a long-lived cleanup task that someone awaits at shutdown.
+
+This is a spoke of [How Async Rust Works Under the Hood](/blog/how-async-rust-works-under-the-hood). The fourth rule there says the runtime owns what it can poll and nothing else. Cleanup is where that rule matters most.
+
+## The setup
+
+The resource is a lease with an id. Releasing it takes an await:
+
+```rust
+async fn release_lease(id: u32) {
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    CLEANUPS_DONE.fetch_add(1, Ordering::SeqCst);
+}
+```
+
+A real version would send a request. The sleep stands in for it, and the counter tells me the truth at the end. Everything ran on a two-worker tokio runtime with rustc 1.95 nightly and tokio 1.53.
+
+## Attempt 1: block on the future inside Drop
+
+The first idea is always the same. Get a handle to the runtime and block:
+
+```rust
+impl Drop for BlockingLease {
+    fn drop(&mut self) {
+        tokio::runtime::Handle::current().block_on(release_lease(self.0));
+    }
+}
+```
+
+Output, when the value is dropped inside a task:
+
+```text
+attempt 1, block_on inside Drop: panicked: Cannot start a runtime from within
+a runtime. This happens because a function (like `block_on`) attempted to block
+the current thread while the thread is being used to drive asynchronous tasks.
+```
+
+In the fixture I wrap this call in `catch_unwind` so the program can continue to the next attempt. The snippet shows the intent.
+
+The message explains itself with the model from the pillar. The thread that is dropping my value is a worker thread in the middle of a poll. Blocking it would stop every other task on that worker, and it could also wait for a task that needs this same thread to progress. Tokio refuses.
+
+`block_in_place` is sometimes suggested here. On a multi-thread runtime it does not panic: it turns the current worker into a blocking thread and hands the worker's other tasks to a new thread. But it panics on a current-thread runtime, it consumes a thread from the pool for the whole cleanup, any concurrent work inside the same task stays suspended, and it does nothing for the shutdown case below. I did not measure it here, and I do not consider it a fix.
+
+## Attempt 2: spawn the cleanup from Drop
+
+The second idea looks correct and is the one I see most in real code:
+
+```rust
+impl Drop for SpawningLease {
+    fn drop(&mut self) {
+        tokio::spawn(release_lease(self.0));
+    }
+}
+```
+
+While the runtime is alive it works:
+
+```text
+attempt 2, spawn inside Drop, runtime alive: cleanups done = 1
+```
+
+Then I spawned a task holding a lease, waited 50 milliseconds, and dropped the runtime. Dropping the runtime drops the task, which drops the lease, which spawns the cleanup:
+
+```text
+attempt 2, spawn inside Drop, runtime shutting down: cleanups started = 0, done = 0
+```
+
+Zero. The spawn did not fail and did not panic. The `started` counter sits on the first line of `release_lease`, before any await, and it is also zero. So during shutdown the runtime accepts the new task and drops it before it is ever polled, not even once. The lease stays held on the server, and nothing in my logs says so.
+
+This is the dangerous one, because the test suite passes. The failure only exists at process exit, and process exit is exactly when a deploy, a scale-down, or a crash drops every lease at once.
+
+## Attempt 3: explicit close, Drop as a detector
+
+The third approach gives up on doing the work in `Drop` and makes the caller responsible:
+
+```rust
+impl ExplicitLease {
+    async fn close(mut self) {
+        release_lease(self.id).await;
+        self.closed = true;
+    }
+}
+
+impl Drop for ExplicitLease {
+    fn drop(&mut self) {
+        if !self.closed {
+            self.forgotten.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
+```
+
+I closed one lease properly and dropped another one without closing:
+
+```text
+attempt 3, explicit close: cleanups done = 1, forgotten leases = 1
+```
+
+`Drop` cannot do the cleanup, but it can see that the cleanup was skipped. In production I turn that counter into a metric and a log line with the id, and in tests into a panic. The leak is still there, but now it is visible.
+
+The weakness is real: a lease dropped by cancellation, for example inside a `select!` branch, is forgotten, not closed. The cancellation article in this series, [Cancellation Safety in Async Rust, Explained](/blog/rust-async-cancellation-safety), explains why that drop happens without warning. So attempt 3 alone is a detector, not a guarantee.
+
+## Attempt 4: Drop hands the work to an owned task
+
+The fourth approach keeps `Drop` synchronous and cheap. It only sends the id on a channel:
+
+```rust
+impl Drop for QueuedLease {
+    fn drop(&mut self) {
+        let _ = self.tx.send(self.id);
+    }
+}
+```
+
+A single long-lived task receives ids and releases them. The important part is who owns that task. My main function keeps its `JoinHandle`, drops the last sender at shutdown, and awaits the task, so the runtime cannot exit before the queue is drained:
+
+```rust
+let cleaner = tokio::spawn(async move {
+    while let Some(id) = rx.recv().await { release_lease(id).await; }
+});
+// ... leases are created and dropped ...
+drop(tx);
+cleaner.await.unwrap();
+```
+
+Three leases dropped, then shutdown:
+
+```text
+attempt 4, Drop sends to a cleanup task, awaited at shutdown: cleanups done = 3
+```
+
+All three. Dropping the value is still synchronous, the cleanup still awaits, and shutdown waits for it because a handle is held and awaited. This is the same ownership rule as graceful shutdown in general, and the series comes back to it in the article on task ownership.
+
+The channel is unbounded here on purpose. A bounded channel would make `Drop` able to fail when the queue is full, and `Drop` has no way to report that. If the number of leases can be very large, I bound it at creation time instead, so a lease cannot be created when the cleanup queue is behind.
+
+## What I take from the four numbers
+
+| Approach | Cleanups that ran | Runtime alive | Runtime shutting down |
+|---|---|---|---|
+| block_on in Drop | 0, panics | no | no |
+| spawn in Drop | 1 then 0 | yes | no, silently |
+| explicit close, Drop detects | 1, and 1 reported | only if called | reported |
+| Drop sends to an owned task | 3 of 3 | yes | yes, if awaited |
+
+The rule I ended with: cleanup that must happen needs an owner that is awaited. `Drop` can hand the work to that owner, or report that the work was skipped. It cannot be the owner.
+
+In practice I combine 3 and 4. The value has an explicit `close`, the `Drop` sends the id to the cleanup task as a fallback, and the cleanup task is idempotent so a double release is harmless.
+
+## What I check in review
+
+- Is there a `block_on` or `block_in_place` inside any `Drop`? That is a panic or a stall waiting for the right runtime flavour.
+- Is there a `tokio::spawn` inside a `Drop`? Then what happens to that task during shutdown, and who would notice?
+- For every resource that needs an async release, who awaits the release at shutdown?
+- Is the release idempotent, so the fallback path and the explicit path can both run?
+
+## Sources
+
+- [Tokio documentation: Handle::block_on and its panic conditions](https://docs.rs/tokio/latest/tokio/runtime/struct.Handle.html#method.block_on)
+- [Tokio documentation: Runtime shutdown behaviour](https://docs.rs/tokio/latest/tokio/runtime/struct.Runtime.html#shutdown)
+- [Async drop, async fundamentals initiative](https://rust-lang.github.io/async-fundamentals-initiative/roadmap/async_drop.html)
+- [The Rust Reference: Destructors](https://doc.rust-lang.org/reference/destructors.html)

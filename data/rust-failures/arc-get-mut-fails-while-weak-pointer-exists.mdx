@@ -1,0 +1,84 @@
+---
+caseId: "RFA-142"
+title: "Why Arc::get_mut Returns None While a Weak Pointer Exists"
+date: "2026-09-05T14:42:00+01:00"
+lastmod: "2026-09-05T14:42:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "6a0b5e6a41003f60ae488286bddb76793288c150b66e5dc84c41b149887b2391"
+area: "concurrency-memory"
+symptom: "Arc::get_mut returns None with one strong Arc because a surviving Weak pointer still refers to the allocation and can potentially upgrade."
+summary: "Strong-count uniqueness is not the complete get_mut contract. The method requires no other Arc and no Weak pointer to the allocation before yielding &mut T; drop observers, use interior synchronization, or choose make_mut with its dissociation semantics."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["targets with atomic pointer-width support"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust Arc get_mut None only one strong count Weak", "Weak pointer prevents Arc get_mut", "Arc get_mut requires no Weak pointers"]
+evidence: ["Rust 1.98.1 deterministic None result", "one strong plus one Weak pointer", "drop Weak before get_mut repair"]
+sources: ["https://doc.rust-lang.org/std/sync/struct.Arc.html#method.get_mut", "https://doc.rust-lang.org/std/sync/struct.Weak.html"]
+---
+
+The [failing program](/rust-failure-atlas/evidence/RFA-142/fail.rs) creates one `Arc<String>`, downgrades it to `Weak<String>`, and keeps no second strong owner. `Arc::get_mut(&mut value)` still returns `None`.
+
+Counting only strong owners suggests the allocation is unique. The method's actual contract is stricter.
+
+## &mut T needs exclusive access, not a low count
+
+An `&mut T` promises exclusive access to `T` for the borrow duration. No other path may read or write the same value in a conflicting way.
+
+The [`Arc::get_mut` documentation](https://doc.rust-lang.org/std/sync/struct.Arc.html#method.get_mut) says it returns a mutable reference only when no other `Arc` or `Weak` pointer refers to the allocation. Otherwise it returns `None`.
+
+A weak pointer cannot directly dereference `T`, but while the strong `Arc` remains alive it may be upgraded into another strong owner. The code holding `&mut Arc<T>` does not necessarily own or control every `Weak<T>` elsewhere in the system.
+
+Rust therefore does not equate “strong count is one at this instant” with a proof of exclusive access.
+
+## weak_count is part of the diagnosis
+
+When `get_mut` unexpectedly fails, I record both:
+
+```rust
+Arc::strong_count(&value)
+Arc::weak_count(&value)
+```
+
+The second count often comes from a cache, parent-child back-reference, callback registry, observer, or self-referential graph. It can survive after the main work appears complete.
+
+Counts are diagnostic observations, not synchronization protocols. Another thread can change them around the observation. I use them to find ownership paths, not to implement “check then mutate” logic.
+
+The [`Weak` documentation](https://doc.rust-lang.org/std/sync/struct.Weak.html) distinguishes a non-owning pointer that can attempt an upgrade from strong ownership that keeps `T` alive. Weak pointers keep the allocation metadata available even after the value is gone.
+
+## Dropping the observer restores the simple case
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-142/fixed.rs) explicitly drops the only weak observer. With one strong pointer and no weak pointers, `get_mut` yields `&mut String`, and the program mutates it directly.
+
+This is useful during staged construction: create one `Arc`, mutate it while completely private, then clone or downgrade only after initialization finishes.
+
+In a long-running graph, collecting every weak observer just to regain mutation may be impractical. That is a sign that exclusive mutation is no longer the representation's normal operation.
+
+## make_mut has different semantics
+
+`Arc::make_mut` supports clone-on-write. If other strong pointers exist, it can clone the inner value so this `Arc` becomes unique. When only weak pointers exist, the `Arc` documentation explains that those pointers can be dissociated, after which their upgrade no longer reaches this value.
+
+This may be correct for snapshot-like data. It can surprise an observer expecting its weak handle to follow future mutations. `make_mut` is not simply a version of `get_mut` that cannot fail; it chooses a new identity relationship when sharing exists.
+
+If every owner must observe the same changing value, I put synchronization inside the shared allocation, for example `Arc<Mutex<T>>`, `Arc<RwLock<T>>`, or domain-specific atomics. This has locking and contention costs but preserves shared identity.
+
+## get_mut_unchecked is not a count shortcut
+
+Nightly APIs may expose unchecked mutable access with a detailed safety contract. I do not use them because I looked at the counts once. Weak pointers on other threads, lifetime differences, and active references can make the required proof more subtle than the strong count.
+
+The safe `None` result is valuable evidence that the ownership topology differs from my model. I fix the model before trying to bypass the check.
+
+For initialization APIs, I prefer constructing the complete `T` before `Arc::new`, or using supported deferred-initialization forms that preserve uniqueness by design.
+
+## My debugging sequence
+
+When `Arc::get_mut` returns `None`, I do this:
+
+1. Verify I passed `&mut Arc<T>` and record strong and weak counts for diagnosis.
+2. Trace every `Arc::clone` and `Arc::downgrade`, including values stored in callbacks and graphs.
+3. Drop all other strong and weak pointers when exclusive staged mutation is intended.
+4. Use `make_mut` only after accepting clone or weak-dissociation semantics.
+5. Put synchronization inside `Arc` when all owners need one mutable shared identity.
+6. Avoid using reference counts as a racy authorization check.
+
+The broad principle is that uniqueness is a capability, not merely one integer. `get_mut` returns a real exclusive reference, so it must account for every path that could regain access. Weak ownership still matters to that proof even though it does not keep the value alive by itself.

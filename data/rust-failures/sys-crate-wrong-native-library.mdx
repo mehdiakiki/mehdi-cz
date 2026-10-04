@@ -1,0 +1,119 @@
+---
+caseId: "RFA-042"
+title: "Why a Rust sys Crate Found the Wrong Native Library"
+date: "2026-09-04T21:00:00+01:00"
+lastmod: "2026-09-07T13:15:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "9d9df9b55742e5369d4893e4c8d42784ecc0138727da49358af69c9e225de5e1"
+area: "cargo-dependencies"
+symptom: "A Rust sys crate discovers the wrong native library installation or links headers and binaries from different versions."
+summary: "Native discovery combines environment overrides, pkg-config, target sysroots, vendored builds, and loader paths. Trace every selected path from build script to runtime."
+rustVersions: ["stable Rust", "Cargo stable"]
+targets: ["affected native or cross target"]
+profiles: ["dev", "release"]
+searchTerms:
+  [
+    "openssl-sys wrong installation Rust",
+    "pkg-config Rust links wrong library",
+    "cargo sys crate native library path",
+  ]
+evidence:
+  ["build-script directive log", "header and library version trace", "dynamic-loader inspection"]
+sources:
+  [
+    "https://doc.rust-lang.org/cargo/reference/build-scripts.html#rustc-link-search",
+    "https://docs.rs/pkg-config/latest/pkg_config/#cross-compilation",
+  ]
+---
+
+A sys crate sits between Cargo and a native library. Its build script may inspect environment variables, call `pkg-config`, use a platform package manager, choose a vendored build, emit link-search paths, and generate Rust bindings or configuration.
+
+When several installations exist, “OpenSSL is installed” or “the library is on PATH” is not enough. I need the exact headers used for compilation, the exact library selected at link time, and the library loaded at runtime.
+
+## Capture the build script output
+
+Cargo normally hides successful build-script output. Very verbose mode exposes execution and saved output:
+
+```bash
+cargo clean -p native-sys
+cargo build -vv
+```
+
+I look for:
+
+```text
+cargo::rustc-link-search=native=/specific/path
+cargo::rustc-link-lib=ssl
+```
+
+The build-script output is also stored under the package's `target/.../build/.../output` directory. Cleaning only the affected package or changing a watched variable ensures the discovery script really reruns.
+
+The first check resolves every emitted directory and library name to a concrete file. If two directories contain the same library name, order matters.
+
+## Environment precedence can select another installation
+
+Sys crates document their own overrides. The OpenSSL bindings, for example, support variables which point discovery at a chosen installation and a `vendored` feature which builds a bundled source version.
+
+`pkg-config` has generic and target-prefixed paths, library directories, and sysroot variables. During cross-compilation, setting `PKG_CONFIG_ALLOW_CROSS=1` without a correct target sysroot can make host discovery succeed—which is worse than a clean failure.
+
+I print only relevant variable names and paths, not unrelated environment or secrets:
+
+```text
+TARGET=aarch64-unknown-linux-gnu
+PKG_CONFIG_SYSROOT_DIR=/opt/aarch64-sysroot
+TARGET_PKG_CONFIG_PATH=/opt/aarch64-sysroot/usr/lib/pkgconfig
+```
+
+Then I run `pkg-config` with the same environment and inspect its `-I`, `-L`, and `-l` output.
+
+The Atlas verifier does this without depending on whichever libraries happen to be installed on the machine. It builds two small static installations from source. [Installation A's header](/rust-failure-atlas/evidence/RFA-042/install-a/include/widget.h) and library report version 1; installation B reports version 2. Both ship relative `.pc` metadata under their own roots.
+
+The [failing discovery script](/rust-failure-atlas/evidence/RFA-042/fail/build.rs) deliberately asks A for `--cflags` and B for `--libs`. The real [C probe](/rust-failure-atlas/evidence/RFA-042/probe.c) compiles and links, then prints `header_version=1 runtime_version=2` and rejects the mismatch. The [repaired script](/rust-failure-atlas/evidence/RFA-042/fixed/build.rs) runs one pkg-config query against A for both flag sets; the same probe prints version 1 twice and succeeds.
+
+For both queries the harness sets `PKG_CONFIG_LIBDIR` to the exact fake metadata directory and removes inherited pkg-config paths and sysroots. This matters: a fixture which silently falls back to `/usr/lib/pkgconfig` would demonstrate the test machine, not the discovery rule.
+
+## Headers and libraries must be one versioned unit
+
+A build can compile against headers from version A and link library B. It may fail at link time when B lacks a declared symbol, or worse, run with a different layout or behavior.
+
+I extract version information from both sides. For a minimal fixture, compile a native helper which reports header macros and call a runtime version function from the linked library. I store both results in the diagnostic artifact.
+
+Generated bindings also belong to this unit. Checked-in bindings generated from a newer header may reference APIs unavailable in the deployed library.
+
+## The runtime loader is a third decision point
+
+The linker's chosen file and the runtime loader's chosen shared object can differ. RPATH, RUNPATH, system cache, application environment, and container layout influence runtime resolution.
+
+Platform inspection tools can list dynamic dependencies and loader decisions. I run them on the final executable inside the production-like image. Seeing the expected path in the build log is not proof that the runtime uses it.
+
+Static linking removes this runtime lookup but introduces its own transitive library and licensing requirements.
+
+## Prefer one explicit discovery policy
+
+For a controlled deployment, I choose one strategy:
+
+- a documented system package and target sysroot;
+- a vendored build for supported targets;
+- or an explicit installation root supplied by the build environment.
+
+Allowing silent fallback between all three makes builds machine-dependent. If an explicit path is invalid, I prefer a clear failure over quietly finding another installation.
+
+The build script should declare every discovery variable with `rerun-if-env-changed`. Otherwise Cargo may reuse a result after the environment changed.
+
+## False repairs
+
+Adding another global `-L` path can select a library at link time while leaving headers unchanged. Copying a shared library beside the binary can affect runtime only. Enabling vendored builds can produce a coherent result, but it is a dependency-policy decision, not proof that system discovery was corrected.
+
+Deleting the entire target directory can remove stale outputs but does not make the next discovery deterministic.
+
+## The regression proof
+
+My CI artifact records target, discovery strategy, header version, linked file, runtime-loaded file, and static/dynamic mode. A small native call verifies a function introduced in the minimum supported version. The hermetic static fixture proves header/link coherence; a production dynamic build adds loader inspection for its deployed executable.
+
+For cross builds I inspect architecture and sysroot paths even when the final program cannot run in CI. The proof is a continuous chain from build-script input to runtime object, not one successful Cargo command on one developer machine.
+
+I repeat the check in the minimal deployment image because package-manager caches and developer
+shell configuration can hide an undeclared dependency. If the image contains only the intended
+installation and the recorded loader path still matches, the discovery rule is portable rather
+than accidental.

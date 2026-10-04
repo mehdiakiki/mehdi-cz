@@ -1,0 +1,88 @@
+---
+caseId: "RFA-325"
+title: "String::replace_range Panics Between UTF-8 Bytes"
+date: "2026-09-06T01:45:00+01:00"
+lastmod: "2026-09-06T01:45:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "ecd1145fd2dd03625e1808a7100509d52cc3f87fccce6f58c3299b2538058915"
+area: "upgrades-compatibility"
+symptom: "Replacing a range selected by displayed-character positions panics because one numeric endpoint lands inside a multi-byte UTF-8 scalar value."
+summary: "String ranges use byte offsets, and each bounded endpoint must be a UTF-8 char boundary. Derive ranges from Rust string iterators or validated byte-search results rather than UI character counts."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust String replace_range char boundary panic", "replace_range byte index UTF-8 Rust", "String replacement multi byte character Rust"]
+evidence: ["Rust 1.98.1 a-é-b string", "interior UTF-8 byte endpoint", "find and len_utf8 boundary repair"]
+sources: ["https://doc.rust-lang.org/std/string/struct.String.html#method.replace_range", "https://doc.rust-lang.org/std/primitive.str.html#method.is_char_boundary", "https://doc.rust-lang.org/std/primitive.str.html#method.char_indices"]
+---
+
+I received a range from a small editor component and passed it directly to `String::replace_range`. The tests used ASCII, so everything worked. The first accented character turned the replacement into a panic.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-325/fail.rs) uses `"aéb"`. The `é` occupies two UTF-8 bytes. Offset two is inside that encoding rather than between two Rust characters.
+
+## String ranges are byte ranges with a boundary rule
+
+[`String::replace_range`](https://doc.rust-lang.org/std/string/struct.String.html#method.replace_range) accepts range bounds expressed as byte offsets. It panics if the start is greater than the end or if a bounded endpoint is not on a UTF-8 character boundary.
+
+This preserves the central `String` invariant: its bytes must always be valid UTF-8. Replacing only half of a scalar value would leave an invalid sequence, so safe Rust rejects the operation.
+
+The integer two is not inherently a byte index or a character index. Its unit comes from the API that produced it.
+
+## Derive offsets from the same representation
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-325/fixed.rs) finds `é` in the Rust string. `find` returns a byte offset. It adds `char::len_utf8()` to obtain the ending byte offset, checks both with [`is_char_boundary`](https://doc.rust-lang.org/std/primitive.str.html#method.is_char_boundary), and replaces the complete character.
+
+For iteration, [`char_indices`](https://doc.rust-lang.org/std/primitive.str.html#method.char_indices) yields each Unicode scalar value with its byte offset. Those indices can safely form boundaries when I retain the correct end of the selected item.
+
+I avoid counting chars and then reusing that count as an offset. `text.chars().count()` reports scalar values, not bytes, and indexing APIs still expect bytes.
+
+## A UI cursor may use a third coordinate system
+
+Editors and browsers may report UTF-16 code units, Unicode scalar positions, grapheme-cluster positions, or bytes depending on the interface. A displayed character can contain several scalar values. Emoji sequences make the difference especially visible.
+
+Converting a browser selection into a Rust byte range therefore needs an explicit adapter. I name the units in data structures, such as `Utf16Offset`, `ByteOffset`, and `GraphemeIndex`, instead of passing naked `usize` values through layers.
+
+The adapter validates out-of-range positions and the possibility that a selection splits a surrogate pair or grapheme. A server should not panic because a client supplied a coordinate it cannot interpret.
+
+## Search results are safer only when kept with their source
+
+A byte range returned by searching one string is not automatically valid for another string, even if the strings look related. Normalization, lowercasing, trimming, or replacing earlier content can change length and boundaries.
+
+I apply the range to the same immutable revision from which it was derived. For collaborative editing or asynchronous jobs, I carry a document version with the range. If the version changed, I recompute or reject the operation.
+
+This is a state-consistency problem in addition to a Unicode problem.
+
+## Prechecking changes panic into a domain error
+
+`replace_range` is convenient for code whose ranges are already trusted. At an external boundary, I check:
+
+- start is no greater than end;
+- end is no greater than `len()`;
+- both endpoints pass `is_char_boundary`;
+- the document version matches;
+- any product-level selection rule also holds.
+
+Then I return a structured error. Catching the panic after calling `replace_range` is useful for the failure fixture, but it is not my preferred request-validation strategy.
+
+## Scalar boundaries may still split what a user sees
+
+Passing `is_char_boundary` proves valid UTF-8, not a good text-editing experience. A range can begin between a base character and a combining mark, or in the middle of an emoji sequence, while still lying on scalar boundaries.
+
+If the feature promises user-perceived character editing, I use a grapheme segmentation implementation and define which Unicode version it follows. If it promises source-code byte spans, scalar boundaries may be exactly right. The domain decides.
+
+## Tests need multiple coordinate types
+
+My replacement tests include ASCII, a two-byte scalar, a four-byte scalar, combining marks, empty ranges, the end of the string, reversed bounds, stale ranges, and invalid client offsets.
+
+I also round-trip coordinates through the actual client protocol. A pure Rust unit test cannot detect that a JavaScript caller counted UTF-16 units while the server expected UTF-8 bytes.
+
+Assertions check the final string and that invalid input returns an error without partial mutation. A panic-only test does not cover the application contract.
+
+## What the evidence proves
+
+RFA-325 pins the standard-library behaviour to Rust 1.98.1. It shows a specific interior byte boundary causing a panic and a repair whose offsets come from the UTF-8 representation itself.
+
+It does not say byte ranges are a bad API. They are efficient and precise when their unit and source revision are known.
+
+The core principle goes beyond Rust: offsets are typed information even when represented as integers. A byte index, scalar index, grapheme index, and UTF-16 index cannot safely substitute for one another. I preserve the unit from selection through mutation.

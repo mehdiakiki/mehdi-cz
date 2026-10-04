@@ -1,0 +1,95 @@
+---
+caseId: "RFA-700"
+title: "str::substr_range Tracks Origin, Not Equal Text"
+date: "2026-09-07T09:31:00+01:00"
+lastmod: "2026-09-07T09:31:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "efb3fe9b2bcbe25033e38510422035452d97a054bb1347bdac734ddd90e61865"
+area: "concurrency-memory"
+symptom: "str::substr_range returns None for equal text stored in another String instead of locating its matching byte range."
+summary: "Rust 1.98 substr_range converts a string view borrowed from one parent into byte offsets. It does not search for matching text, and the returned indices remain UTF-8 byte boundaries."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets supported by the API"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust substr_range returns None equal String", "str substr_range versus find Rust 1.98", "substring byte range same allocation Rust"]
+evidence: ["Rust 1.98.1 runtime assertion", "equal copied text returns None", "derived UTF-8 substring returns its byte range"]
+sources: ["https://doc.rust-lang.org/std/primitive.str.html#method.substr_range", "https://doc.rust-lang.org/std/primitive.str.html#method.find", "https://doc.rust-lang.org/releases.html#version-1980-2026-08-20"]
+---
+
+When I first see `str::substr_range`, the name can sound like a search method. Rust already has `find` for that job. The new Rust 1.98 operation answers another question: if I already hold a `&str` view derived from a larger string, which byte range produced that view?
+
+The difference matters when the same word appears several times, or when a copied string happens to contain equal text.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-700/fail.rs) makes the confusion small:
+
+```rust
+use core::range::Range;
+
+let owner = String::from("alpha beta");
+let equal_copy = String::from("beta");
+
+assert_eq!(
+    owner.substr_range(&equal_copy),
+    Some(Range { start: 6, end: 10 }),
+);
+```
+
+`equal_copy` has the expected four characters, but it owns another allocation. The method returns `None`. It never scans `owner` and never asks whether the bytes compare equal.
+
+## A substring here means a derived view
+
+In this API, “substring” is about location. The [working fixture](/rust-failure-atlas/evidence/RFA-700/fixed.rs) first derives the view:
+
+```rust
+use core::range::Range;
+
+let owner = String::from("alpha beta");
+let derived = &owner[6..10];
+
+assert_eq!(
+    owner.substr_range(derived),
+    Some(Range { start: 6, end: 10 }),
+);
+```
+
+`derived` points into the storage covered by `owner`. Rust can recover the offset from the two string-slice locations and validate containment. That is why repeated text is not ambiguous: the view itself identifies which occurrence produced it.
+
+This operation is especially useful with `split`, `split_once`, trimming, and parsers which return borrowed tokens. Those APIs retain a connection to the source string. I can convert the resulting view into offsets for diagnostics, indexing, or a source map without searching the text again.
+
+## `find` owns the equality question
+
+For separately owned input, I use a search:
+
+```rust
+let owner = "alpha beta beta";
+let query = String::from("beta");
+
+assert_eq!(owner.find(&query), Some(6));
+```
+
+Now byte equality is the intended mechanism. If I need every occurrence, I use `match_indices`; if overlapping matches matter, I choose an algorithm which states that policy. A search can reasonably return the first equal occurrence. `substr_range` instead reports the origin of one already selected view.
+
+This distinction prevents a quiet parser bug. Suppose a document contains the same identifier twice. Searching the token text from the beginning can attach an error to the first copy even when the parser borrowed the second. Origin recovery preserves the actual token location.
+
+## The offsets are UTF-8 bytes
+
+The returned `start` and `end` are byte indices, not character positions. Any `&str` view was already required to begin and end on UTF-8 character boundaries, so the recovered range can slice the same parent safely while that parent remains unchanged.
+
+I still label offsets as bytes in data structures and protocols. A user interface may later translate them into lines, Unicode scalar values, or grapheme clusters. Calling every offset a “character index” creates failures as soon as non-ASCII input arrives.
+
+For example, the second word in `"é beta"` begins after three bytes: two for `é` and one for the space. It does not begin at character index two in the sense many readers expect.
+
+## Borrowing prevents stale ranges during recovery
+
+While the derived `&str` is alive, safe Rust will not let me mutate its owning `String`. That matters. The location can be recovered against the same storage and text from which the view came.
+
+Once I store only the numeric range, the borrow can end and the `String` can change. The range then becomes ordinary external state. Insertions or removals may shift it or make its endpoints invalid UTF-8 boundaries. The Atlas has a separate stale-range case for that later phase; `substr_range` solves origin recovery, not future range maintenance.
+
+## Empty text cannot always carry origin
+
+The documentation warns that empty string slices can be ambiguous at allocation boundaries. With zero bytes, a pointer may not uniquely prove which independent string the empty view came from. I do not build important identity logic around an empty slice's address.
+
+For parsers which emit empty tokens, I keep the cursor or range at the moment the token is created. Another option is returning a small token structure containing both `&str` and the already known byte range.
+
+My regression tests cover copied equal text, repeated words, multi-byte UTF-8, beginning and ending views, and the chosen empty-token rule. The core principle is simple: `find` discovers equal content; `substr_range` recovers the coordinates of an existing borrow. Choosing by that question makes both the performance and the result unsurprising.

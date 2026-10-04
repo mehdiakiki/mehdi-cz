@@ -1,0 +1,152 @@
+---
+title: "Caching AI Results Requires an Identity and Freshness Model"
+date: "2026-12-10T09:00:00+01:00"
+tags: ["AI caching", "LLM engineering", "cache invalidation", "RAG", "production AI"]
+draft: false
+reviewed: true
+reviewedHash: "1c8e6cab9aa9c4367a73a663fd6e323a4472dc8fab79a86ce339eb3115dd61e3"
+cluster: "reliable-ai-systems"
+campaign: "authority-2026"
+opportunity: "AI-036"
+summary: "An AI result is reusable only when task identity, instructions, model policy, authorized context, tools, and freshness still match. I build the key and invalidation rules before adding the cache."
+---
+
+Caching an AI answer looks like an easy saving: if the same question arrives twice, return the first result.
+
+Then I ask what “same” means.
+
+The user text may match while permissions changed. The knowledge index may contain a corrected document. A tool schema may have a new required field. The model alias may point to another snapshot. Even the expected answer format may belong to a new prompt version.
+
+This is why I treat AI caching as an identity and freshness problem before I treat it as a storage problem.
+
+## Provider prompt caching is not application result caching
+
+These are different mechanisms.
+
+[OpenAI prompt caching](https://developers.openai.com/api/docs/guides/prompt-caching) can reuse computation for matching prompt prefixes. The provider still produces a response, and usage metadata tells me how cached input was treated.
+
+An application result cache skips some or all workflow execution and returns a stored outcome. That means my system—not the model provider—claims the old result is still correct and authorized.
+
+I can use both. I do not give them the same invalidation rules.
+
+## The key begins with the task contract
+
+For a deterministic HTTP cache, method and URI may carry much of the identity. [RFC 9111](https://www.rfc-editor.org/rfc/rfc9111) describes HTTP caching semantics and validators. AI workflows usually depend on more hidden inputs.
+
+My logical key may include:
+
+```text
+task type and task version
+normalized user input
+instruction/prompt version
+model routing policy version
+output schema version
+retrieval corpus snapshot
+authorization scope or visibility fingerprint
+tool definitions and relevant tool-data versions
+locale and product configuration
+```
+
+I hash a canonical representation of these fields. I never place raw secrets, full private documents, or bearer tokens in a cache key.
+
+The authenticated user ID is not always the right authorization dimension. Two users may share exactly the same permitted corpus; one user's permissions may also change. I prefer a stable visibility-policy fingerprint that changes when access changes.
+
+## I separate three cached things
+
+One large “AI response cache” hides useful boundaries. I often separate:
+
+1. **Retrieval cache:** query plus corpus and permission snapshot returns document identities.
+2. **Model-call cache:** exact effective input plus model snapshot returns raw structured output.
+3. **Product-result cache:** validated workflow outcome plus business dependencies returns a user-facing result.
+
+Each layer has different freshness.
+
+A retrieved document list becomes stale when the index changes. A model call may remain reproducible only with a pinned model. A product answer about an account balance becomes stale when the balance changes, even if prompt and model are identical.
+
+This separation also shows where a cache hit saved work.
+
+## Freshness comes from dependencies
+
+TTL is useful as a final bound, but it is a weak primary model. “Valid for one hour” says nothing about what changed after five seconds.
+
+I list the facts the answer depended on:
+
+```json
+{
+  "corpus_version": "docs-1842",
+  "policy_version": "access-91",
+  "account_version": 731,
+  "prompt_version": "support-answer-12",
+  "model_policy": "quality-route-4"
+}
+```
+
+An event can invalidate entries by dependency, or the versions can be included in the key so new reads naturally miss old values. I still keep a TTL for forgotten dependencies and storage control.
+
+The [retrieval-index invalidation article](/blog/a-retrieval-index-needs-an-invalidation-strategy) explains why corpus freshness must follow document lifecycle, not only elapsed time.
+
+## Permissions must be checked on every hit
+
+I do not treat “authorized when cached” as “authorized now”.
+
+Before returning a hit, the system checks current access to the result or to the sources represented by it. For a result containing citations, I verify that every cited source remains visible. If this check is as expensive as recomputing the workflow, that tells me the cache boundary may be wrong.
+
+Shared caches need tenant separation in both storage and metrics. A missing tenant dimension is not a low hit-rate bug; it is a data leak.
+
+Sensitive content may not be cacheable at all, or may require encryption, short retention, regional placement, and deletion propagation. I make eligibility explicit by task type.
+
+## Semantic caching is a product decision
+
+Semantic caches reuse an answer for inputs considered similar by an embedding or classifier. This can improve hit rate. It also changes the meaning of a hit from “same identity” to “close enough”.
+
+I would consider it for low-risk explanatory content with strong source validation. I avoid it for:
+
+- account-specific facts;
+- legal, medical, or financial decisions;
+- tool arguments and irreversible actions;
+- requests where one negation changes intent;
+- answers whose permitted sources differ by user.
+
+The similarity threshold needs an evaluation set containing near-duplicates that should **not** share an answer. Average semantic similarity is not a safety test.
+
+## Cache only validated outcomes
+
+If a workflow produces structured output, I validate the schema and business constraints before writing the cache. I also store enough evidence to explain the result:
+
+```text
+created_at
+expires_at
+dependency versions
+model and prompt identity
+validation result
+source/citation identities
+cache policy version
+```
+
+Errors need separate rules. Caching a permanent “document not found” may be valid for a short period. Caching a provider timeout as if it were a negative answer is dangerous.
+
+## My test matrix
+
+I test a hit and every reason it should become a miss:
+
+| Change | Expected result |
+| --- | --- |
+| identical effective inputs | hit |
+| whitespace normalized by contract | hit |
+| prompt version changes | miss |
+| corpus snapshot changes | miss |
+| access revoked | deny, never return old content |
+| tool schema changes | miss |
+| tenant changes | isolated miss |
+| TTL expires | miss |
+| dependency event arrives twice | idempotent invalidation |
+
+I also test races: invalidation arriving while a result is computed, and two workers filling the same missing key. A stale writer should not overwrite a result built from newer dependencies.
+
+## The metric I care about
+
+Hit rate alone rewards unsafe reuse. I measure saved cost and latency beside stale-hit incidents, authorization denials, invalidation lag, and quality by cache policy.
+
+A low-risk cache with a modest hit rate can be more useful than a high-hit semantic cache that occasionally returns the wrong tenant's old truth.
+
+The principle I keep is simple: an AI answer does not become reusable because its text looks familiar. It becomes reusable when I can name its complete identity, prove its dependencies are fresh, and re-check that the current caller may see it.

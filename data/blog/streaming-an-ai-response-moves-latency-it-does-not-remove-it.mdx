@@ -1,0 +1,145 @@
+---
+title: "Streaming an AI Response Moves Latency; It Does Not Remove It"
+date: "2026-12-14T09:00:00+01:00"
+tags: ["AI streaming", "LLM latency", "backpressure", "Server-Sent Events", "production AI"]
+draft: false
+reviewed: true
+reviewedHash: "a193f93747f0f0576eee79bbcab66cde16ff73ac5c22badf7cc1e0ccc048e6cd"
+cluster: "reliable-ai-systems"
+campaign: "authority-2026"
+opportunity: "AI-037"
+summary: "Streaming can improve time to first useful output, but retrieval, queues, generation, buffering, moderation, and slow clients still exist. I trace and bound the complete path."
+---
+
+The first time an AI response streams into a user interface, the product feels transformed. Text appears quickly, the page looks alive, and a ten-second operation no longer feels like a frozen request.
+
+I like that improvement. I also do not call it “latency solved”. Streaming moves when the user receives work. It does not remove the work.
+
+## I measure more than time to first token
+
+A request usually crosses this path:
+
+```text
+request accepted
+queue wait
+authorization and retrieval
+model request sent
+first provider event
+first validated user-visible content
+last provider event
+last client byte
+client render complete
+```
+
+I record at least:
+
+```text
+time to first provider byte
+time to first useful byte
+time to complete
+inter-event gaps
+bytes or tokens delivered
+cancellation time
+```
+
+“First provider byte” may be a role marker or metadata that the UI cannot show. “First useful byte” tells a more honest product story.
+
+[OpenAI's streaming guide](https://developers.openai.com/api/docs/guides/streaming-responses) describes consuming incremental response events rather than waiting for the full result. The API changes delivery. My system still owns everything before and after those events.
+
+## Retrieval can dominate before streaming begins
+
+If the workflow retrieves documents, reranks them, checks permissions, and builds context before calling the model, the user sees none of that work streaming.
+
+I trace retrieval separately and ask whether safe partial work can happen earlier. Sometimes the UI can show that sources are being gathered. Sometimes retrieval must complete before generation because starting with incomplete evidence would produce a worse answer.
+
+I do not stream confident filler to hide a slow data path. The latency trace should point me to the actual bottleneck.
+
+## Backpressure eventually chooses a buffer
+
+The model provider may deliver faster than the browser can consume. A proxy may buffer small chunks. The client may be on a slow network or stop reading entirely.
+
+If every layer keeps accepting data, memory becomes the queue:
+
+```text
+provider -> server buffer -> proxy buffer -> network -> browser buffer -> renderer
+```
+
+The WHATWG [Streams Standard](https://streams.spec.whatwg.org/) models backpressure through queues and desired size. In my application I still set concrete bounds:
+
+- maximum buffered bytes per response;
+- maximum number of concurrent streams;
+- write deadline for a slow client;
+- maximum event size;
+- queue capacity before the provider call;
+- cancellation propagation deadline.
+
+When a client is too slow, I would rather cancel with an explicit status than let one stream occupy unbounded memory.
+
+## Cancellation must travel upstream
+
+Closing the browser tab should eventually stop retrieval, model generation, and optional tool work.
+
+I connect request cancellation to the workflow's cancellation token. Every child task has to observe it, and external calls need abort support or short enough deadlines.
+
+There is an economic reason: if the server keeps generating after the client disappears, streaming reduced perceived latency for nobody and still consumed the full cost.
+
+There is also a correctness reason. A cancelled conversational response must not leave an irreversible tool action running without a durable operation identity and an explicit outcome.
+
+## Partial output changes the failure contract
+
+Without streaming, a failed request can return one clean error. With streaming, the user may already have half an answer.
+
+I define terminal events such as:
+
+```json
+{ "type": "response.completed", "response_id": "r_42" }
+{ "type": "response.failed", "response_id": "r_42", "reason": "provider_timeout" }
+{ "type": "response.cancelled", "response_id": "r_42" }
+```
+
+The client does not treat connection close alone as success. It needs the terminal protocol event or a follow-up status query.
+
+For reconnect, I decide whether events have sequence numbers and short retention. If resume is unsupported, the UI says so rather than concatenating a new generation onto the old partial text.
+
+## Moderation and validation become incremental problems
+
+A complete structured result can be validated before display. A token stream cannot.
+
+For low-risk prose I may show incremental text and retain the ability to stop. For tool arguments, JSON, citations, and high-risk outputs, I buffer until the relevant unit is complete and validated.
+
+```text
+text paragraph       may stream after policy checks
+citation             emit only after source identity is verified
+JSON object          emit as pending; commit after schema validation
+tool call            never execute from an incomplete argument stream
+```
+
+This may increase time to first *useful* output. That is acceptable when the alternative is displaying or executing something invalid.
+
+## Proxies and compression can erase the benefit
+
+I test the deployed path, not only localhost. Reverse proxies, CDNs, middleware, and compression may wait for a larger buffer before flushing.
+
+My integration test records arrival times at the client over the real protocol. It fails if all events arrive together at the end. I also verify heartbeat behaviour, idle timeouts, HTTP headers, and mobile-network conditions.
+
+Server-Sent Events are convenient for server-to-client updates; WebSockets may fit bidirectional protocols. The transport choice does not remove backpressure or completion semantics.
+
+## The comparison I show product teams
+
+I put blocking and streaming traces side by side:
+
+| Metric | Blocking | Streaming |
+| --- | --- | --- |
+| first useful content | completion time | earlier event |
+| full answer time | model completion | similar, sometimes slightly more overhead |
+| partial failure | nothing shown | visible incomplete answer |
+| slow-client memory | response buffer | bounded stream queue required |
+| cancellation | request abort | propagate across active work |
+
+This makes the trade visible. Streaming is often the right choice, but it adds a protocol and state machine.
+
+## What I optimize after streaming
+
+Once the trace is honest, I can reduce queue wait, retrieval time, prompt processing, model output length, proxy buffering, and rendering work. I can also design the answer so the valuable part appears first rather than streaming a long introduction.
+
+My rule is simple: streaming is a delivery strategy, not a latency eraser. I use it to improve time to useful output, while still bounding the queues, stopping abandoned work, validating complete units, and measuring how long the whole answer actually takes.

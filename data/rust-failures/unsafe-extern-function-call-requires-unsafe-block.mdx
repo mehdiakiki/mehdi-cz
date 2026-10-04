@@ -1,0 +1,111 @@
+---
+caseId: "RFA-096"
+title: "E0133: Calling an Unsafe extern Function"
+date: "2026-09-05T09:16:00+01:00"
+lastmod: "2026-09-05T09:16:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "eba07fd3539e7e51bd7550d7c2fef590ef20887a55669543621f5cd891a4fe33"
+area: "ffi-targets"
+symptom: "Calling an unsafe extern C function from ordinary Rust code produces E0133."
+summary: "The ABI controls how a call crosses the machine boundary; unsafe marks semantic preconditions Rust cannot prove. Audit concrete pointers, lengths, ownership, and lifetimes at the call site."
+rustVersions: ["Rust 1.98.1"]
+targets: ["all targets; ABI details vary"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust E0133 call to unsafe extern function",
+    "unsafe extern C fn requires unsafe block",
+    "FFI call safety contract",
+  ]
+evidence:
+  ["Rust 1.98.1 compile failure", "call-site precondition audit", "documented unsafe call repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/error_codes/E0133.html",
+    "https://doc.rust-lang.org/reference/items/functions.html#unsafe-functions",
+  ]
+---
+
+An extern function can be implemented in Rust and still require an unsafe call:
+
+```rust
+unsafe extern "C" fn read_status(pointer: *const i32) -> i32 {
+    unsafe { *pointer }
+}
+
+fn main() {
+    let status = 7;
+    let read = read_status(&status);
+}
+```
+
+Rust 1.98.1 reports E0133 at the call. The [failing fixture](/rust-failure-atlas/evidence/RFA-096/fail.rs) uses edition 2024 so the unsafe operation inside the function is also marked separately.
+
+There are two labels on the function: `extern "C"` and `unsafe`. They solve different problems. Treating them as one general “FFI danger” label makes reviews weaker.
+
+## extern selects a calling convention
+
+The ABI tells the compiler how arguments and return values cross the call boundary: registers, stack layout, symbol interaction, and platform rules. `extern "C"` requests the platform's C calling convention.
+
+It does not make the parameter semantically valid. A raw pointer has no encoded guarantee that it is non-null, aligned, initialized, alive, or legal to read. The function is unsafe because callers must establish such facts.
+
+The [Reference on unsafe functions](https://doc.rust-lang.org/reference/items/functions.html#unsafe-functions) describes extra conditions callers must uphold. The [E0133 index](https://doc.rust-lang.org/error_codes/E0133.html) lists calls to unsafe functions among operations requiring an unsafe context.
+
+## The unsafe block belongs at the proof site
+
+The repaired call is:
+
+```rust
+let status = 7;
+// Safety: this pointer comes from a live, aligned reference to one i32.
+let read = unsafe { read_status(&status) };
+```
+
+The [fixed fixture](/rust-failure-atlas/evidence/RFA-096/fixed.rs) compiles, executes, and verifies the value. Its proof is simple because the pointer is derived immediately from a live local reference.
+
+At a real foreign boundary, the proof may include a length from another field, an ownership flag, a callback lifetime, or a guarantee from external documentation. I put the block close to the place where those concrete facts are known.
+
+Wrapping an entire module in one unsafe block separates operations from their evidence and allows later unsafe calls to enter silently.
+
+## Correct Rust types do not prove a correct foreign declaration
+
+Even a well-documented call site is unsafe if the declared signature disagrees with the actual binary. The extern declaration author must verify the symbol, ABI, widths, layout, and platform version. The call-site author verifies per-call values.
+
+These are two independent proofs. A generated binding helps with the first but still has input headers, flags, and target assumptions that can become stale.
+
+## Safe wrappers should validate what they can
+
+A common design exposes a safe Rust function accepting references or slices, then calls the unsafe extern function internally:
+
+```rust
+fn read_status_safe(status: &i32) -> i32 {
+    // Safety: a shared reference supplies one valid, aligned, live i32.
+    unsafe { read_status(status as *const i32) }
+}
+```
+
+The wrapper's safe signature makes some preconditions unrepresentable to callers. If the foreign function retains the pointer after returning, this wrapper would be unsound because the reference lifetime covers only the call. A safe wrapper is justified only when its signature and validation establish every foreign precondition.
+
+For buffers, I pass pointer and length from the same slice so they cannot disagree. For output pointers, I use `MaybeUninit` and only assume initialization after checking the foreign result contract.
+
+## Unwinding and errors need explicit treatment
+
+A C ABI function may report errors through return codes, thread-local state, output parameters, or callbacks. The Rust wrapper should translate these into a typed result without reading invalid output on failure.
+
+Unwinding across an ABI boundary has separate rules. I do not let a Rust panic cross an ABI that does not permit it, and I do not assume a foreign exception can pass through Rust frames.
+
+## My call-site audit
+
+For each unsafe extern call I write down:
+
+1. The authoritative declaration and supported targets.
+2. Pointer provenance, alignment, initialization, and reachable byte range.
+3. Ownership before and after the call.
+4. Whether the callee stores pointers or callbacks.
+5. Threading and reentrancy requirements.
+6. Error and unwinding behavior.
+
+Then I make the unsafe block cover only the actual call and keep the evidence nearby. Tests can exercise null handling and length boundaries, but tests do not replace the proof because undefined behavior may stay invisible.
+
+E0133 here is not saying foreign code is automatically wrong. It says the Rust compiler cannot verify the semantic bridge from a typed call expression to the external contract. The unsafe block should mark the exact place where that bridge has been checked.

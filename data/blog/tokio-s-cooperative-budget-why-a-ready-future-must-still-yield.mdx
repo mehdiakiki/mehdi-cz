@@ -1,0 +1,208 @@
+---
+title: "Tokio's Cooperative Budget: Why a Ready Future Must Still Yield"
+date: "2026-11-14T09:00:00+01:00"
+tags: ["rust", "Tokio", "cooperative scheduling", "async", "tail latency"]
+draft: false
+reviewed: true
+reviewedHash: "5f12cb904739371c9d46a6722866e64faefcf5d2c6e8dc2e8d4f5e2bea3134bb"
+cluster: "rust-under-the-hood"
+campaign: "authority-2026"
+opportunity: "RUST-044"
+summary: "Tokio can make many runtime operations yield after consuming a cooperative budget, but an always-ready custom loop may bypass it. Fairness must be observable and explicit at library boundaries."
+---
+
+An `.await` expression is not a promise that another Tokio task will run. If the awaited future is immediately ready, the current task can continue without returning control to the executor.
+
+This matters for loops that process an always-ready stream, a hot cache, or custom futures. The loop is asynchronous in syntax and still able to starve a heartbeat.
+
+Tokio adds a cooperative operation budget to many of its own resources. This is an important safety net, but it is not preemption and it does not cover arbitrary code.
+
+## Ready does not yield
+
+Consider:
+
+```rust
+async fn hot_loop(items: &[u64]) -> u64 {
+    let mut sum = 0;
+
+    for item in items {
+        std::future::ready(()).await;
+        sum = sum.wrapping_add(*item);
+    }
+
+    sum
+}
+```
+
+`ready(()).await` completes on its first poll. The future does not return `Pending`, register a waker, or give the scheduler a reason to switch tasks.
+
+On a current-thread runtime, a timer task waits until this whole poll finishes.
+
+The model I keep is simple:
+
+```text
+.await on Pending -> current poll returns; another task can run
+.await on Ready   -> current task continues in the same poll
+```
+
+The source code must cooperate somewhere.
+
+## What Tokio's budget changes
+
+Tokio-aware resources such as its channels and sockets participate in [cooperative scheduling](https://docs.rs/tokio/latest/tokio/task/coop/index.html). When a task makes repeated progress through these resources, operations consume a per-task budget. After exhaustion, a participating resource can return `Pending` so the executor gets control.
+
+The budget is reset when the task is scheduled again.
+
+```text
+task scheduled with budget
+ready Tokio operation -> progress, consume budget
+ready Tokio operation -> progress, consume budget
+...
+budget exhausted -> participating operation yields
+other ready tasks get a scheduling opportunity
+```
+
+Tokio introduced this mechanism to reduce tail latency when resources remain continuously ready, as its [cooperative scheduling history](https://tokio.rs/blog/2020-04-preemption) explains.
+
+I do not depend on a particular numeric budget from an old blog post. It is an implementation heuristic, not a throughput contract for my application.
+
+## A task fairness trace
+
+I use this shape when reviewing a hot loop:
+
+```rust
+use std::time::{Duration, Instant};
+
+async fn heartbeat() {
+    let mut previous = Instant::now();
+    let mut interval = tokio::time::interval(Duration::from_millis(10));
+
+    for _ in 0..20 {
+        interval.tick().await;
+        let now = Instant::now();
+        println!("heartbeat gap: {:?}", now - previous);
+        previous = now;
+    }
+}
+```
+
+I run the heartbeat beside three consumers over the same preloaded amount of work:
+
+```text
+A. custom loop whose awaited future is always Ready
+B. loop using a Tokio mpsc receiver that participates in budgeting
+C. custom loop with an explicit cooperative point
+```
+
+I compare maximum heartbeat gap, work throughput, and total runtime. I do not report only average latency because starvation appears in the tail.
+
+## Explicit yielding has two useful forms
+
+For a plain compute loop, I can yield at a chunk boundary:
+
+```rust
+for (index, item) in items.iter().enumerate() {
+    process(item);
+
+    if index % 256 == 255 {
+        tokio::task::yield_now().await;
+    }
+}
+```
+
+`yield_now` asks to give other scheduled tasks an opportunity. Tokio documents that it does not guarantee which task runs next, so I use it for cooperation, never ordering.
+
+For a library operation that should integrate with Tokio's budget, `consume_budget` is often the better expression:
+
+```rust
+for item in items {
+    process(item);
+    tokio::task::coop::consume_budget().await;
+}
+```
+
+This yields only when the cooperative budget has been exhausted, rather than forcing a scheduler round on every item.
+
+The right interval is measured. An expensive item may need a cooperative point inside its processing, not only after 256 items.
+
+## Tokio cannot budget code it does not see
+
+These operations may bypass the runtime's cooperative mechanism:
+
+```text
+CPU work with no await
+std::future::ready or another immediately-ready custom future
+third-party channels not wrapped for cooperative polling
+a custom Stream returning Ready forever
+blocking system or library calls
+```
+
+Tokio exposes a `cooperative` wrapper for futures at library boundaries. Its documentation uses a non-Tokio channel as the example: wrapping its receive future lets polling consume Tokio task budget.
+
+This is useful for library integration. It cannot interrupt synchronous work happening inside one `poll` call.
+
+## Blocking and budget exhaustion are different failures
+
+A task doing `std::thread::sleep` holds the worker thread. No cooperative operation can be reached until that call returns. That belongs at a blocking boundary, as explained in [How One Blocking Function Stalls an Async Rust Executor](/blog/how-one-blocking-function-stalls-an-async-rust-executor).
+
+A cooperative-budget problem happens when code is non-blocking in the OS sense but keeps making immediate progress without returning to the scheduler.
+
+```text
+blocking call: one poll cannot proceed because the thread waits
+hot ready loop: one poll proceeds too much without yielding
+```
+
+Both increase unrelated task latency. They need different fixes.
+
+## `unconstrained` is a sharp tool
+
+Tokio can run a future without cooperative constraints through `task::coop::unconstrained`. This can make sense in carefully measured internal code. It also removes a fairness protection.
+
+I require a reason and a latency test before using it. “It benchmarks faster in isolation” is not enough when the production worker also owns timers, sockets, and shutdown tasks.
+
+Throughput gained by starving neighbours is not free throughput.
+
+## Fairness belongs in the API contract
+
+If I publish an async library that can process an unbounded number of ready items in one poll, callers cannot repair the behaviour from outside.
+
+I document:
+
+- how much work one poll can perform;
+- which awaited operations participate in Tokio budgeting;
+- where explicit cooperative points exist;
+- whether callers can set a batch size;
+- how cancellation and shutdown are observed;
+- the cost of one worst-case item.
+
+A batch parameter becomes a latency knob, not only a throughput knob.
+
+## Test under continuously ready input
+
+Light-load tests often miss this failure because the input future naturally becomes pending. I keep it continuously ready and add competing tasks:
+
+```text
+preload the channel or stream
+run on one executor worker
+start a 10 ms heartbeat
+start a cancellation listener
+process enough items to remain hot
+record maximum gaps and shutdown delay
+repeat with several batch sizes
+```
+
+Then I repeat on the production runtime configuration. A multi-thread scheduler can hide one unfair task until enough hot tasks occupy all workers.
+
+## My review rule
+
+Whenever I see an async loop, I ask:
+
+```text
+Which awaited operation can actually return Pending?
+If input is always ready, what bounds work per poll?
+Is the operation Tokio-aware or a custom future?
+What is the measured delay imposed on a heartbeat?
+Can shutdown be observed while the loop is saturated?
+```
+
+Tokio's cooperative budget is a very good runtime defence. It is not permission to forget the executor model. A ready future must still reach a trusted cooperative boundary, or the application must create one explicitly.

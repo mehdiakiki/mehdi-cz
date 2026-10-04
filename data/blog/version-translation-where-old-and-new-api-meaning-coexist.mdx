@@ -1,0 +1,165 @@
+---
+title: "Version Translation: Where Old and New API Meaning Coexist"
+date: "2026-12-05T09:00:00+01:00"
+tags: ["API versioning", "version translation", "data contracts", "migration", "backward compatibility"]
+draft: false
+reviewed: true
+reviewedHash: "432e1620483129396bb5134a308369e774e45a0a287dd24a18171d7ac20392b1"
+cluster: "reliable-data-integrations"
+campaign: "authority-2026"
+opportunity: "DATA-074"
+summary: "Supporting two API versions means supporting two meanings. I use explicit translators, a compatibility matrix, shadow comparison, and evidence for the cases that cannot round-trip."
+---
+
+An API version is easy to draw as two boxes:
+
+```text
+v1 request -> v1 handler
+v2 request -> v2 handler
+```
+
+I have learned that this picture becomes painful very quickly. Bug fixes land in one handler. Authorization differs. The same business action produces two shapes and, later, two meanings.
+
+My preferred design is one internal operation with explicit translation at the edges:
+
+```text
+v1 request -> v1 translator --+
+                              +-> internal command -> domain
+v2 request -> v2 translator --+
+
+domain result -> v1 presenter
+              -> v2 presenter
+```
+
+There is still complexity. I have only put it in a place where I can see and test it.
+
+## Two versions can disagree without changing field names
+
+Suppose version 1 accepts:
+
+```json
+{ "status": "active" }
+```
+
+Version 2 accepts:
+
+```json
+{ "lifecycle": "enabled", "effective_at": "2026-12-05T08:00:00Z" }
+```
+
+This is not a rename. Version 2 introduces time. Translating v1 requires a policy for `effective_at`: request arrival, database time, or an unknown historical value. Each choice changes meaning.
+
+That is why I write the translation matrix before the code.
+
+| Change | v1 to internal | internal to v1 | Loss |
+| --- | --- | --- | --- |
+| renamed field | direct map | direct map | none |
+| split one state into two | old default policy | collapse states | distinction lost |
+| new required timestamp | derive with named rule | omit | provenance lost |
+| new enum value | reject or preserve unknown | map to safe legacy state | capability lost |
+| changed money unit | exact conversion | exact if divisible | possible precision |
+
+The final column is the important one. A translator cannot manufacture information an old client never sent.
+
+## I give every assumption a name
+
+A weak translator fills missing data silently:
+
+```text
+effective_at = now()
+```
+
+A stronger translator records why:
+
+```text
+effective_at = request_received_at
+effective_at_source = V1_COMPATIBILITY_POLICY
+translation_version = 7
+```
+
+This evidence helps during migration. If a later policy changes, I can distinguish values supplied by clients from values inferred at the boundary.
+
+It also prevents a familiar argument: “the database says this time, so the user must have sent it.” The database only says what was stored.
+
+## One domain path prevents behavioural drift
+
+Both versions must pass through the same authorization, invariants, idempotency, and transaction rules. I do not let a legacy endpoint bypass new safety checks because its payload is older.
+
+The internal command might look like:
+
+```text
+ChangeLifecycle {
+  account_id,
+  target_state,
+  effective_at,
+  request_identity,
+  translation_evidence
+}
+```
+
+Transport concerns such as header names stay outside. Business meaning enters once.
+
+This is closely related to the [anti-corruption layer](/blog/the-anti-corruption-layer-as-an-integration-boundary-you-can-test), but the version translator has an additional obligation: old and new contracts are both ours. We cannot blame a provider if they drift.
+
+## Round-trip tests expose dishonest compatibility
+
+For lossless changes, I like this property:
+
+```text
+decode_v1(encode_v1(value)) == value
+```
+
+For lossy changes, equality is the wrong assertion. I define the preserved projection:
+
+```text
+legacy_view(decode_v1(encode_v1(value))) == legacy_view(value)
+```
+
+The test states exactly which information v1 can represent. New lifecycle details may disappear, but identity and the safe top-level state must survive.
+
+My fixture set includes:
+
+- every enum value, including unknown values;
+- omitted, null, empty, and default fields;
+- minimum and maximum numeric values;
+- timestamps at offset and daylight-saving boundaries;
+- duplicate requests under both versions;
+- a v1 write followed by a v2 read, and the reverse;
+- data stored by every still-supported translation version.
+
+The [Google API Improvement Proposal on versioning](https://google.aip.dev/185) makes versions part of the API surface. The [Protocol Buffers updating guide](https://protobuf.dev/programming-guides/proto3/#updating) shows that wire compatibility has its own rules. Neither removes the need to test business meaning.
+
+## Shadow translation before moving traffic
+
+When replacing a translator, I can run the new path without committing its result:
+
+```text
+request -> active translator -> real command
+       \-> candidate translator -> comparison only
+```
+
+I compare semantic fields, not serialized byte order. Differences are classified as expected policy changes, acceptable normalization, or defects.
+
+I never shadow an external write. The shadow path ends before side effects. For sensitive payloads, I record only safe field-level differences and fixture identities, not full bodies.
+
+## Deprecation needs observed evidence
+
+I do not remove v1 because a calendar says nobody should use it. I measure:
+
+```text
+requests by authenticated client identity
+successful operations by version
+v1-only fields still used
+translation warnings and losses
+last observed use, with a safe retention window
+```
+
+Then clients receive a concrete migration report: which calls remain, which meanings changed, and which deadline applies. Anonymous or offline clients may require a different strategy, but the absence of a dashboard line is never enough evidence by itself.
+
+## The part I keep deliberately boring
+
+Version routing should be simple. I avoid clever reflection that automatically converts fields with matching names. Explicit code is repetitive, but a code review can see the policy.
+
+The interesting engineering is not whether `/v1` comes from a path or header. It is whether an old request and a new request reach the same invariant with their assumptions visible.
+
+When they cannot mean the same thing, I say so in the matrix. Honest loss is safer than a translator that claims compatibility while quietly inventing data.

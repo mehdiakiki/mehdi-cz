@@ -1,0 +1,233 @@
+---
+title: "Filter Before Retrieval: Permissions Are Part of Relevance"
+date: "2026-11-15T09:00:00+01:00"
+tags: ["RAG", "authorization", "vector search", "document permissions", "security"]
+draft: false
+reviewed: true
+reviewedHash: "a3e27bbf070e96e4cdc03cddede6ecbf0f57179ab6729ec6fc0fcacf0dbc8d40"
+cluster: "reliable-ai-systems"
+campaign: "authority-2026"
+opportunity: "AI-030"
+summary: "A RAG result is relevant only when the caller may see it. Authorization must constrain candidate retrieval before text reaches reranking, prompts, caches, logs, or model providers."
+---
+
+In a retrieval-augmented generation system, a document is not relevant when the user is not allowed to read it.
+
+This sounds obvious. Yet many examples retrieve the global top results, attach a metadata filter later, and assume the remaining list is safe. By then, restricted text may already have entered a reranker, trace, cache, or external model request.
+
+I make authorization part of candidate selection.
+
+```text
+authenticate caller
+resolve current permission context
+retrieve only authorized candidates
+rerank authorized candidates
+build prompt from authorized passages
+generate and verify answer
+```
+
+## Post-filtering creates two problems
+
+Assume the vector search asks for the global top five chunks:
+
+```text
+1 restricted strategy document
+2 restricted salary spreadsheet
+3 public handbook
+4 restricted incident report
+5 public holiday policy
+```
+
+Filtering after top five leaves only two usable results. There may be ten better authorized documents at ranks 6–30, but the retriever never returns them.
+
+So late filtering creates:
+
+1. a security exposure if restricted candidates leave the trusted search boundary;
+2. a relevance failure because unauthorized hits consume the candidate budget.
+
+Azure AI Search documents the recall trade-off among [vector prefilter and postfilter modes](https://learn.microsoft.com/en-us/azure/search/vector-search-filters). The exact implementation differs by search engine, but the application requirement stays the same: unauthorized text must not become an observable candidate.
+
+## Carry the caller, not a client-supplied tenant string
+
+I derive the principal from verified authentication. I do not trust this request body:
+
+```json
+{ "query": "roadmap", "tenant_id": "tenant-b" }
+```
+
+The retrieval service receives a permission context created by the authorization layer:
+
+```ts
+type RetrievalPrincipal = {
+  subjectId: string;
+  tenantId: string;
+  groupIds: string[];
+  roles: string[];
+  policyVersion: string;
+  authenticatedAt: string;
+};
+```
+
+Every downstream call accepts this context or a constrained capability derived from it. A missing context fails closed.
+
+## Put permission identity on every chunk
+
+Chunking must not detach text from source authorization.
+
+```ts
+type AuthorizedChunk = {
+  chunkId: string;
+  documentId: string;
+  documentVersion: string;
+  tenantId: string;
+  allowedSubjects: string[];
+  allowedGroups: string[];
+  classification: string;
+  aclVersion: string;
+  text: string;
+  embedding: number[];
+};
+```
+
+Permission metadata is part of the indexed projection. The source document, every chunk, and the query filter must agree on tenant and ACL version.
+
+[A Retrieval Index Needs an Invalidation Strategy](/blog/a-retrieval-index-needs-an-invalidation-strategy) covers the urgent update path when an ACL changes without the text changing.
+
+## Pre-filtering needs a real security boundary
+
+Adding `tenant_id = X` to a query is useful only when the caller cannot remove or replace the filter.
+
+I prefer one of these shapes:
+
+```text
+search service evaluates the caller token and stored ACL
+trusted retrieval gateway always injects a non-overridable filter
+physical index or namespace isolation plus authorization at routing
+authoritative permitted-document set intersects retrieval
+```
+
+The search credentials held by a browser or ordinary product client must not be able to run an unfiltered query. [Document-level access control](https://learn.microsoft.com/en-us/azure/search/search-document-level-access-overview) is a search-system feature, but it still depends on correct identity, indexed permission metadata, and query construction.
+
+## Parent and child permissions are easy to separate accidentally
+
+A document may inherit permissions from a folder, workspace, or project. The chunking pipeline copies the effective policy, not only direct ACL entries.
+
+I test transitions such as:
+
+```text
+parent folder becomes private
+document moves between workspaces
+group membership is removed
+public link expires
+classification changes while text stays identical
+document is duplicated into another tenant
+```
+
+If the effective permission cannot be resolved, the indexer does not mark the chunk public.
+
+## Group expansion has freshness and size limits
+
+There are two common strategies:
+
+```text
+index groups on documents; resolve caller's current groups at query time
+index users expanded from groups; update documents when membership changes
+```
+
+The first keeps membership fresher but may produce a large query filter. The second makes querying simple but turns every membership change into many index updates.
+
+I record `policyVersion` and `aclVersion` so stale decisions become detectable. I also define a revocation objective. “Eventually” is not enough when a user has left a confidential project.
+
+## Caches must include authorization identity
+
+This cache key is unsafe:
+
+```text
+hash(normalized query)
+```
+
+Alice's retrieved passages or final answer may be served to Bob.
+
+A safer identity includes at least:
+
+```text
+tenant
+permission-context or capability hash
+policy version
+query and filters
+index generation
+retrieval and reranker configuration
+```
+
+Even then, rapidly changing permissions may make caching source text too risky. I cache document IDs and re-authorize before loading content, or avoid result caching for sensitive classes.
+
+Logs, evaluation datasets, and traces need the same rule. A filtered UI does not erase restricted text captured by observability.
+
+## The model must not become an authorization oracle
+
+Prompt instructions such as “do not reveal confidential information” are not access control. If the prompt contains restricted text, the boundary already failed.
+
+The model may quote it, summarize it, leak it through tool arguments, or retain it in a provider-side log according to the deployment contract.
+
+I minimize prompt data after authorized retrieval and apply output checks as defence in depth. Output checks are not a substitute for candidate isolation.
+
+## Multi-user security tests
+
+I build a small fixture with overlapping permissions:
+
+| Document | Alice | Bob | Group red | Tenant |
+| --- | ---: | ---: | ---: | --- |
+| public handbook | yes | yes | yes | A |
+| Alice review | yes | no | no | A |
+| red roadmap | via group | no | yes | A |
+| tenant B plan | no | no | no | B |
+
+For every principal, I run exact-title, keyword, semantic, typo, and quoted-fragment queries. Restricted documents are deliberately the strongest semantic matches.
+
+I assert that unauthorized chunk IDs and text are absent from:
+
+```text
+retriever response
+reranker request and response
+model prompt
+final answer and citations
+cache values
+application logs and traces
+evaluation capture
+```
+
+Then I remove Alice from group red and verify the revocation deadline without rebuilding unrelated embeddings.
+
+## Test failures, not only correct filters
+
+My adversarial cases include:
+
+- missing authentication context;
+- unknown tenant or policy version;
+- authorization service timeout;
+- malformed or oversized group list;
+- stale ACL in one shard;
+- cached result from another user;
+- empty authorized result set;
+- document moved while indexing is delayed;
+- prompt injection asking a tool to rerun retrieval without filters.
+
+The expected behaviour is usually no result or a controlled error, never an unfiltered fallback.
+
+## What I observe
+
+I record identifiers and counts without logging source text:
+
+```text
+authenticated tenant and policy version
+permission filter identity
+candidates examined and authorized
+empty-result rate by authorized corpus size
+ACL update and revocation lag
+fail-closed query count
+cross-tenant security-test status
+```
+
+Relevance metrics are segmented by permission selectivity. A retriever can look excellent on a global corpus and weak for a user who may access only 0.1% of it.
+
+Permissions are not metadata decoration added after semantic search. They define the corpus for this caller. Once I enforce them before candidate disclosure and test every downstream surface, retrieval quality and security become the same design problem.

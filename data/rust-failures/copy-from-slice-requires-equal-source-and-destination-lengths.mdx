@@ -1,0 +1,78 @@
+---
+caseId: "RFA-663"
+title: "copy_from_slice Requires Equal Source and Destination Lengths"
+date: "2026-09-06T08:23:00+01:00"
+lastmod: "2026-09-06T08:23:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "3814f0000329a8d1ab53aff8fff07cb99aed81b6a200126c097cb3076632e1e6"
+area: "concurrency-memory"
+symptom: "copy_from_slice panics when copying a short source into a larger destination buffer even though enough capacity is available."
+summary: "copy_from_slice replaces one complete destination slice and requires exact length equality. Slice the destination explicitly when copying a prefix."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust copy_from_slice length mismatch panic", "copy shorter slice into buffer Rust", "source destination slice lengths Rust"]
+evidence: ["Rust 1.98.1 runtime panic", "two-byte source and three-byte destination", "destination prefix with equal length repairs copy"]
+sources: ["https://doc.rust-lang.org/std/primitive.slice.html#method.copy_from_slice", "https://doc.rust-lang.org/std/primitive.slice.html#method.clone_from_slice", "https://doc.rust-lang.org/std/primitive.slice.html#method.copy_within"]
+---
+
+`copy_from_slice` copies every source element into an equally long destination slice. A larger destination is not accepted automatically. The [failing fixture](/rust-failure-atlas/evidence/RFA-663/fail.rs) tries to copy two bytes into a three-byte array and panics because the slice lengths differ.
+
+## A slice is the exact destination region
+
+The [`copy_from_slice` contract](https://doc.rust-lang.org/std/primitive.slice.html#method.copy_from_slice) requires both slices to have the same length. The receiver is not interpreted as spare capacity. It is the complete region that the operation must replace.
+
+This is a useful API design. If Rust silently copied only the shorter length, a caller could accidentally leave stale bytes at the end or discard source bytes. Exact equality turns an ambiguous partial operation into a checked whole-region operation.
+
+I make the partial region explicit: `destination[..source.len()].copy_from_slice(source)`. The [repaired fixture](/rust-failure-atlas/evidence/RFA-663/fixed.rs) does this and leaves the final destination byte unchanged.
+
+## Capacity and slice length are different
+
+An array `[u8; 3]` has three initialized elements. A `Vec` can have capacity beyond its length, but a slice exposes only initialized elements in a particular range. `copy_from_slice` cannot copy into uninitialized spare vector capacity through a normal slice.
+
+This distinction protects initialization. Writing into `Vec::spare_capacity_mut` uses `MaybeUninit` and requires updating length only after values are initialised. That lower-level path is for carefully reviewed buffer construction, not a workaround for ordinary copies.
+
+When a protocol frame has a fixed header and a variable payload, I calculate and validate offsets first. Then each exact field range receives an exact source. The ranges document layout better than a copy function that guesses how much I meant.
+
+## Overlap is another separate contract
+
+Source and destination passed to `copy_from_slice` cannot be overlapping borrows from the same slice in straightforward safe code. For moving a range within one slice, [`copy_within`](https://doc.rust-lang.org/std/primitive.slice.html#method.copy_within) expresses overlapping memmove-style behaviour.
+
+I choose by intent:
+
+- `copy_from_slice` copies between equal-length regions for `Copy` values.
+- `clone_from_slice` performs element cloning for `Clone` values and still requires equal lengths.
+- `copy_within` moves one range inside the same slice and permits overlap.
+- iterator code is appropriate when transforming, filtering, or deliberately truncating.
+
+Similar names do not mean interchangeable edge behaviour.
+
+## Validate external lengths before slicing
+
+The repaired expression can itself panic if `source.len()` exceeds `destination.len()`. At a trusted internal boundary, an assertion with a domain message may be correct. At a network or file boundary, I return an error before slicing.
+
+A useful check reports expected and received sizes. For fixed-size protocol fields, converting with `try_into()` can make the exact width visible in the type. For streaming input, `Read::read_exact` communicates that incomplete input is an I/O error rather than a shorter successful copy.
+
+I do arithmetic with checked operations when offsets and lengths come from outside. An exact-copy contract helps only after the selected range is valid.
+
+## Partial copies need an explicit remainder policy
+
+If the destination is longer, what should happen to the remainder? It might stay unchanged, be zero-filled, receive later fields, or make the entire request invalid. If the source is longer, should the operation truncate, grow storage, or reject it?
+
+The standard method refuses to choose. Application code must choose once and test it. Silent truncation is especially dangerous for hashes, identifiers, authentication tags, and encoded lengths because distinct inputs can become the same stored prefix.
+
+Tests include source shorter, equal, and longer than the destination. They also check the untouched suffix or returned error, not only the copied prefix.
+
+## My exact-copy checklist
+
+- Are source and destination intended to represent the same complete region?
+- If copying a prefix, is that range explicit in the code?
+- What is the policy for a short or long external input?
+- Can offset-plus-length overflow before slicing?
+- Is overlap possible, requiring `copy_within` instead?
+- Do elements require Copy or Clone semantics?
+- Should an array conversion or `read_exact` express the width better?
+- Does the test verify untouched bytes and error paths?
+
+The core principle is that a slice describes a precise initialized region. `copy_from_slice` replaces that region completely, so equality is part of correctness rather than an inconvenience. I select the range explicitly and keep truncation, padding, and rejection visible at the domain boundary.

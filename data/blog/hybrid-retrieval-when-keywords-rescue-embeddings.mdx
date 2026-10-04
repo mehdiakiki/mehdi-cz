@@ -1,0 +1,181 @@
+---
+title: "Hybrid Retrieval: When Keywords Rescue Embeddings"
+date: "2026-10-31T09:00:00+01:00"
+tags: ["hybrid search", "BM25", "vector search", "RAG", "information retrieval"]
+draft: false
+reviewed: true
+reviewedHash: "d5d08c7759af86ec35050a6488701f90f1f4e3e4cecdbf3f4db1b839797b93ed"
+cluster: "reliable-ai-systems"
+campaign: "authority-2026"
+opportunity: "AI-027"
+summary: "Keyword retrieval finds exact identifiers that embeddings smooth away; vector retrieval finds paraphrases. Fuse ranked candidates, filter permissions first, and evaluate both query families."
+---
+
+Embeddings are good at connecting different words with similar meaning. They can be poor at exact strings that look rare or arbitrary: an error code, symbol, invoice ID, configuration key, or product version.
+
+Keyword search has the opposite shape. It can find `E0502` exactly while missing a question phrased as “why can I not mutate while an immutable borrow exists?”
+
+I use hybrid retrieval when the corpus and queries contain both kinds of evidence.
+
+## Two queries expose the gap
+
+Against a Rust knowledge base:
+
+```text
+Query A: E0502
+Query B: why does a shared borrow stop my later mutation?
+```
+
+A lexical method such as BM25 gives rare exact terms strong weight, so Query A is straightforward. A vector representation can connect the conceptual wording in Query B with an explanation that uses different words.
+
+Neither method dominates every query.
+
+```text
+lexical strengths: exact names, codes, paths, versions, quoted phrases
+vector strengths: paraphrase, concept, intent, multilingual similarity
+```
+
+Hybrid search combines candidate evidence before final ranking or answer generation.
+
+## Run retrieval independently first
+
+I collect two ranked lists:
+
+```text
+BM25 results:   L1, L2, L3, ...
+vector results: V1, V2, V3, ...
+```
+
+This separation keeps each retriever observable. If the final answer misses a document, I can tell whether neither retriever found it, fusion removed it, reranking removed it, or permission filtering did.
+
+I retrieve more candidates than the final context can hold, then fuse and rerank to a smaller set.
+
+## Do not add raw scores from unrelated scales
+
+BM25 scores and cosine or dot-product values do not share a natural unit. Their ranges also change by query and index configuration.
+
+This is fragile:
+
+```text
+final_score = bm25_score + vector_score
+```
+
+Whichever system emits numerically larger values can dominate without being more relevant.
+
+A simple rank-based fusion is Reciprocal Rank Fusion:
+
+```text
+RRF(document) = Σ 1 / (k + rank_in_list)
+```
+
+A document appearing high in both lists accumulates evidence. A document absent from one list contributes only from the other. `k` controls how sharply top ranks dominate.
+
+Elasticsearch's [RRF documentation](https://www.elastic.co/docs/reference/elasticsearch/rest-apis/reciprocal-rank-fusion) provides one current implementation reference.
+
+## A worked fusion
+
+Suppose `k = 60`:
+
+| Document | BM25 rank | Vector rank | Approximate RRF |
+| --- | ---: | ---: | ---: |
+| exact error guide | 1 | 8 | `1/61 + 1/68` |
+| general borrow guide | 5 | 1 | `1/65 + 1/61` |
+| unrelated glossary | 2 | absent | `1/62` |
+
+The exact error guide and conceptual guide both receive support. The glossary does not win merely because it had one lexical match.
+
+Weights can reflect evaluated importance:
+
+```text
+weighted RRF = lexical_weight/(k + lexical_rank)
+             + vector_weight/(k + vector_rank)
+```
+
+I choose weights from labelled queries, not from a visual preference for one result page.
+
+## Exact queries deserve an exact lane
+
+I detect or preserve fields for identifiers:
+
+```text
+error codes: E0502, HTTP 429
+symbols: poll_ready, CARGO_BUILD_WARNINGS
+paths: src/runtime/worker.rs
+versions: Rust 1.97
+IDs: incident-1842
+```
+
+Lowercasing, stemming, punctuation splitting, or embedding-only indexing can damage them. I use keyword subfields or appropriate analysers and keep code identifiers in chunk metadata.
+
+This is not a reason to route every short query to lexical only. `pin rust` is short and conceptual. Evaluation should decide.
+
+## Permissions are not a reranking feature
+
+Tenant and document authorization filters apply before a candidate can become visible to retrieval, scoring, snippets, logs, or the model.
+
+```text
+authorized lexical candidates
+         +
+authorized vector candidates
+         -> fusion -> rerank -> answer
+```
+
+Retrieving forbidden documents and removing them after fusion can leak timing, titles, text into logs, or candidate-space influence. It also wastes the top ranks and reduces recall for permitted evidence.
+
+Permission filtering belongs before both candidate generators. It is a security boundary with relevance consequences, not a cleanup pass after ranking.
+
+## Reranking has a different job
+
+Fusion combines signals from retrieval lists. A reranker can inspect the query and candidate text together to make a more expensive relevance decision.
+
+I use the stages deliberately:
+
+```text
+retrievers: find a broad, high-recall candidate pool cheaply
+fusion:     preserve evidence from several rankers
+reranker:   spend more compute on the reduced pool
+answer:     use only sufficient, permitted evidence
+```
+
+If the correct document never enters either candidate list, a reranker cannot recover it.
+
+## Evaluate by query slice
+
+One average recall number can hide the reason for hybrid search. I label queries:
+
+```text
+exact identifier
+natural-language paraphrase
+mixed identifier plus concept
+version-sensitive
+multilingual
+ambiguous short query
+permission-constrained
+```
+
+For each slice I compare:
+
+| Configuration | Recall@k | First relevant rank | Duplicate rate | Latency |
+| --- | ---: | ---: | ---: | ---: |
+| lexical only | | | | |
+| vector only | | | | |
+| fused | | | | |
+| fused + reranker | | | | |
+
+I also inspect whether the chunk includes the needed qualifier, not only whether it came from the correct document.
+
+## Freshness and field boosts remain explicit
+
+A 2023 answer can be textually perfect for a 2026 API query and still be wrong. I include version and validity metadata, then apply a documented policy.
+
+Lexical field boosts can privilege titles, symbols, or headings. Vector indexes can use separate embeddings for title and body. These features add signals; they should not smuggle an unexplained “authority score” into retrieval.
+
+I record the component scores, ranks, filters, index versions, and final selection for evaluation traces.
+
+## Hybrid is not automatically better
+
+It adds two indexes, fusion configuration, more latency, and more failure modes. If a corpus contains only exact product codes, lexical retrieval may be sufficient. If it is a small curated FAQ with consistent language, vectors may add little.
+
+I adopt hybrid retrieval when labelled failures show complementary recall. The goal is not to run two fashionable systems. It is to preserve the evidence that one representation naturally loses.
+
+Keywords rescue embeddings when exact strings carry meaning. Embeddings rescue keywords when meaning survives a change of words. Rank fusion makes both contributions comparable without pretending their raw scores use the same scale.

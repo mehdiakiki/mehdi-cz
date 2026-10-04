@@ -1,0 +1,86 @@
+---
+caseId: "RFA-359"
+title: "Receiver::try_iter Can Resume After None"
+date: "2026-09-06T02:19:00+01:00"
+lastmod: "2026-09-06T02:19:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "ffa3b31a8361ce1c46fa9d0c3319d0c2940157bac8ddd87108379c96cd7af35c"
+area: "concurrency-memory"
+symptom: "A channel TryIter returns None while empty, then returns Some after a still-connected sender publishes a value."
+summary: "try_iter drains only values immediately available without blocking. Its None is a momentary empty observation, not proof of disconnection or permanent iterator exhaustion; try_recv preserves Empty versus Disconnected."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust Receiver try_iter Some after None", "mpsc try_iter empty not disconnected", "TryIter resumable iterator Rust"]
+evidence: ["Rust 1.98.1 live channel", "None then send then Some seven", "try_recv Empty and Disconnected distinction"]
+sources: ["https://doc.rust-lang.org/std/sync/mpsc/struct.Receiver.html#method.try_iter", "https://doc.rust-lang.org/std/sync/mpsc/struct.Receiver.html#method.try_recv", "https://doc.rust-lang.org/std/sync/mpsc/enum.TryRecvError.html"]
+---
+
+I once used `try_iter` inside a polling loop and read its first `None` as channel completion. A producer was still connected and sent a value later. The same iterator could then return `Some`.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-359/fail.rs) starts with an empty live channel. `next` returns `None`; after a send, the next call returns seven.
+
+## try_iter describes current availability
+
+[`Receiver::try_iter`](https://doc.rust-lang.org/std/sync/mpsc/struct.Receiver.html#method.try_iter) returns an iterator that attempts to yield pending channel values without blocking. It is useful for draining work already available during one turn of an event loop.
+
+When no value is currently available, `next` returns `None` so ordinary iterator consumers stop. A sender can still exist and publish afterwards.
+
+This makes `TryIter` a legal example of the base `Iterator` contract that can produce `Some` after an earlier `None`. It is not a `FusedIterator` completion promise.
+
+## None collapses two channel states
+
+An empty connected channel and an empty disconnected channel both give `try_iter` no item to yield. The iterator's `Option<Item>` has no room to state why.
+
+[`try_recv`](https://doc.rust-lang.org/std/sync/mpsc/struct.Receiver.html#method.try_recv) retains the distinction through `TryRecvError`. `Empty` says senders still exist and data may arrive; `Disconnected` says no sender remains and no buffered item was available.
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-359/fixed.rs) proves `Empty`, sends and receives seven through the same `TryIter`, drops the sender, then proves `Disconnected`.
+
+## Do not fuse a live channel drain
+
+Wrapping this iterator in `fuse` after the first empty observation makes that `None` permanent. Later channel values will no longer appear through the fused wrapper even though the source could resume.
+
+This connects the concrete channel case to the Atlas case about `Iterator::fuse`. A generic adaptor can legally strengthen end semantics in a way that destroys a polling protocol hidden inside `None`.
+
+I construct a fresh `try_iter` for each drain turn, or call `try_recv` in a loop and handle its state explicitly.
+
+## collect is a snapshot-like drain, not a subscription
+
+Calling `receiver.try_iter().collect()` returns values available during that non-blocking traversal. It does not wait for producers, close the channel, or create a stable snapshot against concurrent sends.
+
+A message racing with the drain may be included now or remain for the next turn according to synchronization timing. I do not use the result as proof that global work is complete.
+
+Completion requires ownership knowledge: producers stopped, senders dropped, and buffered values drained, often with a higher-level shutdown protocol.
+
+## Fairness needs a drain budget
+
+A fast producer can keep values available while a consumer drains. Processing until `try_iter` returns `None` may starve timers, network handling, or other queues.
+
+In an event loop I cap the number of messages or time spent per turn, then return to the scheduler. Backpressure and queue capacity still need deliberate design; non-blocking receive does not solve overload.
+
+The iterator is a convenience for availability, not a fairness policy.
+
+## Tests should avoid scheduling races
+
+The fixture performs the first empty observation before sending, all on one thread. This deterministically proves resumption without sleeps. It also drops iterator borrows before calling receiver methods that need the receiver directly.
+
+My larger table covers several buffered values, empty-live, empty-disconnected, values buffered before disconnect, repeated drains, and a bounded processing budget. Concurrent tests use barriers or channels to order the events that matter.
+
+I assert variants rather than elapsed time. `try_` operations promise not to wait for availability, not a precise number of nanoseconds.
+
+## Receiver ownership remains single-consumer
+
+The standard MPSC receiver is the single consumer side. `try_iter` borrows it; it does not clone consumption or duplicate messages. Values yielded are removed from the channel.
+
+If several subsystems need the same event, the architecture needs broadcast, fan-out, or explicit forwarding. Iterating twice does not replay previously consumed items.
+
+I keep drain ownership in one component and distribute domain events after receipt when needed.
+
+Metrics follow the same distinction. An empty drain is not a completed queue and should not increment a shutdown counter. I record drained item count, empty polls, and final disconnection separately so an idle healthy worker does not look terminated.
+
+## The core principle is observation versus finality
+
+“Nothing is available now” is not “nothing will ever be available.” Non-blocking systems need separate representations for temporary emptiness, closure, timeout, cancellation, and failure.
+
+`try_iter` intentionally compresses temporary emptiness into iterator termination for one traversal. I use it for bounded current drains. When lifecycle matters, I return to `try_recv` and preserve `Empty` versus `Disconnected` instead of inventing finality from `None`.

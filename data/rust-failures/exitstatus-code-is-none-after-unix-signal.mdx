@@ -1,0 +1,86 @@
+---
+caseId: "RFA-319"
+title: "ExitStatus::code Is None After Unix Signal Termination"
+date: "2026-09-06T01:39:00+01:00"
+lastmod: "2026-09-06T01:39:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "26e74f2e8081cf1663d99685461ac265fef3a0b5b73499e71ee86e3070237a52"
+area: "ffi-targets"
+symptom: "A child process fails after aborting, but ExitStatus::code returns None instead of a familiar shell-style number such as 134."
+summary: "On Unix, signal termination is not a normal exit code. ExitStatus represents the full wait result; code returns None and the Unix ExitStatusExt trait exposes the terminating signal."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["Unix"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust ExitStatus code None signal", "child process exit code 134 None Rust", "ExitStatusExt signal process abort"]
+evidence: ["Rust 1.98.1 self-spawned Unix child", "process abort signal", "code None and signal Some"]
+sources: ["https://doc.rust-lang.org/std/process/struct.ExitStatus.html#method.code", "https://doc.rust-lang.org/std/os/unix/process/trait.ExitStatusExt.html", "https://doc.rust-lang.org/std/process/fn.abort.html"]
+---
+
+I wrapped a command runner that required an integer exit code. When a child aborted, the shell had taught me to expect a number such as 134. Rust returned `None` from `ExitStatus::code()`.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-319/fail.rs) launches another copy of itself and makes the child call `process::abort`. The parent receives an unsuccessful status with no normal exit code.
+
+## ExitStatus represents more than exit()
+
+[`ExitStatus`](https://doc.rust-lang.org/std/process/struct.ExitStatus.html#method.code) represents the operating system's process termination result. On Unix, a process can terminate by returning or calling `exit`, or it can be terminated by a signal.
+
+`code()` returns `Some(code)` only when an exit code exists. It returns `None` for Unix signal termination. This preserves information instead of inventing one integer namespace for two different mechanisms.
+
+A shell may display `128 + signal` as its own convention. That synthesized value is not what the child passed to `exit`, and Rust does not present it as one.
+
+## Use ExitStatusExt for Unix detail
+
+[`std::os::unix::process::ExitStatusExt`](https://doc.rust-lang.org/std/os/unix/process/trait.ExitStatusExt.html) adds methods for the Unix wait status, including `signal()` and whether a core was dumped where supported.
+
+The repaired fixture checks that normal code is absent and a signal is present. It does not hard-code the numeric abort signal because the semantic requirement is abnormal signal termination, and platform-specific signal constants belong to the relevant operating-system layer.
+
+For user-facing diagnostics I also print `ExitStatus` with its `Display` implementation. Rust's documentation recommends this for proper error reporting because it can describe more than an integer code.
+
+## success handles the common branch
+
+[`ExitStatus::success`](https://doc.rust-lang.org/std/process/struct.ExitStatus.html#method.success) returns true for a zero exit status. Signal termination is not success.
+
+If a caller only needs pass or fail, `success()` avoids prematurely collapsing platform detail. If it needs policy, I match normal nonzero exit, signal, spawn failure, timeout initiated by the parent, and output-decoding failure separately.
+
+An `io::Error` from spawning is not an ExitStatus at all; the child may never have begun. Combining it with status code 127 can confuse local launch failure with a shell convention.
+
+## Do not unwrap code on failure
+
+This common shape can panic precisely while reporting the original process failure:
+
+```rust
+if !status.success() {
+    return Err(format!("child exited {}", status.code().unwrap()));
+}
+```
+
+I format the complete status or branch on the `Option`. Error-reporting paths must accept every state the operating system can return.
+
+The same care applies to monitoring labels. Recording missing codes as zero would turn an abort into success in dashboards; recording every signal as 134 loses which signal actually occurred.
+
+## Parent actions need their own provenance
+
+A supervisor may terminate a child because of timeout, shutdown, resource policy, or user cancellation. The resulting signal says how the operating system ended the process, not why the parent chose that action.
+
+I retain the supervisor reason beside the wait status. “Killed by signal” and “timed out after 30 seconds, then terminated” are different operational explanations even if their final status bits match.
+
+There can also be a grace period and escalation from one signal to another. Logs should describe the sequence rather than only the last wait result.
+
+## Portability requires a common enum plus details
+
+Windows process termination has different extension APIs and conventions. A cross-platform runner can expose a portable high-level outcome with an optional platform-detail field rather than forcing Unix signals into every interface.
+
+I avoid assuming numeric exit codes have identical width or truncation everywhere. The standard documentation notes Unix-specific truncation and runtime-invented values for some non-exit situations.
+
+The RFA-319 evidence is scoped to Unix and uses the Unix extension trait intentionally.
+
+## What I test
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-319/fixed.rs) self-spawns so it needs no external command, aborts only in the child branch, and asserts unsuccessful status, absent code, and present signal.
+
+My runner tests normal zero, normal nonzero, signal termination, nonexistent executable, permission-denied launch, timeout, captured stderr, and output limits. Platform-specific assertions live in target-specific modules.
+
+I also test error rendering itself, because losing the original failure to an unwrap or Unicode conversion is a common secondary bug.
+
+The core principle is that process termination is a sum type even when shells often print one number. Rust preserves that distinction: `code()` is optional on Unix, and signal detail lives behind `ExitStatusExt`. Good runners keep the cause structured until presentation time.

@@ -1,0 +1,184 @@
+---
+title: "Denying Rust Warnings Without Throwing Away the Cargo Cache"
+date: "2026-09-29T09:00:00+01:00"
+tags: ["rust", "cargo", "warnings", "ci", "build performance"]
+draft: false
+reviewed: true
+reviewedHash: "86b977bcfbc151ed7ef969cb33e27e37d164c8922f2068eb99a6bc819dff858f"
+cluster: "rust-under-the-hood"
+campaign: "authority-2026"
+opportunity: "RUST-016"
+summary: "Rust 1.97 lets Cargo deny cached lint warnings without rebuilding crates under different RUSTFLAGS. Here is the behaviour and the migration path."
+---
+
+For years, a common Rust CI command was:
+
+```bash
+RUSTFLAGS="-D warnings" cargo check --workspace --all-targets
+```
+
+It makes warnings fail the job, but `RUSTFLAGS` is part of the compiler invocation. If developers build without it and CI builds with it, Cargo needs a different artifact fingerprint. On a shared target directory, changing the flag can compile local crates again.
+
+Rust 1.97 added a better control: Cargo can change how recorded warnings affect build success without changing the underlying rustc build.
+
+```bash
+CARGO_BUILD_WARNINGS=deny cargo check --workspace --all-targets
+```
+
+This small feature fixes a real separation of concerns. Rustc produces lint diagnostics. Cargo decides whether cached warnings should fail this build.
+
+## The old flag changes the compilation
+
+`-D warnings` is a rustc lint-level flag. With `RUSTFLAGS`, Cargo passes it into compiler invocations:
+
+```text
+rustc ... -Dwarnings
+```
+
+Cargo correctly treats this as a different compilation input. A changed flag can affect whether compilation succeeds and which diagnostics are produced. It cannot reuse an artifact blindly.
+
+`RUSTFLAGS` can also reach dependencies, build scripts, and proc macros depending on how the target is selected. It is a broad mechanism for a policy that usually concerns warnings in local workspace packages.
+
+The [Cargo configuration reference](https://doc.rust-lang.org/cargo/reference/config.html#buildwarnings) now documents `build.warnings` specifically for this job.
+
+## A cache experiment on stable Rust
+
+I created one Rust 2024 library with an unused private function:
+
+```rust
+fn unused_helper() -> u8 {
+    42
+}
+
+pub fn answer() -> u8 {
+    42
+}
+```
+
+Then I ran three commands with Cargo 1.98.
+
+First, the normal check compiled the crate and recorded one `dead_code` warning:
+
+```bash
+cargo check -vv
+```
+
+Second, I changed only Cargo's warning policy:
+
+```bash
+CARGO_BUILD_WARNINGS=deny cargo check -vv
+```
+
+The important output was:
+
+```text
+Fresh warning-cache-demo ...
+warning: function `unused_helper` is never used
+error: warnings are denied by `build.warnings` configuration
+```
+
+Cargo reused the fresh artifact, replayed its stored diagnostic, and failed the command.
+
+Third, I used the old approach:
+
+```bash
+RUSTFLAGS=-Dwarnings cargo check -vv
+```
+
+This time Cargo invoked rustc again with a different artifact hash and `-Dwarnings`. The warning became a compiler error.
+
+| Command after warm normal build | rustc ran again? | build result |
+| --- | --- | --- |
+| `cargo check` | no | success with warning |
+| `CARGO_BUILD_WARNINGS=deny cargo check` | no | failure from cached warning |
+| `RUSTFLAGS=-Dwarnings cargo check` | yes | compiler failure |
+
+The exact timings depend on the project and cache, so “Fresh” versus a rustc invocation is stronger evidence than one wall-clock number.
+
+## Use environment policy in CI
+
+For CI I use:
+
+```yaml
+- name: Check workspace
+  env:
+    CARGO_BUILD_WARNINGS: deny
+  run: cargo check --workspace --all-targets --keep-going
+```
+
+`--keep-going` is useful in a workspace because Cargo can report warnings from more local packages before the job exits.
+
+For a local temporary quiet build:
+
+```bash
+CARGO_BUILD_WARNINGS=allow cargo check
+```
+
+This hides adjustable lint warnings without creating another rustc cache variant.
+
+The [Rust 1.97 announcement](https://blog.rust-lang.org/2026/07/09/Rust-1.97.0/#cargo-support-for-denying-warnings) recommends these environment forms and explains the cache benefit.
+
+## Put permanent lint intent in the manifest
+
+`build.warnings` is an execution policy. It is useful when CI must reject any warning or a developer temporarily wants less noise.
+
+Specific project lint policy still belongs in version-controlled manifests:
+
+```toml
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+```
+
+And each member opts in:
+
+```toml
+[lints]
+workspace = true
+```
+
+This communicates which lints the project intentionally enables. `CARGO_BUILD_WARNINGS=deny` then says that any emitted adjustable warning from a local package fails CI.
+
+I do not put `warnings = "deny"` in library source as a reflex. New compiler releases can add warnings, and downstream users should not have dependency builds broken by the library's blanket policy. Cargo's build policy targets local packages instead.
+
+## Know which warnings it controls
+
+Cargo's documentation is precise: `build.warnings` affects warnings that are adjustable lints for local packages.
+
+It does not turn every line written to stderr into an error. Non-lint warnings and verbose dependency warnings are outside this control.
+
+This matters for another Rust 1.97 change: linker output can appear through the special `linker_messages` lint. The release notes say this lint is intentionally not part of the ordinary `warnings` group. Setting `CARGO_BUILD_WARNINGS=deny` therefore does not mean every platform-specific linker message will fail CI.
+
+I explain that boundary in [Rust 1.97 Linker Messages: Which Warnings Belong to rustc?](/blog/rust-1-97-linker-messages-which-warnings-belong-to-rustc).
+
+## Minimum supported Rust version
+
+`build.warnings` is respected starting with Rust 1.97. A repository supporting an older toolchain cannot assume the environment variable enforces CI policy there.
+
+My migration is explicit:
+
+```text
+CI lane on Rust 1.97+:
+  CARGO_BUILD_WARNINGS=deny cargo check ...
+
+older MSRV lane:
+  cargo check ...
+  use existing version-compatible lint policy
+```
+
+I do not silently remove enforcement from the MSRV job. I decide whether manifest lints, Clippy, or a separate rustc flag is appropriate for that lane and accept the cache tradeoff if it is required.
+
+## A practical migration checklist
+
+1. Confirm CI uses Cargo 1.97 or newer.
+2. Remove `-Dwarnings` from `RUSTFLAGS`, `CARGO_ENCODED_RUSTFLAGS`, and wrappers for the main check job.
+3. Set `CARGO_BUILD_WARNINGS=deny` on the Cargo invocation.
+4. Keep other necessary codegen flags separate; this setting replaces only warning denial.
+5. Run with a warm target directory and `-vv`; verify local crates report `Fresh`.
+6. Test build scripts, proc macros, tests, examples, and selected cross targets.
+7. Keep intentional lint configuration in workspace manifests.
+
+The result is a cleaner contract. Compiler inputs control the artifact. Cargo's warning policy controls whether the current command accepts the recorded diagnostics.
+
+Warnings can still be strict in CI without paying for a second compilation merely because CI is strict.

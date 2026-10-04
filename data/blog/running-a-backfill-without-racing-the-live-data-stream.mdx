@@ -1,0 +1,245 @@
+---
+title: "Running a Backfill Without Racing the Live Data Stream"
+date: "2026-09-11T19:00:00+01:00"
+tags: ["backfill", "stream processing", "change data capture", "data migration", "reliability"]
+draft: false
+reviewed: true
+reviewedHash: "769f7a6fc4a8cfdbe1e5b53bbbe59e9f5bb60b0d3fca4818ee299718d86e2098"
+cluster: "reliable-data-integrations"
+campaign: "authority-2026"
+opportunity: "DATA-010"
+summary: "A dual-read timeline for importing historical data while live updates continue, without gaps or stale snapshot rows overwriting newer events."
+---
+
+A backfill becomes difficult when the product cannot stop changing while history is imported.
+
+I may need to rebuild a search index, populate a new model, migrate an integration, or compute a field for every existing record. The historical scan takes hours or days. During that time, users keep editing data and the live stream keeps producing changes.
+
+If I run the backfill and only then enable live consumption, changes during the scan can be lost. If I enable the stream first and then write old snapshot rows, the backfill can overwrite newer state.
+
+I solve this by declaring a boundary and making both paths version-aware. “Run them together” is not enough.
+
+## The two race conditions
+
+Assume record X starts at version 5.
+
+### The gap
+
+```text
+09:00 backfill starts
+09:10 X changes to version 6
+10:00 backfill finishes
+10:01 live consumer starts after current position
+```
+
+If the backfill read X before 09:10, local state stays at version 5. The stream skipped the period containing version 6.
+
+### The stale overwrite
+
+```text
+09:00 live consumer starts
+09:10 stream applies X version 6
+09:20 backfill delivers its earlier copy of X version 5
+```
+
+If writes follow arrival order, the backfill moves X backwards.
+
+The correct design must prevent both.
+
+## Best case: capture a source position first
+
+When the source offers a transaction-log position, consistent snapshot, or replayable change token, I use this timeline:
+
+```text
+T0  allocate backfill generation G
+T0  record stream position P0
+T0  begin retaining every event after P0
+T1  scan historical state as of P0
+T2  finish and validate all snapshot partitions
+T3  replay retained events after P0
+T4  catch up to the live head
+T5  switch readers or mark generation live
+```
+
+Every backfill row is understood as state at P0. Every later event has a position after P0. Their order is defined by the source, not by when my workers happened to finish.
+
+This is the same core handover used to [combine snapshots and incremental deltas](/blog/how-to-combine-full-snapshots-and-incremental-deltas-safely), but a backfill adds operational concerns: partitioning, throttling, validation, and rollback.
+
+## If no consistent snapshot exists
+
+Many APIs do not let me read “as of position P0.” I may only have pages of current objects plus updated timestamps and webhooks.
+
+Then I use an approximate boundary with overlap:
+
+1. start durable live-event capture;
+2. record a high-water time H;
+3. scan every historical partition;
+4. apply records only when their source version is newer than local state;
+5. poll changes from before H using a safety overlap;
+6. drain captured events;
+7. reconcile the full scope before declaring completion.
+
+This can produce duplicates. Duplicates are safer than a gap when effects are idempotent.
+
+I document that an application timestamp is weaker than a database log position. A delayed index or clock difference can still place a record before H. The overlap and final reconciliation are the recovery mechanisms.
+
+## One apply rule for backfill and live events
+
+I avoid separate write logic such as `insert_from_backfill` and `update_from_stream`. Both paths call one version-aware operation:
+
+```text
+apply(entity_id, payload, source_version, source_position, generation)
+```
+
+The operation follows rules such as:
+
+```text
+incoming version > stored version  → apply
+incoming version = stored version  → idempotent success
+incoming version < stored version  → ignore as stale, record metric
+version incomparable               → use documented conflict path
+```
+
+Provider versions, database log sequence numbers, or ETags are stronger than local arrival timestamps. If the source exposes no ordering field, I may need read-before-write reconciliation or field-level merge rules rather than pretending arrival order is truth.
+
+## Partition progress must be durable
+
+A large backfill is a workflow, not one loop. I partition by tenant, stable ID range, date range, or another source-supported boundary.
+
+For every partition I store:
+
+```text
+generation
+scope and filter hash
+start and end boundary
+page cursor
+status
+attempt count
+rows observed
+rows applied, unchanged, stale, and failed
+validation result
+```
+
+If a worker crashes, it resumes the partition. If the partition definition or transformation code changes, the generation records which version produced the current state.
+
+I avoid offset-based partitions on a changing table. Inserts and deletes move offsets, causing duplicates and gaps. Stable key ranges or provider cursor chains are safer.
+
+## Buffering live events does not mean keeping them in memory
+
+“Start the stream and hold events until the backfill ends” is correct only if “hold” means durable storage with retention and capacity planning.
+
+A memory queue disappears on restart. A short-retention broker may delete early events before a week-long backfill catches up. A stalled consumer can exceed disk limits.
+
+I calculate:
+
+```text
+expected event rate × worst backfill duration × safety factor
+```
+
+Then I monitor retained bytes, oldest event age, and distance from the live head. If the backfill cannot catch up before retention expires, the plan is invalid even when the code is correct.
+
+Sometimes I process live events immediately instead of buffering their effects. This works when version-aware writes prevent stale backfill rows from winning. I still retain enough cursor history to prove the handover.
+
+## Deletes are the sharp edge
+
+A record may exist in the snapshot and be deleted during the backfill. The later tombstone must win. A record may also be absent from one incomplete partition, which is not proof of deletion.
+
+My rules are:
+
+- deletion carries a source version or stream position when possible;
+- a stale snapshot cannot resurrect a newer tombstone;
+- absence-based deletion waits for every partition in the complete scope;
+- failed partitions block absence decisions;
+- retention requirements decide whether the local row is removed or tombstoned.
+
+A backfill that recreates deleted records can appear successful by row count while being semantically wrong.
+
+## Validate before switching readers
+
+Finishing every partition does not prove that the new representation is correct. Before marking generation G live, I compare it with the old path or source.
+
+Useful checks include:
+
+- total and per-partition counts;
+- missing and unexpected identity sets;
+- null and enum distributions;
+- sampled field-level comparisons;
+- invariant violations;
+- stale-write attempts;
+- oldest unprocessed live event;
+- deletion and quarantine counts;
+- product queries run against both versions.
+
+Counts alone are weak. Two datasets can have the same count and completely different members.
+
+For an index or derived view, I may shadow-read both versions and compare normalized results before switching. I keep the old generation available long enough for a quick rollback when storage cost allows it.
+
+## Control the load
+
+A correct backfill can still damage production by using every database connection or provider request.
+
+I give it explicit budgets:
+
+- maximum concurrency per tenant and provider;
+- request-rate and retry limits;
+- database pool share;
+- queue-lag threshold that pauses historical work;
+- product-latency threshold that reduces throughput;
+- maintenance windows for expensive partitions.
+
+Live work has priority. When event lag rises, the backfill slows or pauses. This is more useful than choosing one fixed concurrency before the run and hoping production load stays constant.
+
+## The failure timeline I test
+
+I use a controlled source and pause execution at important moments.
+
+### Update before scan
+
+Change X after P0 but before its partition reads it. Assert the final version is the new one.
+
+### Update after scan
+
+Scan X, then emit its change. Assert the live path applies it.
+
+### New event applied before old row
+
+Apply X version 6, then release the delayed backfill row at version 5. Assert version 6 remains.
+
+### Delete during scan
+
+Read X, delete it, then finish the backfill. Assert the tombstone wins and X is not recreated.
+
+### Worker restart
+
+Crash halfway through a partition and after completing it but before saving progress. Assert replay is idempotent.
+
+### Retention pressure
+
+Make the backfill slower than the event stream. Assert monitoring warns or stops the run before P0 becomes unrecoverable.
+
+### Partial validation failure
+
+Corrupt one partition. Assert the generation cannot become live, while the existing production path continues.
+
+These tests exercise the ordering contract, not only throughput.
+
+## My practical backfill checklist
+
+Before starting, I want clear answers to these questions:
+
+```text
+What exact source position or approximate boundary starts the run?
+Where are later events retained, and for how long?
+What source version prevents a stale overwrite?
+How is each partition resumed?
+When may absence become a deletion?
+Which validation blocks the live switch?
+How does historical load yield to production traffic?
+How can I stop and roll back safely?
+```
+
+If the source cannot provide strong ordering, I weaken the guarantee openly and strengthen overlap and reconciliation.
+
+Debezium's documentation on [incremental snapshots](https://debezium.io/documentation/reference/stable/configuration/signalling.html) is a useful implementation reference for combining chunked snapshot work with a continuing change stream. The exact mechanics differ for HTTP APIs, but the principle is the same: use explicit signals and positions to make the handover observable.
+
+A backfill is complete only when history is loaded, live changes are caught up, validation passes, and the next restart knows where to continue.

@@ -1,0 +1,81 @@
+---
+caseId: "RFA-684"
+title: "A Writer Panic Poisons an RwLock"
+date: "2026-09-06T08:44:00+01:00"
+lastmod: "2026-09-06T08:44:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "f53a69cc03289dac4c70df1afdb83c28a2128344db9855b5230fe04240c21595"
+area: "concurrency-memory"
+symptom: "Reading an RwLock with unwrap panics after another thread panicked while holding its write guard."
+summary: "RwLock poisoning reports that exclusive mutation may have stopped mid-invariant. Recovery can access the guard, but application state still needs validation or replacement."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["targets supporting std threads"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust RwLock poisoned writer panic", "recover PoisonError RwLock read", "RwLock write guard panic"]
+evidence: ["Rust 1.98.1 runtime panic", "worker panics while write guard lives", "PoisonError exposes read guard for chosen recovery"]
+sources: ["https://doc.rust-lang.org/std/sync/struct.RwLock.html#poisoning", "https://doc.rust-lang.org/std/sync/struct.RwLock.html#method.read", "https://doc.rust-lang.org/std/sync/struct.PoisonError.html#method.into_inner"]
+---
+
+Rust's standard `RwLock` can become poisoned when a thread panics while holding an exclusive write guard. Later `read` and `write` calls return `PoisonError`. The [failing fixture](/rust-failure-atlas/evidence/RFA-684/fail.rs) unwraps a read after such a panic and creates a second panic.
+
+## Poison reports interrupted exclusive mutation
+
+The [`RwLock` poisoning documentation](https://doc.rust-lang.org/std/sync/struct.RwLock.html#poisoning) connects poison to a writer panic. Exclusive access may have changed part of a multi-field invariant before unwinding.
+
+The lock mechanism still protects memory and can still provide a guard. Poison is advisory evidence about application consistency. It does not prove the value is corrupt, and obtaining the value does not prove it is correct.
+
+I ask which invariant the writer was responsible for before deciding whether to recover.
+
+## Recovery is a domain policy
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-684/fixed.rs) calls `into_inner` on the poison error and reads the stored value. This demonstrates access, not universal safety.
+
+For a disposable cache, resetting may be appropriate. For derived indexes, rebuilding from an authoritative source may work. For financial or authorization state, propagation or process termination can be safer than continuing with an uncertain partial update.
+
+The recovery path validates or replaces state while holding the appropriate guard, then may clear poison after the invariant is restored. Clearing immediately only erases the warning.
+
+## Keep fallible work outside the write guard
+
+Parsing, allocation, user callbacks, formatting, and external calls can panic or fail. I prepare a complete candidate outside the critical section, then acquire the writer and perform a small replacement when possible.
+
+This shortens contention and reduces the interval where a panic can expose partial state. It does not eliminate all panics, so invariants should remain recoverable.
+
+Calling arbitrary application callbacks under a write lock also creates reentrancy and deadlock risks. A snapshot or message handoff is often cleaner.
+
+## Reader throughput does not make writes transactional
+
+RwLock permits multiple readers or one writer, according to platform scheduling policy. It provides exclusion, not rollback. A series of field assignments under a write guard is invisible to readers during the guard, but a panicking writer can leave the final stored object between domain states.
+
+Replacing one fully constructed immutable snapshot is easier to validate than mutating several fields. `Arc` snapshots can let readers continue with old versions while one writer publishes a new version, if that consistency model fits.
+
+Fairness and writer preference are not portable assumptions unless documented by the platform implementation. I avoid correctness depending on acquisition order.
+
+## Panic is not the only partial-work source
+
+Process termination, cancellation around higher-level operations, and external side effects can also interrupt a logical transaction. Poison covers a particular unwinding condition. It is not durable transaction machinery.
+
+Unsafe code cannot rely on poison as its safety invariant because detection has limitations. Memory safety must hold even if poison is missed. Application recovery metadata can supplement locks with version or validity states.
+
+Async code should not hold a std RwLock guard across await. It can block executor progress and keeps critical access through cancellation points. Async-aware state or message ownership may be better.
+
+## Tests damage the invariant deliberately
+
+Tests spawn a writer that changes state and panics, join it, confirm poison, and exercise the chosen propagation or recovery. They also test recovery failure and repeated access after clearing.
+
+Observability records the original writer panic and one recovery decision. Logging every poisoned read without context can bury the initiating failure.
+
+I also include a state version or checksum when recovery needs stronger evidence than field inspection. The marker is updated only after a complete transition. It cannot replace synchronization, but it can help a recovery path distinguish a committed snapshot from one interrupted before its final step.
+
+## My RwLock poison checklist
+
+- Which invariant could an interrupted writer leave incomplete?
+- Should the service propagate, abort, reset, reload, or validate?
+- Is into_inner being confused with proof of correctness?
+- Can candidate construction move outside the write guard?
+- When is clearing poison honest?
+- Does unsafe code wrongly depend on poison detection?
+- Are acquisition fairness assumptions part of correctness?
+- Do tests force writer panic and recovery failure?
+
+The core principle is that a lock protects access while poison reports uncertain state history. A writer panic can leave a memory-safe but invalid value. I recover only through an explicit domain invariant, not through an unconditional unwrap or silent error removal.

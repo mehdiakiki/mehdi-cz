@@ -1,0 +1,82 @@
+---
+caseId: "RFA-338"
+title: "CString::new Rejects Interior NUL Bytes"
+date: "2026-09-06T01:58:00+01:00"
+lastmod: "2026-09-06T01:58:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "35cc445311a189828ad930a56bb6cadb734403281e826c56b6d47747daa2b3a7"
+area: "ffi-targets"
+symptom: "Building a CString from bytes containing zero returns NulError instead of treating the first zero as a terminator and ignoring the suffix."
+summary: "CString owns exactly one trailing NUL terminator and permits no interior NUL. NulError preserves the offending position and input bytes so callers can reject, inspect, or apply a domain-specific repair."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust CString new interior NUL", "NulError nul_position into_vec", "CString first zero terminator error"]
+evidence: ["Rust 1.98.1 interior-zero input", "reported byte position", "original bytes recovered and valid CString built"]
+sources: ["https://doc.rust-lang.org/std/ffi/struct.CString.html#method.new", "https://doc.rust-lang.org/std/ffi/struct.NulError.html#method.nul_position", "https://doc.rust-lang.org/std/ffi/struct.CString.html#method.as_bytes_with_nul"]
+---
+
+I once passed a byte buffer containing `left\0right` into `CString::new` and expected a C string containing `left`. Rust returned an error instead of silently discarding the suffix.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-338/fail.rs) unwraps this conversion and records the resulting panic message.
+
+## CString is an exact owned representation
+
+[`CString::new`](https://doc.rust-lang.org/std/ffi/struct.CString.html#method.new) consumes input bytes, verifies that none is zero, and appends one trailing NUL terminator. A successful `CString` therefore guarantees one complete C-compatible string rather than an arbitrary buffer containing a prefix string.
+
+An input zero would become an interior terminator after the constructor appended its own final terminator. C functions would observe only the prefix, while Rust code might believe the suffix was sent. Rejecting the input prevents this length disagreement.
+
+## Silent truncation can become a security boundary bug
+
+Suppose validation checks the Rust text `allowed.txt\0secret.txt`, while a C API sees only `allowed.txt`. In another context the validated prefix and acted-on prefix can reverse their security meaning.
+
+Any disagreement between validator and consumer about terminators is dangerous for paths, credentials, commands, certificates, and database keys.
+
+I reject embedded NUL at the boundary and report its location. I do not treat it as ordinary whitespace or sanitize it without a documented product rule.
+
+## NulError preserves useful evidence
+
+[`NulError::nul_position`](https://doc.rust-lang.org/std/ffi/struct.NulError.html#method.nul_position) reports the byte offset of the zero. The error also owns the original bytes and can return them with `into_vec`.
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-338/fixed.rs) checks position four and recovers the complete `left\0right` input. It then constructs a valid string only after using bytes without an embedded zero.
+
+Preserving the input lets a caller produce a precise diagnostic or return ownership without allocating another copy.
+
+## Do not add the final NUL before CString::new
+
+Because `new` appends the terminator, passing `b"hello\0"` also contains a zero in the supplied data and returns an error. When bytes already include exactly one final terminator, `CString::from_vec_with_nul` expresses that representation and validates it.
+
+For borrowing a bounded NUL-terminated slice, `CStr` constructors are often more appropriate. Ownership and whether the terminator is already present are separate choices.
+
+I use [`as_bytes_with_nul`](https://doc.rust-lang.org/std/ffi/struct.CString.html#method.as_bytes_with_nul) when the foreign call needs the complete terminated representation.
+
+## CString bytes need not be UTF-8
+
+The interior-NUL rule does not imply Unicode validity. `CString` can hold nonzero bytes that are not valid UTF-8 because C APIs may use another encoding or opaque byte data.
+
+Converting back into Rust `String` is separately fallible. I keep encoding policy distinct from termination policy and read the foreign API's actual contract.
+
+On Unix, path APIs may accept OS strings that should not be routed through `CString` manually unless the platform binding specifically requires it.
+
+## Unsafe unchecked construction moves the proof to me
+
+`CString::from_vec_unchecked` skips the scan for interior zero and requires the caller to guarantee none exists. It is not a way to request first-NUL truncation.
+
+Using it with unvalidated external data violates its safety contract. I consider it only after profiling demonstrates the scan matters and a local invariant already proves every byte nonzero.
+
+The proof belongs beside the unsafe block, with tests around empty and boundary values.
+
+## Calling C can change ownership and length rules
+
+Borrowing with `as_ptr` does not transfer ownership, and the pointer must not outlive or mutate the `CString` contrary to the API contract. Transferring with `into_raw` has stricter reconstruction rules and must pair with the correct allocator and exactly one `from_raw`.
+
+The NUL invariant solves string representation, not pointer lifetime or allocator ownership. I review all three axes at an FFI boundary.
+
+## What I test
+
+My cases include empty input, ASCII, non-UTF-8 nonzero bytes, a zero at the beginning, middle, and end, already terminated input, and multiple zeros. I assert byte positions and exact recovered input.
+
+Integration tests pass a valid result to the real foreign API and verify that the owner remains alive for the complete call.
+
+The core principle is that a terminator defines observable length. `CString::new` refuses any input whose Rust length and C length would disagree. That strictness protects the boundary; I keep it and handle `NulError` rather than turning hidden suffixes into surprising foreign behaviour.

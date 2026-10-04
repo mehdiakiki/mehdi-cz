@@ -1,0 +1,202 @@
+---
+title: "Adaptive Concurrency for APIs With Changing Rate Limits"
+date: "2026-09-13T09:00:00+01:00"
+tags: ["adaptive concurrency", "API rate limits", "backpressure", "retries", "performance"]
+draft: false
+reviewed: true
+reviewedHash: "af771c92bf49a7607c49c5df63786e9654c1b206d343955bf8f1ea65c644a1cc"
+cluster: "reliable-data-integrations"
+campaign: "authority-2026"
+opportunity: "DATA-012"
+summary: "A measured additive-increase, multiplicative-decrease controller for finding useful API concurrency while respecting throttling, latency, retries, and tenant isolation."
+---
+
+When I write an API importer, I can choose a fixed concurrency such as 4, 16, or 64. This works until the available capacity changes.
+
+Providers may enforce different limits by endpoint, customer plan, tenant, region, or time window. Our own database can also become the bottleneck. A value that is safe in the morning may create throttling in the afternoon; a value chosen for the worst case may leave most capacity unused.
+
+I prefer a small feedback controller that learns a safe operating point from observed success, latency, and throttling. It does not “defeat” the provider's rate limit. It moves work toward available capacity and backs away when the system says no.
+
+## Rate and concurrency are related but different
+
+Rate is requests per unit of time. Concurrency is the number of requests currently in flight.
+
+They are connected by latency. If average latency is 200 milliseconds, concurrency 10 can theoretically complete around 50 requests per second. If latency rises to two seconds, the same concurrency completes only around five per second while holding resources much longer.
+
+This is why I do not control only requests per second. I normally need:
+
+- a rate limiter for explicit provider quotas;
+- a concurrency limiter for in-flight work and local resources;
+- retry backoff for transient failures;
+- a deadline so slow attempts release capacity;
+- a queue that applies backpressure instead of creating unlimited promises.
+
+Each control has a separate purpose.
+
+## Scope the controller to the real limit
+
+A single global concurrency number is often wrong. If provider limits apply per connected account, one noisy tenant can make the controller slow everyone. If limits apply to one API operation, throttling an expensive export should not stop cheap reads.
+
+I choose a key such as:
+
+```text
+provider + account + endpoint class + credential
+```
+
+Then I create one limiter per key, with a separate global ceiling to protect my own infrastructure.
+
+AWS makes a similar warning for adaptive retry mode: clients should be scoped to the resource dimension the service throttles, otherwise one throttled resource can delay unrelated work. Its current [SDK retry behaviour guide](https://docs.aws.amazon.com/sdkref/latest/guide/feature-retry-behavior.html) describes the client-side request-rate bucket and retry bucket.
+
+## Start with a controller I can explain
+
+One practical starting point is additive increase, multiplicative decrease (AIMD):
+
+```text
+if the last control window contains throttling:
+    limit = max(minimum, floor(limit × 0.7))
+else if latency and local saturation are healthy:
+    limit = min(maximum, limit + 1)
+else:
+    keep the current limit
+```
+
+The precise factor and window are configuration, not universal constants. The behaviour is the important part:
+
+- explore capacity slowly;
+- react to overload faster;
+- never go below a small progress limit;
+- cap growth to protect both systems.
+
+I add hysteresis or several healthy windows before growth if a provider oscillates. I also add a cooldown after a strong throttle signal so the controller does not immediately climb back into the same error.
+
+## Which signals lower concurrency
+
+HTTP 429 is the clearest throttling signal, but not the only one. Providers may return a documented error code or 503 during overload. My own system may show database pool saturation or queue-processing latency before the provider rejects anything.
+
+I separate signals:
+
+| Signal | Controller response | Retry response |
+| --- | --- | --- |
+| 429 or documented throttle | Reduce scoped concurrency | Respect `Retry-After`, then retry within budget |
+| Rising p95 latency | Pause growth or reduce gradually | Do not retry a successful slow call |
+| Timeout | Reduce when correlated across calls | Retry only if operation is safe and deadline remains |
+| 5xx burst | Pause growth; reduce if overload-like | Backoff with jitter and budget |
+| Local DB saturation | Reduce global/consumer concurrency | Usually no external retry needed yet |
+| Validation or 4xx input error | No capacity conclusion | Do not retry unchanged request |
+
+The HTTP specification allows `Retry-After` to be either a date or a delay in seconds. I parse both forms, account for clock differences, and put a maximum bound on unexpected values. See [RFC 9110's Retry-After definition](https://www.rfc-editor.org/rfc/rfc9110.html#name-retry-after).
+
+## Retries must consume capacity
+
+A common mistake is to limit original requests while retries run outside the limiter. During throttling, each failure schedules more work and effective concurrency grows.
+
+Every attempt—first or repeated—acquires concurrency and rate capacity. I also use a retry budget so a failing dependency cannot turn one unit of useful work into an unlimited queue of attempts.
+
+Backoff uses jitter to avoid synchronized clients waking at the same instant. If the provider sends `Retry-After`, that becomes the earliest retry time, not permission to send the complete backlog at once.
+
+The controller and retry policy exchange signals, but I keep their state separate. Concurrency answers “how much work may be in flight?” Retry policy answers “should this failed operation be attempted again?”
+
+## A small synthetic benchmark
+
+Before deploying the controller, I test it against a deterministic fake provider. In one simple run, the provider's per-tick capacity changed through three 100-tick phases:
+
+```text
+phase 1 capacity: 40
+phase 2 capacity: 10
+phase 3 capacity: 30
+```
+
+For the adaptive controller, I started at 4, added 1 after a healthy tick, and multiplied by 0.7 after any throttled request. The results were:
+
+| Strategy | Successful requests | Throttled requests | Limits after each phase |
+| --- | ---: | ---: | --- |
+| Fixed 4 | 1,200 | 0 | 4 / 4 / 4 |
+| Fixed 16 | 4,200 | 600 | 16 / 16 / 16 |
+| Fixed 64 | 8,000 | 11,200 | 64 / 64 / 64 |
+| Adaptive | 6,280 | 75 | 34 / 8 / 31 |
+
+This is a synthetic controller test, not production provider data. It intentionally ignores network latency and request duration. Its purpose is to make one trade-off visible: fixed 4 is polite but wastes capacity; fixed 64 gets maximum successful work only by producing more failed attempts than successes; the simple adaptive controller finds much of the changing capacity with far less rejected work.
+
+I keep this benchmark reproducible and add harder scenarios before choosing parameters.
+
+## The benchmark cases that matter
+
+One smooth capacity curve is not enough. I simulate:
+
+### Sudden capacity drop
+
+Move from a high allowance to a low one. Measure rejected requests before the controller settles and ensure retries do not amplify them.
+
+### Recovery after throttling
+
+Restore capacity. Measure how long useful throughput takes to return. A controller that never explores again is stable but wasteful.
+
+### Long latency without 429
+
+Increase response time until requests accumulate. Assert concurrency stops growing even though every response eventually succeeds.
+
+### One noisy tenant
+
+Throttle account A while account B stays healthy. Assert A's limiter shrinks without freezing B, while the global ceiling still protects local resources.
+
+### Retry storm
+
+Return transient errors to many in-flight requests together. Assert all retries use both the limiter and retry budget.
+
+### Oscillating limit
+
+Alternate capacity rapidly. Measure throughput, error rate, and limit variance. Add cooldown or longer windows if the controller chases noise.
+
+### Provider hint
+
+Return `Retry-After` and any documented remaining-quota headers. Assert the client honours the hint without trusting malformed values blindly.
+
+For each scenario, I record successful throughput, throttled attempts, p50/p95 latency, queue age, retry amplification, and time to stabilize. High throughput alone is not the objective.
+
+## Protect fairness and queue age
+
+An adaptive limiter can keep the API healthy while some work waits forever. I schedule across tenants or partitions rather than draining one large account first.
+
+Useful rules include:
+
+- round-robin or weighted fair queues;
+- a small per-tenant in-flight cap;
+- priority for live updates over historical backfills;
+- oldest-item age alerts;
+- cancellation when the result is no longer needed;
+- separate queues for interactive and batch deadlines.
+
+When a [backfill runs beside a live stream](/blog/running-a-backfill-without-racing-the-live-data-stream), rising live-event lag is a direct signal to reduce backfill concurrency.
+
+## Persist only the state that helps
+
+I normally rebuild the controller after a process restart from a conservative initial limit. Persisting a learned limit can improve warm-up, but yesterday's capacity may be wrong today.
+
+If I persist it, I store it with the scope, timestamp, and bounds, then decay it toward a safe default as it becomes old. Durable sync progress and idempotency matter much more than preserving the exact congestion window.
+
+## Do not interpret every failure as throttling
+
+Reducing concurrency after an invalid request hides bugs and slows recovery. I maintain an explicit error taxonomy:
+
+```text
+throttle
+transient dependency failure
+timeout
+authentication failure
+permission failure
+validation failure
+permanent missing resource
+local saturation
+```
+
+Only signals with a plausible relationship to load feed the concurrency controller. Authentication failure should stop or quarantine work, not cause a slow stream of invalid requests forever.
+
+## My practical rule
+
+I treat adaptive concurrency as a bounded feedback loop, not a clever number generator.
+
+It has a documented scope, conservative minimum and maximum, slow growth, fast reduction, latency protection, fair queues, and retry budgets. I test it against changing capacity and failure bursts before connecting it to a real provider.
+
+AWS's adaptive retry implementations use client-side rate limiting informed by throttled and non-throttled responses; the [AWS SDK for Java retry guide](https://docs.aws.amazon.com/sdk-for-java/latest/developer-guide/retry-strategy.html) provides another concrete reference. I do not copy a provider-specific algorithm blindly, but I use the same engineering principle: capacity is observed continuously, and overload feedback changes future request admission.
+
+The goal is not zero throttling at any cost. The goal is useful throughput, bounded failure, fair progress, and a system that becomes calmer when available capacity changes.

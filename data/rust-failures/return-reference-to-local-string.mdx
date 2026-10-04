@@ -1,0 +1,132 @@
+---
+caseId: "RFA-054"
+title: "Why `'static` Cannot Make Rust Return a Reference to a Local String"
+date: "2026-09-05T08:30:00+01:00"
+lastmod: "2026-09-05T08:30:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "26a7db285b9a463e06beafa7d438cf02f5fd2a0a38bcd61d11f4f17d4a91f5c1"
+area: "diagnostics-macros"
+symptom: "A function cannot return &str created from a local String, even when the requested lifetime is written as static."
+summary: "Lifetime annotations describe how references relate; they do not keep local storage alive. Return ownership, borrow from an input, or use genuinely static data according to where the bytes belong."
+rustVersions: ["Rust 1.98.1"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust cannot return value referencing local variable E0515",
+    "return str from local String Rust",
+    "static lifetime does not make value live longer",
+  ]
+evidence: ["Rust 1.98.1 compile failure", "owner-lifetime timeline", "owned return repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/error_codes/E0515.html",
+    "https://doc.rust-lang.org/book/ch10-03-lifetime-syntax.html",
+  ]
+---
+
+Adding `'static` can look like a request to keep a value forever. It is not. This program still fails:
+
+```rust
+fn label(id: u64) -> &'static str {
+    let rendered = format!("item-{id}");
+    rendered.as_str()
+}
+```
+
+Rust 1.98.1 reports:
+
+```text
+error[E0515]: cannot return value referencing local variable `rendered`
+```
+
+The error is about storage, not missing syntax. The [failing fixture](/rust-failure-atlas/evidence/RFA-054/fail.rs) creates a `String` inside `label`. That `String` owns a heap allocation and is dropped when the function returns. A slice pointing into that allocation cannot be used by the caller afterward.
+
+## A lifetime is a checked relationship
+
+The [Rust book's lifetime chapter](https://doc.rust-lang.org/book/ch10-03-lifetime-syntax.html) makes the core point: annotations do not change how long references live. They describe relationships which the compiler must verify.
+
+In the failing signature, `&'static str` promises that the returned reference is valid for the remainder of the program. Nothing inside the function can satisfy that promise. The local owner disappears at the return boundary:
+
+```text
+enter label
+  create rendered String
+  borrow its bytes as &str
+  attempt to return reference
+drop rendered String
+leave label
+  caller would receive a dangling reference
+```
+
+Rust refuses the final two steps. Writing a longer lifetime makes the impossible promise larger; it does not extend the allocation.
+
+## Return the ownership that was created
+
+The direct repair is:
+
+```rust
+fn label(id: u64) -> String {
+    format!("item-{id}")
+}
+```
+
+The `String` moves to the caller. Its allocation remains alive for as long as the caller owns it. Modern Rust moves the small string handle—pointer, length, and capacity—without copying all formatted bytes.
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-054/fixed.rs) compiles, runs, and checks the returned text. This is the correct model when each call constructs new data.
+
+## A borrowed return needs an input owner
+
+Sometimes the function does not create text. It chooses a view into text supplied by the caller:
+
+```rust
+fn before_colon(input: &str) -> &str {
+    input.split_once(':').map_or(input, |(left, _)| left)
+}
+```
+
+Lifetime elision connects the output reference to `input`. The caller owns or otherwise keeps the input bytes alive. The function only selects a region inside them. An explicit version would be `fn before_colon<'a>(input: &'a str) -> &'a str`.
+
+This works because there is an owner outside the function. In the original `label`, there is no input containing `item-7`; the bytes are born locally, so they need to leave as an owned value.
+
+## When `&'static str` is genuine
+
+A string literal is stored in the program image and can provide a static reference:
+
+```rust
+fn status(ok: bool) -> &'static str {
+    if ok { "ready" } else { "failed" }
+}
+```
+
+Both possible byte sequences already exist for the duration of the program. No local `String` owns them. This is a real static source, rather than a local value with a static annotation added.
+
+Leaking a `String` with `Box::leak` can also manufacture a static reference, but it deliberately prevents the allocation from ever being reclaimed. That is appropriate only for bounded, process-lifetime data such as one-time configuration interned under a controlled policy. Using it for request labels turns every call into a memory leak.
+
+## `Cow` is useful only when both cases exist
+
+An API which sometimes returns a literal and sometimes formats owned data can use `Cow<'static, str>`:
+
+```rust
+use std::borrow::Cow;
+
+fn label(id: Option<u64>) -> Cow<'static, str> {
+    match id {
+        None => Cow::Borrowed("unknown"),
+        Some(id) => Cow::Owned(format!("item-{id}")),
+    }
+}
+```
+
+This avoids allocation for the literal case while preserving ownership for dynamic text. It is not automatically better than `String`; it adds an enum branch to every consumer. I use it when measurements or API semantics show that the borrowed case matters.
+
+## Questions that resolve E0515 quickly
+
+I ask where the returned bytes are owned:
+
+- Created in this call: return `String` or another owned type.
+- Stored in an input: return a reference tied to that input.
+- Compiled into the program: a static reference may be correct.
+- Stored in a longer-lived object: borrow from that object and expose its lifetime.
+
+The official [E0515 page](https://doc.rust-lang.org/error_codes/E0515.html) shows the same boundary for references and iterators. The reusable lesson is that return types cannot outlive their backing storage. Once the owner is named, the correct API usually becomes obvious without experimenting with arbitrary lifetime annotations.

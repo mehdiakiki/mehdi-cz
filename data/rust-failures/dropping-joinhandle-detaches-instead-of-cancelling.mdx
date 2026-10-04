@@ -1,0 +1,115 @@
+---
+caseId: "RFA-163"
+title: "Dropping a Rust JoinHandle Detaches Instead of Cancelling"
+date: "2026-09-05T16:53:00+01:00"
+lastmod: "2026-09-05T16:53:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "57bb429e9f9c533791814e346126fc89cad53868967f06730d74587982268328"
+area: "concurrency-memory"
+symptom: "A worker thread completes after its JoinHandle is dropped because dropping the handle detaches observation rather than requesting cancellation."
+summary: "JoinHandle owns the right to join and observe a thread result, not the worker's lifetime. Keep and join the handle for completion, and add a separate cooperative stop signal when cancellation is required."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["targets supporting std::thread"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust dropping JoinHandle does not cancel thread", "JoinHandle drop detaches worker", "how to cancel std thread Rust"]
+evidence: ["Rust 1.98.1 channel coordination", "detached worker completion", "explicit-join repair"]
+sources: ["https://doc.rust-lang.org/std/thread/struct.JoinHandle.html", "https://doc.rust-lang.org/std/thread/struct.JoinHandle.html#method.join", "https://doc.rust-lang.org/std/thread/fn.spawn.html"]
+---
+
+Dropping an owned handle often destroys the resource behind it. A thread handle has a different contract. It stops me from joining; it does not stop the thread.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-163/fail.rs) starts a worker blocked on a channel. The main thread drops its `JoinHandle`, releases the worker, and receives a completion message. The final assertion expected cancellation and fails.
+
+The coordination is deliberate. No sleep or scheduling guess is needed to prove the detached worker continued.
+
+## JoinHandle represents observation and synchronization
+
+The [`JoinHandle` documentation](https://doc.rust-lang.org/std/thread/struct.JoinHandle.html) says that dropping the handle detaches the associated thread. The thread may continue running, but its return value and panic result can no longer be collected through that handle.
+
+Calling [`join`](https://doc.rust-lang.org/std/thread/struct.JoinHandle.html#method.join) waits for termination and returns either the worker's value or its panic payload. A successful join also supplies the memory-ordering relationship needed for the joining thread to observe operations completed by the worker.
+
+So the handle provides two important capabilities:
+
+```text
+wait for completion
+observe success or panic
+```
+
+It is not a cancellation token.
+
+## Why forcible thread cancellation is unsafe as a default
+
+A thread can be stopped at a bad moment: while holding a mutex, halfway through updating a file, inside an allocator, or after an external effect but before recording completion. Arbitrarily killing it would leave invariants and resources uncertain.
+
+Rust's standard threads therefore use cooperative cancellation. The worker checks a signal and exits at safe points. The signal may be an atomic flag, a channel disconnection, an explicit command, or a domain-specific shutdown state.
+
+The controller then joins the thread. Signalling without joining does not prove shutdown finished; joining without signalling can wait forever if the worker has no natural exit.
+
+I treat cancellation as a protocol:
+
+```text
+request stop -> worker reaches safe point -> worker cleans up -> join observes completion
+```
+
+## Keep the handle when completion matters
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-163/fixed.rs) retains the handle, releases the worker, and joins it before reading the completion message. This fixes the fixture's actual requirement: the caller must not continue until the work has finished.
+
+For a long-lived worker, I would add a stop message rather than using “release one job” as shutdown. A small owner type can hold both sender and handle, expose `shutdown`, and define what happens in `Drop`.
+
+I am careful with a `Drop` implementation that automatically joins. Destructors cannot return errors, and joining can block indefinitely. An explicit `shutdown(self) -> Result<...>` often gives better control, while `Drop` provides a documented fallback.
+
+## Detached threads can outlive their logical owner
+
+A detached thread cannot outlive the process, but it can outlive the object or request that created it. That produces several problems:
+
+- background writes continue after a caller reports cancellation;
+- tests finish while worker panics are merely printed;
+- resources stay open unexpectedly;
+- a server reload leaves old work overlapping new work;
+- process exit cuts the worker off without a join or application cleanup.
+
+The type system enforces `'static` requirements for data captured by [`thread::spawn`](https://doc.rust-lang.org/std/thread/fn.spawn.html), preventing borrowed stack data from dangling. It cannot infer the application's logical ownership boundary.
+
+Returning or storing the handle makes that boundary reviewable.
+
+## Panic disappears from the caller when detached
+
+A spawned thread panic normally becomes `Err` from `join`. If the handle is dropped, nobody receives that result. The default panic hook may print a message, but logging is not structured error handling.
+
+This is particularly dangerous in tests and maintenance jobs. The parent path may report success while a detached worker failed. I join workers whose result contributes to the operation's success.
+
+For intentionally detached telemetry or best-effort work, I say so in the API and handle errors inside the worker. “Fire and forget” should describe an accepted reliability policy, not an accidentally dropped value.
+
+## Async handles may have different cancellation rules
+
+I do not transfer this rule blindly to every runtime. Async task handles are library-specific: some detach on drop, some expose abort methods, and structured-concurrency scopes may cancel or wait according to their own lifecycle.
+
+The method is the same: read the handle's drop contract and test it. A name such as `JoinHandle` does not guarantee identical behaviour across `std`, Tokio, or another executor.
+
+This Atlas case is specifically about `std::thread::JoinHandle` on Rust 1.98.1.
+
+## Deterministic testing without sleeps
+
+The fixture uses two channels:
+
+1. a release channel proves the worker is waiting;
+2. a completion channel proves it ran after handle drop.
+
+This removes timing assumptions. A test based on `sleep(10ms)` may pass or fail with scheduler load. Protocol bugs deserve protocol-level coordination.
+
+For cancellation tests, I add acknowledgements for “stop observed” and “cleanup finished,” then join. Timeouts remain useful as test failure bounds, not as the mechanism that makes the ordering likely.
+
+## My lifecycle checklist
+
+For every spawned thread, I ask:
+
+- Who stores the handle?
+- Who requests shutdown?
+- Which operations are safe cancellation points?
+- Who joins and handles a panic?
+- Can application shutdown proceed while the worker remains alive?
+- Is detachment intentional and documented?
+
+The core principle is that ownership of a control handle is not always ownership of execution. Dropping `JoinHandle` abandons the right to observe the result, while the operating-system thread keeps running. Reliable shutdown needs a separate stop protocol plus a join boundary.

@@ -1,0 +1,106 @@
+---
+caseId: "RFA-715"
+title: "Converting an Exhausted Legacy RangeInclusive May Panic"
+date: "2026-09-07T11:12:00+01:00"
+lastmod: "2026-09-07T11:12:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "c0f6d1345580e52c3e6968c8f4ae9aa991a24912b2d0bee970e6a5e778093294"
+area: "concurrency-memory"
+symptom: "Converting an exhausted legacy RangeInclusive into the new std::range::RangeInclusive panics instead of producing an empty bounds value."
+summary: "The legacy inclusive range is also an iterator with consumed state. Once exhausted, its endpoint fields are unspecified, so conversion to the newer bounds-oriented RangeInclusive may panic or return an empty range."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust convert exhausted legacy RangeInclusive panic", "attempted to convert from exhausted legacy RangeInclusive", "std range RangeInclusive from legacy empty conversion"]
+evidence: ["Rust 1.98.1 documented conversion panic", "single-element legacy iterator exhausted before From", "is_empty guard avoids reconstructing consumed bounds"]
+sources: ["https://doc.rust-lang.org/releases.html#version-1980-2026-08-20", "https://doc.rust-lang.org/std/range/legacy/struct.RangeInclusive.html#impl-From%3CRangeInclusive%3CT%3E-for-RangeInclusive%3CT%3E", "https://doc.rust-lang.org/std/range/struct.RangeInclusive.html", "https://doc.rust-lang.org/std/iter/trait.Iterator.html"]
+---
+
+Rust now has a newer `std::range::RangeInclusive` alongside the legacy inclusive range used by `start..=end`. Conversion looks simple until the legacy value has already been iterated:
+
+```rust
+use std::range::{legacy, RangeInclusive};
+
+let mut exhausted: legacy::RangeInclusive<i32> = 0..=0;
+assert_eq!(exhausted.next(), Some(0));
+
+let converted = RangeInclusive::from(exhausted);
+```
+
+On Rust 1.98.1, this panics with “attempted to convert from an exhausted `legacy::RangeInclusive`.” The official contract permits the conversion either to panic or to return an empty range after exhaustion.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-715/fail.rs) captures the current panic. The [repaired program](/rust-failure-atlas/evidence/RFA-715/fixed.rs) checks `is_empty` before converting and treats exhaustion as a separate state.
+
+## The legacy value is both bounds and iterator state
+
+The syntax `0..=0` creates the legacy inclusive range. That type implements `Iterator`, so calling `next` mutates it. After its only item is returned, the iterator is exhausted.
+
+Its `start()` and `end()` accessors still exist, but Rust documents their precise values as unspecified after iteration finishes. `is_empty()` is the supported way to ask whether more values remain.
+
+The new range type is more directly a bounds value with public `start` and `last` fields. Converting requires meaningful bounds or a representable empty state. An exhausted legacy iterator cannot always provide portable original endpoints because its internal endpoint state was allowed to change during traversal.
+
+That is the missing distinction: the source value is not an immutable pair merely because it was created from two bounds.
+
+## Why From can panic here
+
+Developers often expect `From` to be infallible because its method returns the destination directly. Rust's trait signature indeed has no error value, but individual implementations can have documented panic conditions. Infallible at the type level does not mean panic-free for every runtime state.
+
+This implementation must translate one representation and state model into another. For an unconsumed range, the bounds carry the needed information. For an exhausted legacy iterator, the documented state no longer guarantees reconstructable endpoints.
+
+The current toolchain chooses a panic for the one-element exhausted example. Since the public documentation also allows an empty result, I do not build logic which requires every Rust release or type instantiation to panic in exactly the same way. The stable rule is to avoid converting exhausted legacy values when original bounds matter.
+
+## Preserve bounds before consuming
+
+If later code needs the original interval, I separate the bounds from iteration at the beginning:
+
+```rust
+let start = 0;
+let last = 10;
+let mut iterator: legacy::RangeInclusive<i32> = start..=last;
+
+for value in iterator.by_ref() {
+    process(value);
+}
+
+let range = RangeInclusive { start, last };
+```
+
+The exact constructor syntax should follow the new range API used by the project, but the design point is constant: preserve immutable domain data separately from a mutable traversal cursor.
+
+Cloning the legacy range before iteration can also preserve a convertible copy when the index type implements `Clone` and copying it is appropriate. I name the two values `bounds` and `remaining` so their roles are visible.
+
+## Guarding is right when only the remainder matters
+
+Sometimes I do not need original bounds. I want to convert whatever remains. Then I check:
+
+```rust
+if legacy_range.is_empty() {
+    // Handle no remaining values directly.
+} else {
+    let range = RangeInclusive::from(legacy_range);
+    // Use the remaining bounds.
+}
+```
+
+This is the Atlas repair. It does not pretend an exhausted traversal still carries a useful interval. It makes empty handling explicit.
+
+Using `start() > end()` as the guard is incorrect after exhaustion because those values are unspecified. The type provides `is_empty` specifically for this state question.
+
+## Catching the panic is a weaker boundary
+
+I could wrap conversion in `catch_unwind`, but that couples control flow to one permitted implementation outcome. Another conforming implementation may return an empty range instead, so “panic means empty” is not a stable classification.
+
+Panic handling also does not recover the original bounds. It only proves conversion could not produce them through that path. A precondition check or preserved copy gives clearer semantics.
+
+For generic code, I return my own `Option` or domain result before calling `From`. That API can distinguish an absent remaining range from a valid nonempty interval without relying on unwinding.
+
+## This differs from ordinary empty bounds
+
+An inclusive range with `start > last` is empty by its bound relationship. An exhausted range can have started nonempty and become empty through iteration. These histories are not interchangeable when conversion needs to recover bounds.
+
+The existing Atlas case about unspecified endpoints after exhaustion explains why inspecting `start` and `end` is unreliable. This case covers the next boundary: passing that state to a new range representation may fail. The search query and repair are different even though both come from the same iterator-state rule.
+
+I test at least four states around conversion: a normal multi-element range, a fresh single-element range, a partially consumed range, and a fully exhausted range. I also include a bound-empty range if the index type permits it. This prevents one happy-path conversion from standing in for the full state machine.
+
+The core principle applies to many Rust adapters: conversion preserves what the source type still guarantees, not everything the value once represented. When an object doubles as a mutable iterator, consume state and original domain data should be treated as separate resources.

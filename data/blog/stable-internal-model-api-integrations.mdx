@@ -1,0 +1,267 @@
+---
+title: "Why Every API Integration Needs a Stable Internal Model"
+date: "2026-09-04T09:00:00+01:00"
+tags: ["system design", "api integration", "data synchronization", "architecture", "software engineering"]
+draft: false
+reviewed: true
+reviewedHash: "338de352f35f1774a217822f9302c8fad0a9763200636803fc401a5456034f27"
+cluster: "reliable-data-integrations"
+campaign: "authority-2026"
+opportunity: "DATA-001"
+summary: "Third-party APIs should not become your product model. Learn how a stable internal representation contains provider changes and keeps integrations understandable."
+---
+
+When I connect one external API, copying its JSON into the product database can look reasonable. The fields already exist. The provider already chose names. I can ship faster.
+
+The problem appears with the second provider, or with version two of the first provider. A `customer` becomes an `account`. One API uses `active`, another uses `enabled`, and a third has five states with different meaning. The external model slowly enters every part of the product.
+
+The principle I learned is simple:
+
+> An external payload is an observation from another system. It is not automatically the product model.
+
+A stable internal model gives me a place to translate that observation before the rest of the product uses it.
+
+## The dependency I can create by accident
+
+Imagine that I synchronize customers from two services.
+
+Provider A returns:
+
+```json
+{
+  "id": "cus_42",
+  "status": "active",
+  "plan": "team"
+}
+```
+
+Provider B returns:
+
+```json
+{
+  "account_ref": 9001,
+  "disabled": false,
+  "tier": { "code": "business" }
+}
+```
+
+If product code reads both shapes directly, provider-specific conditions spread quickly:
+
+```ts
+const active = source === "a" ? row.status === "active" : !row.disabled;
+```
+
+Soon the billing screen, search index, permissions, and automation engine all know about `status`, `disabled`, `plan`, and `tier.code`. A change in one remote API is now a product-wide migration.
+
+This is the wrong direction of dependency. A provider I do not control is deciding the shape of code I do control.
+
+## Put translation at the boundary
+
+Instead, each connector can produce one internal representation:
+
+```ts
+type Account = {
+  identity: {
+    source: "provider-a" | "provider-b";
+    externalId: string;
+  };
+  lifecycle: "enabled" | "disabled" | "unknown";
+  serviceLevel: "individual" | "team" | "business" | "unknown";
+  observedAt: string;
+};
+```
+
+The provider adapters own the translation:
+
+```text
+Provider A payload ──> Provider A adapter ──┐
+                                            ├──> Account ──> product
+Provider B payload ──> Provider B adapter ──┘
+```
+
+The rest of the system understands `Account`. It does not need to understand every remote API.
+
+This shape is sometimes called an anti-corruption layer. The name is dramatic, but the idea is practical: translate between systems that do not share the same semantics. The [Azure Architecture Center](https://learn.microsoft.com/en-us/azure/architecture/patterns/anti-corruption-layer) describes the same boundary pattern.
+
+## A mapper that keeps interpretation explicit
+
+I prefer a total mapper that either produces a known internal observation or returns a typed boundary error. I do not let a partially validated provider object escape into product code.
+
+```ts
+type ProviderAAccount = {
+  id: string
+  status: string
+  plan?: string | null
+  updated_at: string
+}
+
+type MappingError =
+  | { kind: "invalid_identity"; value: unknown }
+  | { kind: "invalid_time"; value: unknown }
+
+type MappedAccount = Account & {
+  sourceUpdatedAt: string
+  sourceStatus: string
+  mappingVersion: 3
+}
+
+function mapProviderA(input: ProviderAAccount): MappedAccount | MappingError {
+  if (input.id.trim() === "") {
+    return { kind: "invalid_identity", value: input.id }
+  }
+
+  if (Number.isNaN(Date.parse(input.updated_at))) {
+    return { kind: "invalid_time", value: input.updated_at }
+  }
+
+  const lifecycle =
+    input.status === "active"
+      ? "enabled"
+      : input.status === "disabled"
+        ? "disabled"
+        : "unknown"
+
+  const serviceLevel =
+    input.plan === "solo"
+      ? "individual"
+      : input.plan === "team"
+        ? "team"
+        : input.plan === "business"
+          ? "business"
+          : "unknown"
+
+  return {
+    identity: { source: "provider-a", externalId: input.id },
+    lifecycle,
+    serviceLevel,
+    observedAt: new Date().toISOString(),
+    sourceUpdatedAt: input.updated_at,
+    sourceStatus: input.status,
+    mappingVersion: 3,
+  }
+}
+```
+
+This example deliberately preserves the unfamiliar status even though the product receives `unknown`. The mapper version explains which rules produced the observation. In production I inject the observation clock instead of calling `new Date()` directly, so tests and replays are deterministic.
+
+The tests are contracts over meaning:
+
+```ts
+function expectMapped(result: MappedAccount | MappingError): MappedAccount {
+  if ("kind" in result) throw new Error(`unexpected mapping error: ${result.kind}`)
+  return result
+}
+
+assert.equal(expectMapped(mapProviderA(activeFixture)).lifecycle, "enabled")
+assert.equal(expectMapped(mapProviderA(newStatusFixture)).lifecycle, "unknown")
+assert.equal(expectMapped(mapProviderA(newStatusFixture)).sourceStatus, "paused_by_policy")
+assert.deepEqual(mapProviderA(emptyIdFixture), {
+  kind: "invalid_identity",
+  value: "",
+})
+```
+
+I also keep a fixture for every observed provider enum, missing optional fields, invalid timestamps, and a payload from the previous API version. This makes a mapping change reviewable as product behaviour rather than an incidental JSON refactor.
+
+## Stable does not mean frozen
+
+An internal model must evolve. Stable means that it changes for product reasons, through an explicit decision. It does not change accidentally because a provider renamed one field.
+
+There are three useful layers:
+
+1. **Source representation**: what the external system returned.
+2. **Canonical representation**: what the product understands consistently.
+3. **Product behaviour**: what I decide to do with that meaning.
+
+Keeping these layers separate lets each one change at its own speed.
+
+If a provider adds `paused`, the source decoder can accept it first. The mapper can translate it to `unknown` while I decide whether the product needs a new lifecycle state. Product code continues to work during that decision.
+
+## Identity comes before deduplication
+
+The word `id` is not enough. An external identifier normally has meaning only inside a source and a resource type.
+
+This key is risky:
+
+```text
+42
+```
+
+This key carries its namespace:
+
+```text
+(provider-a, customer, 42)
+```
+
+Explicit identity helps with retries, updates, deletion, and provenance. It also prevents two providers that both use `42` from referring to the same internal record by mistake.
+
+Sometimes two external records describe the same real-world entity. That is a separate entity-resolution decision. I do not hide it inside the ingestion key.
+
+## Keep evidence when translation loses information
+
+Canonical models are smaller than source payloads. This is useful, but translation can lose information. When the use case permits it, I like to retain a source envelope beside the normalized record:
+
+```ts
+type SourceEnvelope = {
+  source: string;
+  resourceType: string;
+  externalId: string;
+  fetchedAt: string;
+  sourceVersion?: string;
+  payloadHash: string;
+  payload: unknown;
+};
+```
+
+This gives me answers when a mapping becomes suspicious:
+
+- What did the provider actually return?
+- Which mapper version processed it?
+- Is the canonical value old, or did the source send an old value?
+- Can I replay the record after fixing a mapper?
+
+Raw payload retention has privacy, security, and storage costs. It needs a retention policy and access controls. The principle is not "store everything forever." The principle is "do not destroy the only evidence before you know you can reproduce the result."
+
+## Make unknown values visible
+
+A tolerant reader should survive additive changes, but silent tolerance can hide damage.
+
+For example, mapping every unfamiliar status to `disabled` keeps the pipeline green and changes product behaviour. Mapping it to `unknown`, recording a metric, and preserving the source value is safer.
+
+Useful boundary signals include:
+
+- count of unknown enum values;
+- mapping failures by provider and resource type;
+- age of the last successful synchronization;
+- records accepted, rejected, and quarantined;
+- source versions observed in production.
+
+The adapter is not only a converter. It is also the place where semantic differences become observable.
+
+## When a canonical model is not worth it
+
+Not every integration needs a large abstraction.
+
+A direct representation can be enough when the data is only displayed, there is one provider, and the product does not attach important behaviour to it. Even then, keeping provider access behind one module is cheap insurance.
+
+The warning sign is not the number of connectors. It is the number of product decisions depending on provider-specific fields. Once external semantics reach several consumers, translation deserves a clear boundary.
+
+## What I took from building integration systems
+
+Working on integration systems made this boundary very concrete for me: moving bytes was not enough. The receiving system needed durable identity and meaning.
+
+The examples in this article are intentionally invented. The reusable lesson is that connector code should contain provider differences, not distribute them through the product.
+
+## A small design checklist
+
+Before adding a provider, I now ask:
+
+- What is the stable internal concept?
+- Which fields are source facts, and which are product interpretation?
+- How is external identity namespaced?
+- What happens when a new enum value appears?
+- Can I trace an internal record back to its source?
+- Can mapping logic change without rewriting every consumer?
+- Which information may be discarded, and why is that safe?
+
+The goal is not a perfect universal schema. The goal is a boundary that lets the product keep its own language.

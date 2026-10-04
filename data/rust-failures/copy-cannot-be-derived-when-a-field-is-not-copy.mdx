@@ -1,0 +1,99 @@
+---
+caseId: "RFA-428"
+title: "Why Copy Cannot Be Derived When One Field Is Not Copy"
+date: "2026-09-06T04:18:00+01:00"
+lastmod: "2026-09-06T04:18:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "e6864d0fbb237f23fd9906d5948c12c7f0d1abf2106bd5942b00a231ca681d71"
+area: "concurrency-memory"
+symptom: "Deriving Copy for a record containing Vec<u8> fails with E0204 because bitwise implicit duplication would create two owners of one allocation."
+summary: "Copy is an implicit duplication contract available only when every field supports it and the type has no destructor. Keep Clone for owned collections, borrow data, or redesign the representation rather than forcing shallow copying."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust E0204 trait Copy cannot be implemented field Vec", "derive Copy field does not implement Copy", "why Vec is Clone but not Copy Rust"]
+evidence: ["Rust 1.98.1 E0204 compile failure", "Vec field inside Copy derive", "explicit Clone repair"]
+sources: ["https://doc.rust-lang.org/error_codes/E0204.html", "https://doc.rust-lang.org/std/marker/trait.Copy.html", "https://doc.rust-lang.org/std/clone/trait.Clone.html"]
+---
+
+I had a small-looking record and added `Copy` beside `Clone`. Rust rejected the derive with E0204 because one field was a `Vec<u8>`.
+
+The [failing fixture](/rust-failure-atlas/evidence/RFA-428/fail.rs) contains only that vector field. The record itself is a few machine words, but those words describe heap storage with one ownership protocol. Copying the descriptor bit for bit would not duplicate the allocation safely.
+
+## Copy means implicit duplication
+
+For a `Copy` type, assignment and argument passing duplicate the value instead of moving it:
+
+```rust
+let second = first;
+use_value(first); // still valid only if the type is Copy
+```
+
+The [`Copy` documentation](https://doc.rust-lang.org/std/marker/trait.Copy.html) describes it as a marker for types whose values can be duplicated simply by copying bits. Rust may perform this operation implicitly in many places.
+
+Every field must therefore support the same contract. One non-Copy field makes the composite non-Copy.
+
+## Vec has ownership that cannot be copied shallowly
+
+A vector owns an allocation and tracks its pointer, length, and capacity. Duplicating only those fields would create two vectors believing they exclusively own the same allocation. Both would eventually try to free it, and mutations could violate aliasing rules.
+
+Safe Rust prevents this by making `Vec<T>` non-Copy. Its `Clone` implementation allocates or otherwise constructs distinct owned element storage according to `T: Clone`.
+
+The visible size of a handle is not the same as the semantic cost of duplicating what it owns.
+
+## Keep Clone when duplication is deliberate
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-428/fixed.rs) derives only `Clone` and calls `.clone()` explicitly. This makes the potentially allocating operation visible at the call site.
+
+Explicit cloning also lets APIs avoid duplication by moving the value instead. A caller who no longer needs `first` can transfer it at constant cost rather than cloning its buffer.
+
+I do not add `.clone()` automatically wherever the borrow checker reports a move. I first ask whether ownership should transfer, data should be borrowed, or shared ownership is the real model.
+
+## Borrowed fields change the contract
+
+A shared reference `&T` is Copy because copying it creates another shared reference under Rust's borrowing rules. A mutable reference `&mut T` is not Copy because implicit duplication would create overlapping exclusive references.
+
+The [E0204 page](https://doc.rust-lang.org/error_codes/E0204.html) highlights this difference. Replacing `Vec<u8>` with `&[u8]` can make a view type Copy, but it also introduces a lifetime and removes ownership.
+
+I often separate an owned record from a borrowed view:
+
+```rust
+struct Batch { values: Vec<u8> }
+#[derive(Clone, Copy)]
+struct BatchView<'a> { values: &'a [u8] }
+```
+
+They serve different boundaries and should have different names.
+
+## Drop and Copy cannot coexist
+
+A type implementing `Drop` cannot implement `Copy`. Implicit duplication would make it unclear how many destructor obligations exist and would break resource ownership.
+
+File handles, locks, sockets, guards, and heap owners should normally move. When shared access is required, dedicated types such as `Arc<T>` provide reference-counted cloning, which is still explicit and has synchronization costs.
+
+## Adding Copy is an API commitment
+
+Public types that implement Copy are duplicated implicitly in downstream code. Removing Copy later can break callers. Adding a non-Copy field to such a public struct then becomes difficult even if fields are private and construction is controlled.
+
+I implement Copy only when the value is naturally cheap, independent, and likely to remain so: numeric coordinates, small IDs, flags, or immutable handles with an intentional copied representation.
+
+“It compiles today” is weaker than “this is a stable semantic promise.”
+
+## Generic derives can add bounds
+
+For generic structs, derive-generated `Copy` and `Clone` implementations may introduce bounds based on fields. Phantom marker choices and wrapper types can influence those results.
+
+I inspect the public bound when a generic type is meant to be Copy regardless of its marker parameter. Manual implementations can sometimes express a more precise bound, but only when every actual field supports safe copying.
+
+## My decision checklist
+
+- Does each field implement Copy?
+- Would bitwise duplication create independent valid values?
+- Is any resource released in Drop?
+- Is explicit Clone the honest cost signal?
+- Would a borrowed view be a separate useful type?
+- Is Copy a public compatibility promise I can maintain?
+- Am I fixing ownership design or merely silencing moves?
+
+The core principle is that Copy describes semantics, not object size. A tiny vector descriptor still owns external storage, so implicit shallow duplication is wrong. Rust makes that ownership visible by requiring moves or explicit cloning, and I keep that signal instead of fighting it.

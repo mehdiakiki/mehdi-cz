@@ -1,0 +1,79 @@
+---
+caseId: "RFA-681"
+title: "OnceLock::get_or_init Runs Only the Winning Initializer"
+date: "2026-09-06T08:41:00+01:00"
+lastmod: "2026-09-06T08:41:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "8a38e616aa12d82e566ce488be64a4e2b9aacaca7af6a893dce75295733bf1c7"
+area: "concurrency-memory"
+symptom: "A closure passed to the second get_or_init call never runs because the OnceLock already contains a value."
+summary: "get_or_init lazily publishes one value and later callers only borrow it. Put required per-call work outside the initializer and avoid reentrant initialization."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["targets supporting std threads"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust OnceLock get_or_init closure once", "get_or_init later closure not called", "OnceLock concurrent initializer"]
+evidence: ["Rust 1.98.1 runtime assertion", "atomic counts initializer calls", "second closure skipped after publication"]
+sources: ["https://doc.rust-lang.org/std/sync/struct.OnceLock.html#method.get_or_init", "https://doc.rust-lang.org/std/sync/struct.OnceLock.html#method.set", "https://doc.rust-lang.org/std/sync/struct.OnceLock.html#method.wait"]
+---
+
+`OnceLock::get_or_init(f)` runs `f` only when initialization is needed. After a value is stored, later calls return a reference without running their closures. The [failing fixture](/rust-failure-atlas/evidence/RFA-681/fail.rs) calls two different initializers and its counter advances only once.
+
+## The closure is a lazy candidate
+
+The [`get_or_init` contract](https://doc.rust-lang.org/std/sync/struct.OnceLock.html#method.get_or_init) guarantees that with concurrent callers only one initialization function executes when it does not panic. Every successful caller receives a reference to the published value.
+
+The closure is not a callback for each access. Logging, request accounting, refreshing, and validation that must happen every time belong outside it.
+
+I read the expression as “get the published value, or become its initializer,” not “get and also execute this closure.”
+
+## Side effects happen at most once after success
+
+Putting registration, metrics, or external writes inside the closure ties them to the winning initialization attempt. Other callers skip them. This can be desirable when the effect constructs the value, but it is wrong for per-request work.
+
+If initialization panics, OnceLock remains uninitialized and another call may try again. Therefore the closure is not exactly-once for external side effects across panics. An effect can happen before panic and repeat on retry.
+
+I make initialization idempotent or separate external commit from local construction. Once-only memory publication is not a distributed transaction.
+
+## Concurrent callers do not choose by priority
+
+Several threads may arrive with different closures. The API promises one executed successful initializer, not which thread or candidate wins. If choosing a value depends on precedence, I resolve precedence before entering the race or initialise from one authoritative source.
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-681/fixed.rs) asserts one call and the retained first value. In a concurrent test, I assert one execution and a value from the permitted set rather than scheduler-specific identity.
+
+[`set`](https://doc.rust-lang.org/std/sync/struct.OnceLock.html#method.set) offers explicit candidate ownership and returns a loser. `get_or_init` constructs lazily only for the winner. The ownership needs often decide between them.
+
+## Reentrant initialization is an error
+
+Calling `get_or_init` on the same cell from its own initializer is reentrant. The documentation says the outcome is unspecified, with current implementations potentially deadlocking. I do not rely on a panic to detect it.
+
+Reentrancy can be indirect: configuration initialization calls logging, logging asks for configuration, and both share the same cell. Keeping the dependency graph acyclic is essential. Startup components should receive dependencies rather than reach into globals during construction.
+
+Thread-local recursion guards can improve diagnostics in wrappers, but they do not make a cyclic initialization valid.
+
+## Waiting and access are separate
+
+The call may block while another thread initializes. An initializer performing slow network I/O can therefore hold many callers. I usually prepare fallible remote state during startup and publish a completed immutable object, or provide a service-level readiness mechanism.
+
+The `wait` method explicitly blocks until initialized, while `get` never blocks and may return None. Choosing among them defines startup latency and availability behaviour.
+
+Async executors need care because blocking standard synchronization on runtime worker threads can stall unrelated tasks. Initialization may happen before serving or through an async-aware architecture.
+
+## Tests count executions, not timing
+
+The fixture uses an atomic counter because closure execution is the property. Concurrent tests start callers behind a barrier and verify the final count. They avoid sleeping and do not assert which thread wins.
+
+I also test panic then retry, slow initialization visibility, and rejection of cyclic dependency in higher-level wrappers. A simple final-value assertion misses duplicated side effects.
+
+## My lazy initialization checklist
+
+- Is closure work needed once or on every access?
+- Can external side effects repeat after a panic?
+- Are competing initializers truly equivalent?
+- Is the dependency graph free from reentrant cycles?
+- Can blocking initialization delay critical threads or an async executor?
+- Should startup perform fallible work before publication?
+- Does the caller need rejected candidate ownership from set instead?
+- Do tests count executions without assuming scheduler order?
+
+The core principle is that lazy initialization controls publication, not arbitrary callback execution. `get_or_init` runs one successful constructor and then becomes a read path. I keep per-call work and recoverable external workflows outside that constructor.

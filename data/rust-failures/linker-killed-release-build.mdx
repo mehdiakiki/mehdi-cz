@@ -1,0 +1,123 @@
+---
+caseId: "RFA-040"
+title: "Why the Linker Is Killed Only During a Rust Release Build"
+date: "2026-09-04T21:00:00+01:00"
+lastmod: "2026-09-07T15:35:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "e6fbb8545f012b18fd61a7aded05ff365bdd64af91edae36e0cafec3755d8c10"
+area: "cargo-dependencies"
+symptom: "The linker is killed for a release build while debug builds of the same Rust workspace complete successfully."
+summary: "Release linking can combine optimization, fewer codegen units, native objects, and LTO into a larger peak-memory event. Measure the process before changing profile settings."
+rustVersions: ["stable Rust", "Cargo stable"]
+targets: ["affected host or CI target"]
+profiles: ["release", "paired custom profiles"]
+searchTerms:
+  [
+    "Rust linker killed release build memory",
+    "cargo build release ld killed",
+    "Rust LTO linker out of memory",
+  ]
+evidence: ["peak-memory trace", "profile comparison", "linker invocation"]
+sources:
+  [
+    "https://doc.rust-lang.org/cargo/reference/profiles.html",
+    "https://doc.rust-lang.org/rustc/codegen-options/index.html#lto",
+  ]
+---
+
+When a linker prints only `Killed`, the message often came from outside the linker. On Linux, the kernel or a container memory limit may have terminated it. On another platform, the linker may report its own allocation failure. I confirm the termination reason before tuning Rust.
+
+Release builds differ from development builds in more than optimization. Cargo's default profiles change optimization, debug assertions, overflow checks, incremental mode, and codegen-unit count. Projects often enable LTO only for release. Native libraries and generated code may also select release-specific paths.
+
+## Measure the peak
+
+I capture three things in the failing environment:
+
+- maximum resident memory for the compiler and linker;
+- container or job memory limit and system logs for an out-of-memory kill;
+- Cargo's verbose final compiler/linker invocation.
+
+Running the same command on a laptop with more memory does not explain CI. I reproduce inside the same memory boundary.
+
+Cargo timings help identify long compilation units, but the process peak and kill reason remain the decisive evidence for this symptom.
+
+The Atlas fixture makes the memory boundary part of the command. Its [Linux resource runner](/rust-failure-atlas/evidence/RFA-040/resource_runner.c) applies `RLIMIT_AS` to one linker child and records its exit code, terminating signal, and maximum resident set size from `wait4`.
+
+The [failing](/rust-failure-atlas/evidence/RFA-040/fail.rs) and [repaired](/rust-failure-atlas/evidence/RFA-040/fixed.rs) Rust sources are intentionally identical. Each produces the same 512 KiB optimized object, and the verifier checks that the object bytes match before making 120 local-symbol copies. The final link graph therefore contains roughly 60 MiB of Rust-generated payload in both experiments.
+
+On the reviewed x86-64 Linux environment, `ld.lld` completes under an 8 GiB address-space ceiling but reports `Cannot allocate memory` under 262,144 KiB. GNU `ld.bfd` links the same object list under the 262,144 KiB ceiling. The result is not a universal ranking of linkers. It is a controlled demonstration that linker choice changed this graph's resource profile while source, objects, command shape, and limit stayed fixed.
+
+This fixture also corrects the wording of the symptom. Its constrained linker exits with an allocation error; it is not killed by the kernel. A production log containing only `Killed` needs container events or kernel evidence before I call it the same termination mode.
+
+## Isolate one release setting at a time
+
+I add custom profiles instead of randomly changing the main release profile:
+
+```toml
+[profile.release-no-lto]
+inherits = "release"
+lto = "off"
+
+[profile.release-thin]
+inherits = "release"
+lto = "thin"
+
+[profile.release-more-cgu]
+inherits = "release"
+codegen-units = 32
+```
+
+LTO performs whole-program optimization across a wider graph and costs link time and memory. Thin LTO normally uses fewer resources than fat LTO. More codegen units divide compilation work, though the final memory behavior depends on the toolchain and linker.
+
+I compare peaks, not only pass or fail. A build which uses 7.9 GiB under an 8 GiB limit remains fragile even when it succeeds once.
+
+## Reduce the linked graph
+
+Rust monomorphizes generic code for concrete types. Large dependency graphs, many generic instantiations, generated tables, and embedded assets can create a large final artifact. Feature unification may enable code not expected by the application.
+
+I inspect:
+
+```bash
+cargo tree -e features
+cargo tree -d
+```
+
+Then I ask whether release binaries link examples, build-time tools, optional protocols, or multiple implementations which are not needed. Removing an unused feature is better than buying memory for code the product never calls.
+
+Multiple binary targets can each pay a link peak. Building one package and binary at a time identifies which artifact is responsible.
+
+## Linker choice can matter
+
+Linkers have different performance, virtual-address, and resident-memory characteristics. Rust can select a linker per target through Cargo configuration. Changing linkers is a real toolchain decision, so I verify target support, native-library compatibility, debug information, and reproducibility before making it permanent. I measure the actual graph instead of assuming one implementation always uses less memory.
+
+I do not paste a platform-specific `-fuse-ld` flag into global `RUSTFLAGS` without scoping it. Host build scripts and proc macros may receive flags differently depending on whether a target was explicitly specified.
+
+## Parallelism is not the same as link peak
+
+Reducing Cargo `--jobs` can lower the sum of several concurrent compiler processes. It may help when the linker overlaps with other large units. It does not necessarily reduce the memory used inside one final link.
+
+I compare a single-job peak with the normal build. If the individual linker already exceeds the limit, job reduction only delays the same kill.
+
+## Debug information and stripping
+
+Release defaults may omit debug information, but many production profiles enable it for symbolized crashes. Full debuginfo can materially increase object and link work. `line-tables-only` or split debug information may retain useful backtraces with a different resource profile, depending on target.
+
+Stripping happens too late to solve every peak because the linker still processes the input. I measure rather than assuming final file size equals peak memory.
+
+## Repairs in priority order
+
+1. Remove unnecessary features and linked targets.
+2. Use thin LTO or disable cross-crate LTO if measured product impact permits.
+3. Select an efficient supported linker.
+4. Adjust codegen units and debug information using measured profiles.
+5. Reduce overlapping build jobs when aggregate concurrency is the problem.
+6. Increase the build memory limit when the remaining graph is necessary.
+
+The final choice balances runtime performance, build reliability, artifact size, and crash diagnostics. There is no honest universal flag.
+
+## The regression proof
+
+I keep a release build in the constrained CI environment and record peak memory as an artifact. The gate should leave headroom, not merely stay one byte below the limit. I also preserve production LTO, linker, target, feature settings, exit status, and termination signal in the command and result.
+
+This turns “the linker sometimes gets killed” into a capacity budget that can be reviewed when dependency or code-generation changes increase the graph.

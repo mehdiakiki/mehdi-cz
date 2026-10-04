@@ -1,0 +1,189 @@
+---
+title: "Behavior Without Shape: Traits, Interfaces, and Types That Own No Bytes"
+date: "2026-09-10T07:30:00+01:00"
+lastmod: "2026-09-10T07:30:00+01:00"
+tags: ["types", "rust", "typescript", "traits", "zero-sized types", "types under the hood"]
+draft: false
+reviewed: true
+reviewedHash: "5b94917973b7ea2149e326811c392aca2cae5c335f76af5939c3e3cd96b71561"
+cluster: "rust-under-the-hood"
+campaign: "editorial"
+summary: "A trait is the behavior half of a type with no shape at all. I measured a type of zero bytes carrying a trait, a million of them in a Vec with zero allocations, and a door that cannot be walked through while closed, all with nothing left in the binary. This is the kind of type I think most code does not use enough."
+---
+
+The last article showed two types with the same shape and different names. This one goes to the other extreme: a type with no shape at all. Zero bytes. It still has behavior, the compiler still checks that behavior, and the optimized binary contains nothing of it.
+
+This is a spoke of [What Is a Type?](/blog/what-is-a-type-a-set-of-values-a-promise-about-operations-or-both), and it is the one where I have an opinion. Types made only of behavior are the cheapest way I know to make a compiler catch a mistake, and most code I read uses them far less than it should.
+
+The programs and a script that reproduces every output are in the `types-under-the-hood` fixture of the site repository. I used rustc 1.95 nightly and TypeScript 5.9 on x86-64 Linux.
+
+## A type with zero bytes and one method
+
+Here is the smallest type I can write that does something:
+
+```rust
+pub trait Stamp { fn stamp(&self, n: u64) -> u64; }
+
+pub struct Doubler;
+impl Stamp for Doubler { fn stamp(&self, n: u64) -> u64 { n * 2 } }
+```
+
+`Doubler` has no fields. Rust calls this a zero-sized type, and it means it literally. I wrote about sized and unsized types before, in [Sized vs !Sized](/blog/sized-vs-unsized-in-rust), and this is the extreme case of sized. The fixture prints six size lines together; here are the first and the fifth:
+
+```text
+size of Doubler:            0 bytes
+size of &Doubler:           8 bytes
+```
+
+A `Doubler` takes no memory, and a reference to one is a real 8-byte pointer, non-null and correctly aligned, that addresses no bytes. Yet `Doubler` has a method, and the compiler checks that I call `stamp` only on things that implement `Stamp`. So this is a type made entirely of the behavior half. Its shape half is the empty set of bytes, and its set of values has exactly one member, the way `()` does.
+
+I wanted to know what the method call costs, so I compiled two functions with optimizations:
+
+```rust
+#[no_mangle]
+pub fn with_trait(n: u64) -> u64 { Doubler.stamp(n) }
+
+#[no_mangle]
+pub fn without_trait(n: u64) -> u64 { n * 2 }
+```
+
+```asm
+with_trait:
+    leaq    (%rdi,%rdi), %rax
+    retq
+
+without_trait = with_trait
+```
+
+One instruction, add the number to itself, and the second function is an alias of the first, the same merge I showed in the previous article. The trait, the struct, and the method call are all gone. `Doubler.stamp(n)` became `n + n`.
+
+This zero cost belongs to the optimized build, not to the trait. In a debug build `with_trait` still calls `Doubler::stamp` through a real `callq`, and `without_trait` compiles to a checked multiply with an overflow branch, so the two are not even similar. The fixture script prints both debug bodies. The trait is free because the optimizer could see through it, and it can see through it because there was nothing to see.
+
+## A million of them, and no allocation
+
+I pushed this further, because I did not fully believe it. I put one million `Doubler` values in a `Vec` and counted allocations with a counting allocator:
+
+```text
+a Vec of 1000000 Doublers:  len 1000000, allocations 0, size of the Vec value 24 bytes
+total: 2000000
+```
+
+Zero allocations. The `Vec` is the usual 24 bytes, a pointer, a length, and a capacity, and the length says one million. The standard library knows the element type has no size, so it never asks the allocator for anything, and the capacity reports `usize::MAX`.
+
+The pointer inside is a dangling but aligned value that is never read. Iterating over the million elements and calling `stamp` on each still gives the right total, two million. There is nothing to iterate over in memory, and on this build the loop runs on the length alone.
+
+I find this a good way to feel what "behavior without shape" means. The type is real enough to have a million instances and a method. It is not real enough to occupy a single byte.
+
+## The trait object: behavior that finally costs something
+
+There is one place where the behavior half leaves a trace, and it is worth seeing next to the zero:
+
+```text
+size of &Doubler:           8 bytes
+size of &dyn Stamp:         16 bytes
+```
+
+A reference to a `Doubler` is 8 bytes. A reference to "something that implements `Stamp`", a trait object, is 16. The extra 8 bytes point to a vtable, a table with the methods plus the destructor, the size, and the alignment of the concrete type.
+
+The vtable is the only extra data structure the trait system itself adds. There is one per pair of concrete type and trait, and it appears as soon as I ask for `dyn`, which is the moment the program may have to choose the implementation at runtime. As long as the compiler can choose, the behavior costs nothing. I look at the vtable closely in a later article of this series, on erasure and monomorphization.
+
+## The interface in TypeScript: the same zero
+
+TypeScript has the same thing under the name interface:
+
+```ts
+interface Stamp {
+  stamp(n: number): number;
+}
+
+class Doubler implements Stamp {
+  stamp(n: number): number {
+    return n * 2;
+  }
+}
+
+function run(s: Stamp, n: number): number {
+  return s.stamp(n);
+}
+```
+
+The compiled JavaScript keeps the class, because a class is a value, but the interface is gone. The word `Stamp` does not appear in the output. `implements Stamp` was a promise checked once, and `run(s: Stamp, ...)` was a promise about the argument checked once. After that, JavaScript calls whatever `s.stamp` happens to be, which is exactly what it did before TypeScript existed.
+
+## The opinion: use the zero-byte type for states
+
+So far I measured. Now the part I actually want to say.
+
+The most useful thing a zero-byte type can carry is a state. Here is a door that has two states, and the state is a type:
+
+```rust
+use std::marker::PhantomData;
+
+pub struct Closed;
+pub struct Open;
+pub struct Door<State> { id: u32, _state: PhantomData<State> }
+
+impl Door<Closed> {
+    pub fn new(id: u32) -> Self { Door { id, _state: PhantomData } }
+    pub fn open(self) -> Door<Open> { Door { id: self.id, _state: PhantomData } }
+}
+impl Door<Open> {
+    pub fn walk_through(&self) -> u32 { self.id }
+    pub fn close(self) -> Door<Closed> { Door { id: self.id, _state: PhantomData } }
+}
+```
+
+`PhantomData<State>` is a zero-byte field that only exists to carry the type parameter. So a `Door<Closed>` and a `Door<Open>` are the same four bytes:
+
+```text
+size of Door<Closed>:       4 bytes
+size of Door<Open>:         4 bytes
+size of u32:                4 bytes
+```
+
+There is no state field. The state is in the type, and the methods are attached to one state each. Walking through a closed door is not a runtime check that returns an error. It is a program that does not exist.
+
+The error is shortened to the lines that matter:
+
+```rust
+let door = Door::<Closed>::new(7);
+door.walk_through();
+```
+
+```text
+error[E0599]: no method named `walk_through` found for struct `Door<Closed>` in the current scope
+   = note: the method was found for
+           - `Door<Open>`
+```
+
+Read the note again. The compiler knows the method exists, and knows it exists for a different state of the same door. That is a state machine checked at compile time, and it cost four bytes, the same as the id alone.
+
+This is what I mean when I say most code I read under-uses behavior-only types. The usual way to write this door is a `state: DoorState` field, a `match` in every method, and an `Err(NotOpen)` that every caller has to handle, and that is easy to handle by passing it one level up, to someone who knows even less about the state. That version mixes shape and behavior. The state field costs between zero and a few bytes depending on how it packs, plus a branch on every call that the compiler can only sometimes remove, and it moves the mistake from compile time to run time, where it is found by whoever reads the logs.
+
+The typestate version is not always possible. It works when the states are known when I write the code and when a value moves through them in a known order, a connection that is opened then closed, a builder that is configured then built, a request that is validated then sent. It also forces each transition to take the value by `self`, which fights with code that only holds a `&mut` to it, and a value that comes back from a database or a network re-enters through a runtime check anyway.
+
+When the state comes from the outside world at runtime, a field is the honest choice. But when I know the states, I now reach for the type first, and I think the reflex should be more common than it is.
+
+The same idea exists in TypeScript with a literal tag, `{ kind: "open" }` and `{ kind: "closed" }`, and the narrowing does the job of the two `impl` blocks. It costs one property slot per object at runtime, a machine word, because JavaScript has no zero-byte value, and the string itself is stored once and shared. But the shape of the reasoning is identical.
+
+## The model I take from this
+
+1. A type can have behavior and no shape. It has one value, zero bytes, and as many methods as I give it.
+2. That behavior is free in an optimized build. The compiler checks it, then compiles the method call down to the same instructions as the plain code. In a debug build the call is still a call.
+3. The only extra data structure the trait system adds is the vtable, one per pair of concrete type and trait, and it appears as soon as I ask for `dyn`.
+4. The best use of a zero-byte type is a state. Attaching methods to the state turns "this call is invalid right now" into "this call does not compile".
+
+## What I check when I see a state field
+
+- Are the states known when the code is written, and does a value move through them in a known order? Then the state can be a type.
+- How many methods start with a check of that field? Each one is a method that could belong to one state instead.
+- Who handles the error when the check fails? If the answer is "the caller, in theory", the type would have handled it for free.
+- Is there a `Vec` or a map of these values with mixed states? Then the typestate does not fit, and the field is right.
+
+## Sources
+
+- [The Rustonomicon: exotically sized types, including zero-sized types](https://doc.rust-lang.org/nomicon/exotic-sizes.html)
+- [Rust standard library: std::marker::PhantomData](https://doc.rust-lang.org/std/marker/struct.PhantomData.html)
+- [Rust standard library: Vec and zero-sized elements](https://doc.rust-lang.org/std/vec/struct.Vec.html)
+- [The Rust Reference: trait objects](https://doc.rust-lang.org/reference/types/trait-object.html)
+- [The Embedded Rust Book: typestate programming](https://docs.rust-embedded.org/book/static-guarantees/typestate-programming.html)
+- [TypeScript handbook: object types and interfaces](https://www.typescriptlang.org/docs/handbook/2/objects.html)

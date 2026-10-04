@@ -1,0 +1,93 @@
+---
+caseId: "RFA-257"
+title: "Why checked_ilog2 Returns None for Zero"
+date: "2026-09-06T00:37:00+01:00"
+lastmod: "2026-09-06T00:37:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "6d988fb2ffebce6cc79db2b927e704d442159ca8f07127f277c7cd7b0db6318a"
+area: "upgrades-compatibility"
+symptom: "0_u32.checked_ilog2 returns None while code expected zero as the bit position or bucket for a zero value."
+summary: "Integer logarithm is defined only for positive input. checked_ilog2 reports zero as outside its domain; add a separate zero bucket or validate a nonzero value before using the logarithm."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust checked_ilog2 zero None", "ilog2 zero panic Rust", "integer log2 bucket zero value"]
+evidence: ["Rust 1.98.1 unsigned zero", "checked domain result", "positive boundary table"]
+sources: ["https://doc.rust-lang.org/std/primitive.u32.html#method.checked_ilog2", "https://doc.rust-lang.org/std/primitive.u32.html#method.ilog2", "https://doc.rust-lang.org/std/num/struct.NonZero.html"]
+---
+
+The bit pattern of zero is perfectly valid, but its integer logarithm is not.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-257/fail.rs) expects `0_u32.checked_ilog2()` to produce a number. [`checked_ilog2`](https://doc.rust-lang.org/std/primitive.u32.html#method.checked_ilog2) returns `None`.
+
+## Logarithm asks for a positive magnitude
+
+For a positive integer, `ilog2` returns the floor of the base-two logarithm. It identifies the exponent of the greatest power of two not exceeding the value.
+
+There is no finite integer exponent satisfying that relationship for zero. As values approach zero from the positive real side, the logarithm heads toward negative infinity. Returning zero would confuse an undefined input with the valid result for one.
+
+The checked method preserves that distinction through `Option`.
+
+## The unchecked-looking convenience method panics
+
+[`u32::ilog2`](https://doc.rust-lang.org/std/primitive.u32.html#method.ilog2) returns a plain `u32`, so it panics for zero. `checked_ilog2` is the right operation when zero can be ordinary input.
+
+This is domain checking rather than overflow checking. The result for every positive `u32` fits easily in `u32`; the failure is that zero has no valid answer.
+
+I read “checked” as “reports this operation's invalid numerical cases,” not only “detects a too-large result.”
+
+## Zero buckets are an application policy
+
+Histogram and allocator code often uses `ilog2` to select a size class. The product may need a bucket for empty values. I encode that separately:
+
+```text
+zero -> empty bucket
+positive n -> logarithmic bucket
+```
+
+Mapping zero directly to bucket zero can be correct, but bucket zero then contains both zero and values whose `ilog2` is zero, such as one. If those populations need different treatment, the bucket identifier should preserve the distinction.
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-257/fixed.rs) keeps `None` for zero and shows the floor behavior for one, eight, and fifteen.
+
+## ilog2 is floor, not exact-power validation
+
+Eight returns three, and fifteen also returns three. `ilog2` does not say the input is a power of two. It says which power-of-two interval contains it.
+
+If exactness matters, I combine the result with `is_power_of_two` or compare `1 << exponent` with the input. Using only the log can accept a rounded-down value as an exact alignment.
+
+This matters when calculating masks, page sizes, or tree heights.
+
+## Bit width can answer a related zero-friendly question
+
+Sometimes the real question is how many bits are needed to represent a value. Zero policies differ: a mathematical bit length may be zero, while a storage field may require at least one bit.
+
+That is not automatically the same as `ilog2`. For positive values, bit width is generally `ilog2 + 1`; zero needs its own convention. I name helpers after the question rather than using a log and patching cases until tests pass.
+
+## A nonzero type can move validation earlier
+
+When an internal algorithm only accepts positive sizes, [`NonZero`](https://doc.rust-lang.org/std/num/struct.NonZero.html) can represent the precondition. Parsing or construction remains fallible, but subsequent logarithm calls no longer repeat a zero check.
+
+This is helpful for capacities, alignment, and fan-out values passed through many functions. It is less appropriate when zero is meaningful data that must be retained.
+
+## What I test
+
+My boundary table includes zero, one, values immediately below and above powers of two, and the integer maximum. It checks floor behavior separately from power-of-two classification.
+
+For bucket systems, I assert monotonicity, exact boundary transitions, maximum bucket count, and the explicit zero policy. A correct primitive can still feed an off-by-one array index if bucket allocation uses another convention.
+
+## General bases add another invalid input
+
+The related `ilog(base)` family also requires a base of at least two. A checked variant can therefore fail because the value is zero or because the base is invalid. If errors need different messages, collapsing both into one `None` is too weak and I validate each operand before calling.
+
+Base one is especially tempting when a configurable grouping factor defaults badly. It cannot produce logarithmic progress: every power of one remains one. Base zero has the same kind of domain problem plus arithmetic hazards.
+
+I log the value and base as separate fields. “Logarithm unavailable” without operands makes production diagnosis slow and can hide that a rollout changed configuration rather than data.
+
+## Do not derive allocation shifts without checking
+
+Code often turns a logarithm back into a power using `1 << exponent`. That round trip gives the lower power-of-two boundary, not the original input unless it was exact. A later `+1` for ceiling buckets must also handle exact powers differently.
+
+I test the complete mapping from requested size to bucket capacity. The individual log call may be correct while the surrounding rounding formula allocates a bucket that is too small.
+
+The core principle is that representable input is not always inside an operation's mathematical domain. Zero fits in `u32` but has no finite integer logarithm. `checked_ilog2` exposes that absence cleanly; the application can reject zero, represent it separately, or map it to a named bucket without confusing it with the valid logarithm of one.

@@ -1,0 +1,111 @@
+---
+caseId: "RFA-093"
+title: "Why Arc<RefCell<T>> Is Still Not Thread-Safe"
+date: "2026-09-05T09:13:00+01:00"
+lastmod: "2026-09-05T09:13:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "b68c8902a953c7535d7f4c8de5c2ecf0ad7fa8e5d29bd4fb59826b1e23d73dff"
+area: "concurrency-memory"
+symptom: "Arc<RefCell<T>> cannot enter thread::spawn because RefCell is not Sync despite the atomic reference count."
+summary: "Arc makes shared ownership bookkeeping thread-safe; it does not upgrade the inner value. Read Send and Sync from the inside out, then choose Mutex, ownership transfer, or a single-owner task."
+rustVersions: ["Rust 1.98.1"]
+targets: ["targets with std thread and atomic pointer support"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust Arc RefCell cannot be shared between threads safely",
+    "RefCell not Sync thread spawn E0277",
+    "Arc inner type thread safe",
+  ]
+evidence: ["Rust 1.98.1 compile failure", "Send Sync composition", "Arc Mutex repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/std/sync/struct.Arc.html",
+    "https://doc.rust-lang.org/std/cell/struct.RefCell.html",
+  ]
+---
+
+This type looks half-way to a common shared-state pattern:
+
+```rust
+use std::cell::RefCell;
+use std::sync::Arc;
+
+let value = Arc::new(RefCell::new(1));
+let worker_value = Arc::clone(&value);
+std::thread::spawn(move || *worker_value.borrow_mut() += 1);
+```
+
+Rust 1.98.1 reports E0277 because `RefCell<i32>` cannot be shared between threads safely. The diagnostic explains that `Arc<RefCell<i32>>` therefore cannot implement the Send behavior required by `thread::spawn`. The [failing fixture](/rust-failure-atlas/evidence/RFA-093/fail.rs) keeps the full trait chain.
+
+The atomic reference count protects who owns the allocation. It does not protect operations performed on the value inside the allocation.
+
+## Arc's guarantees are conditional on T
+
+[`Arc<T>`](https://doc.rust-lang.org/std/sync/struct.Arc.html) implements Send and Sync only when `T` has the required Send and Sync properties. This is essential. If Arc made any inner value thread-safe, `Arc<RefCell<T>>` could create simultaneous unsynchronized mutations from several threads.
+
+[`RefCell<T>`](https://doc.rust-lang.org/std/cell/struct.RefCell.html) enforces borrowing at runtime with an ordinary borrow flag. Conflicting borrows panic rather than fail compilation, but the flag itself is not synchronized between threads. A data race on that state would be undefined behavior, not a controlled borrow panic.
+
+`Rc<RefCell<T>>` is a good single-thread pattern when shared ownership and runtime-checked mutation are intentional. Replacing Rc with Arc changes only one of those properties.
+
+## Read composite thread safety from the inside out
+
+I inspect a nested type one layer at a time:
+
+1. What operations does the inner `T` permit through shared references?
+2. Is that access safe from several threads?
+3. What does the outer owner or pointer add?
+4. What trait does the destination API require?
+
+In this case, RefCell is not Sync. Therefore a shared reference to it cannot be used from multiple threads. Arc cannot promise otherwise.
+
+This method also explains `Arc<Cell<T>>`, `Arc<*mut T>`, and application wrappers containing a non-Sync field. The compiler's long trait note is a path through the layers, not noise.
+
+## Mutex provides a cross-thread borrow protocol
+
+The [verified repair](/rust-failure-atlas/evidence/RFA-093/fixed.rs) uses:
+
+```rust
+use std::sync::{Arc, Mutex};
+
+let value = Arc::new(Mutex::new(1));
+let worker_value = Arc::clone(&value);
+let worker = std::thread::spawn(move || {
+    *worker_value.lock().unwrap() += 1;
+});
+```
+
+The mutex serializes access and yields a guard representing the temporary exclusive borrow. Arc keeps the mutex allocation alive for every owner.
+
+This is not a mechanical RefCell-to-Mutex substitution. Locking can block, poison, deadlock, or become a bottleneck. The repaired fixture is small enough that these policies are visible, but a production design needs them documented.
+
+## Ownership transfer can be simpler
+
+If only the worker needs the value, Arc is unnecessary. Move the value into the thread and receive a result through `JoinHandle` or a channel. Unique ownership removes synchronization from the data path.
+
+If one dedicated thread or async task owns complex mutable state, other components can send commands. This replaces shared memory coordination with message ordering and lifecycle management. It is often easier to reason about for state machines.
+
+## Local async tasks are a different domain
+
+Single-thread executors can run non-Send futures and use `Rc<RefCell<T>>` safely when every access remains on that thread. The type is not globally wrong. It is wrong at the boundary that permits execution on another thread.
+
+I keep local types behind a local-task module so they do not accidentally flow into a multi-thread spawn API later.
+
+## Unsafe Sync is almost never the repair
+
+Writing `unsafe impl Sync` for a wrapper around RefCell tells the compiler a synchronization guarantee exists. Unless the wrapper truly implements exclusive access with correct memory ordering, the promise is false. A comment cannot synchronize a borrow flag.
+
+Use existing synchronization primitives unless building one is the purpose of the code and it is tested with tools appropriate for concurrency.
+
+## My diagnosis checklist
+
+When an Arc-based type fails Send or Sync, I ask:
+
+1. Which inner field first lacks the marker?
+2. Is cross-thread sharing actually required?
+3. Can ownership move to one worker?
+4. Does mutation need a mutex, RwLock, atomics, or messages?
+5. What are the lock duration and shutdown rules?
+
+The useful lesson is that thread safety composes; it is not painted on by the outermost type. Arc safely shares ownership of a T that is itself safe to share. The inner synchronization model remains the program's responsibility.

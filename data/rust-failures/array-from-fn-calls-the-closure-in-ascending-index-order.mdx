@@ -1,0 +1,92 @@
+---
+caseId: "RFA-395"
+title: "array::from_fn Calls Its Closure in Ascending Index Order"
+date: "2026-09-06T03:35:00+01:00"
+lastmod: "2026-09-06T03:35:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "af89a3d6d1b7bdd9a2b91c1d10661ef1cffcf7bec9aab94c4cb203430c23f47a"
+area: "upgrades-compatibility"
+symptom: "A stateful array constructor observes indices 0, 1, 2, 3, even when code assumed the closure could be called in reverse or unspecified order."
+summary: "std::array::from_fn constructs an array by calling an FnMut closure with indices in ascending order. This order is part of the documented contract, so later elements may safely use state produced while earlier elements were built."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust array from_fn order", "array from_fn calls closure ascending", "stateful array construction Rust"]
+evidence: ["Rust 1.98.1 four-element array", "recorded closure indices", "zero one two three visit order"]
+sources: ["https://doc.rust-lang.org/std/array/fn.from_fn.html", "https://doc.rust-lang.org/std/ops/trait.FnMut.html", "https://doc.rust-lang.org/reference/expressions/array-expr.html"]
+---
+
+I used to read `array::from_fn` as only a convenient way to fill `[T; N]`. The more useful part of its contract is the order: it calls the closure for `0`, then `1`, and continues forward until `N - 1`.
+
+The [failing fixture](/rust-failure-atlas/evidence/RFA-395/fail.rs) records every supplied index. The values are correct, but the assertion expects reverse visits. Rust produces `[0, 1, 2, 3]`, because forward order is promised rather than an implementation accident.
+
+## The index is construction state
+
+[`std::array::from_fn`](https://doc.rust-lang.org/std/array/fn.from_fn.html) accepts a closure from `usize` to `T` and returns `[T; N]`. The compiler normally infers `N` from the expected array type.
+
+```rust
+let powers: [u64; 5] = std::array::from_fn(|index| 1 << index);
+assert_eq!(powers, [1, 2, 4, 8, 16]);
+```
+
+Each call receives the position currently being initialized. The documented ascending order means a stateful closure can build on earlier calls. This is different from a parallel map whose execution order may not be part of its contract.
+
+The closure implements [`FnMut`](https://doc.rust-lang.org/std/ops/trait.FnMut.html), so it may update captured state. That ability is deliberate. It is not limited to a pure formula based only on the index.
+
+## A stateful closure can express a recurrence
+
+Suppose I need an array of cumulative values:
+
+```rust
+let mut current = 1_u64;
+let sequence: [u64; 5] = std::array::from_fn(|_| {
+    let value = current;
+    current *= 2;
+    value
+});
+assert_eq!(sequence, [1, 2, 4, 8, 16]);
+```
+
+The call order makes this deterministic. Call zero sees the initial state. Call one sees the mutation performed by call zero. I can reason about it as one forward pass.
+
+I still avoid hiding complicated protocols inside the closure. If construction can fail, needs rollback, or mutates external resources, an explicit loop into a fallible collection may communicate more. `from_fn` is strongest when the state is local and every index always produces one element.
+
+## It is not the array repeat expression
+
+Rust also has `[expression; N]`, documented with other [array expressions](https://doc.rust-lang.org/reference/expressions/array-expr.html). That syntax means repetition of one value shape; it does not give the expression a changing index on every position.
+
+`from_fn` is the right tool when each element depends on its position or on state advanced per element. The two forms can produce the same result for constants, but they tell different stories to the reader.
+
+```rust
+let zeros = [0_u8; 4];
+let positions: [u8; 4] = std::array::from_fn(|i| i as u8);
+```
+
+I choose based on the invariant, not only on which line is shorter.
+
+## Output alone may not prove the order
+
+The values `index * 10` produce `[0, 10, 20, 30]` because each index selects its destination too. Looking only at that output does not show when calls happened. A hypothetical implementation could calculate independent values in another order and still place them correctly.
+
+This is why the evidence fixture stores indices in a separate `Vec`. It observes the call sequence, not only the final array. The [repaired fixture](/rust-failure-atlas/evidence/RFA-395/fixed.rs) asserts both facts independently.
+
+This testing pattern generalizes. When an API promises evaluation order, use a small trace, counter, or state machine to observe calls. Do not try to infer sequencing from a commutative final result.
+
+## Zero length means zero calls
+
+The array length is a const generic. For `[T; 0]`, there are no indices and the closure is not needed to produce an element. Code should not rely on a side effect occurring at least once merely because a closure was passed.
+
+At the other extreme, a large `N` means the closure runs once per element. Expensive work in the closure remains linear work. The fixed-size result does not make construction free, and it does not imply that the compiler precomputes effects.
+
+## Failure belongs to a different abstraction
+
+The closure returns `T`, not `Result<T, E>`. Returning a `Result` creates an array of results rather than short-circuiting construction. If I need “stop on the first error,” I usually construct through an iterator and collect into a suitable fallible target, or write a small explicit routine that makes partial progress and cleanup clear.
+
+This separation matters in systems code. Infallible initialization and transactional initialization are not the same operation. I do not bury I/O failure, parsing failure, or resource acquisition behind a closure that looks like simple element generation.
+
+## The invariant I keep in tests
+
+For stateful construction, I assert three things: the visit trace is `0..N`, the result has the intended value at every index, and the captured state has the expected final value. These checks distinguish ordering, placement, and state advancement.
+
+The core principle is that evaluation order is useful only when the API promises it. Here Rust does. `array::from_fn` is a forward constructor with an index-aware mutable closure, so I can use previous local state confidently while still keeping externally fallible work out of the operation.

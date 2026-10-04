@@ -1,0 +1,91 @@
+---
+caseId: "RFA-296"
+title: "Any::type_id on Box<dyn Any> Can Report the Box Type"
+date: "2026-09-06T01:16:00+01:00"
+lastmod: "2026-09-06T01:16:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "5094113992620770f9fbadc3b197c9d8d5577c1e428e3762acd5eb1d6105a859"
+area: "diagnostics-macros"
+symptom: "Calling type_id directly on Box<dyn Any> does not match TypeId::of::<u32>() even though the box contains a u32."
+summary: "Method dispatch can call Any for the smart-pointer container instead of the dynamic value behind it. Dereference to dyn Any before asking for type_id, or use the safe is and downcast methods for concrete inspection."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets with core and alloc"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust Box dyn Any type_id wrong type", "Any type_id smart pointer container", "get contained TypeId Box dyn Any"]
+evidence: ["Rust 1.98.1 boxed u32", "direct method dispatch mismatch", "dereferenced dyn Any match"]
+sources: ["https://doc.rust-lang.org/std/any/trait.Any.html#method.type_id", "https://doc.rust-lang.org/std/any/struct.TypeId.html", "https://doc.rust-lang.org/std/any/trait.Any.html#method.downcast_ref"]
+---
+
+I put a `u32` inside `Box<dyn Any>` and asked the box for its `type_id`. It did not equal `TypeId::of::<u32>()`. The data was correct; my method call was directed at the container layer.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-296/fail.rs) shows the one-character-level difference that matters: `value.type_id()` versus `(&*value).type_id()`.
+
+## The box is also a concrete Any value
+
+[`Any`](https://doc.rust-lang.org/std/any/trait.Any.html) is implemented for `'static` types. `Box<dyn Any>` is itself a concrete, owned type meeting that condition.
+
+When method resolution sees `value.type_id()`, it can call `Any::type_id` for the `Box<dyn Any>` container. That returns the identity of the box type, not of the erased object behind the `dyn Any` pointer.
+
+Dereferencing the smart pointer and borrowing the trait object selects the dynamic layer:
+
+```rust
+let inner: &dyn Any = &*value;
+let id = inner.type_id();
+```
+
+Now dynamic dispatch reports the concrete contained type.
+
+## Smart pointers introduce an observation layer
+
+The same general question appears with `Box`, `Rc`, `Arc`, and references: am I calling a trait method on the wrapper or on its target?
+
+Autoderef often makes ordinary methods feel transparent, but overlapping trait implementations can make the selected receiver important. Writing the receiver type explicitly is a strong debugging move. I assign `&dyn Any` to a local variable when reviewing type-erased code instead of relying on a visually compact call.
+
+This is not a failure of runtime type information. It is normal static method resolution followed by dynamic dispatch at the layer I selected.
+
+## Prefer `is` and `downcast_ref` for most decisions
+
+Code rarely needs to compare raw [`TypeId`](https://doc.rust-lang.org/std/any/struct.TypeId.html) values. The trait object offers `is::<T>()` and [`downcast_ref::<T>()`](https://doc.rust-lang.org/std/any/trait.Any.html#method.downcast_ref), which state the intended concrete type directly.
+
+```rust
+if let Some(number) = value.downcast_ref::<u32>() {
+    // use number
+}
+```
+
+On `Box<dyn Any>`, the downcast helpers are provided for the dynamic object and avoid manually interpreting IDs. Owned `downcast::<T>()` can recover a `Box<T>` when ownership should move out.
+
+I use raw IDs for registries or dispatch tables only when that structure is genuinely simpler than typed downcast branches.
+
+## TypeId is opaque across releases
+
+`TypeId` supports equality, hashing, and ordering, but its hash and ordering can change between Rust releases. I do not persist a debug rendering or numeric representation as a stable schema, send it across services, or use its order to define product behavior.
+
+For durable plugin names or wire protocols, I define my own stable identifier. Runtime `TypeId` remains an in-process key tied to concrete Rust types in the current program.
+
+This boundary matters in dynamic registries. A stored `TypeId` can select a local handler, while a stable string or versioned enum identifies data outside the process.
+
+## Any requires static data
+
+`Any` only describes `'static` concrete types. A type containing a non-static reference does not implement it in the general way needed for arbitrary downcasting.
+
+Type erasure does not erase lifetime obligations. If a registry must store borrowed values, it needs another abstraction with explicit lifetimes rather than forcing everything through `Any`.
+
+I also do not use unchecked downcasts based only on an ID seen elsewhere. The safe methods already verify the contained type. Unchecked downcasting makes a wrong layer or stale registry entry into undefined behavior.
+
+## Naming the layers improves diagnostics
+
+When a downcast fails, I log the expected stable domain kind and where the value entered the registry. A raw TypeId is not human-friendly evidence.
+
+During debugging I inspect three types separately: the variable's static wrapper type, the trait-object interface, and the dynamic concrete type. Mixing these into the phrase “the type” is how this bug stays confusing.
+
+The box owns and allocates. The trait object defines available runtime operations. The concrete value supplies the dynamic ID and data.
+
+## What I test
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-296/fixed.rs) dereferences to the trait object, compares the contained ID with `u32`, and confirms the safe downcast returns `7`.
+
+My test table covers a direct `&dyn Any`, boxed values, different concrete numeric types, `String`, a failed downcast, and an owned downcast. For registry code I also reject duplicate registrations and test the stable external identifier separately from TypeId.
+
+The core principle is that type erasure still has layers. Calling a method on a smart pointer can observe the pointer's concrete type; calling through `&dyn Any` observes the erased value's concrete type. I make the receiver explicit before trusting runtime type checks.

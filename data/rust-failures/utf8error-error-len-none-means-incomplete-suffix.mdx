@@ -1,0 +1,82 @@
+---
+caseId: "RFA-337"
+title: "Utf8Error::error_len None Can Mean an Incomplete Suffix"
+date: "2026-09-06T01:57:00+01:00"
+lastmod: "2026-09-06T01:57:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "7d156005960caa94596d95018f162fa67106e5673495ebb70797249236e48761"
+area: "ffi-targets"
+symptom: "Incremental UTF-8 decoding reports an error position but no error length when a chunk ends partway through a valid multi-byte character."
+summary: "Utf8Error separates a known invalid sequence from an unexpectedly ended candidate sequence. error_len is None for the latter, allowing a streaming decoder to retain the short suffix for the next chunk."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust Utf8Error error_len None", "incomplete UTF-8 chunk valid_up_to", "stream UTF-8 sequence across chunks Rust"]
+evidence: ["Rust 1.98.1 truncated euro-sign bytes", "valid two-byte ASCII prefix", "suffix completed by next byte"]
+sources: ["https://doc.rust-lang.org/std/str/struct.Utf8Error.html#method.error_len", "https://doc.rust-lang.org/std/str/struct.Utf8Error.html#method.valid_up_to", "https://doc.rust-lang.org/std/str/fn.from_utf8.html"]
+---
+
+I wrote an incremental decoder that treated every UTF-8 error as corrupt input and skipped `error_len()` bytes. Then I met the `None` branch: the current chunk had ended before Rust could decide whether the sequence was invalid.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-337/fail.rs) contains `ok` followed by the first two bytes of the three-byte euro sign. `valid_up_to()` is two, while `error_len()` is `None`.
+
+## None describes missing evidence, not a zero-length error
+
+[`Utf8Error::error_len`](https://doc.rust-lang.org/std/str/struct.Utf8Error.html#method.error_len) returns `Some(len)` when an unexpected byte establishes an invalid sequence. It returns `None` when input ends unexpectedly one to three bytes after the valid prefix.
+
+In a complete file, that suffix is malformed because no more bytes will arrive. In a stream chunk, it may be the beginning of a perfectly valid scalar value split at an arbitrary I/O boundary.
+
+The same bytes need different handling depending on whether the decoder has reached end of stream.
+
+## valid_up_to identifies the trusted prefix
+
+[`valid_up_to`](https://doc.rust-lang.org/std/str/struct.Utf8Error.html#method.valid_up_to) returns the maximum prefix length that [`from_utf8`](https://doc.rust-lang.org/std/str/fn.from_utf8.html) accepts. In the fixture, bytes zero and one form `ok`.
+
+A streaming decoder can emit or process that prefix, retain the remaining two bytes, append the next chunk, and validate again. The [repaired program](/rust-failure-atlas/evidence/RFA-337/fixed.rs) appends the missing byte and obtains `ok€`.
+
+I keep the incomplete suffix small and bounded because UTF-8 scalar encodings have a fixed maximum width.
+
+## Some length permits lossy forward progress
+
+When `error_len()` is `Some(n)`, the documentation identifies the invalid sequence starting at `valid_up_to()`. A lossy decoder can emit a replacement marker and continue after those `n` bytes.
+
+That is a policy, not the only response. A strict protocol may reject the entire message. A diagnostic tool may preserve escaped bytes. A security boundary may need to stop before different components normalize invalid sequences differently.
+
+I avoid advancing by one byte without understanding the reported length because this can generate multiple replacement markers for one invalid sequence.
+
+## End of stream turns incomplete into invalid
+
+At final EOF, no next chunk can complete a `None` suffix. The decoder must resolve it according to policy: error, replacement, or byte-preserving escape.
+
+This requires an explicit `finish` step. A decoder that only has `push_chunk` cannot distinguish temporary incompleteness from final truncation.
+
+The same pattern appears in parsers for variable-length integers, compressed frames, and network messages. Chunk end is not message end.
+
+## Do not decode each network chunk independently
+
+TCP and generic `Read` calls do not preserve application message or character boundaries. A valid UTF-8 string can be split after any byte.
+
+Calling `from_utf8` on each chunk and rejecting any error therefore rejects valid streams under normal segmentation. Buffering only “large enough chunks” does not solve it because a boundary can still fall inside a scalar.
+
+I carry incomplete state across reads or use a streaming decoder with the same contract.
+
+## Offsets need a global coordinate
+
+`valid_up_to()` is relative to the slice passed to `from_utf8`. For a long stream, I maintain the absolute byte offset of that slice and account for any retained prefix.
+
+Diagnostics can then report both the global byte position and a safe escaped context. Converting the valid prefix to chars changes the coordinate system, so I do not mix character counts into byte-offset errors.
+
+If the stream protocol has frame boundaries, I report frame and byte offset separately.
+
+## Tests must enumerate every split boundary
+
+For known valid Unicode text, I feed the bytes with every possible chunk boundary, including one-byte chunks. The final decoded text must equal the original.
+
+I also test a truly invalid continuation byte, overlong or forbidden forms as rejected by Rust, an incomplete final suffix at EOF, several invalid sequences, and valid ASCII after an invalid region under lossy policy.
+
+RFA-337 uses a fixed incomplete sequence to prove the `None` state without timing or I/O dependencies.
+
+## The core principle
+
+A parser error can mean “invalid with current evidence” or “not enough evidence yet.” `Utf8Error` preserves that distinction through `Some(len)` and `None`. I carry incomplete suffixes across transport chunks and make EOF explicit, rather than treating an arbitrary read boundary as proof of corrupt text.

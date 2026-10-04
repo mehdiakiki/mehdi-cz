@@ -1,0 +1,228 @@
+---
+title: "A Retrieval Index Needs an Invalidation Strategy"
+date: "2026-11-10T09:00:00+01:00"
+tags: ["RAG", "search index", "cache invalidation", "embeddings", "data pipeline"]
+draft: false
+reviewed: true
+reviewedHash: "2a213bceffa26ec1aba0505e3e0a1aa1bf520cef615eb4d00fccccb61cc4e958"
+cluster: "reliable-ai-systems"
+campaign: "authority-2026"
+opportunity: "AI-029"
+summary: "A RAG index is a derived projection with document versions, chunker and embedding identities, tombstones, ACL changes, atomic generations, and a measurable freshness SLO."
+---
+
+A retrieval index becomes wrong when a document changes and old chunks remain searchable. It becomes dangerous when a user's access is removed but the old vectors still return restricted text.
+
+Indexing is not a one-time embedding job. It is a derived-data pipeline with invalidation and repair.
+
+## Name every input to a chunk
+
+One indexed record depends on more than document text:
+
+```text
+source document version
+parser version
+chunking policy version
+inherited metadata
+access-control policy
+embedding model and dimensions
+normalization and language settings
+```
+
+I store an index identity:
+
+```ts
+type IndexedChunk = {
+  chunkId: string;
+  documentId: string;
+  documentVersion: string;
+  sourceHash: string;
+  parserVersion: string;
+  chunkerVersion: string;
+  embeddingModel: string;
+  embeddingDimensions: number;
+  aclVersion: string;
+  indexGeneration: string;
+  sourceStart: number;
+  sourceEnd: number;
+};
+```
+
+If any meaning-bearing input changes, I can identify which derived records are stale.
+
+## Stable chunk IDs and content IDs serve different goals
+
+A location-based chunk ID such as `document + section + ordinal` is stable enough for updates but can shift when an earlier section is inserted.
+
+A content hash deduplicates identical text but gives the same identity to text that appears under different headings or permissions.
+
+I often separate:
+
+```text
+logical chunk ID: position in one document version
+content hash:      exact normalized content for reuse detection
+embedding key:     content hash + model/config identity
+```
+
+Metadata and ACL remain attached to the logical occurrence even when embedding computation is reused.
+
+## Update is add-new plus remove-old
+
+Replacing all chunks in place can leave a mixed document if the process crashes halfway:
+
+```text
+new chunks 1-4 written
+old chunks 5-9 still visible
+indexing process dies
+```
+
+I build document version 12 separately, verify its manifest, then atomically switch the active version or query filter:
+
+```text
+document 17 active_version = 12
+```
+
+Old version 11 is removed asynchronously after no query can select it.
+
+For whole-corpus changes such as a new embedding model, I use index generations:
+
+```text
+generation G41 serves queries
+generation G42 builds and validates
+alias switches from G41 to G42
+G41 retained briefly for rollback, then deleted
+```
+
+## Deletion needs a tombstone path
+
+If a source document is deleted, a failed delete event must not leave its chunks searchable forever.
+
+The pipeline carries a source version or tombstone:
+
+```json
+{
+  "document_id": "doc_17",
+  "version": "13",
+  "deleted": true,
+  "occurred_at": "2026-11-10T08:12:00Z"
+}
+```
+
+The indexer removes or excludes every older active chunk for that document and records completion. Reconciliation compares source-active documents with index manifests to catch lost tombstones.
+
+Hard deletion from the source without an event or sweep makes stale retrieval likely.
+
+## ACL changes are urgent invalidations
+
+Text can remain identical while permission changes. Re-embedding is unnecessary, but query visibility must change before the next unauthorized result.
+
+I separate embedding data from authorization metadata when the store permits it, update the ACL version through a high-priority path, and fail closed when permission state is unknown.
+
+```text
+content freshness target: minutes
+access revocation target: seconds or immediate authoritative filter
+```
+
+An eventually updated metadata filter may be too slow for revocation. Some systems query an authoritative ACL service or permitted document set before vector search.
+
+## Caches have the same dependency graph
+
+A query cache can keep results from an old generation or ACL version even after the index is correct.
+
+The cache key includes:
+
+```text
+tenant and actor permission context
+query and filters
+active index generation
+retrieval configuration
+reranker version
+```
+
+For rapidly changing permissions, I avoid caching unrestricted candidate text under a broad tenant key.
+
+Answer caches also need source-version evidence so they are invalidated when cited documents change.
+
+## Embedding-model changes require a generation
+
+Vectors from different models or dimensional configurations are not automatically comparable. Mixing them in one search field can produce invalid scores or rejected writes.
+
+I record exact model identity and build a new generation. Before cutover I compare:
+
+- labelled retrieval recall;
+- permission filtering;
+- language and identifier query slices;
+- index size and build throughput;
+- query latency;
+- old/new result disagreement;
+- rollback readiness.
+
+“The new model is larger” is not relevance evidence.
+
+## Retries need idempotent index writes
+
+The indexing job can fail after writing vectors but before advancing its checkpoint. On retry, it upserts the same logical chunk IDs for the same document version.
+
+The document manifest is committed only when every expected chunk is present:
+
+```ts
+type DocumentManifest = {
+  documentId: string;
+  version: string;
+  expectedChunkIds: string[];
+  indexedChunkCount: number;
+  status: "building" | "active" | "failed" | "deleted";
+};
+```
+
+Counting alone is not enough; two duplicate chunks and one missing chunk can still match the expected count.
+
+## Define freshness from source to searchable
+
+I measure:
+
+```text
+source_committed_at
+change_observed_at
+index_build_started_at
+index_write_completed_at
+version_activated_at
+first_verified_query_at
+```
+
+The freshness SLO is based on activation or verified query, not merely when a queue acknowledged the job.
+
+I report age of the oldest pending source change, deleted documents still active, ACL updates beyond deadline, failed manifests, and generation drift between query nodes.
+
+## Reconciliation closes missed-event gaps
+
+Even a good change stream can lose a bug, configuration mistake, or historical inconsistency. I run a periodic comparison:
+
+```text
+source document ID + active version + source hash + ACL version
+versus
+index document manifest + active generation
+```
+
+The repair queue has stable identity and does not create another duplicate build storm.
+
+I sample retrieved chunks and verify the source range and current permission still exist. This checks semantic corruption that counts cannot see.
+
+## Test the lifecycle
+
+My test sequence is:
+
+```text
+create document V1
+update to V2 while V1 query is active
+crash halfway through V2 indexing
+resume and atomically activate V2
+revoke access without changing text
+delete document and lose one delete attempt
+reconcile the missing tombstone
+build a new embedding generation and roll back once
+```
+
+At every point, queries may return one complete authorized version or no result. They must not return a mixed version or revoked text.
+
+A retrieval index is a projection of source content, configuration, and permission state. Once I version those inputs, activate complete generations, carry tombstones, invalidate caches, and measure source-to-search freshness, RAG data stops pretending to be static.

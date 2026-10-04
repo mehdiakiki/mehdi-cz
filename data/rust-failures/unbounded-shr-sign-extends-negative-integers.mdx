@@ -1,0 +1,81 @@
+---
+caseId: "RFA-377"
+title: "unbounded_shr Sign-Extends Negative Rust Integers"
+date: "2026-09-06T03:17:00+01:00"
+lastmod: "2026-09-06T03:17:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "82ae99272cdc95a7ddf52389d7327c18fedb53838d4c9eb5a4cc4a000404daea"
+area: "upgrades-compatibility"
+symptom: "Calling unbounded_shr on a negative i32 with count 32 returns minus one rather than zero."
+summary: "unbounded_shr keeps signed right-shift semantics: counts at or above the width remove every original bit, yielding zero for positive i32 and minus one for negative i32. Cast to unsigned for a logical shift."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust unbounded_shr negative returns -1", "signed right shift 32 Rust", "arithmetic vs logical unbounded shift Rust"]
+evidence: ["Rust 1.98.1 signed integer operations", "negative i32 shifted by 32", "checked and unsigned policy contrast"]
+sources: ["https://doc.rust-lang.org/std/primitive.i32.html#method.unbounded_shr", "https://doc.rust-lang.org/std/primitive.i32.html#method.checked_shr", "https://doc.rust-lang.org/std/primitive.i32.html#method.wrapping_shr"]
+---
+
+I expected an excessive right shift to remove every bit and therefore produce zero. That model works for a positive integer. It is incomplete for a signed negative integer: `(-13_i32).unbounded_shr(32)` returns `-1`.
+
+The [failing fixture](/rust-failure-atlas/evidence/RFA-377/fail.rs) asserts zero and records the actual minus-one result on Rust 1.98.1.
+
+## Signed right shift fills with the sign bit
+
+An arithmetic right shift preserves the sign of a signed value by filling new high positions with copies of the sign bit. For a negative two's-complement value, that bit is one.
+
+For small counts, this resembles division toward negative infinity by powers of two. As the count grows, the original low bits disappear while leading ones continue entering. Once every original bit has been shifted out, the result is all one bits. Interpreted as `i32`, that pattern is `-1`.
+
+The [`unbounded_shr` documentation](https://doc.rust-lang.org/std/primitive.i32.html#method.unbounded_shr) states the boundary directly: a count at least the bit width produces zero for a positive number and minus one for a negative number.
+
+## Unbounded describes the count policy
+
+The name does not mean arbitrary-precision arithmetic. The output is still one fixed-width `i32`. “Unbounded” means the shift count is not reduced modulo the width and is accepted even when it reaches or exceeds that width.
+
+This contrasts with [`wrapping_shr`](https://doc.rust-lang.org/std/primitive.i32.html#method.wrapping_shr), which masks the count. For `i32`, a count of 32 behaves like a count of zero, so `(-13).wrapping_shr(32)` returns `-13`.
+
+[`checked_shr`](https://doc.rust-lang.org/std/primitive.i32.html#method.checked_shr) represents an excessive count as `None`. These functions answer different questions; none is a universally safer spelling.
+
+## Use unsigned values for logical bit fields
+
+If I am parsing flags, hashes, packed headers, or machine words, I usually want a logical right shift that fills with zeros. I represent the word as `u32` before shifting.
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-377/fixed.rs) compares both policies. The signed negative value yields `-1`, while the same bit pattern cast to `u32` yields zero after an unbounded shift of 32.
+
+The cast changes interpretation, not the stored bits. This makes intent explicit: the operation is on a bit field, not a signed quantity.
+
+I avoid casting the shifted result after the signed operation. By then sign extension has already filled the value with ones. The signedness decision belongs before the shift.
+
+## Counts from input need a policy
+
+Shift counts often come from file headers, protocol fields, user configuration, or calculated offsets. I decide what out-of-range means before choosing an API:
+
+- `checked_shr` when the count is invalid input;
+- `strict_shr` when it indicates a programming bug that must panic;
+- `wrapping_shr` when hardware-style masked counts are the specified behavior;
+- `unbounded_shr` when shifting the complete finite value away is meaningful.
+
+Using `% i32::BITS` manually chooses wrapping semantics. Clamping to the width chooses an unbounded-like boundary for unsigned values, but negative signed values still need sign behavior considered.
+
+## The value minus one is not an error sentinel here
+
+In many APIs, `-1` signals failure. Here it is the exact arithmetic-shift result. Treating it as an error can confuse a valid transformation with input rejection.
+
+I keep validation separate from computation. If counts above 31 are forbidden, I reject them before shifting or use `checked_shr`. If they are accepted, tests include both positive and negative operands at 31, 32, and a much larger count.
+
+This also matters in generic code. An integer trait abstraction that exposes “right shift” without describing signedness and count policy is incomplete. I name operations after the behavior the domain needs.
+
+## Do not infer the right-shift contract from one CPU
+
+Machine instructions may mask counts or have target-specific details. Rust method documentation is the program contract. The compiler can lower a documented operation however it chooses as long as the observable result matches.
+
+Relying on one assembly instruction becomes especially fragile across integer widths and targets. A test against the Rust API expresses the actual dependency.
+
+For performance-sensitive parsing, I still inspect generated code after correctness is fixed. The semantic choice comes first; otherwise a fast instruction may implement the wrong shift policy.
+
+## Boundary tables catch the misunderstanding
+
+I use a small table containing `0`, `1`, `BITS - 1`, `BITS`, and `BITS + 1` for counts, crossed with zero, positive, and negative values. This exposes masking, rejection, sign extension, and total shift-out behavior quickly.
+
+The core principle is that “all original bits left” does not imply “the result is zero” for an arithmetic right shift. The operation also defines which bits enter. `unbounded_shr` removes the original bits at a large count while preserving signed fill semantics, leaving zero or minus one according to the sign.

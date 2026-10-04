@@ -1,0 +1,263 @@
+---
+title: "Rust 2024 Temporary Scopes: When Values Are Dropped"
+date: "2026-09-09T09:00:00+01:00"
+tags: ["rust", "rust 2024", "lifetimes", "drop", "concurrency"]
+draft: false
+reviewed: true
+reviewedHash: "675567d6f2b4c0d69190ce12f048636bd7b3f0f1a2fdabad4fb886ab765eb655"
+cluster: "rust-under-the-hood"
+campaign: "authority-2026"
+opportunity: "RUST-061"
+summary: "Follow Rust drop scopes through if let, match, and tail expressions, including the Edition 2024 changes affecting locks and temporary borrows."
+---
+
+In Rust, a borrow can be accepted by the compiler and still live longer than expected. A lock guard can stay alive into an `else` branch. A `RefCell` borrow in the last expression of a function can outlive a local it refers to.
+
+These are not mainly lifetime-annotation problems. They are **temporary scope** and **drop order** problems.
+
+Rust 2024 made two important scope rules narrower. To understand the change, I separate three ideas that are often mixed together:
+
+- lexical scope of a named variable;
+- borrow-checker lifetime of a reference;
+- drop scope of a temporary value.
+
+They influence each other, but they are not the same clock.
+
+## A temporary can own a resource
+
+This expression creates an unnamed `RwLockReadGuard`:
+
+```rust
+let value = *state.read().unwrap();
+```
+
+`state.read().unwrap()` is a temporary value. The guard owns the read lock until its destructor runs. Dereferencing it copies the inner value, but that does not immediately force the guard to be dropped.
+
+The language's temporary-scope rules decide the drop point.
+
+This matters because RAII turns destruction into behavior:
+
+- a mutex guard unlocks;
+- a `RefCell` guard ends a dynamic borrow;
+- a transaction guard may roll back;
+- a tracing guard may close a span;
+- any user-defined `Drop` implementation may run code.
+
+"Unused now" and "already dropped" are different statements.
+
+## The `if let` lock trap before Rust 2024
+
+Consider this function:
+
+```rust
+use std::sync::RwLock;
+
+fn initialise_if_empty(state: &RwLock<Option<u64>>) {
+    if let Some(value) = *state.read().unwrap() {
+        println!("already set to {value}");
+    } else {
+        let mut value = state.write().unwrap();
+        *value = Some(1);
+    }
+}
+```
+
+In Rust 2021, the temporary read guard created in the `if let` scrutinee can live through the whole `if let ... else` expression. The `else` branch then tries to obtain a write lock while the same thread still holds a read lock. Depending on the lock implementation and environment, this can deadlock.
+
+Rust 2024 narrows this temporary scope. When the pattern does not match, the scrutinee's temporaries are dropped before entering `else`. The read lock is released before the write acquisition.
+
+The source text did not change. The edition changed the destruction point.
+
+## Why replacing it with `match` can restore the old behavior
+
+It is tempting to say that `if let` is only syntax sugar for `match`. For temporary scopes, this is not a safe mental shortcut.
+
+```rust
+match *state.read().unwrap() {
+    Some(value) => println!("already set to {value}"),
+    None => {
+        let mut value = state.write().unwrap();
+        *value = Some(1);
+    }
+}
+```
+
+The scrutinee of a `match` is not a temporary scope boundary. Its temporary guard can live until after the entire match expression. This version can therefore keep the read lock while entering the `None` arm, including in Rust 2024.
+
+This difference is important during edition migration. The compiler may suggest a `match` rewrite when code intentionally depends on the longer pre-2024 behavior. For the lock example, preserving that behavior is exactly what I do not want.
+
+Review the semantic reason. Do not accept a mechanical rewrite only because it compiles.
+
+## The clearest version names the value
+
+If destruction order affects correctness, I prefer to make it visible:
+
+```rust
+use std::sync::RwLock;
+
+fn initialise_if_empty(state: &RwLock<Option<u64>>) {
+    let current = {
+        let guard = state.read().unwrap();
+        *guard
+    }; // the read guard is dropped here
+
+    if let Some(value) = current {
+        println!("already set to {value}");
+    } else {
+        let mut value = state.write().unwrap();
+        *value = Some(1);
+    }
+}
+```
+
+This version communicates the lock boundary in every edition. It also gives code review a visible line where the guard ends.
+
+When the value cannot be copied, I transform it into owned data while the guard is held, or redesign the operation. The key is not to return a reference that secretly needs the guard.
+
+## Tail expressions had the opposite-looking problem
+
+Rust 2024 also changed temporaries created by the final expression of a block. Look at this function:
+
+```rust
+use std::cell::RefCell;
+
+fn text_length() -> usize {
+    let text = RefCell::new(String::from("hello"));
+    text.borrow().len()
+}
+```
+
+In Rust 2021, this can fail with `E0597`. The temporary `Ref<String>` produced by `borrow()` belongs to the function body's tail expression. Under the older rule, that temporary may be dropped after the named local `text`. But the guard's destructor still refers to the `RefCell`, so rustc rejects the order.
+
+Rust 2024 drops the tail-expression temporary before the block's local variables. The guard dies first, then `text`, and the function compiles.
+
+One portable way to express the intended order is to introduce a result local:
+
+```rust
+fn text_length_explicit() -> usize {
+    let text = RefCell::new(String::from("hello"));
+    let length = text.borrow().len();
+    length
+}
+```
+
+The borrow temporary belongs to the `let length = ...;` statement and is gone before the function returns `length`.
+
+This small local is not noise. It documents an ownership boundary.
+
+## Narrower scopes can also reject old code
+
+Earlier drop is not always more permissive. This compiles under Rust 2021 but is rejected under Rust 2024:
+
+```rust
+fn main() {
+    let length = { &String::from("1234") }.len();
+    println!("{length}");
+}
+```
+
+In Rust 2021, the temporary `String` can be extended beyond the inner block so the reference remains valid for `.len()`.
+
+In Rust 2024, the tail temporary of the inner block is dropped at that block's end. The reference would dangle before `.len()` is called, so the compiler rejects it.
+
+Lift the owner into a named binding:
+
+```rust
+fn main() {
+    let string = String::from("1234");
+    let length = string.len();
+    println!("{length}");
+}
+```
+
+This is more obvious anyway. The owner and its use are visible.
+
+## Temporary lifetime extension is a specific rule
+
+Rust sometimes extends a temporary when it is directly borrowed in a `let` binding:
+
+```rust
+let text: &String = &String::from("hello");
+println!("{text}");
+```
+
+The temporary `String` lives to the end of the enclosing block, so the reference is usable.
+
+It is dangerous to generalise this into "Rust keeps temporaries alive when needed." Temporary lifetime extension follows specific syntactic forms. A small refactor, function call, or inner block can change whether it applies.
+
+For correctness-sensitive resources, use an owner binding rather than making readers remember the extension grammar.
+
+## A semicolon can move a drop point
+
+An expression statement usually creates a temporary scope ending at its semicolon:
+
+```rust
+fn log_length(cell: &RefCell<String>) {
+    cell.borrow().len();
+    // the temporary Ref has been dropped before this line
+
+    let mut text = cell.borrow_mut();
+    text.push('!');
+}
+```
+
+Remove the semicolon and make the expression the block's tail, and edition-specific tail rules may become relevant.
+
+This is one reason tiny changes near the last expression can produce surprising borrow-checker diagnostics. The value computed may be the same, but its temporary belongs to a different drop scope.
+
+## How to inspect an edition difference
+
+Put the smallest example in two tiny crates or compile it twice:
+
+```toml
+[package]
+name = "drop-scope-check"
+version = "0.1.0"
+edition = "2021" # then try "2024"
+```
+
+Use the migration lints before changing edition:
+
+```rust
+#![warn(if_let_rescope)]
+#![warn(tail_expr_drop_order)]
+```
+
+Or run the normal edition migration tooling:
+
+```bash
+cargo fix --edition
+```
+
+The lints find code where destruction behavior may change, especially temporaries with meaningful destructors. They cannot decide whether earlier or later destruction matches your application invariant. That review remains ours.
+
+## Rules I use in concurrent code
+
+For ordinary values, implicit temporary scopes are comfortable. For guards and transactions, I prefer a stricter style:
+
+1. Give the guard a name.
+2. Keep the protected work in a small block.
+3. Convert borrowed results to owned values before leaving the block when needed.
+4. Use `drop(guard)` only when an explicit early release is clearer than a scope.
+5. Never hold a synchronous lock guard across `.await` unless the lock type and design explicitly allow it.
+6. Review `if let` and tail expressions during a Rust 2024 migration.
+
+The compiler guarantees memory safety, but it does not guarantee that a lock is released at the moment a human reader guesses.
+
+## The durable mental model
+
+A temporary is a real value, and real values have destructors. Find the temporary's drop scope. Then ask what its destructor means.
+
+Rust 2024 made two common cases easier by dropping some temporaries earlier:
+
+- `if let` scrutinee temporaries before entering `else`;
+- block tail-expression temporaries before the block's local variables.
+
+The best code still makes important resource boundaries explicit. Edition rules should support the design, not be the only place where the design is written.
+
+## Further reading
+
+- [Destructors and temporary scopes in the Rust Reference](https://doc.rust-lang.org/reference/destructors.html#temporary-scopes)
+- [Rust 2024 `if let` temporary scope](https://doc.rust-lang.org/edition-guide/rust-2024/temporary-if-let-scope.html)
+- [Rust 2024 tail-expression temporary scope](https://doc.rust-lang.org/edition-guide/rust-2024/temporary-tail-expr-scope.html)
+- [Rust 2024 migration guide](https://doc.rust-lang.org/edition-guide/rust-2024/index.html)

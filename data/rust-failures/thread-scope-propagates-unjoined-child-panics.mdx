@@ -1,0 +1,84 @@
+---
+caseId: "RFA-358"
+title: "thread::scope Propagates Unjoined Child Panics"
+date: "2026-09-06T02:18:00+01:00"
+lastmod: "2026-09-06T02:18:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "9d542f78d56c6e866689ad628da881d02414fc8e7d4ae56298f1a457215f3637"
+area: "concurrency-memory"
+symptom: "thread::scope panics after its closure finishes because a scoped child panicked and its handle was not manually joined."
+summary: "A thread scope automatically joins outstanding children before returning. Panics from automatically joined children propagate through scope; manually joining a handle lets the scope body inspect that failure and choose policy."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust thread scope child panic propagates", "scoped thread automatically joined panic", "handle panic inside thread scope"]
+evidence: ["Rust 1.98.1 scoped child thread", "unjoined panic propagated by scope", "manual join observes failure"]
+sources: ["https://doc.rust-lang.org/std/thread/fn.scope.html", "https://doc.rust-lang.org/std/thread/struct.ScopedJoinHandle.html#method.join", "https://doc.rust-lang.org/std/thread/fn.spawn.html"]
+---
+
+I once used `thread::scope` and intentionally ignored a worker handle because the scope would join it for me. That part was correct. What I forgot was that an unjoined worker panic is then propagated by the scope itself.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-358/fail.rs) catches the outer unwind only to prove it happened. A child panics, the scope closure reaches its end, automatic joining observes the failure, and `scope` panics.
+
+## A scope is a lifetime and completion boundary
+
+[`thread::scope`](https://doc.rust-lang.org/std/thread/fn.scope.html) permits child threads to borrow data that does not live for `'static`. This is safe because every scoped thread finishes before the scope returns.
+
+Handles that were not manually joined are automatically joined at the end. The scope therefore cannot quietly let a borrowed worker outlive its borrowed inputs.
+
+Automatic joining is not detachment. It is structured concurrency for threads: completion remains owned by the lexical scope.
+
+## Failure is part of that ownership
+
+The documentation states that if an automatically joined thread panicked, `scope` will panic. A child failure cannot disappear only because its handle variable was ignored.
+
+This default is useful. A parallel computation that lost one partition should not normally claim complete success. Propagation keeps failure connected to the parent operation.
+
+It can surprise code that expected fire-and-forget behavior. A borrowed scoped thread cannot truly be fire-and-forget because the borrow requires bounded lifetime.
+
+## Join manually to choose a policy
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-358/fixed.rs) saves the [`ScopedJoinHandle`](https://doc.rust-lang.org/std/thread/struct.ScopedJoinHandle.html#method.join) and calls `join` inside the scope. It observes `Err` and returns a boolean from the scope body. Because the failed child was manually joined, the scope does not propagate that same panic again.
+
+Production code can turn the panic payload into a controlled component error, cancel sibling work, or deliberately resume unwinding. I avoid depending on a particular panic payload type from arbitrary code.
+
+If a panic indicates a violated invariant, converting it into routine success is usually the wrong policy.
+
+## Joining one worker does not join all workers
+
+A scope may contain several children. Manually handling one handle leaves the others for automatic joining. If any unhandled child panics, the scope can still panic.
+
+I collect handles when I need a complete result table and join each one. Ordering those joins can affect when failures are observed, but all scoped threads still finish before return.
+
+For fail-fast coordination, threads need an explicit cancellation signal; a panic in one worker does not automatically stop CPU work already running in siblings.
+
+## Unwinding is not process termination
+
+This behavior assumes panics unwind. Builds configured to abort terminate the process instead of running `catch_unwind` recovery. Even with unwinding, foreign exceptions and aborting operations have different rules.
+
+The fixture uses `catch_unwind` as an evidence instrument, not as a recommendation to surround every scope. Panic strategy is part of deployment behavior and should be tested where recovery matters.
+
+Normal operational failures belong in `Result` values returned from workers. Panics remain for invariants and exceptional conditions.
+
+## Thread-local destructors add another detail
+
+The scope documentation notes that joining waits for each thread's main function to finish, while thread-local destructors may still be running when the scope returns. I do not use scope return as a portable signal that arbitrary thread-local cleanup side effects are complete.
+
+Resources owned directly by the worker stack follow normal thread completion and drop behavior. Hidden thread-local lifecycle deserves separate coordination if an application depends on it.
+
+This is another reason to communicate required completion through explicit values and handles.
+
+## Tests should distinguish returned errors and panics
+
+My table includes a successful child, a child returning `Err`, a manually joined panic, an automatically joined panic, several children with one failure, and borrowed input. I assert whether the scope returns or unwinds.
+
+I do not use sleeps to prove joining. A channel or atomic synchronization point gives deterministic evidence that a child reached completion before the parent observes the result.
+
+The minimal panic fixture is intentionally isolated so the test harness can treat its non-zero exit as expected evidence.
+
+## The core principle is structured failure
+
+Owning the lifetime of concurrent work also means owning its outcome. `thread::scope` prevents borrowed tasks from escaping and prevents unjoined panics from becoming invisible.
+
+I either accept propagation as the correct operation-level failure, or join manually and translate every child outcome. Ignoring the handle is a choice to let the scope apply its documented policy, not a choice to ignore the child.

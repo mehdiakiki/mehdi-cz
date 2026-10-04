@@ -1,0 +1,99 @@
+---
+caseId: "RFA-703"
+title: "slice::strip_circumfix Rejects Overlapping Markers"
+date: "2026-09-07T09:34:00+01:00"
+lastmod: "2026-09-07T09:34:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "6713e640a6dcc3ba3b01acc9a9849753fd2b1a56b1eabcadd7adfdf608d5d8cf"
+area: "concurrency-memory"
+symptom: "slice::strip_circumfix returns None even though the slice starts with the prefix and ends with the suffix."
+summary: "Rust 1.98 strip_circumfix removes both markers only when their matched regions do not overlap. Two individually valid matches may not define one remaining body."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust strip_circumfix overlap returns None", "slice prefix suffix both match but None", "strip_circumfix non overlapping markers 1.98"]
+evidence: ["Rust 1.98.1 runtime panic", "individually matching markers overlap at one element", "disjoint frame markers return the body"]
+sources: ["https://doc.rust-lang.org/std/primitive.slice.html#method.strip_circumfix", "https://doc.rust-lang.org/std/primitive.slice.html#method.strip_prefix", "https://doc.rust-lang.org/releases.html#version-1980-2026-08-20"]
+---
+
+`strip_circumfix` is a convenient Rust 1.98 method for removing a prefix and suffix together. Its useful extra rule is easy to miss: both markers must match and their matched regions must not overlap.
+
+The [failing example](/rust-failure-atlas/evidence/RFA-703/fail.rs) uses a three-byte frame:
+
+```rust
+let frame = [0xAA_u8, 0xBB, 0xCC];
+let body = frame
+    .strip_circumfix(&[0xAA, 0xBB], &[0xBB, 0xCC])
+    .unwrap();
+```
+
+The prefix matches. The suffix also matches. They both claim the middle `0xBB`, however, so there is no way to remove two disjoint markers. The method returns `None`, and `unwrap` panics.
+
+## Three conditions form one operation
+
+I model the result as requiring all of these conditions:
+
+```text
+input starts with prefix
+input ends with suffix
+prefix length + suffix length <= input length
+```
+
+For general slice patterns the implementation owns the exact matching details, but this length model explains the fixed-slice case. Checking only `starts_with` and `ends_with` omits the third condition.
+
+The API's `Option` combines the conditions because it promises one valid middle slice. It does not return partial progress such as “prefix matched but suffix overlapped.” If a parser needs those distinctions for diagnostics, I check them separately and return my own error enum.
+
+## Overlap is normally malformed framing
+
+In a framed protocol, markers describe storage outside the body. Allowing them to consume the same byte makes body length ambiguous and often indicates a truncated message.
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-703/fixed.rs) uses disjoint markers:
+
+```rust
+let frame = [0xAA_u8, 0x10, 0x20, 0xCC];
+let body = frame
+    .strip_circumfix(&[0xAA], &[0xCC])
+    .expect("non-overlapping frame markers");
+
+assert_eq!(body, &[0x10, 0x20]);
+```
+
+An empty body is valid when the complete prefix is immediately followed by the complete suffix. Their lengths then add up exactly to the input length; no byte is shared.
+
+If overlapping markers are a meaningful grammar in the domain, this method is the wrong parser. I need a grammar-specific decision about which marker owns the overlap. Hiding that policy behind a fallback slice would make malformed input difficult to distinguish from valid empty input.
+
+## Sequential stripping is not automatically equivalent
+
+It is tempting to write:
+
+```rust
+let rest = input.strip_prefix(prefix)?;
+let body = rest.strip_suffix(suffix)?;
+```
+
+For ordinary fixed markers this naturally tests the suffix after the prefix has been removed and therefore rejects the overlap. It can be a good implementation when I need a different error at each step.
+
+But checking `input.strip_prefix(prefix)` and `input.strip_suffix(suffix)` independently and then calculating indices manually is risky. Both can succeed against the original input while the resulting index subtraction underflows or describes a reversed range.
+
+I either use `strip_circumfix` for the combined contract or make the three conditions explicit.
+
+## Empty markers need a stated policy
+
+An empty prefix or suffix matches without consuming elements. The standard method supports this. That may be useful in generic code where either delimiter is optional, but it can also turn a missing configured marker into silent success.
+
+At a protocol boundary I validate marker configuration separately. If the start marker must be non-empty, I reject an empty configured value before parsing any messages. The slice method cannot know the product rule.
+
+## Byte framing and text framing differ
+
+The slice method works for element sequences. For bytes, marker lengths are byte counts. Text parsing adds UTF-8 pattern and boundary concerns and uses the corresponding `str` operations.
+
+I do not decode arbitrary binary data merely to reuse string helpers. Conversely, if the format is text, I avoid cutting raw bytes at unverified positions and later assuming the result is valid UTF-8.
+
+## Regression cases I keep
+
+My table includes a valid non-empty body, a valid empty body, missing prefix, missing suffix, both missing, markers longer than input, one-byte overlap, complete overlap, and empty configured markers.
+
+This is a small API, but the lesson is larger. “The left condition passes and the right condition passes” does not prove two consumers can claim disjoint parts of one input. Rust 1.98's `strip_circumfix` makes non-overlap part of the return contract, and `None` preserves the difference between a valid middle slice and an impossible framing.
+
+I also put a maximum frame length before this step when bytes come from an untrusted stream. Correct delimiter handling does not prevent a peer from making me buffer an unbounded body. Framing validity and resource bounds are two independent checks, and both belong before application decoding.

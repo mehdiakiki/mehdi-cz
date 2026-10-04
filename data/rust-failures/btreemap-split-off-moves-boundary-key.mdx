@@ -1,0 +1,93 @@
+---
+caseId: "RFA-201"
+title: "Which Side Gets the Key in BTreeMap::split_off?"
+date: "2026-09-05T17:40:00+01:00"
+lastmod: "2026-09-05T17:40:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "9c515701788080120948165f21a82da568db614f48dbc7d4c837bb087ef5739d"
+area: "concurrency-memory"
+symptom: "BTreeMap::split_off places the requested boundary key in the returned map although the caller expected that key to stay in the original map."
+summary: "BTreeMap::split_off keeps keys strictly below the boundary in self and returns keys greater than or equal to the boundary. Make the interval convention explicit when partitioning queues, indexes, or time ranges."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets with alloc"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust BTreeMap split_off boundary key",
+    "BTreeMap split_off inclusive or exclusive",
+    "split BTreeMap keep key on left",
+  ]
+evidence: ["Rust 1.98.1 three-key map", "inclusive returned boundary", "explicit partition repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/std/collections/struct.BTreeMap.html#method.split_off",
+    "https://doc.rust-lang.org/std/collections/struct.BTreeMap.html#method.range",
+    "https://doc.rust-lang.org/std/ops/enum.Bound.html",
+  ]
+---
+
+I use ordered maps for work queues, checkpoints, and indexes where a boundary has business meaning. The dangerous part is often not finding the boundary. It is deciding who owns the item exactly on it.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-201/fail.rs) splits keys `1`, `2`, and `3` at `2`. The original map keeps only `1`. The returned map contains `2` and `3`.
+
+The boundary belongs to the returned side.
+
+## The operation means less-than and greater-than-or-equal
+
+[`BTreeMap::split_off`](https://doc.rust-lang.org/std/collections/struct.BTreeMap.html#method.split_off) returns everything after the supplied key, including the key itself when it exists. Written as intervals, the result is:
+
+```text
+self      = keys in (-infinity, boundary)
+returned  = keys in [boundary, +infinity)
+```
+
+This is the same half-open convention I often use for slices and time windows, but the method name alone does not tell me which side is inclusive. I write the interval beside important calls.
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-201/fixed.rs) asserts both complete key sets. That gives a stronger regression test than checking only their lengths.
+
+## The key does not need to exist
+
+When the exact boundary is absent, the returned map starts at the nearest key greater than it. Splitting keys `1` and `3` at `2` leaves `1` and returns `3`.
+
+If the boundary is greater than every key, the returned map is empty. If it is smaller than every key, the original map becomes empty.
+
+These cases matter for pagination and scheduled work. A checkpoint may fall between two real records. The code must preserve the interval rule even when no record has exactly the checkpoint value.
+
+I therefore test present, missing-between, before-first, and after-last boundaries.
+
+## Keeping the boundary on the left needs another policy
+
+Sometimes I want `self` to contain `key <= boundary`. For integers it is tempting to split at `boundary + 1`. That can overflow, and it does not generalize to strings, tuples, timestamps, or custom ordered keys.
+
+A safer design starts from the actual requirement. I can call `split_off(&boundary)` and then move the boundary entry back when present. I can also choose a composite cursor whose second component creates the precise ordering I need.
+
+For example, a queue key might be `(scheduled_at, unique_id)`. Splitting only on a timestamp is not directly possible when the map key includes an ID. I need a well-defined lower or upper sentinel, or I should consume a [`range`](https://doc.rust-lang.org/std/collections/struct.BTreeMap.html#method.range) with explicit [`Bound`](https://doc.rust-lang.org/std/ops/enum.Bound.html) values.
+
+The key type and the boundary protocol must be designed together.
+
+## This is not a copy
+
+`split_off` mutates the original map and returns another owned map. Code that keeps a reference or count from before the split can become logically stale even though Rust prevents invalid references across the mutable call.
+
+In service code, I name the two maps after their meaning: `before_checkpoint` and `at_or_after_checkpoint`, not `left` and `right`. The longer names reduce the chance that a later change reverses the inclusion rule.
+
+If I only need to inspect a region, `range` avoids changing ownership. If I need to process and remove a prefix, other entry-removal patterns may express the lifecycle better. I do not use `split_off` only because it is available.
+
+## Comparable is not the same as chronological
+
+A `BTreeMap` follows `Ord`. If a timestamp key is a string, lexical order may differ from chronological order unless the representation is normalized. If a custom key's `Ord` ignores a field, two values that look different in logs may occupy the same ordering identity.
+
+The split contract is correct relative to `Ord`, not relative to what a human thinks the key means. I test ordering separately from the split.
+
+This is particularly useful for version strings. Lexically, `"10"` can sort before `"2"`. No choice of inclusive boundary repairs the wrong ordering model.
+
+## The distributed-systems consequence
+
+A boundary key is often a checkpoint. If both workers include it, work can be duplicated. If neither includes it, work can be lost. Duplicate processing may be acceptable with idempotency; missing processing usually is not.
+
+I document checkpoints with mathematical intervals and stable tie-breakers. I also store enough cursor information to resume at the same boundary rule. A comment saying “continue after last item” is ambiguous if the API actually starts at that item.
+
+For batch handoff, I check three properties: the union of both sides equals the original keys, their intersection is empty, and the order boundary matches the declared interval. The tiny fixture demonstrates all three more clearly than a production incident log.
+
+The core principle is that boundaries belong somewhere. `BTreeMap::split_off` puts the exact boundary in the returned map. Once I write that as `< boundary` and `>= boundary`, the method stops being surprising and the surrounding checkpoint design becomes reviewable.

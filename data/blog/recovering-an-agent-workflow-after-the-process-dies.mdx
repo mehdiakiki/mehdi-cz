@@ -1,0 +1,215 @@
+---
+title: "Recovering an Agent Workflow After the Process Dies"
+date: "2026-10-20T09:00:00+01:00"
+tags: ["AI agents", "durable workflow", "recovery", "idempotency", "state machine"]
+draft: false
+reviewed: true
+reviewedHash: "07f59f30b476f46f5b11e4529a3d8c37b452b9f05498820337e34da439baa322"
+cluster: "reliable-ai-systems"
+campaign: "authority-2026"
+opportunity: "AI-022"
+summary: "A recoverable agent stores workflow decisions and effect identities outside the process. Resume from durable state, reconcile ambiguous actions, and never confuse chat history with execution state."
+---
+
+An agent can plan six steps, finish three, and lose its process. After restart, replaying the conversation and asking the model what to do next is not recovery.
+
+The model may produce a different plan. More importantly, an external action may have succeeded before the crash even though the local transcript never recorded its result.
+
+I recover an agent as a durable state machine.
+
+## Conversation state and workflow state are different
+
+Conversation state helps the model understand what the user said. Workflow state proves what the system committed.
+
+```text
+conversation
+  messages, summaries, retrieved context, model outputs
+
+workflow
+  run identity, current step, approvals, effect identities,
+  attempts, durable results, leases, deadlines, terminal status
+```
+
+The first can be compacted or regenerated. The second controls external effects and must have database-level invariants.
+
+## Persist decisions, not a suspended call stack
+
+A process stack contains local variables and a program counter. Most systems cannot safely serialize it and restore every network connection later.
+
+I store a durable checkpoint:
+
+```ts
+type AgentRun = {
+  runId: string;
+  actorId: string;
+  tenantId: string;
+  objectiveHash: string;
+  workflowVersion: number;
+  currentStep: string;
+  status:
+    | "running"
+    | "waiting_for_approval"
+    | "waiting_for_retry"
+    | "completed"
+    | "failed"
+    | "cancelled";
+  stateVersion: number;
+  leaseOwner?: string;
+  leaseExpiresAt?: string;
+};
+```
+
+On recovery, code reads this state and decides what transition is legal. It does not continue from an invisible line inside the old function.
+
+Cloudflare's current [durable execution documentation](https://developers.cloudflare.com/agents/api-reference/durable-execution/) gives a concrete form of this principle: checkpoint data is stashed, but the original lambda is not restored; recovery code uses the saved data to decide how to proceed.
+
+## Every step has a durable lifecycle
+
+I represent a step separately:
+
+```ts
+type RunStep = {
+  runId: string;
+  stepId: string;
+  kind: "model" | "tool" | "approval" | "wait";
+  status: "planned" | "running" | "succeeded" | "failed" | "unknown";
+  inputHash: string;
+  attempt: number;
+  effectKey?: string;
+  resultReference?: string;
+  startedAt?: string;
+  completedAt?: string;
+};
+```
+
+The state transition uses compare-and-set on `stateVersion` so two recovery workers cannot both claim the same next step.
+
+```sql
+update agent_run
+set lease_owner = :worker,
+    lease_expires_at = :expiry,
+    state_version = state_version + 1
+where run_id = :run
+  and state_version = :expected
+  and (lease_expires_at is null or lease_expires_at < now());
+```
+
+A process-local mutex cannot protect recovery across machines.
+
+## The critical crash is after the effect
+
+Suppose a tool sends an invoice:
+
+```text
+mark step running
+send invoice
+record success
+```
+
+If the process dies after sending but before recording success, the durable status remains `running` or `unknown`. Repeating the call with a new identity may send twice.
+
+I give the intended effect one stable key before calling the provider:
+
+```text
+effect key = run_id + step_id + canonical_tool_arguments_hash
+```
+
+After recovery:
+
+```text
+status succeeded -> continue
+status planned    -> execute once with effect key
+status running/unknown
+  -> query provider by effect key or retry same idempotent request
+  -> record observed outcome
+  -> continue
+```
+
+Durable workflow engines can retry a step. They cannot make an arbitrary external API exactly once. The effect still needs idempotency or reconciliation.
+
+## Model steps need reproducible evidence
+
+Model output is non-deterministic and provider behaviour can change. I store enough evidence to explain the decision:
+
+```text
+model and provider identifier
+prompt/template version
+hashes or governed references for model-visible inputs
+tool schema version
+output or structured-result reference
+token and cost usage
+safety and validation result
+```
+
+I avoid copying unrestricted customer data into every trace. References, hashes, redacted samples, and retention classes keep the recovery record useful without creating another secret store.
+
+On retry I decide explicitly whether to reuse the previous accepted model output or request a new one. “Retry” should not silently mean “make a new plan.”
+
+## Approval survives, but its scope does not widen
+
+A workflow may wait hours for human approval. The approval is durable and bound to exact action arguments, actor, tenant, limit, resource state, and expiry.
+
+After restart, the workflow verifies all of these again. If the resource changed or approval expired, it returns to `waiting_for_approval` with a new preview.
+
+Cloudflare's [agent workflow documentation](https://developers.cloudflare.com/agents/api-reference/run-workflows/) is one current example of combining durable steps with waits for human events. The application must still define what the approval authorizes.
+
+## Time is state too
+
+Sleeping inside one process is not a durable retry. I store:
+
+```text
+next_attempt_at
+attempt_count
+retry_deadline
+last_error_class
+provider_retry_after
+```
+
+A scheduler wakes eligible work. A transient timeout receives bounded backoff and jitter. Authentication failure, invalid arguments, or policy rejection does not become healthy through 100 retries.
+
+For short runtime-level retries, frameworks can help. Long waits belong to durable scheduling so they do not keep one process alive merely to count time.
+
+## Workflow versioning needs a migration rule
+
+A run may start on workflow version 4 and recover after version 5 deploys.
+
+I do not assume the new code can interpret every old checkpoint. Options are:
+
+- keep versioned transition handlers until old runs finish;
+- migrate stored state with an audited transformation;
+- stop old runs in a visible manual state;
+- restart only steps that have safe identities and preserved approvals.
+
+Deleting or renaming a step identifier without a migration can strand live work.
+
+## A crash matrix for agent execution
+
+I inject failure at these points:
+
+| Crash point | Recovery expectation |
+| --- | --- |
+| before step claim | another worker claims it |
+| after claim, before model call | lease expires; same step resumes |
+| after model response, before save | model may run again; no external effect yet |
+| after tool accepted effect, before save | reconcile by stable effect key |
+| after save, before next transition | saved result is reused |
+| while waiting for approval | durable wait remains visible |
+| after cancellation requested | no new steps start; in-flight effects reconcile |
+
+I assert the external effect count and final workflow state. A test that only observes the API returning `200` misses the recovery path.
+
+## Terminal states need business meaning
+
+`failed` should say what remains true:
+
+```text
+failed_before_effect
+effect_unknown_reconciliation_required
+partially_completed_compensation_running
+cancelled_no_effect
+cancelled_after_irreversible_effect
+```
+
+This is more useful to an operator and user than one red badge.
+
+The model can remain flexible inside a step. The workflow around it should be boring: durable identities, explicit transitions, current authorization, bounded time, and recovery rules for every ambiguous effect. Then a dead process is an expected event, not a reason to ask the model to remember what reality contains.

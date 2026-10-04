@@ -1,0 +1,100 @@
+---
+caseId: "RFA-136"
+title: "Why Copy Cannot Be Implemented for a Type With Drop"
+date: "2026-09-05T14:36:00+01:00"
+lastmod: "2026-09-05T14:36:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "d020712df792cb7267b100c28c5397099e98056627b38f6e60b5827f822e9a43"
+area: "diagnostics-macros"
+symptom: "Deriving Copy for a small token fails with E0184 after the type receives a Drop implementation, even when every stored field would otherwise be Copy."
+summary: "Copy creates implicit bitwise duplicates, while Drop assigns an automatic cleanup action to every value. Rust forbids combining them because implicit duplication would make cleanup ownership and the number of destructor calls incoherent; use explicit Clone or separate the guard."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets"]
+profiles: ["check", "dev", "release", "test"]
+searchTerms: ["Rust E0184 Copy type has destructor", "Copy not allowed on types with Drop Rust", "derive Copy fails after implementing Drop"]
+evidence: ["Rust 1.98.1 E0184 compile failure", "implicit-copy lifecycle conflict", "explicit Clone repair"]
+sources: ["https://doc.rust-lang.org/error_codes/E0184.html", "https://doc.rust-lang.org/std/marker/trait.Copy.html", "https://doc.rust-lang.org/std/ops/trait.Drop.html"]
+---
+
+The [failing program](/rust-failure-atlas/evidence/RFA-136/fail.rs) defines an empty `CleanupToken`, derives `Clone` and `Copy`, and gives the token a destructor. Rust rejects `Copy` with E0184 even though the type stores no non-copyable field.
+
+The conflict is not about bytes. It is about what one value means during its lifecycle.
+
+## Copy can happen without an explicit operation
+
+The [`Copy` documentation](https://doc.rust-lang.org/std/marker/trait.Copy.html) describes types whose values can be duplicated by a simple bitwise copy. Assignment and passing by value leave the original usable:
+
+```rust
+let second = first;
+use_again(first);
+```
+
+There is no visible `copy()` call at the point where the duplicate appears. Generic code, patterns, and ordinary assignments may all create another value.
+
+This is a good contract for integers, small coordinates, and handles whose duplication has no independent cleanup consequence. It is a dangerous contract for a guard that releases a lock, closes a resource, decrements external state, commits a measurement, or marks an operation finished.
+
+## Drop gives each value an automatic action
+
+The [`Drop` documentation](https://doc.rust-lang.org/std/ops/trait.Drop.html) explains that Rust calls `drop` automatically when a value leaves scope. If a cleanup token could be copied implicitly, both the original and its duplicate would later receive that action.
+
+Which copy owns the cleanup? Should both run it? Should only the last one run it? A plain bitwise copy does not carry a protocol for answering these questions.
+
+Rust therefore rejects the combination. The [E0184 explanation](https://doc.rust-lang.org/error_codes/E0184.html) states the direct rule: a type with a destructor cannot implement `Copy`.
+
+I read this as a semantic consistency check:
+
+```text
+Copy -> duplicating the value needs no ownership event
+Drop -> destroying each value performs an ownership event
+```
+
+The same type cannot honestly promise both under Rust's current model.
+
+## Explicit Clone makes duplication reviewable
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-136/fixed.rs) removes `Copy` and keeps `Clone`. Duplication now appears as `token.clone()`.
+
+This does not automatically make the design correct. The `Clone` implementation still needs to define what another cleanup-capable value means. For a reference-counted handle, cloning may acquire another counted ownership share, and dropping each clone releases one share. For a database transaction guard, cloning may make no sense and should not be implemented at all.
+
+The important improvement is that `Clone` is an explicit operation with an implementation. It can update bookkeeping, fail indirectly only through a chosen design, or be omitted from the API.
+
+In the minimal fixture, the destructor only prints, so two explicit clones produce two cleanup messages. A real type would need a stronger invariant.
+
+## An empty type can still carry ownership
+
+The token has zero stored data, but zero-sized does not mean semantically irrelevant. Its existence can represent permission, an active scope, or a pending cleanup. Rust's ownership system tracks values and destructors even when their runtime size is zero.
+
+This is useful for guards that restore thread-local state or mark a tracing span complete. Such a guard should normally move, not copy. The compiler then helps ensure there is one owner of the completion action.
+
+If callers only need a cheap identifier, I separate it from the guard:
+
+```rust
+#[derive(Clone, Copy)]
+struct TokenId(u64);
+
+struct CleanupGuard {
+    id: TokenId,
+}
+```
+
+`TokenId` can travel freely. `CleanupGuard` retains unique lifecycle responsibility.
+
+## Removing Drop is not always a repair
+
+Another quick fix is deleting the `Drop` implementation. This is correct only when cleanup is unnecessary or performed safely somewhere else. If callers depend on the guard to release a resource, removing the destructor trades a compiler error for a resource leak or stale state.
+
+I write down the invariant first: what action must happen, exactly once or once per ownership share, and who owns that action? The answer decides whether the type should be move-only, explicitly cloneable with reference counting, or split into a copyable ID and a non-copyable guard.
+
+## My debugging sequence
+
+When E0184 appears, I do this:
+
+1. Find the `Drop` implementation, including one generated by another layer.
+2. State the cleanup side effect and whether it belongs to exactly one owner.
+3. Remove `Copy`; then decide separately whether `Clone` is meaningful.
+4. If cloning is valid, implement the bookkeeping that makes every later drop correct.
+5. Split identity from cleanup ownership when callers only need a copyable label.
+6. Test move, explicit clone, normal drop, panic unwinding, and early-return paths.
+
+The broad principle is that representation does not decide lifecycle semantics. A value may occupy zero bytes and still own a real obligation. Rust refuses implicit copying when destruction carries such an obligation, forcing the API to make duplication an explicit design choice.

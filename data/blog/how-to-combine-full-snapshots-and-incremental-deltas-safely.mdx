@@ -1,0 +1,242 @@
+---
+title: "How to Combine Full Snapshots and Incremental Deltas Safely"
+date: "2026-09-11T09:00:00+01:00"
+tags: ["snapshots", "change data capture", "incremental sync", "data integration", "state machines"]
+draft: false
+reviewed: true
+reviewedHash: "32b68ded4f58a606fdf5d0c2aa2c27b55b95c2a1a461f08c61fc0d10c7ef529b"
+cluster: "reliable-data-integrations"
+campaign: "authority-2026"
+opportunity: "DATA-009"
+summary: "A state-machine walkthrough for joining a full snapshot with live changes without gaps, stale overwrites, or false deletions."
+---
+
+Full snapshots and incremental deltas solve different problems.
+
+A snapshot gives me a broad view of current state. A delta stream gives me efficient changes after a position. Reliable synchronization often needs both: the snapshot creates or repairs the local copy, then deltas keep it fresh.
+
+The difficult part is the handover. Data can change while the snapshot is running. If I start the delta reader too late, I lose changes. If I start it early but apply everything without ordering, an old snapshot row can overwrite a newer event.
+
+I treat this as a state machine with a declared consistency boundary, not as two background jobs started at roughly the same time.
+
+## The two simple orders both have a race
+
+### Snapshot first, stream second
+
+```text
+T0 start snapshot
+T1 record X changes
+T2 snapshot completes
+T3 start delta stream
+```
+
+If the stream begins at T3, the change at T1 is missing. The snapshot may have read X before T1, so neither path contains the new value.
+
+### Stream first, snapshot second
+
+```text
+T0 start delta stream
+T1 receive new X
+T2 snapshot reads old X
+T3 snapshot overwrites new X
+```
+
+Now there is no gap, but ordering is wrong.
+
+The safe design needs a boundary that both paths understand.
+
+## Best case: snapshot at a log position
+
+When the source provides a transaction log or change sequence, I prefer this sequence:
+
+```text
+1. choose source position P0
+2. start retaining deltas after P0
+3. read a snapshot consistent at P0
+4. apply the snapshot
+5. apply retained deltas where position > P0
+6. switch to continuous delta consumption
+```
+
+The state machine is:
+
+```text
+EMPTY
+  ↓ allocate generation G and boundary P0
+SNAPSHOTTING(G, P0)
+  ↓ snapshot complete
+CATCHING_UP(G, after P0)
+  ↓ caught up to live position
+LIVE(G, cursor)
+  ↓ cursor invalid or reconciliation required
+REBUILDING(G+1)
+```
+
+I persist these transitions. If the process restarts, it knows whether the generation is incomplete and which data may be visible.
+
+This is the cleanest model because a source position orders snapshot state and later changes.
+
+## When the API has no transaction log
+
+Many SaaS APIs offer list endpoints, update timestamps, and webhooks but no consistent database snapshot. Then I cannot promise perfect point-in-time semantics from features the provider does not expose.
+
+I combine several protections:
+
+- record a high-water time before scanning;
+- start accepting webhooks before or at that boundary;
+- store source versions or updated timestamps with each object;
+- prevent an older observation from overwriting a newer one;
+- poll with an overlap window after the scan;
+- run reconciliation after the handover.
+
+The important honesty is that a local timestamp is not automatically a source transaction boundary. Clock skew, delayed indexing, and commits can place a change on the wrong side. I use overlap and idempotency because the boundary is approximate.
+
+If the provider gives neither a stable version nor a change feed, my guarantee becomes eventual repair rather than gap-free capture. I document this limitation instead of hiding it behind the word “sync.”
+
+## Every object needs ordering information
+
+During handover, I may observe the same object through both paths. I keep enough provenance to decide which observation can replace local state:
+
+```text
+source object ID
+source version or modification time
+snapshot generation
+observation path
+observed at
+tombstone state
+```
+
+A database sequence, ETag, or provider event position is normally stronger than arrival time. Arrival time tells me when my system saw the data, not when the source committed it.
+
+My apply rule is roughly:
+
+```text
+if incoming source version is newer:
+    apply
+else if it is the same operation:
+    accept as idempotent
+else:
+    keep current state and record stale observation
+```
+
+This rule must be shared by snapshot, webhook, and polling workers.
+
+## Deletions need a complete snapshot scope
+
+A snapshot is often used to discover deletions: records present locally but absent from the source are marked deleted.
+
+I only make this decision after proving the scan was complete for a known scope. A timeout on page 42 must not delete everything that would have appeared on pages 43 onward.
+
+I use generation marks:
+
+```text
+start generation G
+for every successfully observed object:
+    mark last_seen_generation = G
+after every page and partition completes:
+    candidates = objects with last_seen_generation < G
+    apply the documented deletion policy
+```
+
+If any partition fails, generation G cannot authorize absence-based deletions.
+
+This also means filters are part of the scope. A scan of `status=active` cannot prove that an absent object was deleted; it may simply have become inactive.
+
+## Do not expose half a replacement accidentally
+
+A large snapshot may take hours. Updating the live copy row by row can give readers a mixture of generations.
+
+Depending on the product, I choose one of three visibility models:
+
+### In-place, version-aware merge
+
+Each row becomes visible as it is processed, but newer delta versions always win. This is simple and gives gradual freshness. Readers accept a temporarily mixed generation.
+
+### Staged generation and atomic switch
+
+Build generation G in separate storage, catch it up with deltas, then move a pointer from the previous generation to G. Readers get a coherent view, but storage and catch-up logic are more complex.
+
+### Partitioned switch
+
+Replace one tenant, account, or key range at a time. This balances storage and consistency, but readers need to know the active generation per partition.
+
+I choose from a product requirement: can a reader safely see partially refreshed data? There is no need to pay for an atomic global switch when independent records tolerate gradual refresh.
+
+## A concrete handover timeline
+
+Here is a recovery-first flow for one provider account:
+
+```text
+09:00 create generation G12
+09:00 save high-water H from source, or local time if no source boundary exists
+09:00 begin durable webhook/change capture
+09:01 start snapshot restricted to <= H when supported
+09:35 finish all pages; no absence decision before this point
+09:36 apply retained deltas after H with version checks
+09:38 poll overlap [H - safety_window, now]
+09:40 reconcile counts/IDs and mark G12 live
+```
+
+If the process crashes at 09:20, G12 remains incomplete and cannot declare deletion. If it crashes at 09:37, the retained delta cursor and idempotent writes allow catch-up to resume.
+
+The timeline records which guarantees come from the provider and which come from our recovery logic.
+
+## Snapshot signals should be durable too
+
+Some change-data-capture systems support incremental snapshots while streaming. They use signals or watermarks to divide a table into chunks and reconcile rows changed during each chunk.
+
+The general lesson is useful even when I implement against an HTTP API: “snapshot running” cannot exist only in process memory. I persist generation, boundary, partitions, page progress, buffered-delta position, and completion state.
+
+Otherwise a restart cannot know whether a received event was already included in a snapshot page or still needs replay.
+
+## The tests that find handover bugs
+
+I use a deterministic fake source where I can mutate data at exact points.
+
+### Update before its snapshot page
+
+Change X after the boundary but before the scan reads X. Assert the final value is the new version, whether it comes from snapshot or delta.
+
+### Update after its snapshot page
+
+Read X, then change it. Assert the delta path applies it.
+
+### Delta arrives before stale snapshot row
+
+Apply the new event first, then deliver the old snapshot observation. Assert version ordering prevents regression.
+
+### Delete during snapshot
+
+Delete X after its page was read. Assert the tombstone is captured and wins.
+
+### Incomplete final page
+
+Fail the scan before completion. Assert no absence-based deletion is authorized.
+
+### Restart in every state
+
+Restart during `SNAPSHOTTING`, `CATCHING_UP`, and the live switch. Assert the generation resumes or restarts deliberately without mixing checkpoints.
+
+### Cursor history expires
+
+Invalidate the delta cursor during catch-up. Assert the incomplete generation is abandoned and a new generation begins from a fresh boundary.
+
+These tests are more valuable than loading a static fixture because the defects exist in timing and ordering.
+
+## My practical rule
+
+I never say “run a full import, then turn on webhooks” without identifying the events between those steps.
+
+A safe snapshot-delta design needs:
+
+- one generation and scope for the snapshot;
+- a source position or honest approximate high-water mark;
+- delta retention before scanning begins;
+- per-object ordering and idempotent application;
+- deletion only after complete scope coverage;
+- a durable catch-up checkpoint;
+- reconciliation when source guarantees are weaker than our needs.
+
+Kubernetes documents a useful version of this contract: a paginated list can represent a consistent snapshot, while clients can continue from its `resourceVersion` through a watch. Its [API concepts](https://kubernetes.io/docs/reference/using-api/api-concepts/) also explain how clients must recover when historical versions expire.
+
+The local checkpoint mechanics are covered in [A Durable Cursor for Incremental API Synchronization](/blog/a-durable-cursor-for-incremental-api-synchronization). The next related challenge is applying the same boundary during a long historical backfill while live traffic continues.

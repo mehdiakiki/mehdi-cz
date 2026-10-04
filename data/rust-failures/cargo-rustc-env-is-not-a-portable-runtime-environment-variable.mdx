@@ -1,0 +1,97 @@
+---
+caseId: "RFA-705"
+title: "cargo::rustc-env Is Not a Portable Runtime Environment Variable"
+date: "2026-09-07T09:36:00+01:00"
+lastmod: "2026-09-07T09:36:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "d589f16e6172b4496907cbd247742f52a32a8eb2311ce116b17eab993dba02f5"
+area: "cargo-dependencies"
+symptom: "A variable emitted with cargo::rustc-env exists under cargo run but is missing when the built executable is started directly."
+summary: "cargo::rustc-env is for embedding a build-time value with env!. Cargo also supplies it to cargo run and cargo test processes, but deployed binaries do not inherit Cargo's execution environment."
+rustVersions: ["Rust 1.98.1", "Cargo 1.98.1", "edition 2024"]
+targets: ["all Cargo targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["cargo rustc-env missing standalone executable", "cargo run environment different direct binary", "rustc-env compile time env macro runtime variable"]
+evidence: ["Cargo 1.98.1 paired execution fixture", "Cargo-run and direct-process output differ", "compile-time env value produces identical output"]
+sources: ["https://doc.rust-lang.org/cargo/reference/build-scripts.html#rustc-env", "https://doc.rust-lang.org/std/macro.env.html", "https://doc.rust-lang.org/std/env/fn.var.html"]
+---
+
+A build script can print `cargo::rustc-env=NAME=VALUE`. The name sounds like an ordinary runtime environment variable, and a local `cargo run` appears to confirm that interpretation. Then the installed binary starts under systemd, a container, or a shell and the variable is gone.
+
+Cargo documents a narrower primary purpose: make the value available while compiling the package so Rust source can read it with `env!`.
+
+The [failing evidence package](/rust-failure-atlas/evidence/RFA-705/fail/src/main.rs) prints both views:
+
+```rust
+println!("compiled={}", env!("RFA_BUILD_LABEL"));
+println!(
+    "runtime={}",
+    std::env::var("RFA_BUILD_LABEL").unwrap_or_else(|_| "missing".to_owned()),
+);
+```
+
+Its build script emits `RFA_BUILD_LABEL=embedded`. Under `cargo run`, both lines say `embedded`. Running the already built executable directly keeps the compiled line but prints `runtime=missing`.
+
+## Cargo participates in both observations
+
+`cargo::rustc-env` tells Cargo to set a variable for the rustc invocation which compiles the package. The `env!` macro reads it during compilation and places the resulting string in the program.
+
+Cargo also sets that variable when it launches a program through `cargo run` or `cargo test`. The Cargo Book explicitly discourages relying on this runtime convenience because it connects application behavior to Cargo's process environment.
+
+A deployed executable is normally started by something else. Build-script stdout is not a request to modify that future service manager, container definition, user shell, or operating system.
+
+## The discriminating test uses one artifact
+
+Rebuilding two variants can hide the boundary. My evidence runner builds once, then executes the same artifact in two ways:
+
+```bash
+cargo run
+./target/debug/application
+```
+
+The first parent is Cargo. The second parent is the shell used by the verifier with a clean value for this custom variable. Different output from one binary proves the value was not inherently stored as a runtime environment entry.
+
+This is a useful release test for any configuration which “works in Cargo.” Package managers, IDEs, test harnesses, and service managers all add environment. The final artifact should be tested under the environment which will really launch it.
+
+## Build identity belongs in `env!`
+
+For a commit identifier, schema version, build channel, or other value fixed when the binary is compiled, I use:
+
+```rust
+const BUILD_LABEL: &str = env!("RFA_BUILD_LABEL");
+```
+
+Now both Cargo-launched and directly launched executions read the same compiled value. The [repaired fixture](/rust-failure-atlas/evidence/RFA-705/fixed/src/main.rs) verifies identical output on both paths.
+
+If the value is optional at build time, `option_env!` makes absence part of the compile-time branch. I avoid silently substituting a misleading production identity.
+
+## Runtime configuration needs a runtime owner
+
+For a database endpoint, log level, feature rollout, or secret which can change after compilation, I read `std::env::var` and document who supplies it. The deployment manifest, service manager, shell, or configuration layer owns that contract.
+
+I do not use `cargo::rustc-env` to smuggle mutable deployment configuration into a binary. Embedding creates a new artifact for every value, exposes the value to artifact inspection, and makes rotation or environment promotion harder.
+
+Secrets should normally not be embedded. A build log, cache, binary string table, or provenance record can preserve them far longer than intended.
+
+## Rebuild tracking is another boundary
+
+When a build script derives the emitted value from an ambient variable, it also needs the correct `cargo::rerun-if-env-changed` instruction. Otherwise a second build can reuse the first embedded value.
+
+These instructions solve separate problems:
+
+```text
+rerun-if-env-changed -> when the build script must execute again
+rustc-env            -> what rustc sees while compiling this package
+deployment env       -> what the process sees when somebody later launches it
+```
+
+Combining them mentally is how stale builds and missing production settings appear.
+
+## Do not use runtime lookup as fallback magic
+
+Code like `env::var("LABEL").unwrap_or(env!("LABEL").to_owned())` may be intentional override behavior, but it creates a policy: runtime input wins over artifact identity. I name and test that policy instead of adding it merely to make local and production executions pass.
+
+For security-sensitive identity, allowing an ambient override can make logs claim that one artifact is another. For harmless display labels, an override may be useful. The domain decides.
+
+My regression runs the binary through Cargo and directly, with the variable present, absent, and deliberately different. The result makes each source of configuration visible. `cargo::rustc-env` is dependable when treated as a compile-time bridge; Cargo's convenient runtime injection is development context, not a deployment guarantee.

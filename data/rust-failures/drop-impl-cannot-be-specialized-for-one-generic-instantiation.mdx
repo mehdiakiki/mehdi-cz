@@ -1,0 +1,120 @@
+---
+caseId: "RFA-400"
+title: "A Drop Implementation Cannot Be Specialized for One Generic Instantiation"
+date: "2026-09-06T03:40:00+01:00"
+lastmod: "2026-09-06T03:40:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "2c0a093fe20d72a2313c6793c6cba7d85c3a667650959876c301393cbf641874"
+area: "diagnostics-macros"
+symptom: "Implementing Drop for Wrapper<Special> fails with E0366 even when Wrapper<T> has no other destructor implementation."
+summary: "Drop belongs to the complete generic type definition, so Rust rejects a destructor only for one concrete instantiation. Implement one uniform generic destructor or give the specially owned value a separate nominal wrapper."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust E0366 Drop impls cannot be specialized", "implement Drop for one generic type parameter", "Drop Wrapper Special same generic parameters"]
+evidence: ["Rust 1.98.1 E0366 compile failure", "concrete generic instantiation", "uniform generic Drop repair"]
+sources: ["https://doc.rust-lang.org/error_codes/E0366.html", "https://doc.rust-lang.org/std/ops/trait.Drop.html", "https://doc.rust-lang.org/nomicon/dropck.html"]
+---
+
+I wanted one generic wrapper to clean up only when it contained a special resource. The natural-looking implementation was `impl Drop for Wrapper<Special>`. Rust rejected it with E0366: Drop implementations cannot be specialized.
+
+The [failing fixture](/rust-failure-atlas/evidence/RFA-400/fail.rs) is intentionally small. There is no overlapping destructor and no complicated trait bound. The concrete self type alone is enough to fail.
+
+## Drop belongs to the type's lifecycle contract
+
+The official [E0366 explanation](https://doc.rust-lang.org/error_codes/E0366.html) requires a `Drop` implementation to use the same generic parameter sequence as the type definition.
+
+```rust
+struct Wrapper<T>(T);
+
+impl Drop for Wrapper<Special> {
+    fn drop(&mut self) {}
+}
+```
+
+This looks similar to an ordinary inherent implementation, where methods may be available only for `Wrapper<Special>`. A destructor is different. Rust automatically inserts destruction at ownership boundaries and uses drop checking while validating lifetimes. Whether a type has drop glue cannot behave like an optional convenience method selected for one concrete argument.
+
+[`Drop`](https://doc.rust-lang.org/std/ops/trait.Drop.html) is therefore not an ordinary specialization point. I cannot add several conditional destructors and ask the compiler to select the most specific one.
+
+## The direct repair is uniform Drop
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-400/fixed.rs) implements the destructor for every `Wrapper<T>`:
+
+```rust
+impl<T> Drop for Wrapper<T> {
+    fn drop(&mut self) {
+        // cleanup valid for every T
+    }
+}
+```
+
+This works when cleanup belongs to the wrapper itself: decrementing a wrapper-owned counter, releasing a wrapper-owned allocation, or ending a protocol that does not require special operations on `T`.
+
+The implementation may naturally cause each field to be dropped afterward. I normally do not call `drop` on fields manually. Rust runs the wrapper's `drop` method and then destroys its fields according to the language's destruction rules.
+
+## A separate type is often the honest design
+
+If only one payload has a special ownership obligation, I usually give it a different nominal owner:
+
+```rust
+struct Wrapper<T>(T);
+struct SpecialOwner(Special);
+
+impl Drop for SpecialOwner {
+    fn drop(&mut self) {
+        // lifecycle unique to SpecialOwner
+    }
+}
+```
+
+Now the type name communicates the lifecycle. Generic code handling `Wrapper<T>` does not silently gain a destructor for one hidden instantiation.
+
+This separation also improves APIs. Constructors can establish the exact invariant required by `SpecialOwner`, while an unrestricted tuple wrapper may allow states that the destructor cannot safely or meaningfully clean up.
+
+## An enum can centralize a closed set of owners
+
+When the alternatives are a known closed set, an enum is another clear design:
+
+```rust
+enum Resource {
+    Plain(Plain),
+    Special(Special),
+}
+```
+
+A uniform `Drop` implementation can match internal state if explicit work before field destruction is truly needed. Often the variants' fields already own their cleanup and the enum requires no custom destructor at all.
+
+I prefer letting each resource-owning field implement RAII. A container destructor that inspects variants should exist only for ordering or cross-field invariants that automatic field drop cannot express.
+
+## This is related to conditional bounds, but not identical
+
+E0366 fixes the self type to one concrete instantiation. E0367, covered elsewhere in the Atlas, appears when `impl<T: SomeTrait> Drop for Wrapper<T>` adds a bound not present on `Wrapper<T>`.
+
+Both diagnostics protect one principle: every constructible value of the declared type must have a coherent destruction story. One tries to narrow by a concrete argument; the other narrows by a trait bound.
+
+Adding the bound to the struct can repair E0367, but it does not make concrete Drop specialization valid. For this case, the self type still needs the generic shape declared by the struct.
+
+## Drop affects borrowing before it runs
+
+The [Nomicon discussion of drop checking](https://doc.rust-lang.org/nomicon/dropck.html) explains why destructors participate in lifetime reasoning. A destructor can observe fields just before they are destroyed, so the compiler must conservatively validate what may still be borrowed then.
+
+This is why I do not see E0366 as only a missing specialization feature. Destruction is connected to move legality, lifetime validity, and automatic compiler-inserted control flow. Conditional identity would complicate all of those properties.
+
+## I first ask whether custom Drop is necessary
+
+Many attempted destructors duplicate what fields already do. `File`, `Box`, `Vec`, locks, and owned guards clean themselves up. Wrapping them usually does not require a custom `Drop` implementation.
+
+Custom Drop is useful when order matters, an external protocol needs a best-effort notification, or wrapper-owned state must change. It cannot report errors normally, and panicking in a destructor is dangerous during unwinding. Explicit `close` or `finish` methods are better when the caller must handle failure.
+
+## My review checklist
+
+When E0366 appears, I inspect:
+
+- whether cleanup belongs to every generic instantiation;
+- whether a separate owner type would state the invariant better;
+- whether fields already provide the necessary RAII;
+- whether an explicit fallible finalization method is required;
+- whether code is trying to approximate trait specialization through Drop.
+
+The core principle is that destruction follows nominal ownership, not an ad hoc concrete type pattern. Rust requires one coherent Drop identity for the generic wrapper. I either implement that identity uniformly or introduce a type whose name and constructors carry the special lifecycle.

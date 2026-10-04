@@ -1,0 +1,95 @@
+---
+caseId: "RFA-266"
+title: "Why mpsc recv Still Returns Messages After Every Sender Is Dropped"
+date: "2026-09-06T00:46:00+01:00"
+lastmod: "2026-09-06T00:46:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "ffb1cd9c5c7fa2eee705c5e2fe0f1e8df6738d70a2cc56b01d1fc19dc2652629"
+area: "concurrency-memory"
+symptom: "Receiver::recv returns a queued message after the final Sender is dropped and reports disconnection only after the buffer is drained."
+summary: "Channel disconnection stops future sends but does not erase already accepted messages. Receive until the buffered queue is empty before treating RecvError as end of stream."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets with std threading"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust mpsc recv buffered messages after disconnect", "Receiver recv when Sender dropped queue", "channel disconnect drain pending messages Rust"]
+evidence: ["Rust 1.98.1 buffered channel", "sender drop before receive", "message-then-RecvError sequence"]
+sources: ["https://doc.rust-lang.org/std/sync/mpsc/struct.Receiver.html#method.recv", "https://doc.rust-lang.org/std/sync/mpsc/#disconnection", "https://doc.rust-lang.org/std/sync/mpsc/struct.Receiver.html#method.iter"]
+---
+
+Dropping every sender closes an `mpsc` channel for future production. It does not cancel messages already accepted into the channel.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-266/fail.rs) sends `"queued"`, drops the only sender, and calls [`Receiver::recv`](https://doc.rust-lang.org/std/sync/mpsc/struct.Receiver.html#method.recv). The first call returns the message. Only the following receive reports disconnection.
+
+## Closed and empty are separate state dimensions
+
+A receiver can describe the channel with two questions:
+
+```text
+Can another message still be sent?
+Is an accepted message currently buffered?
+```
+
+Dropping all senders changes the first answer to no. It does not force the second answer to no.
+
+`recv` returns queued messages while they exist. It returns `RecvError` when no message remains and no sender can ever add one.
+
+## Accepted work is not revoked by sender lifetime
+
+A successful send transfers the message into the channel's delivery responsibility. If later sender destruction erased it, shutdown timing could silently lose already accepted work.
+
+Rust's behavior makes graceful producer shutdown possible: producers disappear, consumers drain what was sent, then receive a definitive end-of-stream error.
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-266/fixed.rs) asserts this two-step sequence exactly.
+
+## Disconnection is not processing completion
+
+Even after the receiver obtains the final message, its side effect may still be running or may fail. Channel empty/disconnected means no more messages will arrive through that channel; it does not prove every job committed successfully.
+
+For important work I add acknowledgements, join worker threads, or track durable job state. Sender drop is an input-lifecycle signal, not an end-to-end completion barrier.
+
+This complements the earlier principle that successful `send` means accepted by the channel, not processed by the consumer.
+
+## Receiver iteration follows the same drain rule
+
+[`Receiver::iter`](https://doc.rust-lang.org/std/sync/mpsc/struct.Receiver.html#method.iter) blocks while senders remain and no item is available. After all senders are gone, it yields buffered messages and ends once drained.
+
+Keeping an unused sender clone alive can therefore make a consumer loop wait forever after useful producers are done. I audit clones and ownership rather than assuming the lexical producer function owns every sender.
+
+Using `for message in receiver` is concise when channel disconnection is the intended stream terminator.
+
+## Forced shutdown may need a different policy
+
+Sometimes shutdown must abandon pending work. Simply dropping senders does not express that. The consumer needs a cancellation signal, deadline, message policy, or ownership design that permits dropping the receiver and its queue.
+
+Graceful drain and immediate cancellation have different durability guarantees. I name them separately in shutdown APIs and test both.
+
+If messages hold resources, dropping the receiver destroys queued messages without processing them, which may release memory but skip application effects.
+
+## Multiple producers do not change the rule
+
+The channel remains connected while any `Sender` clone exists. One producer ending does not mean end of stream. The final clone's drop establishes that no future messages can arrive.
+
+This is easy to get wrong when a sender is stored in a supervisor, closure, or test variable. I keep sender ownership narrow and explicitly drop orchestration copies before waiting for consumer completion.
+
+## try_recv exposes empty versus disconnected
+
+Nonblocking receive distinguishes a temporarily empty connected channel from a disconnected empty channel. That distinction prevents a poll loop from treating “nothing right now” as permanent completion.
+
+Buffered messages still win before the disconnected condition, as with blocking receive. Timeout receive adds another temporary outcome but does not change the drain semantics.
+
+## What I test
+
+My matrix includes connected empty, connected buffered, disconnected buffered, and disconnected empty states. With multiple senders it drops them one by one and proves only the last drop closes production.
+
+For worker systems I separately test processing acknowledgements and failure paths. Channel mechanics alone cannot prove business completion.
+
+## FIFO order is local to accepted sends
+
+Messages from one sender arrive in their send order. With multiple producers, scheduling determines how their sends interleave. Draining after disconnection preserves the channel's accepted queue order, not a global timestamp order invented afterward.
+
+If consumers require deterministic cross-producer order, messages need sequence metadata and a merge policy. Waiting until every sender drops does not automatically sort buffered work.
+
+I test ordering claims separately from the disconnect sequence. Combining them in one assertion can make a scheduling-dependent test look like a shutdown failure.
+
+The core principle is that closing future input does not erase past accepted input. Rust's `mpsc` receiver drains buffered messages after every sender is dropped and reports disconnection only when the queue is empty. Build graceful and forced shutdown around that state machine rather than one vague “closed” flag.

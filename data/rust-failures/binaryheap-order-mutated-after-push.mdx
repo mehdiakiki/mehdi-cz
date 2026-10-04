@@ -1,0 +1,85 @@
+---
+caseId: "RFA-133"
+title: "Why BinaryHeap Does Not Reorder an Item Mutated After push"
+date: "2026-09-05T12:33:00+01:00"
+lastmod: "2026-09-05T12:33:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "d93a1417b658950640681461a4185b8e39beffe03a6ac80c6d437970d2c04683"
+area: "concurrency-memory"
+symptom: "An inserted BinaryHeap item becomes the largest through interior mutation, but peek still returns the previous root because the heap was not told to restore ordering."
+summary: "BinaryHeap relies on Ord-visible state remaining stable while an item is stored. Mutating priority through Cell or shared state is a documented logic error; remove and reinsert, use PeekMut for the root, or rebuild from changed values."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["targets with std::collections"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust BinaryHeap mutate priority after push", "BinaryHeap interior mutability ordering logic error", "Rust heap item changed but peek wrong"]
+evidence: ["Rust 1.98.1 deterministic root mismatch", "Ord-visible value changed after push", "drain-transform-rebuild repair"]
+sources: ["https://doc.rust-lang.org/std/collections/struct.BinaryHeap.html", "https://doc.rust-lang.org/std/cmp/trait.Ord.html"]
+---
+
+The [failing program](/rust-failure-atlas/evidence/RFA-133/fail.rs) pushes priorities `10` and `20` into a max-heap. It then changes the first value to `100` through a shared `Cell`. Most people expect `peek()` to return `100`, but the heap still exposes `20` at its root.
+
+The value changed. The data structure did not receive an operation that restores its ordering.
+
+## A heap stores an arrangement, not a live query
+
+`BinaryHeap` maintains a partial ordering that makes the greatest item available at the root. When `push` adds a value, the implementation moves it until the heap invariant holds. When `pop` removes the root, it repairs the remaining structure.
+
+It does not compare every item again on every `peek`. Doing so would remove the performance property for which the heap exists.
+
+I use this model:
+
+```text
+push/pop operation -> may repair positions
+interior mutation  -> changes a value without notifying the heap
+peek               -> trusts the existing positions
+```
+
+The [`BinaryHeap` documentation](https://doc.rust-lang.org/std/collections/struct.BinaryHeap.html) calls it a logic error for an item's ordering to change while inside the heap. As with similar collection invariants, the consequences remain encapsulated but can include incorrect results, panics, leaks, or non-termination.
+
+## Ord must describe stable priority
+
+The fixture implements [`Ord`](https://doc.rust-lang.org/std/cmp/trait.Ord.html) by reading a `Cell<i32>`. At any one instant, comparisons are sensible. Over time, the result for the same stored item changes.
+
+Rust normally prevents taking a free `&mut T` to arbitrary heap elements. Interior mutability and external shared state can bypass that structural protection while remaining memory-safe.
+
+I also avoid `Ord` implementations that consult clocks, random state, mutable configuration, database values, or global ranking tables. A priority queue needs the comparison result to be a property of the stored value for its complete residence time.
+
+## Rebuild after a batch of changes
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-133/fixed.rs) drains the values, transforms `10` into `100`, collects them, and extends the heap again. Re-insertion lets the collection compute positions from the new priorities.
+
+Collecting before extending is important. The `drain` iterator still mutably borrows the original heap, so trying to extend that same heap while the iterator is alive produces E0499. The evidence verifier caught this exact mistake in the first repair draft.
+
+For a batch update, rebuilding can be clearer and efficient enough. For individual priority changes, I can remove and reinsert the affected logical item, although `BinaryHeap` is not optimized for finding arbitrary entries.
+
+If frequent updates by ID are a product requirement, I consider another representation: a heap plus an index map with carefully coordinated positions, a versioned-entry technique, or a dedicated priority-queue crate.
+
+## PeekMut is deliberately narrower
+
+`BinaryHeap::peek_mut` provides mutable access to the greatest element through a guard. The collection can repair the heap when that guard is dropped if the root changed. This is controlled mutation because the heap knows which position may have changed.
+
+It does not make arbitrary shared mutation safe. A `Cell` hidden inside another entry can change while no heap API is active, and the collection has no observation point.
+
+This pattern appears across Rust: guard types do more than satisfy borrowing syntax. Their destructor can restore an invariant after scoped mutation.
+
+## Versioned entries avoid in-place priority updates
+
+In schedulers, I often prefer inserting a new `(priority, id, generation)` entry rather than mutating the old one. When popping, the consumer checks whether the generation is still current and discards stale entries.
+
+This uses extra memory until stale entries are removed, but it preserves heap stability and avoids arbitrary removal. It is especially useful when changes are append-like and the number of reprioritizations is bounded.
+
+The choice depends on update frequency, queue size, latency, and whether duplicate stale records are acceptable. The key rule remains: the value already in the heap does not silently change its `Ord` identity.
+
+## My debugging sequence
+
+When heap output appears out of order, I do this:
+
+1. Inspect every field read by `Ord`, `PartialOrd`, `Eq`, and `PartialEq`.
+2. Find interior mutability or external state reachable after insertion.
+3. Verify the ordering implementations agree and remain transitive.
+4. Reproduce with three small priorities and a deterministic mutation.
+5. Choose scoped root mutation, remove/reinsert, full rebuild, or versioned entries.
+6. Add a test that changes priorities through every supported API and drains the full heap in order.
+
+The broader principle is that efficient data structures cache a relationship between values and positions. If code changes the values outside the structure's mutation protocol, the cached relationship becomes false. Safe Rust contains the damage, but only a stable ordering contract keeps the result correct.

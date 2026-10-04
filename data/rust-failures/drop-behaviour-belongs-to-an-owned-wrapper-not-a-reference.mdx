@@ -1,0 +1,91 @@
+---
+caseId: "RFA-513"
+title: "Rust Drop Behaviour Belongs to an Owned Wrapper, Not a Reference"
+date: "2026-09-06T05:43:00+01:00"
+lastmod: "2026-09-06T05:43:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "94c4be0525aa7b502cac7011d0a417c384f1793872932a5071d5d03ab95f8d9e"
+area: "concurrency-memory"
+symptom: "Implementing Drop for &mut Resource fails with E0120 because Drop may be implemented only for local structs, enums, and unions."
+summary: "Dropping a reference ends a borrow but does not own the referent. Put cleanup responsibility in the owned resource or a local guard whose lifetime represents the cleanup scope."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust E0120 Drop implemented for reference", "implement Drop for &mut T Rust", "RAII guard cleanup borrowed resource Rust"]
+evidence: ["Rust 1.98.1 E0120 compile failure", "Drop impl targets mutable reference", "local guard Drop repair"]
+sources: ["https://doc.rust-lang.org/error_codes/E0120.html", "https://doc.rust-lang.org/std/ops/trait.Drop.html", "https://doc.rust-lang.org/book/ch15-03-drop.html"]
+---
+
+I tried to implement `Drop` for `&mut Resource`. Rust emitted E0120 because references are not local structs, enums, or unions on which my crate can define destruction behaviour.
+
+The [failing fixture](/rust-failure-atlas/evidence/RFA-513/fail.rs) also exposes an ownership mismatch: a reference borrows a resource; it does not own the resource being destroyed.
+
+## Drop follows ownership of a value
+
+Rust runs `Drop::drop` when an owned value reaches the end of its drop scope. The value's type defines the cleanup invariant.
+
+A reference value ending means the borrow ends. The referent remains owned elsewhere and may continue living. Attaching referent cleanup to any temporary reference would make borrowing capable of unexpectedly destroying or resetting someone else's state.
+
+The [official E0120 page](https://doc.rust-lang.org/error_codes/E0120.html) directs this design toward a wrapper.
+
+## The repaired fixture introduces a guard
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-513/fixed.rs) defines local `Guard<'a>` containing `&'a mut Resource` and implements `Drop` for the guard.
+
+Now the guard is an owned nominal value with one clear drop scope. Its borrow ensures exclusive access to the resource while the guard exists. Cleanup can run at guard destruction without claiming ownership of the resource itself.
+
+This is the RAII guard pattern used for scoped state and lock-like APIs.
+
+## Put final destruction on the resource owner
+
+If cleanup must happen exactly when the resource itself dies, `Drop` belongs on the local resource type. It may close a handle, release foreign memory, or restore an invariant.
+
+If the resource type is foreign, I wrap it in a local newtype that owns it. The wrapper's destructor then follows the wrapper's ownership and can prevent raw access that would violate cleanup assumptions.
+
+The distinction is final ownership versus temporary scoped access.
+
+## Drop cannot be called directly as ordinary cleanup
+
+Rust does not allow an explicit `value.drop()` call through the trait as a normal method. `std::mem::drop(value)` consumes the value and lets its destructor run at the appropriate point.
+
+For fallible cleanup, relying only on `Drop` is insufficient because destructors do not return `Result`. I expose an explicit `close` or `finish` method and keep `Drop` as a best-effort fallback when appropriate.
+
+I test both explicit and implicit paths.
+
+## Guard destructors must remain panic-safe
+
+Destructors can run during unwinding. A second panic may abort the process, and complex work can create surprising latency at scope boundaries.
+
+I keep guard cleanup small, non-panicking, and clear about failure handling. Network operations or required persistence usually deserve explicit methods rather than hidden destructor work.
+
+The [`Drop` documentation](https://doc.rust-lang.org/std/ops/trait.Drop.html) also matters for drop order and interaction with ownership.
+
+## Forgetting and cycles are real limits
+
+Safe mechanisms can intentionally leak values, and reference-count cycles can prevent destruction. Therefore `Drop` is not a universal guarantee that externally important work always happens.
+
+I do not base safety on a destructor running in every conceivable program termination path. Memory safety invariants must remain valid even when cleanup is skipped; external durability uses explicit protocols.
+
+## Drop order should be part of the guard design
+
+Fields are dropped according to Rust's defined ordering after the type's own `drop` method runs. A guard holding several resources should not depend on accidental declaration changes without tests and documentation. I may wrap fields separately or use `Option::take` when cleanup needs deliberate sequencing, while respecting the prohibition on moving ordinary fields directly out of a type that implements `Drop`.
+
+For nested scopes, I keep guard bindings close to the operations they protect. An underscore-prefixed named binding lives to scope end, while `_` can discard a value immediately. Small lifetime differences can decide when cleanup happens, so the repaired code should exercise the intended scope boundary.
+
+## Cleanup should be observable in tests
+
+For a real guard I record a flag, counter, or fake resource event and assert it after the guard's scope ends. Compilation proves only that the destructor is legal; the test proves that it performs the promised transition once.
+
+## My E0120 checklist
+
+- Does the target type own the resource or only borrow it?
+- Is the target a local struct, enum, or union?
+- Should cleanup happen at final ownership or at scope exit?
+- Would a local guard represent temporary cleanup responsibility?
+- Does a foreign owned resource need a newtype wrapper?
+- Can cleanup fail and therefore need an explicit method?
+- Is the destructor small and non-panicking?
+- What happens if the value is leaked or the process terminates?
+
+The core principle is that destruction responsibility follows an owned local value. A reference only grants access; a guard or owner gives cleanup one explicit lifetime and one accountable type.

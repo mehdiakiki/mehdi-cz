@@ -1,0 +1,231 @@
+---
+title: "Rust Strict Provenance: Why a Pointer Is More Than an Address"
+date: "2026-09-12T19:00:00+01:00"
+tags: ["rust", "strict provenance", "pointers", "unsafe rust", "memory model"]
+draft: false
+reviewed: true
+reviewedHash: "477f0139a86ca7b870c4b1ca4cc2b296c2494ce2d3e8fc1d23f953c69fca368f"
+cluster: "rust-under-the-hood"
+campaign: "authority-2026"
+opportunity: "RUST-047"
+summary: "A Rust pointer carries an address and provenance. Learn addr, with_addr, map_addr, exposed provenance, and sound pointer-tagging patterns."
+---
+
+At machine-code level, a pointer often looks like an integer address. In Rust's abstract machine, this is not the complete story. A pointer also has **provenance**: information about the memory allocation and access from which the pointer originated.
+
+This difference is important when writing allocators, intrusive collections, tagged pointers, FFI layers, or any unsafe code that converts pointers to integers and back.
+
+The practical advice is not "never touch an address." Rust has APIs made exactly for this work. I choose explicitly whether to preserve provenance or expose it.
+
+## Address answers where; provenance answers from where
+
+Imagine two heap allocations that happen, at different moments, to use the same numeric address. An integer alone cannot tell which allocation a pointer was derived from. It also cannot explain whether a pointer came from a live reference, an old freed allocation, or an unrelated object.
+
+Rust's memory model needs this history because the optimizer reasons about:
+
+- allocation boundaries;
+- pointer arithmetic;
+- aliasing and exclusive access;
+- object lifetimes;
+- invalidation of references and derived pointers.
+
+A useful mental model is:
+
+```text
+pointer = address + provenance (+ metadata for a wide pointer)
+```
+
+This is an abstract model, not a promise that ordinary hardware stores a hidden provenance field beside every pointer. The compiler may track the distinction while the emitted pointer is one machine word.
+
+For slices and trait objects there is also pointer metadata, such as a length or vtable. Metadata and provenance are different concepts.
+
+## The old round trip hides intent
+
+Unsafe code traditionally used casts like this:
+
+```rust
+let address = pointer as usize;
+let changed = address | 1;
+let tagged_pointer = changed as *mut Node;
+```
+
+What provenance should the last pointer receive? The integer may have been stored, modified, mixed with other integers, sent through FFI, or reconstructed much later. A unary integer-to-pointer cast does not say which original allocation justifies future access.
+
+Rust supports this exposed-provenance behavior, but it is deliberately the less precise path. When I still have an original pointer, Strict Provenance APIs state the intent better.
+
+## Inspect an address without exposing provenance
+
+Use `addr()` when the integer is only an address value:
+
+```rust
+fn is_aligned<T>(pointer: *const T, alignment: usize) -> bool {
+    pointer.addr() % alignment == 0
+}
+```
+
+`addr()` does not expose the pointer's provenance for a later ambiguous reconstruction. It says: I need the numeric address for calculation or inspection.
+
+This difference may compile to the same instruction as a cast. The benefit is in the semantics and in making the unsafe proof reviewable.
+
+## Change address while preserving provenance
+
+`with_addr` combines a new address with the provenance of an existing pointer:
+
+```rust
+fn clear_low_bit<T>(pointer: *mut T) -> *mut T {
+    let clean_address = pointer.addr() & !1;
+    pointer.with_addr(clean_address)
+}
+```
+
+The returned pointer is still derived from `pointer`. This does not grant access to arbitrary memory. Its use remains constrained like pointer arithmetic from the original pointer: the target address must be valid for the allocation and operation.
+
+For the common "transform this pointer's address" pattern, `map_addr` is shorter:
+
+```rust
+fn clear_low_bit<T>(pointer: *mut T) -> *mut T {
+    pointer.map_addr(|address| address & !1)
+}
+```
+
+These methods let me perform address arithmetic without throwing away the allocation identity I already have.
+
+## A complete tagged-pointer example
+
+Pointer tagging stores small flags in alignment bits that valid pointers cannot use. Here is a minimal example:
+
+```rust
+#[repr(align(2))]
+struct Node {
+    value: u32,
+}
+
+const MARKED: usize = 1;
+
+fn main() {
+    let raw = Box::into_raw(Box::new(Node { value: 42 }));
+    assert_eq!(raw.addr() & MARKED, 0);
+
+    let tagged = raw.map_addr(|address| address | MARKED);
+    assert_ne!(tagged.addr() & MARKED, 0);
+
+    // Never dereference the tagged address. Remove the tag first while
+    // preserving the provenance carried by `tagged`.
+    let restored = tagged.map_addr(|address| address & !MARKED);
+
+    unsafe {
+        assert_eq!((*restored).value, 42);
+        drop(Box::from_raw(restored));
+    }
+}
+```
+
+The alignment declaration guarantees that bit zero is free for this type. I never dereference the tagged value. `map_addr` preserves the provenance chain, and exactly one `Box::from_raw` retakes ownership of the original allocation.
+
+A production tagged pointer needs more work: correct generic alignment, DST metadata, atomic representation if shared, panic safety, and a carefully documented ownership model. The example isolates only the provenance part.
+
+## Preserving provenance does not make an address valid
+
+This is an important limit. `with_addr` is not a permission generator:
+
+```rust
+let other_address = 0x1234usize;
+let invented = pointer.with_addr(other_address);
+```
+
+The result carries `pointer`'s provenance, but dereferencing it is valid only if the new address is appropriate for that same allocation and all normal requirements hold:
+
+- the allocation is still live;
+- the address is in bounds for the access;
+- alignment is correct;
+- the pointee has a valid bit pattern;
+- aliasing rules permit the access.
+
+Provenance is one part of pointer validity. It does not replace the rest of the unsafe contract.
+
+## When provenance really must be exposed
+
+Some systems interfaces genuinely store a pointer as an integer without retaining a source pointer. Rust calls this **Exposed Provenance**.
+
+The explicit APIs are:
+
+```rust
+let address = pointer.expose_provenance();
+
+// Later, when no original pointer is available:
+let reconstructed = std::ptr::with_exposed_provenance_mut::<Node>(address);
+```
+
+Traditional `pointer as usize` and `address as *mut Node` casts have equivalent exposed-provenance behavior, but the named APIs make the choice visible.
+
+This path is less precise. The abstract machine must find a previously exposed provenance that can justify the access, and the exact choice is not specified. If no suitable live provenance exists, dereferencing the reconstructed pointer is undefined behavior.
+
+Use it for cases that require it, not as the default pointer-arithmetic tool.
+
+## Common cases and the right question
+
+### Pointer tagging
+
+Keep a source pointer and use `map_addr`. The tag should be removed before dereference.
+
+### Offset inside one allocation
+
+Use pointer arithmetic methods such as `add`, `offset`, or their wrapping variants according to their contracts. They retain the pointer relationship to the allocation.
+
+### Integer handle crossing C code
+
+If the C API promises to return the integer unchanged, exposed provenance may model the round trip. Document that the original allocation remains alive and that aliasing rules are preserved. If you control the ABI, an opaque pointer type is often clearer than an integer.
+
+### Memory-mapped I/O
+
+There may be no Rust allocation from which to derive the fixed hardware address. The standard library documents externally managed memory such as MMIO as a reason exposed provenance exists. Volatile access and platform-specific rules are separate obligations.
+
+### Hashing or logging a pointer
+
+If the number is only observed and never converted back for access, `addr()` states this cleanly. Remember that addresses can leak sensitive process-layout information in logs.
+
+## Provenance and aliasing are related, not identical
+
+Keeping the right provenance does not revive a pointer invalidated by aliasing.
+
+For example, creating and using an exclusive `&mut T` can invalidate other pointers under Rust's aliasing model, depending on how they are derived and used. Converting one of those pointers to an integer before invalidation and reconstructing it afterward does not reset history.
+
+Likewise, provenance from a freed allocation cannot be used to access a new allocation merely because the allocator reused the same address.
+
+The integer bits matching is not enough.
+
+## Why this matters even on ordinary CPUs
+
+It is easy to dismiss provenance as future hardware theory because x86-64 pointers usually are plain addresses. But the compiler already uses pointer-origin and aliasing information to optimise code.
+
+It also matters for tools. Miri can check many unsafe-code assumptions using an interpreted Rust memory model. Code that expresses strict provenance gives such tools more precise information and is easier to audit.
+
+Architectures with capability pointers, such as CHERI-style systems, make the distinction more visible in hardware. Code that needlessly erases provenance is harder to port there.
+
+## A migration method for old unsafe code
+
+When I find `pointer as usize` followed by `usize as *mut T`, I review it in this order:
+
+1. Is the integer converted back to a pointer at all? If not, use `addr()`.
+2. Is an original pointer into the allocation still available? Use `with_addr` or `map_addr`.
+3. Is this ordinary in-allocation arithmetic? Prefer pointer arithmetic APIs.
+4. Does an external interface force an address-only round trip? Use explicit exposed-provenance APIs and document the lifetime protocol.
+5. Independently verify bounds, alignment, validity, aliasing, and deallocation ownership.
+6. Run the smallest possible unsafe test under Miri when supported.
+
+This turns a vague cast into a local proof with a named intent.
+
+## Keep the ancestry clear
+
+A pointer address tells the CPU where. Provenance tells Rust why this pointer may access that memory.
+
+Use `addr`, `with_addr`, and `map_addr` when you can preserve the relationship to an allocation. Use exposed provenance when the system boundary truly removes that relationship. Neither family makes an invalid access safe by itself.
+
+This may feel theoretical on the first read. In an unsafe code review it becomes very practical: every reconstructed pointer should have a clear ancestry.
+
+## Further reading
+
+- [Pointer provenance in `std::ptr`](https://doc.rust-lang.org/std/ptr/index.html#provenance)
+- [`with_exposed_provenance` documentation](https://doc.rust-lang.org/std/ptr/fn.with_exposed_provenance.html)
+- [Pointer methods including `addr`, `with_addr`, and `map_addr`](https://doc.rust-lang.org/std/primitive.pointer.html)
+- [Miri](https://github.com/rust-lang/miri)

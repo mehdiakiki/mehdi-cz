@@ -1,0 +1,89 @@
+---
+caseId: "RFA-138"
+title: "Why catch_unwind Rejects a Mutable Reference as UnwindSafe"
+date: "2026-09-05T14:38:00+01:00"
+lastmod: "2026-09-05T14:38:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "08f39ce6ee3f817a6f64e3d6d715766501c8c64d6682c8bbd12efe9a01fb97f8"
+area: "concurrency-memory"
+symptom: "catch_unwind rejects a closure that mutably borrows local state because &mut i32 is not automatically considered safe to cross an unwind boundary."
+summary: "A panic can interrupt mutation after an invariant changes. The UnwindSafe bound asks whether code after catch_unwind may observe that broken state; AssertUnwindSafe is a scoped assertion by the programmer, not proof or rollback."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["targets supporting unwinding panics"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust catch_unwind mutable reference not UnwindSafe", "&mut may not be safely transferred across unwind boundary", "AssertUnwindSafe mutable closure Rust"]
+evidence: ["Rust 1.98.1 E0277 compile failure", "mutable unwind boundary", "narrow AssertUnwindSafe repair"]
+sources: ["https://doc.rust-lang.org/std/panic/fn.catch_unwind.html", "https://doc.rust-lang.org/std/panic/struct.AssertUnwindSafe.html", "https://doc.rust-lang.org/std/panic/trait.UnwindSafe.html"]
+---
+
+The [failing program](/rust-failure-atlas/evidence/RFA-138/fail.rs) passes a closure to `catch_unwind`. The closure increments a local integer and then panics. Rust rejects it with E0277 because `&mut i32` may not be safely transferred across an unwind boundary.
+
+The integer itself is not memory-unsafe. The diagnostic is asking about the state visible after an interrupted mutation.
+
+## catch_unwind creates a recovery boundary
+
+The [`catch_unwind` documentation](https://doc.rust-lang.org/std/panic/fn.catch_unwind.html) says the function invokes a closure and returns an error when an unwinding panic is captured. If control continues, surrounding code may use values that the closure already changed.
+
+Consider a more realistic mutation:
+
+```text
+remove old index entry
+update canonical record
+add new index entry
+```
+
+A panic after the first or second step leaves a state that safe Rust memory rules cannot classify as a domain invariant. Catching the panic makes that partial state observable to later code.
+
+`UnwindSafe` is a marker for this exception-safety boundary. It is not an unsafe trait, and failing the bound does not mean undefined behaviour is about to occur. It is a warning that logical recovery deserves attention.
+
+## Mutable references receive special caution
+
+A captured `&mut T` represents exclusive access to state that the closure may change. After unwinding, the caller regains access and may assume an operation either completed or did nothing. Rust cannot prove that assumption from arbitrary closure code.
+
+This is why even the simple counter triggers the bound. The compiler does not inspect every mutation and invent a transaction protocol. It applies a conservative structural rule.
+
+Interior-mutability types can raise similar questions because they allow state changes through shared references. The [`UnwindSafe` documentation](https://doc.rust-lang.org/std/panic/trait.UnwindSafe.html) frames the trait as a speed bump for exception safety rather than an absolute safety guarantee.
+
+## AssertUnwindSafe records my decision
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-138/fixed.rs) wraps the closure in `AssertUnwindSafe`. It catches the panic and verifies that the counter remains incremented.
+
+The [`AssertUnwindSafe` documentation](https://doc.rust-lang.org/std/panic/struct.AssertUnwindSafe.html) describes this wrapper as asserting that using the captured value across the boundary is safe. No rollback occurs. The number stays at `1` because the assignment completed before panic.
+
+In this fixture, that state is valid and intentional. In a real system, I write the invariant next to the narrow wrapper:
+
+```rust
+let result = catch_unwind(AssertUnwindSafe(|| update_one_counter(&mut state)));
+```
+
+Wrapping only the disputed capture or smallest closure keeps future additions visible during review. Wrapping a large environment can silently declare later mutable captures acceptable too.
+
+## Result is better for expected failure
+
+The standard documentation warns against using `catch_unwind` as a general `try/catch`. A parsing error, network timeout, invalid request, or storage failure should normally be a `Result` with an explicit error type.
+
+Panics usually represent violated assumptions or unrecoverable failures inside a component. Catching them can make sense at a thread, plugin, request-isolation, test, or foreign-language boundary. Even there, the surrounding process must decide whether shared state remains usable.
+
+`catch_unwind` only catches unwinding panics. A build using `panic=abort`, a double panic during cleanup, process termination, and some foreign exceptions do not become an ordinary returned error.
+
+## Build state privately before publishing it
+
+The strongest repair is often structural rather than `AssertUnwindSafe`. I compute a replacement in temporary owned data, validate it, and publish it with one small mutation at the end. If earlier work panics, the old state remains intact.
+
+For complex shared state, a poison flag, generation number, or explicit `Invalid` state can prevent later readers from assuming completeness. Database and file operations need their own transaction or recovery design; Rust stack unwinding cannot roll them back.
+
+I also test a panic at several points, not only at the beginning. Fault injection reveals which intermediate states can escape.
+
+## My debugging sequence
+
+When `catch_unwind` reports an `UnwindSafe` failure, I do this:
+
+1. List every captured value and every mutation before a possible panic.
+2. State what later code may assume after `Err` is returned.
+3. Prefer `Result` for expected operational failures.
+4. Build new state privately and publish it atomically where possible.
+5. Use `AssertUnwindSafe` only around the smallest boundary with a written invariant.
+6. Test interrupted steps and remember that aborting panics cannot be caught.
+
+The broad principle is that memory safety and recovery safety are different. Rust keeps memory valid during unwinding, but the application still owns the meaning of half-completed work. `UnwindSafe` makes that responsibility harder to ignore.

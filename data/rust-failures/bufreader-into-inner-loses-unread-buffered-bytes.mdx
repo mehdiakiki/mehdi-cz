@@ -1,0 +1,84 @@
+---
+caseId: "RFA-330"
+title: "BufReader::into_inner Can Skip Unread Buffered Bytes"
+date: "2026-09-06T01:50:00+01:00"
+lastmod: "2026-09-06T01:50:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "e9eee60f006af8141e0204d87e5e624c2701d1902fa299ee38275b2e7b0fd0fe"
+area: "ffi-targets"
+symptom: "After reading one byte and unwrapping a BufReader, the underlying reader appears at EOF even though the caller expected the remaining bytes."
+summary: "BufReader reads ahead into private memory. into_inner returns the already-advanced source and discards any unread buffered bytes, so protocol handoff must drain, seek, or transfer the buffering layer deliberately."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust BufReader into_inner loses bytes", "BufReader underlying reader position ahead", "unread buffer discarded into_inner Rust"]
+evidence: ["Rust 1.98.1 Cursor source", "one consumed byte with five buffered", "complete buffered read repair"]
+sources: ["https://doc.rust-lang.org/std/io/struct.BufReader.html#method.into_inner", "https://doc.rust-lang.org/std/io/struct.BufReader.html#method.buffer", "https://doc.rust-lang.org/std/io/struct.BufReader.html#method.seek"]
+---
+
+I once parsed a small header through `BufReader`, unwrapped the socket, and gave the raw stream to another protocol layer. That layer missed the first part of its message. The bytes were not lost on the network; my first reader had already fetched them.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-330/fail.rs) makes this deterministic with an in-memory cursor. It consumes only `a`, confirms unread bytes exist in the buffer, calls `into_inner`, and then receives nothing from the underlying cursor.
+
+## Buffering changes two positions
+
+`BufReader` exposes a logical position to its caller while reading larger chunks from its source. After one small read, the underlying reader may have advanced much farther than one byte. The difference lives in the private unread buffer.
+
+[`BufReader::buffer`](https://doc.rust-lang.org/std/io/struct.BufReader.html#method.buffer) shows the currently buffered bytes that have not been consumed. They are logically next for the `BufReader`, even though the inner reader is already past them.
+
+Thinking only about one cursor hides this state. There is a consumer position and a source position, with buffered bytes between them.
+
+## into_inner does not rewind the source
+
+[`BufReader::into_inner`](https://doc.rust-lang.org/std/io/struct.BufReader.html#method.into_inner) consumes the wrapper and returns `R`. Its documentation warns that leftover data in the internal buffer is lost and later reads from the inner reader may therefore skip data.
+
+The method cannot generally put bytes back. A socket is not seekable. A custom `Read` implementation may have irreversible side effects. Even for a seekable source, silently seeking would add an I/O operation and failure mode not represented by the return type.
+
+So the returned reader is honest about its physical state. My handoff assumption was wrong.
+
+## Finish reading through the same buffering owner
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-330/fixed.rs) reads the remaining bytes through `BufReader` before unwrapping. It receives `bcdef`, then observes that the inner cursor sits at position six.
+
+For a real layered protocol I often keep one `BufReader` for the complete connection and pass `&mut` access to parsers. Each parser consumes exactly its frame and leaves the next bytes inside the shared buffer.
+
+This makes buffer ownership match stream ownership. A temporary parser should not privately read ahead from a stream that another component will later own.
+
+## Seekable inputs have an explicit repair path
+
+For files or cursors, [`BufReader::seek`](https://doc.rust-lang.org/std/io/struct.BufReader.html#method.seek) discards the internal buffer while arranging the underlying position according to the logical seek. The documentation specifically explains the relationship with `into_inner`.
+
+If I must unwrap a seekable reader at its logical position, I can seek to the current logical position before handoff and handle the I/O result. I do not apply that solution to sockets, pipes, compressed streams, or one-pass decoders.
+
+The source capability belongs in the type bound: `Read + Seek` is a stronger contract than `Read`.
+
+## Multiple buffers around one stream create the same failure
+
+Creating two `BufReader` instances over clones or shared access to one stream can make each reader prefetch bytes the other expects. File-handle clones may also share an operating-system offset, depending on the handle API.
+
+The issue is not solved by reducing buffer capacity. Even one byte of read-ahead can cross a message boundary. Capacity tuning changes probability and performance, not ownership correctness.
+
+I use one buffering coordinator or an explicit framing layer that owns all read-ahead data.
+
+## Protocol parsing must return leftovers
+
+Some parsers accept a byte slice and return both a parsed value and an unconsumed remainder. This is a useful design because read-ahead stays visible to the caller.
+
+For incremental network parsing, I retain the buffer across calls, advance only through complete frames, and leave an incomplete suffix for the next read. Dropping the parser must not silently drop bytes that belong to the stream.
+
+This connects to the UTF-8 incomplete-sequence case later in the Atlas: an incomplete suffix may be valid data waiting for the next chunk.
+
+## What I test at handoff boundaries
+
+I use a source smaller than the buffer so read-ahead is deterministic, consume a short prefix, assert that `buffer()` is non-empty, and then exercise the intended handoff. I test exact boundaries, several frames in one source read, and one frame split across reads.
+
+For seekable repair I verify the inner stream position after the explicit seek. For a socket-style source I verify that one long-lived buffer retains the remainder.
+
+Tests should assert byte identity, not only the number of parsed messages. Skipped bytes can sometimes produce a different valid-looking frame.
+
+## The deeper rule is ownership of speculative work
+
+Buffering is a controlled form of speculation: the wrapper reads bytes before its caller requests them individually. Whoever performs that speculation must remain responsible for the results or hand them over explicitly.
+
+The core principle goes beyond Rust I/O. Prefetch queues, database cursors, decompression windows, and message consumers all advance a lower layer ahead of logical consumption. `BufReader::into_inner` exposes that difference. I keep the buffer with the stream or deliberately reconcile the two positions before transfer.

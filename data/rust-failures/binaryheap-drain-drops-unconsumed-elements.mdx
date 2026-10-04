@@ -1,0 +1,95 @@
+---
+caseId: "RFA-360"
+title: "Dropping BinaryHeap::Drain Drops Every Unconsumed Element"
+date: "2026-09-06T02:17:00+01:00"
+lastmod: "2026-09-06T02:17:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "792eec1b205ab534ff5923d9b3675d4d262ae50228f7661e1e20a75e5bb48e12"
+area: "concurrency-memory"
+symptom: "After one value is taken from BinaryHeap::drain and the iterator is dropped, the heap contains zero elements rather than the two unvisited values."
+summary: "BinaryHeap::drain is a clear-all operation with an iterator over removed ownership. Dropping that iterator drops the remaining elements in arbitrary order; use pop when the heap remainder must survive."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust BinaryHeap drain dropped early", "BinaryHeap drain removes all elements", "keep remainder after draining heap"]
+evidence: ["Rust 1.98.1 three-item BinaryHeap", "one Drain item consumed", "empty heap after iterator drop and pop contrast"]
+sources: ["https://doc.rust-lang.org/std/collections/struct.BinaryHeap.html#method.drain", "https://doc.rust-lang.org/std/collections/struct.BinaryHeap.html#method.pop", "https://doc.rust-lang.org/std/collections/binary_heap/struct.Drain.html"]
+---
+
+I once read one element from `BinaryHeap::drain()` and expected the unvisited elements to remain in the heap. They did not. `drain` had already committed to clearing the complete collection; its iterator only controlled how removed values reached me.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-360/fail.rs) starts with three integers. It takes one item from the drain iterator and lets the iterator leave scope. The heap length is zero, not two.
+
+## drain means clear and yield ownership
+
+[`BinaryHeap::drain`](https://doc.rust-lang.org/std/collections/struct.BinaryHeap.html#method.drain) clears the heap and returns an iterator over the removed elements. This is different from an iterator that lazily decides whether each element should be removed.
+
+The returned [`Drain`](https://doc.rust-lang.org/std/collections/binary_heap/struct.Drain.html) temporarily borrows the heap mutably. Values yielded by `next()` become owned by the caller. Values not requested are still part of the clear operation and are dropped when the drain iterator is dropped.
+
+Stopping iteration controls observation, not the mutation scope.
+
+## The removal order is arbitrary
+
+A `BinaryHeap` promises efficient access to its greatest element through `peek` and `pop`. Its internal vector is not globally sorted. Ordinary `drain` follows an arbitrary order and does not pay to produce priority order.
+
+I do not use the first drained value as “the maximum.” It may happen to be one value in a particular implementation, but the public contract does not make that a priority operation.
+
+When order matters, stable Rust offers repeated [`pop`](https://doc.rust-lang.org/std/collections/struct.BinaryHeap.html#method.pop), which returns greatest values one by one. Consuming the heap with `into_sorted_vec` is another option when ascending output and ownership of the whole heap are appropriate.
+
+## Dropping the iterator completes destruction
+
+The drain iterator owns the removed elements not yet yielded. Rust must dispose of those values when the iterator is dropped, otherwise resources would leak during normal early exits.
+
+This matters for more than integers. A heap may own files, permits, buffers, or objects whose `Drop` implementations release resources. Calling `drain().next()` and discarding the iterator can release every remaining resource, even though application code processed only one.
+
+The order in which the remaining values are dropped is arbitrary too. I never encode business sequencing in destructors attached to a heap drain.
+
+## The borrow makes the transition atomic to safe callers
+
+While `Drain` lives, it holds a mutable borrow of the heap. Safe code cannot simultaneously inspect the heap and watch its length change. After the iterator is gone, the heap is available again and empty.
+
+This design gives implementations room to move storage efficiently while presenting one clear before-and-after contract. The temporary unavailability is a useful signal: I am in the middle of transferring or dropping all ownership.
+
+If I need to interleave removal with new pushes, `drain` is the wrong operation. I use repeated `pop` and make the scheduling policy explicit.
+
+## Early return does not preserve the remainder
+
+Iterator consumers often short-circuit. `find`, `any`, `take`, an error returned with `?`, or a manual `break` can stop requesting drain items. None of these undo the clear operation.
+
+For example, searching drained jobs for the first matching ID will destroy every non-returned job when the temporary iterator drops. The resulting code may look like a read-oriented query even though it empties the queue.
+
+I query with `iter()` when I only need a borrowed search. If I need to remove one selected priority item, I design that removal separately and account for `BinaryHeap` not indexing arbitrary items.
+
+## Use pop when the remainder should survive
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-360/fixed.rs) shows both contracts. One heap is deliberately drained and confirmed empty after an early iterator drop. A second heap uses `pop()` to remove only `9`; converting the remainder to a sorted vector proves that `7` and `8` survived.
+
+This makes intent visible in review:
+
+- `drain()` means all elements leave the collection.
+- `pop()` means one greatest element leaves.
+- `clear()` means all elements are dropped without yielding them.
+- consuming iteration transfers the whole heap and makes the old variable unavailable.
+
+The correct choice follows ownership, not only desired syntax.
+
+## Panic and partial processing need a policy
+
+If processing one yielded item panics, unwinding drops the iterator and therefore drops unconsumed elements. Memory safety remains protected, but business work can be partially completed.
+
+For a durable job system, a heap in process memory is not enough to guarantee at-least-once execution. I acknowledge jobs only after successful work and keep recoverable state outside a destructive drain where needed.
+
+Even without panic, a fallible loop returning early has the same logical risk. I avoid destructive bulk iteration when a failed item should leave later items available for retry.
+
+## Tests need a destructor-visible value
+
+The integer fixture proves the final length, which is the smallest deterministic demonstration. In a resource-owning component I also use a test value whose destructor increments a counter. After consuming one drain item and dropping it separately, I can verify that every original value was eventually dropped exactly once.
+
+I do not assert drain order. A test that locks arbitrary order converts an implementation detail into a false API dependency.
+
+## The core principle is that lazy output need not mean lazy mutation
+
+An iterator describes how results are delivered, but it does not automatically describe when the source is mutated. `BinaryHeap::drain` commits to clearing the heap and then lets me receive removed values lazily.
+
+I now read destructive iterator documentation in two dimensions: what happens to the collection, and what happens to unconsumed items. Here the answers are “the heap becomes empty” and “the iterator drops the rest.”

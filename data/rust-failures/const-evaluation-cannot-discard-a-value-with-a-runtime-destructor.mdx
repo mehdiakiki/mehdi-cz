@@ -1,0 +1,87 @@
+---
+caseId: "RFA-556"
+title: "Rust Const Evaluation Cannot Discard a Value with a Runtime Destructor"
+date: "2026-09-06T06:35:00+01:00"
+lastmod: "2026-09-06T06:35:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "afd22564dabcb05a0ece4a5ebcc3f260b9a30f99461f4b6439d969413edf612c"
+area: "diagnostics-macros"
+symptom: "Selecting tuple element .1 in a static initializer fails with E0493 because the unselected Guard must be dropped during const evaluation and Guard has a custom runtime destructor."
+summary: "Const evaluation may construct values, but it cannot run arbitrary custom Drop code while discarding temporaries. Ensure every destructor-bearing value escapes or initialize at runtime."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust E0493 destructor cannot be evaluated at compile time", "Drop type static initializer tuple const eval", "custom destructor const context Rust"]
+evidence: ["Rust 1.98.1 E0493 compile failure", "tuple creates discarded Guard during static initialization", "direct Guard construction repair"]
+sources: ["https://doc.rust-lang.org/error_codes/E0493.html", "https://doc.rust-lang.org/reference/const_eval.html", "https://doc.rust-lang.org/std/ops/trait.Drop.html"]
+---
+
+A static initializer is evaluated in a restricted compile-time environment. Constructing the final value can be valid while creating and discarding an intermediate value is not, especially when that intermediate has custom `Drop` behaviour.
+
+The [failing fixture](/rust-failure-atlas/evidence/RFA-556/fail.rs) builds two `Guard` values in a tuple and selects `.1`. The first guard must be discarded during const evaluation, which would invoke its custom destructor. Rust emits E0493.
+
+## Drop can run arbitrary runtime code
+
+An implementation of [`Drop`](https://doc.rust-lang.org/std/ops/trait.Drop.html) may close handles, update counters, lock state, log, or call other ordinary functions. Const evaluation cannot simply execute arbitrary runtime effects while producing the program image.
+
+The compiler also cannot silently skip the destructor because that would change the type's promised lifecycle semantics.
+
+The [official E0493 explanation](https://doc.rust-lang.org/error_codes/E0493.html) states that values with custom destructors cannot be dropped during const evaluation.
+
+## The discarded temporary causes the failure
+
+Both tuple elements are constructed. Selecting one moves it into the final `Runtime`, but the other has no destination and must be destroyed. That hidden cleanup is the invalid operation.
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-556/fixed.rs) constructs exactly one `Guard` directly in the static. It becomes part of the final program value instead of being dropped by the initializer.
+
+This is why simplifying a const expression can fix the error even when all named types stay the same.
+
+## Const restrictions apply to temporary lifecycles
+
+I inspect not only function calls but also intermediate ownership:
+
+- tuple and array elements later discarded;
+- overwritten values;
+- pattern matches that drop unused parts;
+- blocks with temporary locals;
+- method chains that consume and replace owners.
+
+The Reference lists allowed [constant expressions](https://doc.rust-lang.org/reference/const_eval.html) and their restrictions. A small reduction often shows which temporary needs cleanup.
+
+## Runtime lazy initialization may be the honest boundary
+
+If initialization fundamentally needs allocation, I/O, complex branching, or destructor-bearing temporary work, I move it to runtime. `LazyLock`, `OnceLock`, or explicit application startup can create the value once.
+
+This is not a performance failure. Startup initialization is often negligible and yields much clearer error handling. Forcing complex resource construction into const context can make APIs less maintainable.
+
+I reserve compile-time initialization for values whose construction is naturally pure and const-supported.
+
+## ManuallyDrop is not a casual escape hatch
+
+`ManuallyDrop<T>` suppresses automatic destruction and is used in low-level ownership representations. Introducing it solely to make a static initializer compile can leak resources or create unsafe drop invariants.
+
+If I use it, I document exactly who later destroys the value, prove destruction happens once, and audit layout interactions. For ordinary application state, direct construction or runtime initialization is safer.
+
+## The final static still has process-lifetime behaviour
+
+A normal immutable static is not dropped at program exit in the way stack locals are. A custom destructor on its field therefore does not imply deterministic shutdown cleanup.
+
+If shutdown must flush or close a resource, I keep it under an application owner whose lifetime and shutdown path are explicit. The E0493 fixture demonstrates compile-time temporary cleanup, not a guarantee that static destructors will run later.
+
+## Macro expansion can hide the discarded value
+
+A derive or helper macro may expand a simple-looking initializer into tuples, matches, or replacement operations. When the source does not visibly create a temporary, I inspect expanded code or reproduce the constructor without the macro. I then keep a regression fixture pinned to the supported compiler version. Const evaluation evolves across Rust releases, but a newly accepted expression still deserves a lifecycle review: compilation support does not automatically mean the macro's hidden drop behaviour matches the resource semantics I intended.
+
+## My E0493 checklist
+
+- Which type in the const expression implements `Drop`?
+- Which intermediate value would be discarded before becoming the final constant?
+- Can I construct the final value directly without that temporary?
+- Is a match, tuple projection, or overwrite causing implicit cleanup?
+- Does initialization belong at runtime instead?
+- Am I considering `ManuallyDrop` without a complete ownership proof?
+- Does the program incorrectly rely on a static destructor at shutdown?
+- Can a minimal const fixture isolate the exact unsupported operation?
+
+The core principle is that compile-time evaluation cannot perform arbitrary runtime cleanup. I make destructor-bearing values escape into the final object or move resource lifecycle into explicit runtime ownership.

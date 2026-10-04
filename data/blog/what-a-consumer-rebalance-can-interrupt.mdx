@@ -1,0 +1,175 @@
+---
+title: "What a Consumer Rebalance Can Interrupt"
+date: "2026-10-19T09:00:00+01:00"
+tags: ["Kafka consumer", "consumer rebalance", "offset commit", "event streaming", "distributed systems"]
+draft: false
+reviewed: true
+reviewedHash: "4b30039d755434b88cdb612f9e78e03ed4e8b4d79e7b9ee425e0800eb8fdfc21"
+cluster: "reliable-data-integrations"
+campaign: "authority-2026"
+opportunity: "DATA-049"
+summary: "A Kafka rebalance can revoke a partition while application work is still running. Track ownership generations, contiguous completion, offset commits, and external effects explicitly."
+---
+
+A consumer rebalance is often described as “partitions move between workers.” The difficult part is what the old worker was doing when ownership moved.
+
+It may have fetched records, started database transactions, launched asynchronous work, called an external provider, or completed later offsets while an earlier one was still running.
+
+I design the handler around revocation, not only around the happy poll loop.
+
+## Assignment is a lease, not permanent ownership
+
+In a consumer group, the coordinator assigns each partition to one member. Membership or subscription changes can trigger a rebalance. The old assignment is revoked and another member may receive it.
+
+```text
+generation 31: worker A owns partition 4
+rebalance
+generation 32: worker B owns partition 4
+```
+
+Worker A may still have application tasks for partition 4 in memory. The broker's new assignment does not automatically cancel an HTTP request or thread in my process.
+
+The [Kafka consumer API](https://kafka.apache.org/41/javadoc/org/apache/kafka/clients/consumer/KafkaConsumer.html) documents group management, polling, liveness, and offset control. Its `ConsumerRebalanceListener` exists so applications can react to assigned and revoked partitions.
+
+## Draw the work after poll
+
+One poll can return several records:
+
+```text
+partition 4: offsets 100, 101, 102
+partition 7: offsets 88, 89
+```
+
+If the application launches all five concurrently, “the consumer processed offset 102” is not enough to commit position 103. Offset 100 might still be running.
+
+For each partition I track a contiguous completed prefix:
+
+```text
+100 complete
+101 running
+102 complete
+
+safe next offset to commit = 101
+```
+
+Kafka commits the **next** record position, not a list of arbitrary completed offsets. Committing 103 here would skip 101 after reassignment.
+
+## The revocation race
+
+Consider:
+
+```text
+worker A starts offset 101
+rebalance revokes partition 4 from A
+worker B receives partition 4 at committed offset 101
+worker B starts offset 101
+worker A's old task finishes
+```
+
+Now two workers can attempt the same business effect. This is normal at-least-once behaviour around ownership change.
+
+I use inbox identity or idempotency keys so both attempts represent one intended effect. If an old worker can overwrite new state, I also use a fencing value tied to ownership generation or a newer application lease.
+
+## A revoke callback has limited time
+
+On revocation, I may try to:
+
+1. stop accepting work for the partition;
+2. cancel work that is safely cancellable;
+3. wait for a bounded drain;
+4. commit the contiguous completed position;
+5. release local resources.
+
+I do not assume the callback can wait forever. Group liveness has time limits, and a stuck drain delays reassignment.
+
+Kafka has eager and cooperative rebalance protocols. Cooperative rebalancing can reduce how many partitions move at once, but any partition actually revoked still needs a correct handoff.
+
+## Poll timing is part of correctness
+
+Kafka consumers must continue participating in the group. `max.poll.interval.ms` limits how long the application can go without calling `poll()` before it is considered failed for group management.
+
+Long record processing inside the poll thread can therefore cause the rebalance it was not designed to survive.
+
+Two common designs are:
+
+```text
+simple synchronous
+poll -> process bounded batch -> commit -> poll
+
+decoupled workers
+poll -> enqueue bounded per-partition work
+poll thread maintains liveness
+completion tracker controls safe offsets
+```
+
+The second design scales long work but needs explicit backpressure, ownership, and contiguous-offset tracking. Moving work to a thread pool is not the end of the design.
+
+## Pausing does not freeze ownership
+
+Pausing a partition stops new records from being returned for it. It does not convert the group assignment into a permanent lock.
+
+A rebalance can still revoke a paused partition. I use pause for backpressure and bounded draining, while still handling revocation as a separate lifecycle event.
+
+## External effects outlive cancellation
+
+Cancelling a future does not guarantee that a provider cancelled the request. The payment, email, or database operation may already be accepted.
+
+Every mutating call uses a stable effect key derived from message identity and operation purpose:
+
+```text
+effect key = consumer + topic + partition + offset + operation
+```
+
+After an ambiguous timeout or revocation, the next owner reconciles with that same identity. It does not create a fresh request because the worker generation changed.
+
+## Commit failure has meaning too
+
+A synchronous commit during revocation can fail because the member no longer owns the generation. This does not mean completed business effects should run again without protection.
+
+The next worker starts from the last durable broker position and duplicate protection absorbs already committed effects. I log the attempted position, group generation, assignment, and error without pretending an offset commit can roll back the database.
+
+For the wider transaction gap, see [Where a Transaction Ends in a Message Consumer](/blog/where-a-transaction-ends-in-a-message-consumer).
+
+## A rebalance test should hold work open
+
+I test with two consumers and a controllable handler:
+
+```text
+1. consumer A receives offsets 100-102
+2. block offset 101 before its effect
+3. allow 100 and 102 to complete
+4. start consumer B or otherwise trigger rebalance
+5. release old work after revocation
+6. observe the reassigned start position
+7. verify every business effect exists once
+```
+
+Then I repeat with the crash after the external effect but before local completion, and with commit failure in the revoke path.
+
+The assertions are:
+
+- no offset before an incomplete gap was skipped;
+- old ownership could not overwrite newer fenced state;
+- duplicate delivery did not duplicate the business effect;
+- the consumer resumed within its liveness budget;
+- metrics identify the revoked in-flight work.
+
+## Operational signals
+
+I keep per-partition visibility for:
+
+```text
+assignment generation and owner
+highest fetched offset
+highest contiguous completed offset
+last committed next-offset
+in-flight count and oldest age
+paused duration
+rebalance count and duration
+tasks completed after revocation
+duplicate effects prevented
+```
+
+Aggregate consumer lag does not reveal a worker finishing revoked work.
+
+A rebalance can interrupt ownership, not necessarily the code already running. Once I treat assignment as a lease, the design becomes clearer: stop new work, bound the drain, commit only contiguous completion, fence stale owners where needed, and make every external effect safe to observe twice.

@@ -1,0 +1,111 @@
+---
+caseId: "RFA-699"
+title: "slice::subslice_range Tracks Origin, Not Equal Values"
+date: "2026-09-07T09:30:00+01:00"
+lastmod: "2026-09-07T09:30:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "f2972b593b53438c8cb3a47e0dca80b21b000f11ac59fae1384e3c9a79be310a"
+area: "concurrency-memory"
+symptom: "slice::subslice_range returns None for a separate slice containing exactly the values visible inside the original slice."
+summary: "Rust 1.98 subslice_range recovers the indices of a view borrowed from one parent slice. It uses location and alignment, not element equality, so an equal copy is not a subslice of that allocation."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets supported by the API"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust subslice_range returns None equal slice", "subslice_range does not compare elements", "find range of borrowed subslice Rust 1.98"]
+evidence: ["Rust 1.98.1 runtime assertion", "equal values from a different array return None", "same-allocation derived subslice returns its range"]
+sources: ["https://doc.rust-lang.org/std/primitive.slice.html#method.subslice_range", "https://doc.rust-lang.org/std/primitive.slice.html#method.windows", "https://doc.rust-lang.org/releases.html#version-1980-2026-08-20"]
+---
+
+Rust 1.98 added a small slice method which answers a very specific question: where did this borrowed subslice come from? It does not answer the more familiar question, “where do these values occur?” Confusing the two makes a correct `None` look like a library bug.
+
+The [failing fixture](/rust-failure-atlas/evidence/RFA-699/fail.rs) uses these values:
+
+```rust
+use core::range::Range;
+
+let owner = [10_u8, 20, 30, 40];
+let equal_copy = [20_u8, 30];
+
+assert_eq!(
+    owner.subslice_range(&equal_copy),
+    Some(Range { start: 1, end: 3 }),
+);
+```
+
+The two middle values are equal, but `equal_copy` is a different array in a different piece of storage. `subslice_range` returns `None`, and the assertion panics. No element comparison failed because no element comparison happened.
+
+## The method reverses a borrow
+
+A slice is a pointer and a length. When I create `&owner[1..3]`, the returned slice points inside `owner`. `subslice_range` can compare locations, check alignment, and translate that derived view back into element indices.
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-699/fixed.rs) keeps that relationship:
+
+```rust
+use core::range::Range;
+
+let owner = [10_u8, 20, 30, 40];
+let derived = &owner[1..3];
+
+assert_eq!(
+    owner.subslice_range(derived),
+    Some(Range { start: 1, end: 3 }),
+);
+```
+
+This is useful after APIs such as `split`, because every yielded part is still a view into the original slice. I can attach offsets to those parts without rescanning values and without doing unsafe pointer subtraction myself.
+
+## Equal content is a search problem
+
+If the input is a separate sequence and I want the first equal occurrence, I use a value-search operation:
+
+```rust
+let wanted = [20_u8, 30];
+let position = owner
+    .windows(wanted.len())
+    .position(|window| window == wanted);
+
+assert_eq!(position, Some(1));
+```
+
+That loop has different semantics and different cost. It compares elements. It may also find several occurrences, so “first,” “last,” or “all” must be part of the calling contract.
+
+I do not replace `subslice_range` with `windows` as a generic fix. I first decide which question the program needs:
+
+- Origin recovery asks whether this exact view belongs to this exact parent.
+- Value search asks whether an equal sequence occurs somewhere in the parent.
+
+The same-looking values do not make these contracts interchangeable.
+
+## The returned range is the new range type
+
+On Rust 1.98, the method returns `Option<core::range::Range<usize>>`. This is not the legacy `std::ops::Range` type people usually get from the `1..3` syntax today. If I annotate the expected value with the old type, I get a type mismatch even though both debug as `1..3`.
+
+That secondary surprise is useful during migration. I let inference work when I only inspect `start` and `end`, or I import `core::range::Range` explicitly when the type belongs in an interface. I do not convert types blindly just because their printed form matches.
+
+## Empty slices need care
+
+The official documentation calls out an edge case for zero-length slices. Empty slices have no elements whose addresses can establish a unique origin, and an empty view at a boundary may produce a false positive involving another allocation.
+
+If empty pieces matter to my parser, I preserve context from the operation that created them. For example, I enumerate split results or carry the cursor position rather than asking an empty pointer to recover history it may not uniquely encode.
+
+For non-empty views of non-zero-sized elements, the origin model is much easier to reason about. The API also rejects a view which points between elements rather than at the parent's element alignment.
+
+## Where I would use it
+
+The strongest use is extending an iterator which already returns borrowed pieces:
+
+```rust
+let packet = [0, 7, 8, 0, 9];
+
+let fields: Vec<_> = packet
+    .split(|byte| *byte == 0)
+    .map(|field| packet.subslice_range(field).unwrap())
+    .collect();
+```
+
+Now the offsets describe the actual views produced by `split`, including repeated values. A content search could select the wrong repeated occurrence; origin recovery cannot confuse two non-empty views merely because they compare equal.
+
+In production code I test repeated sequences, a view at each boundary, an unrelated equal allocation, and the empty-view policy. This makes the intention visible. `subslice_range` is not a faster `find`. It is the safe inverse of deriving a slice, and that narrower promise is exactly why it can avoid scanning.
+
+I also keep zero-sized element types out of this use. Their elements have no distinct storage offsets, and the documented method panics for them. A cursor carried by the parser is the clearer coordinate in that case.

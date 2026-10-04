@@ -1,0 +1,101 @@
+---
+caseId: "RFA-404"
+title: "Arc::unwrap_or_clone Clones Only When Ownership Is Shared"
+date: "2026-09-06T03:44:00+01:00"
+lastmod: "2026-09-06T03:44:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "8edcb066c13e3686169252e8368e2e325106f1fc2c9084b84f10fd69ef436b80"
+area: "concurrency-memory"
+symptom: "Arc::unwrap_or_clone calls Payload::clone once when a second strong Arc remains, but calls it zero times for a unique Arc."
+summary: "Arc::unwrap_or_clone extracts T by moving it when the Arc is uniquely strong-owned and clones T otherwise. It is an ownership-sensitive exit from sharing, not a promise that extraction is always free."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["targets with atomic pointer support"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust Arc unwrap_or_clone when does it clone", "Arc unwrap_or_clone strong count", "extract Arc value clone only if shared"]
+evidence: ["Rust 1.98.1 custom Clone counter", "two strong owners clone branch", "unique owner move branch"]
+sources: ["https://doc.rust-lang.org/std/sync/struct.Arc.html#method.unwrap_or_clone", "https://doc.rust-lang.org/std/sync/struct.Arc.html#method.try_unwrap", "https://doc.rust-lang.org/std/sync/struct.Arc.html#method.strong_count"]
+---
+
+I like `Arc::unwrap_or_clone` because it expresses a common transition: leave shared ownership and obtain an ordinary owned `T`. The name also hides an important branch. Sometimes it unwraps; sometimes it clones.
+
+The [failing fixture](/rust-failure-atlas/evidence/RFA-404/fail.rs) keeps two strong Arc handles alive. Calling `unwrap_or_clone` on one handle increments the payload's custom clone counter. The other strong owner prevents moving the shared payload out.
+
+## Unique ownership permits a move
+
+[`Arc::unwrap_or_clone`](https://doc.rust-lang.org/std/sync/struct.Arc.html#method.unwrap_or_clone) consumes one `Arc<T>`. If that handle is the only strong owner, Rust can take `T` from the allocation and return it without calling `T::clone`.
+
+This is the fast ownership path:
+
+```text
+one strong Arc<T> -> consume Arc -> move out T
+```
+
+The allocation and reference-counting machinery can be dismantled because no other strong handle may access the payload.
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-404/fixed.rs) tests this branch after testing the shared branch. The clone count does not increase for the unique Arc.
+
+## Shared ownership requires an independent value
+
+With another strong Arc alive, moving out `T` would invalidate that other owner's access. The method instead clones the payload for the caller consuming its handle:
+
+```text
+two or more strong Arc<T> -> consume one Arc -> clone T -> other Arc keeps original T
+```
+
+The returned value is not reference counted. It is a separate owned `T` created through `Clone`.
+
+If `T::clone` is expensive—large buffers, deep graphs, or reference-expanding state—the cost appears exactly at this boundary. I do not call the method “zero copy” without proving uniqueness.
+
+## strong_count is diagnostic, not a reservation
+
+[`Arc::strong_count`](https://doc.rust-lang.org/std/sync/struct.Arc.html#method.strong_count) can help logs and tests, but reading a count does not reserve the unique path. Another thread or owner may clone or drop a handle around the observation.
+
+I do not write correctness logic as “if count is one, then later extraction will not clone.” I call the ownership API and accept its atomic decision at the transition.
+
+In single-threaded fixture setup, a count assertion is deterministic because I control every handle. In concurrent production code, it is a snapshot.
+
+## Weak pointers do not force the clone branch
+
+The relevant question is strong ownership of the payload. Weak handles do not keep `T` alive by themselves. A unique strong Arc may still be unwrapped while weak allocation observers exist, though those observers can no longer upgrade after the payload is taken and destroyed or moved.
+
+This is consistent with `Arc::try_unwrap`, which is not blocked merely by weak pointers. I still account for what observers expect: extracting the final strong value ends their ability to acquire it.
+
+## try_unwrap exposes the branch differently
+
+[`Arc::try_unwrap`](https://doc.rust-lang.org/std/sync/struct.Arc.html#method.try_unwrap) returns `Ok(T)` for unique strong ownership and returns the original `Arc<T>` in `Err` when sharing remains.
+
+That API is appropriate when cloning is forbidden or when the caller wants to retry, queue, or preserve shared ownership. `unwrap_or_clone` is appropriate when an owned result is required and cloning is an accepted fallback.
+
+I choose based on policy:
+
+- cloning acceptable: `unwrap_or_clone`;
+- cloning must never happen silently: `try_unwrap`;
+- continued sharing acceptable: keep `Arc<T>`;
+- mutation under sharing: consider `make_mut`, a lock, or a different state model.
+
+## Clone can have more behavior than copying bytes
+
+`Clone` is explicit but not necessarily cheap or side-effect free. A custom implementation may allocate, duplicate handles, increase other reference counts, or rebuild indexes. It may also panic.
+
+The fixture uses a counter so the branch is visible. In real reviews I inspect `T`'s Clone implementation and nested fields. An Arc around a large structure makes Arc cloning cheap; it does not make cloning the inner structure cheap.
+
+## The consumed handle always goes away
+
+In both branches, the Arc passed to the method is consumed. On the shared path, its strong count contribution ends and an independent clone is returned. On the unique path, the payload moves out and the Arc allocation is no longer the owner.
+
+This matters for count-based diagnostics. A surviving second Arc sees one fewer owner after the shared call. The cloned plain `T` does not contribute to the Arc strong count.
+
+## I test both branches
+
+An ordinary value assertion cannot show whether cloning happened because both branches return equivalent `T` values. I use a custom Clone counter or a payload whose clone identity is observable in tests.
+
+The test holds the second Arc through the call so non-lexical lifetimes cannot let it drop early. Then it constructs a separate unique Arc and proves no additional clone.
+
+For performance-critical code, I benchmark realistic contention and payloads. The clone counter proves semantics, while measurement establishes cost.
+
+## The ownership principle
+
+Reference counting makes shared reads cheap, but leaving sharing has to resolve ownership. If the value is unique, Rust can move it. If another strong owner exists, obtaining an independent value requires `Clone`.
+
+`Arc::unwrap_or_clone` packages that decision safely. I use it when both outcomes satisfy the product contract, and I make the shared-path clone cost visible instead of assuming the method name promises extraction without duplication.

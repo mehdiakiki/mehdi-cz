@@ -1,0 +1,176 @@
+---
+title: "Release Sequences in Rust: The Rule Behind a Surprising Acquire Load"
+date: "2026-10-27T09:00:00+01:00"
+tags: ["rust", "release sequence", "atomics", "memory ordering", "concurrency"]
+draft: false
+reviewed: true
+reviewedHash: "b00bd651c818e20c06b2dd09ce0cf19b944f44bd9928a4f28aa1469850ed9dc1"
+cluster: "rust-under-the-hood"
+campaign: "authority-2026"
+opportunity: "RUST-038"
+summary: "An Acquire load can synchronize through relaxed read-modify-write operations with an earlier Release. Trace the modification order, the value read, and what breaks the sequence."
+---
+
+This Rust pattern can be correct even though the Acquire load does not read the value written directly by the Release store:
+
+```text
+thread A: write data; flag.store(1, Release)
+thread B: flag.fetch_add(1, Relaxed)   // flag becomes 2
+thread C: flag.load(Acquire) == 2; read data
+```
+
+The rule connecting A and C is a **release sequence**.
+
+It is precise and easy to overgeneralise, so I draw the atomic's modification order first.
+
+## Three relations are involved
+
+For one atomic object `flag`, all modifications have a modification order:
+
+```text
+M1: A stores 1 with Release
+M2: B performs Relaxed fetch_add and writes 2
+```
+
+`M2` is a read-modify-write operation. It reads the previous atomic value and writes a new one as one atomic step.
+
+Under the memory model followed by Rust atomics, a release sequence is headed by a Release operation and can continue through following atomic read-modify-write modifications in that object's modification order.
+
+If C's Acquire load reads the value written by a member of that release sequence, it can synchronize with the Release head.
+
+```text
+A ordinary writes
+  sequenced-before
+A Release store M1
+  release sequence through
+B Relaxed RMW M2
+  read by
+C Acquire load
+  sequenced-before
+C ordinary reads
+```
+
+The result is a happens-before path from A's earlier writes to C's later reads.
+
+## The relaxed RMW does not publish B's earlier data
+
+The sequence carries synchronization from the Release **head**. It does not magically give Relaxed release semantics for every write before B.
+
+Suppose B does:
+
+```text
+B writes other_data
+B flag.fetch_add(1, Relaxed)
+```
+
+C's Acquire observation of B's RMW result is not, by that fact alone, a Release/Acquire publication of `other_data` from B.
+
+If B also needs to publish its own preceding writes, its operation needs an appropriate release component, such as `AcqRel` for an RMW that also acquires earlier state.
+
+I always name whose writes need visibility.
+
+## A plain relaxed store breaks the chain
+
+Compare:
+
+```text
+M1: store(1, Release)
+M2: store(2, Relaxed)
+M3: load(Acquire) reads 2
+```
+
+`M2` is a plain store, not a read-modify-write operation continuing the release sequence. The Acquire load reading `2` does not synchronize with `M1` through the rule we used above.
+
+This is why replacing `fetch_add` with a seemingly equivalent load-plus-store can destroy more than atomicity:
+
+```rust
+// Not an RMW and also loses concurrent updates.
+let old = flag.load(Ordering::Relaxed);
+flag.store(old + 1, Ordering::Relaxed);
+```
+
+The exact operation kind matters.
+
+## The Acquire must read from the sequence
+
+An Acquire load of the same atomic is not enough. It needs to observe the value written by the Release head or its release sequence.
+
+If it reads an older value, or a value from a later modification outside the sequence, the claimed synchronizes-with edge is absent.
+
+My proof includes:
+
+```text
+Which atomic write did this load read from?
+Is that write the Release head or a qualifying RMW after it?
+What modification, if any, interrupted the sequence?
+Which ordinary writes were before the Release head?
+Which ordinary reads are after the Acquire?
+```
+
+“There is one Release and one Acquire somewhere” is not a proof.
+
+## A reference-count shape uses this idea
+
+Reference counting often increments with Relaxed while a live reference already guarantees the allocation exists. Decrements use a release component so writes performed through each owner become ordered before destruction.
+
+A simplified final-release shape is:
+
+```rust
+if count.fetch_sub(1, Ordering::Release) != 1 {
+    return;
+}
+
+std::sync::atomic::fence(Ordering::Acquire);
+// Now destroy the value, after the necessary release history.
+```
+
+The acquire fence and release sequence ensure the final destructor observes writes that need to happen before destruction. A production reference-count implementation also proves overflow, pointer provenance, aliasing, weak counts, and object lifetime.
+
+The [Rustonomicon Arc chapter](https://doc.rust-lang.org/nomicon/arc-mutex/arc-drop.html) explains this final-decrement pattern.
+
+## AcqRel has a split personality
+
+For a read-modify-write operation:
+
+```rust
+counter.fetch_add(1, Ordering::AcqRel)
+```
+
+the Acquire part applies to its read, and the Release part applies to its write. `Ordering::Acquire` on an RMW makes its store part Relaxed; `Ordering::Release` makes its load part Relaxed. The [standard library Ordering docs](https://doc.rust-lang.org/std/sync/atomic/enum.Ordering.html) call out these split effects.
+
+This matters when a compare-exchange uses separate success and failure orderings. Failure performs no write, so it cannot have Release ordering.
+
+## Release sequence is not a queue ordering guarantee
+
+The term sounds like a sequence of application messages. It is only a relation among modifications of one atomic object.
+
+It does not guarantee:
+
+- fairness between threads;
+- FIFO lock acquisition;
+- chronological completion order;
+- a consistent snapshot of several atomics;
+- absence of the ABA problem;
+- safety of unrelated non-atomic accesses without the full happens-before path.
+
+I keep the proof local to the carrier atomic and the memory it publishes.
+
+## A small litmus test
+
+For learning, I model three roles:
+
+```text
+A: data = 42; flag.store(1, Release)
+B: wait until flag != 0; flag.fetch_add(1, Relaxed)
+C: wait until flag == 2 with Acquire; assert data == 42
+```
+
+B's wait condition ensures its RMW follows the Release rather than racing to modify the initial zero first. C must read the `2` from that RMW.
+
+A model checker can explore schedules, but the test must encode the intended preconditions. If B can increment zero to one before A's store, seeing two may come from a different modification history.
+
+## Read the graph, not the enum names
+
+Release sequences are useful in compact lock-free protocols and reference counting. They also show why memory ordering cannot be understood one line at a time.
+
+I write the modification order, identify the Release head, mark each following RMW, and draw the reads-from edge for the Acquire. If I cannot draw that graph unambiguously, I use a simpler synchronization design.

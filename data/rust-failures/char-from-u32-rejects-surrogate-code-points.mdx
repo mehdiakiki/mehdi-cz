@@ -1,0 +1,79 @@
+---
+caseId: "RFA-242"
+title: "Why char::from_u32 Rejects UTF-16 Surrogate Values"
+date: "2026-09-06T00:22:00+01:00"
+lastmod: "2026-09-06T00:22:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "abb7f0b0ce0af7148fa70a674ef7d21f63ea87134cf09e9e225e82a01816f928"
+area: "ffi-targets"
+symptom: "char::from_u32 returns None for 0xD800 even though the number is below char::MAX and occurs in UTF-16 data."
+summary: "Rust char represents a Unicode scalar value, which excludes the UTF-16 surrogate interval. Decode UTF-16 code units as pairs with decode_utf16 instead of converting each u16 number independently."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust char from_u32 surrogate returns None", "convert UTF-16 u16 to char Rust", "Unicode scalar value surrogate Rust"]
+evidence: ["Rust 1.98.1 surrogate input", "safe conversion rejection", "valid scalar comparison"]
+sources: ["https://doc.rust-lang.org/std/primitive.char.html#method.from_u32", "https://doc.rust-lang.org/std/primitive.char.html#method.decode_utf16", "https://doc.rust-lang.org/std/primitive.char.html#validity-and-layout"]
+---
+
+The number `0xD800` looks like it should fit in a Rust `char`: it is far below `char::MAX`, and it can appear in a UTF-16 buffer. Still, [`char::from_u32`](https://doc.rust-lang.org/std/primitive.char.html#method.from_u32) returns `None`.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-242/fail.rs) records exactly this result. The conversion is rejecting an invalid Unicode scalar value, not an integer overflow.
+
+## char is not every Unicode code point
+
+Rust defines `char` as one Unicode scalar value. Scalars include code points from `U+0000` through `U+10FFFF` except the surrogate range `U+D800..=U+DFFF`.
+
+That gap is part of [`char` validity](https://doc.rust-lang.org/std/primitive.char.html#validity-and-layout). A valid `char` can always be encoded as valid UTF-8. A surrogate cannot, because surrogates are components of UTF-16's encoding scheme rather than standalone scalar values.
+
+Checking only `value <= char::MAX as u32` therefore accepts too much. There is a hole in the numeric domain.
+
+## A UTF-16 code unit is not a character
+
+UTF-16 stores 16-bit code units. Many scalars use one unit, but scalars above `U+FFFF` use a high-surrogate and low-surrogate pair. An isolated surrogate is malformed input.
+
+Converting every `u16` independently with `char::from_u32(unit as u32)` loses the pairing rule. It either rejects valid pairs one unit at a time or tempts code to use an unsafe unchecked conversion.
+
+The correct standard operation is [`char::decode_utf16`](https://doc.rust-lang.org/std/primitive.char.html#method.decode_utf16), which consumes an iterator of `u16` units. It combines valid pairs and reports unpaired surrogates as errors.
+
+## Rejection is data, not always a program bug
+
+At an external boundary, malformed text is expected. I keep the `Option` or decoding `Result` visible until the application chooses a policy:
+
+- reject the record with an offset;
+- replace malformed input with `char::REPLACEMENT_CHARACTER`;
+- preserve original bytes or code units for diagnostics;
+- use a platform-specific wide-string type when the boundary permits ill-formed UTF-16.
+
+Replacing invalid input can be right for display and wrong for identifiers, signatures, or filenames. It is a product and protocol decision, not merely a Unicode helper choice.
+
+## Unsafe conversion cannot repair invalid data
+
+`char::from_u32_unchecked` promises the caller already supplied a scalar value. Giving it a surrogate violates the validity invariant and causes undefined behavior. The fact that `char` occupies four bytes does not make every four-byte integer representation valid.
+
+I use unchecked conversion only after a proof that is cheaper to retain than to repeat, and I document that proof next to the unsafe block. Parsing untrusted text is almost never such a case.
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-242/fixed.rs) keeps the checked behavior: the surrogate maps to `None`, while `U+1F980` maps to the crab scalar. This separates the invalid gap from a perfectly valid value above the Basic Multilingual Plane.
+
+## FFI needs the source encoding, not a guessed cast
+
+Windows APIs often exchange UTF-16 code units. Unix paths are commonly arbitrary bytes. Network protocols may require UTF-8. I record which representation crosses an FFI or storage boundary before choosing a Rust type.
+
+A `Vec<u16>` from a foreign API is not automatically a `String`, and a pointer labelled “wide char” does not prove valid terminated UTF-16. Length, termination, ownership, endianness, and malformed-input policy are separate parts of the contract.
+
+## Indexes need units too
+
+An error at UTF-16 unit offset 4 does not necessarily correspond to scalar index 4 or UTF-8 byte offset 4. When I convert encodings, I retain the offset unit in diagnostics. Otherwise a user receives a position that points at the wrong place in the original input.
+
+This is particularly important for language servers and source tooling, where protocols can specify UTF-16 positions while Rust source strings are UTF-8.
+
+## What I test
+
+My boundary table includes the values immediately around the surrogate gap, `char::MAX`, a value above it, a valid surrogate pair, a lone high surrogate, and a lone low surrogate. It also tests the selected replacement or rejection policy.
+
+I keep the original unit sequence in a failure fixture rather than testing only the final replacement text. Two distinct malformed sequences can both render as `�`, so a string-only assertion loses evidence about what the decoder received. This matters when I need to reproduce a customer file, compare platform behavior, or report the precise malformed offset without logging unrelated sensitive text.
+
+For streaming decoding, I also split a valid surrogate pair across input chunks. A decoder must retain the pending high surrogate until the next unit arrives or the stream ends. Treating each chunk as a complete independent string can reject text that is valid across the boundary. The same principle appears in UTF-8 and protocol framing: transport chunks are not semantic units.
+
+The core principle is that representable integers, encoded units, code points, scalar values, and visible characters are different sets. `char::from_u32` protects the scalar-value invariant. When the input is UTF-16, decoding the sequence is the semantic operation; casting its individual units is not.

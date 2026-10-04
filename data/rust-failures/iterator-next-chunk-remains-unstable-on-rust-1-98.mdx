@@ -1,0 +1,99 @@
+---
+caseId: "RFA-398"
+title: "Iterator::next_chunk Remains Unstable on Rust 1.98"
+date: "2026-09-06T03:38:00+01:00"
+lastmod: "2026-09-06T03:38:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "daec061cd709b3065068a1ec392e40af71ac52e06d3313d68ba476536765b8b9"
+area: "upgrades-compatibility"
+symptom: "Code copied from the standard-library documentation fails on stable Rust 1.98.1 with E0658 and the iter_next_chunk feature name."
+summary: "Iterator::next_chunk is documented but remains a nightly-only API on Rust 1.98.1. Stable code can collect up to N items and convert a complete Vec into an array, while deliberately preserving partial items on exhaustion."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust next_chunk unstable E0658 1.98", "iter_next_chunk stable alternative", "collect iterator fixed array preserve partial"]
+evidence: ["Rust 1.98.1 E0658 compile failure", "iter_next_chunk feature gate", "stable take and Vec conversion helper"]
+sources: ["https://doc.rust-lang.org/std/iter/trait.Iterator.html#method.next_chunk", "https://doc.rust-lang.org/error_codes/E0658.html", "https://doc.rust-lang.org/book/appendix-07-nightly-rust.html"]
+---
+
+I can find `Iterator::next_chunk` in Rust's standard-library documentation, read its signature, and still be unable to call it on stable Rust. Documentation presence and stable availability are two different facts.
+
+On Rust 1.98.1, the [failing fixture](/rust-failure-atlas/evidence/RFA-398/fail.rs) does not reach its assertion. Compilation stops with E0658 and names the `iter_next_chunk` unstable feature.
+
+This is a compatibility failure, not an iterator logic failure.
+
+## Read the stability badge with the signature
+
+The [`Iterator::next_chunk`](https://doc.rust-lang.org/std/iter/trait.Iterator.html#method.next_chunk) page describes an appealing operation: take the next `N` items as `[Item; N]`, or return the items already consumed when the iterator ends early.
+
+The same documentation marks the method experimental. On a stable compiler, knowing the method exists does not grant access to it. Rust exposes unstable items in the documentation so their design can be discussed and nightly users can use the feature gate.
+
+I now check three things when copying an unfamiliar standard-library method:
+
+- the documentation version matches my toolchain;
+- the item has a stable version marker rather than an experimental badge;
+- a tiny fixture compiles with the same channel and edition as the project.
+
+This takes less time than building a larger design around an unavailable API.
+
+## E0658 is the evidence
+
+Rust's [E0658 explanation](https://doc.rust-lang.org/error_codes/E0658.html) means an unstable feature was used on the stable channel. The compiler also prints the internal feature name. That name is useful for tracking, but adding `#![feature(iter_next_chunk)]` is not a stable repair.
+
+Feature attributes themselves require nightly Rust. The [Rust Book's release-channel appendix](https://doc.rust-lang.org/book/appendix-07-nightly-rust.html) explains the stable, beta, and nightly distinction.
+
+For a library intended for ordinary downstream users, silently requiring nightly is a major compatibility decision. I prefer a small stable implementation unless the nightly dependency is already an explicit project constraint.
+
+## A stable helper can preserve the important meaning
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-398/fixed.rs) uses `take(N)` and collects into a `Vec`:
+
+```rust
+fn next_chunk_stable<I, const N: usize>(it: &mut I)
+    -> Result<[I::Item; N], Vec<I::Item>>
+where
+    I: Iterator,
+{
+    let partial = it.take(N).collect::<Vec<_>>();
+    if partial.len() == N {
+        Ok(partial.try_into().ok().unwrap())
+    } else {
+        Err(partial)
+    }
+}
+```
+
+The length test establishes why conversion must succeed in the `Ok` branch. The awkward `ok().unwrap()` avoids requiring the item type to implement `Debug`, which a direct `unwrap` on the conversion error would require.
+
+On short input, the helper returns the partial values instead of dropping or hiding them. The original iterator is exhausted because those values were consumed while attempting the chunk.
+
+## This fallback is similar, not identical
+
+The stable helper allocates a `Vec`. The intended standard method can construct a fixed array without exposing that same allocation contract. The error types also differ: the unstable API returns an iterator over the partial array storage, while this helper returns an owned vector.
+
+Those differences matter in hot loops, embedded targets, and generic APIs. I do not describe the helper as a zero-cost drop-in replacement. It preserves the application-level semantics needed by many callers: complete fixed chunk or owned partial values.
+
+If allocation is unacceptable, I choose another stable design. Processing slices with `array_chunks`, buffering at a higher layer, or using a domain-specific fixed-capacity structure may fit, depending on where the data lives. The correct choice cannot be inferred only from the method name.
+
+## Partial consumption is not rollback
+
+When fewer than `N` items exist, the attempted items have already left the source iterator. Returning them allows the caller to process or report them, but it does not rewind the iterator.
+
+This is important for network frames and parsers. “Could not form a complete chunk” must not be interpreted as “nothing was read.” If retry logic calls the helper again on the same iterator, it starts after the partial items.
+
+I encode this with two assertions: the error contains the partial values and the source iterator has no hidden copy of them.
+
+## The successful path leaves the suffix
+
+With four inputs and `N = 3`, the helper returns the first three as an array and leaves the fourth for the next call. This is the other half of the cursor contract.
+
+A useful fixture tests both insufficient and sufficient input. Testing only the returned array can miss accidental over-consumption, especially if a custom iterator batches work internally.
+
+## How I isolate future stabilization
+
+I put the fallback behind a small local function with behavior tests. If `next_chunk` becomes stable in a later minimum supported Rust version, replacing the implementation is then one controlled change.
+
+I do not scatter nightly-looking calls through the codebase or use compiler-version conditional tricks without need. The wrapper records the desired semantics; the evidence records why the stable implementation exists today.
+
+The core principle is simple: documentation describes APIs at several maturity levels. Rust 1.98.1 documents `next_chunk`, but stable code cannot call it. Pin the toolchain, test availability, and preserve partial-consumption semantics explicitly while waiting for stabilization.

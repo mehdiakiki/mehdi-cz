@@ -1,0 +1,176 @@
+---
+title: "Shape Without Behavior: Two Structs With the Same Fields"
+date: "2026-09-09T09:20:00+01:00"
+lastmod: "2026-09-09T09:20:00+01:00"
+tags: ["types", "rust", "typescript", "structural typing", "types under the hood"]
+draft: false
+reviewed: true
+reviewedHash: "b429c8b60eacbd2c2175b15b1c49c6c9d5a7d9203d837beb897e9e6f36ad03f9"
+cluster: "rust-under-the-hood"
+campaign: "editorial"
+summary: "A Point and a Vector with the same two fields: TypeScript accepts one for the other, Rust refuses, and on this build the bytes and the instructions are identical, to the point that the optimized build keeps one function body under both names. The difference is a rule about names, and the name leaves no trace in the program."
+---
+
+Two structs with the same fields, `Point { x, y }` and `Vector { x, y }`. TypeScript lets me pass one where the other is expected, because it compares shapes, which is called structural typing. Rust refuses with a type error, because it compares names, which is called nominal typing.
+
+Underneath, on this build, they are the same 16 bytes at the same offsets. The function that measures one compiles to the same six instructions as the function that measures the other, and the optimized build keeps one function body under both names. The difference between the two languages is a rule about names, and the name leaves no trace in the compiled program.
+
+This is a spoke of [What Is a Type?](/blog/what-is-a-type-a-set-of-values-a-promise-about-operations-or-both). The first article of this series said a type has a shape half and a behavior half. This one is about a type that has the same shape as another, and what the name is for. The programs and a script that reproduces every output are in the `types-under-the-hood` fixture of the site repository. I used rustc 1.95 nightly and TypeScript 5.9 on x86-64 Linux.
+
+## The TypeScript side: shape is enough
+
+```ts
+type Point = { x: number; y: number };
+type Vector = { x: number; y: number };
+
+function vectorNorm(v: Vector): number {
+  return Math.sqrt(v.x * v.x + v.y * v.y);
+}
+
+const p: Point = { x: 3, y: 4 };
+console.log(vectorNorm(p));
+
+const withColor = { x: 3, y: 4, color: "red" };
+console.log(vectorNorm(withColor));
+```
+
+This compiles without a single error under `--strict`, and it prints `5` twice.
+
+A `Point` is accepted as a `Vector` because it has an `x` and a `y` of the right type. The object with an extra `color` is accepted too, because it also has an `x` and a `y`.
+
+In TypeScript, "is a `Vector`" means "has at least these fields with these types". The name `Vector` is a nickname for that shape, and the name `Point` is a nickname for the same shape, so they are the same type.
+
+There is one exception that people hit early. Passing the extra field directly as a literal is refused. The error is one line in the real output, wrapped here and without its file position:
+
+```ts
+console.log(vectorNorm({ x: 3, y: 4, color: "red" }));
+```
+
+```text
+error TS2353: Object literal may only specify known properties,
+              and 'color' does not exist in type 'Vector'.
+```
+
+This is the excess property check, and it applies only to a fresh object literal, because a literal with an unknown field is almost always a typo. The variable one line above was accepted with the same extra field, and that works as long as the variable shares at least one field with the target type. So even the exception is about shape. The compiler is asking "did you mean this shape?", not "is this the right name?".
+
+## The Rust side: the name is part of the type
+
+The same program in Rust:
+
+```rust
+pub struct Point { pub x: f64, pub y: f64 }
+pub struct Vector { pub x: f64, pub y: f64 }
+
+fn vector_norm(v: Vector) -> f64 { (v.x * v.x + v.y * v.y).sqrt() }
+
+fn main() {
+    let p = Point { x: 3.0, y: 4.0 };
+    println!("{}", vector_norm(p));
+}
+```
+
+The error, shortened to the lines that matter:
+
+```text
+error[E0308]: mismatched types
+7 |     println!("{}", vector_norm(p));
+  |                    ----------- ^ expected `Vector`, found `Point`
+```
+
+Same two fields, same two types, refused. In Rust a struct declaration creates a new type, and two declarations create two types, even when the bodies are identical. The name is part of the identity.
+
+## Underneath: the same bytes
+
+The interesting question is what this difference costs. I asked rustc for the size and the field offsets of both. Then I reinterpreted a `Point` as a `Vector` with `transmute`, which tells the compiler to reuse the bytes without any conversion, and I called the `scale` method that only `Vector` has:
+
+```text
+size: Point 16 bytes, Vector 16 bytes
+offsets: Point.x 0 Point.y 8, Vector.x 0 Vector.y 8
+transmute(Point 3,4) as Vector: x=3 y=4 norm=5
+scaled: (6.0, 8.0)
+```
+
+Two `f64` at offsets 0 and 8, in both. The `Point` with `x = 3, y = 4` read as a `Vector` is a vector with `x = 3, y = 4`, its norm is 5, and it scales like any vector. There was nothing to convert.
+
+One caution that matters. Rust does not promise that two structs with the same fields share a layout. The default representation may reorder fields, and the Rustonomicon says plainly that two different types get no layout guarantee relative to each other.
+
+On this build the offsets match. The program asserts that the sizes and offsets are equal before the `transmute`, and that assertion is the only reason the `transmute` is sound here. I would not write it in real code. I use it as a measurement of what the two types are made of.
+
+## Underneath: the same instructions, and then one function
+
+Then I compiled a norm function for each type, with optimizations, and asked for the assembly. Both functions carry `#[no_mangle]`, which only keeps their names readable in the output:
+
+```rust
+#[no_mangle]
+pub fn point_norm(p: Point) -> f64 { (p.x * p.x + p.y * p.y).sqrt() }
+
+#[no_mangle]
+pub fn vector_norm(v: Vector) -> f64 { (v.x * v.x + v.y * v.y).sqrt() }
+```
+
+This is `point_norm`:
+
+```asm
+point_norm:
+    mulsd   %xmm0, %xmm0
+    mulsd   %xmm1, %xmm1
+    addsd   %xmm0, %xmm1
+    xorps   %xmm0, %xmm0
+    sqrtsd  %xmm1, %xmm0
+    retq
+```
+
+Square `x`, square `y`, add, clear a register, take the square root into it, return. Six instructions. In this build the two fields arrived in two floating point registers, `xmm0` and `xmm1`, not as a struct in memory. The Rust calling convention is not fixed, so that is an observation and not a rule.
+
+And this is the whole of `vector_norm` in the same output:
+
+```asm
+vector_norm = point_norm
+```
+
+That line is an alias, not a second function. LLVM has a pass called MergeFunctions that finds functions with identical instructions and keeps one body. LLVM leaves it off by default, and rustc turns it on for optimized builds and asks for aliases, which is why the second name simply points at the first. In a debug build the two bodies stay separate.
+
+So at the level of the machine, `Point` and `Vector` did not compile to similar code. They compiled to the same code, and the compiler noticed.
+
+The nominal check in Rust and the structural check in TypeScript agree completely about what exists at runtime: two floats and six instructions. They disagree only about which programs to accept.
+
+## So what is the name for?
+
+If the name leaves no trace, why does Rust insist on it? Because the name is where the behavior half of the type attaches.
+
+```rust
+impl Vector {
+    pub fn scale(self, k: f64) -> Vector { Vector { x: self.x * k, y: self.y * k } }
+}
+```
+
+`Vector` can be scaled. `Point` cannot, and scaling a point makes no sense, so that is right. Adding two vectors makes sense, adding two points does not, and subtracting two points gives a vector.
+
+All of these are rules about operations, the behavior half, and in Rust they hang on the name. If `Point` and `Vector` were the same type, there would be no place to say that one operation is allowed and the other is not.
+
+TypeScript makes the other choice. Behavior attaches to the shape, or to the object itself through its methods, and any object with the right fields gets in. That is convenient when data comes from JSON and nobody declared it. It is weaker when two shapes are equal by accident, because the compiler cannot tell a point from a vector, and it will not stop me from scaling a point.
+
+Neither choice exists at runtime, since both compile to `x` and `y`. The choice is about which mistakes the compiler can catch before that.
+
+## The model I take from this
+
+1. Shape is the set of fields and their types. Two structs can have the same shape.
+2. Structural typing says same shape, same type. Nominal typing says same shape, different type if the name differs.
+3. Underneath, on a given build, both are the same bytes and the same instructions. The layout equality is observed, not promised, and the optimized build merged the two functions because it could not find a difference.
+4. The name is the hook for behavior. In a nominal language, operations attach to the name, so equal shapes can have different allowed operations. In a structural language, they cannot.
+
+## What I check when two types look the same
+
+- Do they have the same operations? If not, they should be different types, and in a structural language that means adding a field that makes the shapes differ, often a literal tag like `kind: "point"`.
+- Is a value crossing from one to the other by accident? In Rust the compiler tells me. In TypeScript I have to look.
+- Is the cost of the distinction real? It is not. On this build the bytes and the instructions are the same, so the only cost is writing the conversion.
+- Am I relying on two types sharing a layout? Then it must be `repr(C)` on both, because the default layout does not promise it.
+
+## Sources
+
+- [TypeScript handbook: object types and excess property checks](https://www.typescriptlang.org/docs/handbook/2/objects.html)
+- [Rust standard library: std::mem::transmute](https://doc.rust-lang.org/std/mem/fn.transmute.html)
+- [Rust standard library: std::mem::offset_of](https://doc.rust-lang.org/std/mem/macro.offset_of.html)
+- [The Rust Reference: type layout](https://doc.rust-lang.org/reference/type-layout.html)
+- [The Rustonomicon: repr(Rust)](https://doc.rust-lang.org/nomicon/repr-rust.html)
+- [LLVM: the MergeFunctions pass](https://llvm.org/docs/MergeFunctions.html)

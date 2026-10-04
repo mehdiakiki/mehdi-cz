@@ -1,0 +1,106 @@
+---
+caseId: "RFA-208"
+title: "select_nth_unstable Finds the Pivot; It Does Not Sort the Slice"
+date: "2026-09-05T17:47:00+01:00"
+lastmod: "2026-09-05T17:47:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "a9652a3b4eec841619ddb217130aa80788ea5fee1f565974607d83ca4ca6f1ad"
+area: "concurrency-memory"
+symptom: "After select_nth_unstable finds the correct nth value, the surrounding slice is still not globally sorted."
+summary: "select_nth_unstable places the nth element at its sorted position and partitions lower and higher elements around it in linear time. The two returned sides remain internally unsorted."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust select_nth_unstable does not sort",
+    "select_nth_unstable partition guarantee",
+    "Rust nth element slice still unsorted",
+  ]
+evidence: ["Rust 1.98.1 twenty-value slice", "correct pivot with unsorted sides", "sort-or-partition repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/std/primitive.slice.html#method.select_nth_unstable",
+    "https://doc.rust-lang.org/std/primitive.slice.html#method.sort_unstable",
+    "https://doc.rust-lang.org/std/primitive.slice.html#method.is_sorted",
+  ]
+---
+
+I wanted the median of a buffer and found `select_nth_unstable`. The selected value was correct, so it was easy to look at the mutated slice and treat it as sorted. That extra conclusion is not guaranteed.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-208/fail.rs) selects index `9` from twenty shuffled integers. The value at that position becomes `10`, but the complete slice is still not sorted.
+
+Selection establishes a partition, not a total order.
+
+## The three returned parts are the contract
+
+[`select_nth_unstable`](https://doc.rust-lang.org/std/primitive.slice.html#method.select_nth_unstable) returns three mutable pieces:
+
+```text
+unsorted values <= pivot | pivot at index | unsorted values >= pivot
+```
+
+The pivot occupies the same index it would occupy in a sorted slice. Every element before it compares less than or equal to it, and every element after compares greater than or equal to it. The order inside each side is unspecified.
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-208/fixed.rs) asserts those inequalities. It calls `sort_unstable` afterward only because its second requirement asks for complete order.
+
+## Why selection can be faster
+
+A full comparison sort generally needs `O(n log n)` comparisons. Selecting the nth element can use a linear-time selection algorithm and avoid ordering relationships that the caller never requested.
+
+If I need a median, percentile threshold, or top-k partition, sorting every value may do unnecessary work. If I need to print every value in ascending order, selection is the wrong final operation.
+
+This is a common performance principle: a weaker output guarantee can permit less work. I should not consume the faster API and silently assume the stronger guarantee.
+
+The current standard-library documentation describes the implementation, but I program against the contract. Internal ordering may change across Rust versions without breaking the API.
+
+## “Unstable” describes equal values
+
+The word unstable here means equal elements do not preserve their original relative order. It does not mean unreliable, random, or unsafe.
+
+For integers, equal values look identical, so the distinction can disappear. With records such as `(score, original_id)`, selecting only by score can reorder equal-score records.
+
+If tie order matters, I include the tie-breaker in the comparison or preserve original positions separately. I do not infer stability from one observed run.
+
+The selected element among several equal candidates is also not a promise about which original record wins. The value compares correctly at the nth position, but identity among equals needs explicit policy.
+
+## Top-k still needs local sorting when display order matters
+
+After selecting index `k`, the lower side contains the k lower-ranked elements as a set-like partition. It does not present them from smallest to largest.
+
+For “find the ten smallest and display them sorted,” a useful plan can be:
+
+```text
+select boundary k
+take the lower partition
+sort only that partition
+```
+
+The exact index convention must be checked: index `k` has `k` elements before it. Whether the pivot belongs in the requested top group depends on whether I want `k` or `k + 1` results.
+
+Duplicates at the boundary need a product rule too. A score threshold may return more than k records if all tied values must be included.
+
+## Comparator correctness remains required
+
+The basic method uses `Ord`. Its `_by` variant accepts a comparator, and that comparator must implement a consistent total order. A comparator that changes with external state or violates transitivity can make ordering algorithms panic or produce meaningless partitions.
+
+Floating-point data requires a decision around NaN. I can use a total-order operation where appropriate or define how invalid measurements are filtered. Pretending every partial order is total only moves the failure.
+
+I test custom comparators with equality, reversed order, and repeated values before using them in a performance-sensitive selection path.
+
+## The method mutates the full slice
+
+Even when I only read the pivot, the operation reorders elements across the slice. Any external index that assumed the original position-to-record relationship becomes stale.
+
+Rust prevents aliases that violate memory safety during the mutable borrow, but it does not know about IDs stored in another table. If original order has meaning, I select over indices or copy the relevant records into scratch storage.
+
+For large records, moving indices can also be cheaper than moving whole values repeatedly. I benchmark with the real element shape.
+
+## My test avoids accidental sorting
+
+Some small inputs happen to become fully sorted under a particular implementation. My first fixture did exactly this, which would have produced weak evidence. The final pinned fixture uses a larger arrangement that keeps the sides visibly unsorted on Rust 1.98.1, while the repair asserts only documented inequalities.
+
+The portable regression must not demand a particular unsorted arrangement. It proves pivot and partition properties. A separate assertion calls [`is_sorted`](https://doc.rust-lang.org/std/primitive.slice.html#method.is_sorted) only when demonstrating that the mistaken stronger assumption fails on the pinned toolchain.
+
+The core principle is to use exactly the guarantee an algorithm provides. `select_nth_unstable` answers “which value belongs here, and which side does every other value belong on?” It does not answer “what is the complete sorted order?”

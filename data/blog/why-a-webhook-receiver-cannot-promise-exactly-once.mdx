@@ -1,0 +1,197 @@
+---
+title: "Why a Webhook Receiver Cannot Promise Exactly Once"
+date: "2026-10-25T09:00:00+01:00"
+tags: ["webhooks", "exactly once", "idempotency", "HTTP", "distributed systems"]
+draft: false
+reviewed: true
+reviewedHash: "d229444cb36800ce293f2dd80ee09737146307cef16fa96dddf8530a00cd63fa"
+cluster: "reliable-data-integrations"
+campaign: "authority-2026"
+opportunity: "DATA-052"
+summary: "A webhook sender cannot distinguish a lost success response from a failed request, so delivery may repeat. Build one durable business effect with identity, signatures, inbox claims, and recovery."
+---
+
+A webhook provider sends an HTTP request. My server stores the event and returns `200`. The response is lost between networks.
+
+The provider cannot know whether the request failed before processing or succeeded before the response disappeared. Retrying is the safe delivery choice.
+
+This one ambiguity is enough to make “the webhook is delivered exactly once” an unrealistic receiver promise.
+
+## The response-loss timeline
+
+```text
+provider                 receiver
+   |  POST event E  --------> |
+   |                         verify
+   |                         commit E
+   |  <-------- 200           |
+   |       response lost      |
+   |                          |
+   |  POST event E again ---> |
+```
+
+Both sides behaved correctly. The receiver observed two deliveries of one logical event.
+
+If the provider never retries, a request lost before arrival disappears. If it retries ambiguous requests, duplicates are possible. HTTP alone cannot give the sender knowledge it did not receive.
+
+## Promise one business effect, not one delivery
+
+I state the contract more carefully:
+
+```text
+The endpoint accepts repeated delivery.
+For a stable provider event identity inside the retention window,
+it commits the intended business transition once.
+```
+
+That is an idempotent processing promise. It has explicit dependencies: stable identity, atomic claim, retention, and effect semantics.
+
+## Verify authenticity before expensive work
+
+The receiver first reads a bounded raw body and verifies the provider's signature over the exact bytes and required metadata.
+
+```text
+bounded body read
+    -> signature and timestamp validation
+    -> replay-window policy
+    -> parse and schema validation
+    -> durable inbox claim
+```
+
+Parsing and reserializing before verification can change bytes. A valid signature proves that someone with the signing key produced the signed content. It does not prove the event is new or authorized for an arbitrary tenant inferred from its payload.
+
+For timestamp and nonce concerns, see [Webhook Signatures Need Replay Protection Too](/blog/webhook-signatures-need-replay-protection-too).
+
+## Use provider identity plus scope
+
+A good deduplication key is normally supplied by the provider:
+
+```text
+provider account + endpoint/tenant scope + provider event ID
+```
+
+I avoid using only a payload hash. Two legitimate events can have identical JSON, and the same provider ID arriving with different bytes is a conflict worth investigating, not a new event.
+
+The inbox can store:
+
+```sql
+create table webhook_inbox (
+  provider text not null,
+  provider_account text not null,
+  event_id text not null,
+  payload_sha256 text not null,
+  status text not null,
+  received_at timestamptz not null,
+  primary key (provider, provider_account, event_id)
+);
+```
+
+On conflict I compare the stored hash. Same ID and different payload becomes a security or provider-contract alert.
+
+## Return success after a durable boundary
+
+The HTTP handler does not need to finish every business action before responding. It needs to cross a boundary from which work can recover.
+
+```text
+verify request
+commit inbox event and queued intent
+return 2xx
+worker performs business processing
+```
+
+If the process dies after commit and before `2xx`, the retry finds the existing inbox row. If it dies after `2xx`, the durable queued intent still exists.
+
+Returning success after placing work only in process memory creates loss:
+
+```text
+enqueue in RAM -> return 200 -> process dies -> event gone
+```
+
+## The inbox claim and domain change need a transaction
+
+When processing begins, duplicate detection and local domain mutation belong in one database transaction. Otherwise this gap exists:
+
+```text
+mark event processed
+crash
+business change never happens
+```
+
+Or the reverse:
+
+```text
+business change commits
+crash
+processed marker absent
+retry repeats change
+```
+
+The transactional inbox pattern closes the local gap. External APIs remain outside the database transaction and need their own idempotency keys or reconciliation.
+
+## Provider ordering may not match business ordering
+
+Webhook retries can delay one event while a later event succeeds. Two provider workers can also deliver concurrently.
+
+I do not infer order from receive time. When the domain needs ordering, I use provider sequence/version data or enforce an expected state transition:
+
+```sql
+update subscription
+set status = :new_status,
+    provider_version = :version
+where id = :id
+  and provider_version < :version;
+```
+
+If the provider gives no usable version, I design reconciliation against its current authoritative state rather than pretending arrival order is truth.
+
+## Retention limits the guarantee
+
+If the inbox deletes an event ID after 30 days and the provider or operator can replay it after 60, the receiver will see it as new.
+
+I align identity retention with:
+
+```text
+provider retry window
+manual redelivery window
+incident replay policy
+backup restore horizon
+business-effect risk
+```
+
+High-impact effects can keep a compact permanent business idempotency key even after bulky webhook payloads expire.
+
+## Acknowledge known duplicates consistently
+
+For a repeated valid event whose first processing is already durable, I return the provider's expected success status. Returning an error asks it to retry a condition I intentionally recognise.
+
+For an event still processing, the choice depends on the durable queue and provider protocol. I can safely return success if recovery no longer depends on another provider delivery.
+
+For same ID with different payload, I do not silently acknowledge as an ordinary duplicate. I quarantine, alert, and follow the provider's documented retry contract.
+
+## The failure test
+
+I replay the exact raw request and inject crashes:
+
+| Failure point | Expected result |
+| --- | --- |
+| before inbox commit | provider retry can recover |
+| after commit, before response | duplicate delivery, one inbox identity |
+| after response, before worker starts | durable work remains pending |
+| after domain commit, before completion marker | local transaction prevents split evidence |
+| after external effect, before result save | reconcile by external idempotency key |
+
+I also test concurrent identical deliveries and the same event ID with modified bytes.
+
+## Measure business completion
+
+HTTP counts are not enough. I monitor:
+
+- signature failures by reason;
+- new versus duplicate valid deliveries;
+- same-ID/different-payload conflicts;
+- age from provider event time to durable receipt;
+- age from receipt to business completion;
+- inbox records stuck or failed;
+- external effects reconciled after ambiguity.
+
+A webhook endpoint cannot control how many times the network presents a request. It can control whether those deliveries share one durable identity and converge on one intended business result.

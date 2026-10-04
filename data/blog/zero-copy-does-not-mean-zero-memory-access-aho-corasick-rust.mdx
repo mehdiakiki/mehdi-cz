@@ -1,0 +1,265 @@
+---
+title: "Zero-Copy Does Not Mean Zero Memory Access: Aho-Corasick Streaming in Rust"
+date: "2026-09-05T11:30:00+01:00"
+lastmod: "2026-09-05T11:30:00+01:00"
+tags: ["rust", "zero-copy", "aho-corasick", "streaming", "performance engineering"]
+draft: false
+reviewed: true
+reviewedHash: "eaeb542196664a7abe086ff60dec47e4743df64cae5a9f3c19be43493281ac88"
+cluster: "rust-under-the-hood"
+campaign: "editorial"
+summary: "Zero-copy scanning still reads every inspected byte. It removes a second materialization in memory. I use streaming Aho-Corasick to explain automaton state, chunk boundaries, DFA dependency chains, prefilters, and honest performance measurement."
+---
+
+When I say a scanner is zero-copy, I do not mean bytes somehow travel from memory into an answer without being touched. The processor must load a byte before it can use that byte.
+
+I mean something more precise:
+
+> The scanner reads the caller's bytes directly instead of first materializing the same bytes in another application-owned buffer.
+
+This distinction looks small, but it is a useful principle in Rust and beyond Rust. “Zero-copy” describes which memory-to-memory copies an architecture avoids. It does not mean zero loads, zero cache traffic, zero bounds, zero buffering anywhere, or zero ownership work.
+
+A streaming Aho-Corasick scanner is a good place to make this concrete because it combines four ideas that are often mixed together:
+
+1. Patterns are compiled into an automaton before scanning.
+2. A small state can summarize the relevant input history.
+3. Chunk boundaries must not change matching results.
+4. Removing one copy helps only in proportion to the bottleneck that remains.
+
+## Core principle: remove materialization, not observation
+
+Consider a caller giving a scanner a chunk:
+
+```rust
+fn scan_chunk(&mut self, chunk: &[u8]) {
+    for &byte in chunk {
+        self.advance(byte);
+    }
+}
+```
+
+`for &byte in chunk` loads each byte into a register. Calling this a copy is technically possible in the broadest sense—bits moved—but it is not what application engineers normally mean by an avoidable copy.
+
+The problematic copy is this additional materialization:
+
+```text
+caller chunk -> scanner-owned buffer -> scanning loop
+```
+
+At the logical dataflow level, the buffered path performs an input read and destination write for the buffer operation, followed by another read by the scanner. The direct path scans the caller's slice without that intermediate write and later read.
+
+Exact hardware traffic is more complicated. A copy implementation can use wide vector instructions. Stores can trigger cache-line allocation. The destination may remain hot in cache for the next loop. I therefore do not convert the logical diagram directly into a “two times faster” prediction.
+
+The principle remains: zero-copy removes a materialized duplicate. It cannot remove the observation required by the algorithm.
+
+## Aho-Corasick compiles comparison work into state transitions
+
+The naive multi-pattern design starts at each input position and tests many patterns. Aho-Corasick builds a finite automaton from the pattern set. During scanning, the automaton remembers which pattern prefixes remain possible.
+
+For a dense deterministic finite automaton, the conceptual hot loop is close to this:
+
+```rust
+let mut state = start;
+
+for &byte in chunk {
+    state = transition[state][usize::from(byte)];
+    if is_match(state) {
+        emit_match(state);
+    }
+}
+```
+
+The `state` value summarizes the relevant past. If the previous chunk ended after `err` and the next begins with `or`, the carried state can let the scanner recognize `error` without joining both chunks into one allocation.
+
+This is a broader engineering principle:
+
+> Good streaming state preserves the information needed for the next decision, not the complete history that produced it.
+
+Protocol parsers, incremental decoders, checksums, UTF-8 validators, and database cursors use the same idea. The difficult work is deciding what information is sufficient.
+
+## “One table lookup per byte” is not true for every implementation
+
+I need to be exact here. The dense DFA loop above is not a definition of every Aho-Corasick implementation.
+
+Rust's [`aho-corasick` crate](https://docs.rs/aho-corasick/latest/aho_corasick/struct.AhoCorasick.html) can use a noncontiguous NFA, a contiguous NFA, or a DFA. Its [design documentation](https://github.com/BurntSushi/aho-corasick/blob/master/DESIGN.md) explains the trade: a DFA precomputes failure transitions and advances one state per byte, but can require much more construction time and memory. A contiguous NFA can be close in search speed while remaining much smaller.
+
+The crate may select an implementation automatically. If I benchmark “Aho-Corasick” without recording the selected kind, I have omitted an important experimental variable.
+
+There is another exception: prefilters. The crate's [builder documentation](https://docs.rs/aho-corasick/latest/aho_corasick/struct.AhoCorasickBuilder.html#method.prefilter) describes heuristic prefilters that use specialized literal search to skip quickly to possible matches. In that path, the implementation is intentionally searching candidate bytes before entering the full automaton near a hit.
+
+So I use narrower language:
+
+- A dense DFA path can advance through a direct state-and-byte transition.
+- Other automata represent transitions differently.
+- A prefilter can avoid running the automaton for every byte.
+
+Precision is more valuable than a dramatic sentence that is only sometimes true.
+
+## State can cross chunks, but output semantics may require more
+
+For standard detection, carrying automaton state and an absolute offset can be enough to recognize a match spanning two input chunks. The chunk size then does not determine the size of the scanning state.
+
+But this does not prove every streaming operation is buffer-free.
+
+Suppose the scanner must return the matched bytes, replace them, redact them, choose the leftmost-longest match, or delay output until it knows no higher-priority pattern can win. It may need to retain some input or pending output near the boundary.
+
+Rust's `aho-corasick` streaming iterator uses an internal buffer. Its documentation says the buffer uses a constant amount of memory and must be at least as large as the longest possible match. It also notes that stream searching is limited to supported match semantics. These are not accidental implementation defects. They come from the output contract.
+
+This gives me another principle:
+
+> Algorithmic state and product state are not always the same state.
+
+The automaton may know whether a pattern matched using one state ID. The API may still need bytes to return, delay, or transform the result.
+
+When I claim a design is zero-copy, I state the boundary:
+
+- Does scanning borrow the input directly?
+- Are matched bytes copied into results?
+- Is boundary overlap retained?
+- Is output buffered?
+- Does the `Read` implementation already copy into its own buffer?
+
+Without this boundary, “zero-copy” is marketing rather than a technical property.
+
+## Why removing a complete copy may produce only a modest win
+
+The next DFA transition depends on the previous transition:
+
+```text
+state[n + 1] = transition[state[n]][byte[n]]
+```
+
+The processor cannot fully compute the lookup for byte `n + 1` before it knows `state[n + 1]`. This dependency chain limits instruction-level parallelism. If the transition table is the dominant cost, removing a fast bulk copy can improve total time without transforming it.
+
+I would not explain this by saying a separate `memcpy` loop is completely overlapped instruction by instruction with the later scan. When copying and scanning happen sequentially, that is generally not the shape. A better explanation is:
+
+- optimized copying has high throughput;
+- it can leave the copied bytes warm in cache;
+- the state-transition chain remains on the critical path;
+- address arithmetic inside the scan may overlap with some waiting;
+- fixed call, chunk, and match-reporting costs remain.
+
+If removing buffering changes a measured workload by 0–12%, I report that range together with the machine, compiler, automaton kind, pattern set, input distribution, and chunk sizes. I do not publish “zero-copy is 10% faster” as a universal rule.
+
+The wider principle is Amdahl's law in practical language:
+
+> Removing one cost can improve only the fraction of time that cost occupied.
+
+## A prefilter changes which cost dominates
+
+A prefilter can scan many bytes using SIMD or a highly optimized literal search and enter the automaton only near candidate positions. For inputs where candidate bytes are rare, this can make the search path much faster than one dependent automaton transition per byte.
+
+Once the scanner becomes faster, the old copy becomes a larger part of total time. A buffer copy that looked minor beside the DFA can look expensive beside a prefilter moving through memory at high throughput.
+
+This is why optimization order matters:
+
+```text
+buffered automaton
+    -> direct chunk scanning
+    -> direct scanning with a justified prefilter
+```
+
+Removing the copy first may deliver a modest result. It also prevents the copy from consuming a larger fraction after the scanner is accelerated.
+
+I call this “protecting the next optimization.” It is useful beyond text search. A serialization copy may be small while database work dominates, then become the bottleneck after query optimization. A lock may be hidden behind network latency, then dominate after batching. Bottlenecks move.
+
+## Two tempting chunk implementations are wrong
+
+The first wrong design scans every chunk independently from the start state:
+
+```rust
+for chunk in chunks {
+    scan_from_start(chunk);
+}
+```
+
+It misses patterns split across boundaries. Tests with large chunks often hide this because most matches remain within one chunk.
+
+The second design keeps the last `longest_pattern_length - 1` bytes and prepends them to every new chunk. This can work for some matching semantics, but it introduces copying, duplicate-match handling, and offset adjustment. It is not automatically wrong; it is simply not the same as carrying automaton state.
+
+I test boundary positions deliberately:
+
+```text
+pattern:    failure
+chunk A:    xxfa
+chunk B:    ilureyy
+expected:   one match at absolute range 2..9
+```
+
+Then I vary every possible split point through the pattern. Property tests can compare chunked scanning against one-shot scanning for the same bytes and match semantics.
+
+## A benchmark must identify what it proves
+
+I would compare at least these implementations:
+
+1. Copy each chunk into a scanner-owned buffer, then scan.
+2. Scan caller-owned chunks directly while carrying state.
+3. Scan directly with the intended prefilter enabled.
+
+The workload matrix needs variation:
+
+- no matches, rare matches, and dense matches;
+- random patterns and heavily shared prefixes;
+- short and long patterns;
+- chunk sizes below, near, and far above the longest pattern;
+- boundaries placed inside matches;
+- DFA, contiguous NFA, and automatic selection;
+- construction included and excluded;
+- warm-cache and end-to-end reader measurements.
+
+I record emitted match count and compare results before looking at time. A fast scanner that skips cross-chunk matches is only a broken scanner.
+
+For each run I keep Rust version, optimization flags, CPU model, frequency policy, automaton memory usage, pattern corpus, input checksum, and benchmark command. Nanoseconds per byte and throughput are helpful, but they need confidence intervals and repeated samples.
+
+Hardware counters can explain rather than decorate: cycles, instructions, cache misses, branches, and memory bandwidth. I use them after the functional equivalence test passes.
+
+## Rust makes the ownership boundary visible
+
+Rust slices make direct scanning natural. A `&[u8]` says the scanner borrows bytes for the call and does not need to own them. The state object can outlive the slice because it stores automaton state and offsets, not references into a temporary chunk.
+
+If matches borrow from the input, their lifetime cannot silently extend past the chunk. This forces an API decision: consume results during the call, return owned metadata such as offsets, or keep the backing bytes alive somewhere.
+
+The compiler does not decide which product behavior is best. It makes the lifetime cost visible.
+
+This connects with [what zero-copy means at a JavaScript–Rust boundary](/blog/what-denos-op2-macro-generates-at-the-javascript-rust-boundary): avoiding one Rust allocation does not prove the runtime, FFI layer, or caller made no copy. It also connects with [CPU feature dispatch](/rust/failures/target-feature-function-call-requires-unsafe): a SIMD prefilter must be selected with a valid runtime feature proof on portable binaries.
+
+## The principle beyond Rust
+
+I use the same questions in other systems:
+
+- A network framework may avoid copying payload bytes while still copying descriptors.
+- A parser may return slices into an input buffer but allocate its syntax tree.
+- A database may expose a borrowed page while decompression materializes another buffer.
+- A language runtime may share an external buffer until mutation triggers a copy.
+- A kernel zero-copy API may avoid user-space payload copies while DMA and cache coherence still move data physically.
+
+“Zero-copy” is always relative to a boundary and a representation.
+
+My review question is not “does this code use the phrase?” It is:
+
+> Which bytes would otherwise be written to which second memory region, who would own that region, and what remaining operation now limits throughput?
+
+If I cannot answer this, I do not yet understand the optimization.
+
+## My practical checklist
+
+When I review a streaming scanner, I ask:
+
+1. Which automaton representation is actually running?
+2. What state crosses chunk boundaries?
+3. Which match semantics and output requirements need retained bytes?
+4. Where does a real memory-to-memory copy occur?
+5. Are loads, copies, allocations, and buffers being named separately?
+6. Does the direct path produce exactly the one-shot match set at every split point?
+7. What remains on the serial critical path after the copy disappears?
+8. Does a prefilter change the bottleneck and the useful benchmark corpus?
+9. Are CPU features dispatched safely?
+10. Can another engineer reproduce both correctness and performance claims?
+
+The most useful lesson is not that copying is always bad. Sometimes a compact owned buffer improves locality, simplifies lifetime management, or enables a better algorithm. The lesson is to describe the movement precisely.
+
+Zero-copy does not mean zero work. It means one materialization is gone. In a good design, I can point to that removed write, show how state preserves correctness across boundaries, and measure what becomes the new limiting cost.
+
+## Continue through the practical cluster
+
+I separated the surrounding questions so each one can be used without reading a very large monolithic guide. The [Aho–Corasick article collection](/blog/tags/aho-corasick/page/1) is publication-aware: it reveals each supporting article when that article's scheduled date arrives, without sending current readers to future pages.

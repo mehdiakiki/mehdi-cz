@@ -1,0 +1,165 @@
+---
+title: "Build Once, Search Many Times: Reusing Aho–Corasick Safely in Rust"
+date: "2026-10-28T13:50:00+01:00"
+lastmod: "2026-09-05T12:00:00+01:00"
+tags: ["rust", "aho-corasick", "concurrency", "performance", "architecture"]
+draft: false
+reviewed: true
+reviewedHash: "1d5d581689bff0a3ad886f2b35e0bba3d4d100a1e18053f7f45980d444268334"
+cluster: "rust-under-the-hood"
+campaign: "editorial"
+summary: "Automaton construction can be expensive, while compiled matchers are reusable and thread-safe. I show ownership patterns for services, workers, and safe configuration updates."
+---
+
+If I build the same Aho–Corasick matcher inside every request, I can optimize the scan loop for days and still leave the largest avoidable cost in place.
+
+Construction compiles pattern meaning into states, transitions, match metadata, and optional acceleration structures. That work exists so many haystacks can reuse it.
+
+My default architecture is simple: build once, publish an immutable matcher, and keep per-search state local.
+
+## Construction is part of the resource model
+
+The combined length of all patterns determines the input to construction. Representation matters too. A dense DFA can take much more time and memory to build than a contiguous NFA.
+
+The official [`AhoCorasick` documentation](https://docs.rs/aho-corasick/latest/aho_corasick/struct.AhoCorasick.html#resource-usage) recommends building once and reusing the automaton. It also exposes `memory_usage()` because retained matcher memory can be significant.
+
+For trusted static patterns, startup construction can be enough:
+
+```rust
+use aho_corasick::AhoCorasick;
+
+fn main() {
+    let matcher = AhoCorasick::new([
+        "timeout",
+        "connection refused",
+        "permission denied",
+    ]).expect("static patterns should compile");
+
+    for line in logs() {
+        for found in matcher.find_iter(line.as_bytes()) {
+            process(found.pattern().as_usize(), found.start(), found.end());
+        }
+    }
+}
+```
+
+The search iterator holds state for that search. The compiled matcher remains reusable for the next line.
+
+## Sharing does not require one global search cursor
+
+`AhoCorasick` is `Send` and `Sync`, and its documentation guarantees that cloning it is cheap because its internals use thread-safe reference counting. This allows several ownership styles.
+
+Scoped threads can borrow one matcher:
+
+```rust
+use aho_corasick::AhoCorasick;
+
+fn count_all(inputs: &[&[u8]]) -> usize {
+    let matcher = AhoCorasick::new(["error", "failure"]).unwrap();
+
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = inputs
+            .iter()
+            .map(|input| {
+                let matcher = &matcher;
+                scope.spawn(move || matcher.find_iter(*input).count())
+            })
+            .collect();
+
+        handles.into_iter().map(|handle| handle.join().unwrap()).sum()
+    })
+}
+```
+
+Long-lived workers can receive a cheap clone or an `Arc<AhoCorasick>`. I choose the one that makes application ownership clear; I do not add an outer `Arc` only because I assume clone copies the complete transition table.
+
+The important separation is:
+
+```text
+shared immutable data: compiled patterns and automaton
+local mutable data:    cursor, offsets, output buffer, counters
+```
+
+Putting a mutex around the whole matcher and scan can serialize independent searches unnecessarily.
+
+## Dynamic updates need build-then-swap
+
+Some services receive new pattern configurations while running. I do not mutate a matcher in place. I build a new immutable value separately, validate it, then atomically or briefly under a lock replace the shared reference.
+
+Conceptually:
+
+```text
+load and validate candidate patterns
+        |
+build new matcher outside request lock
+        |
+run correctness and resource checks
+        |
+publish new shared matcher
+        |
+old searches finish on old matcher
+```
+
+This avoids blocking readers during expensive construction. It also provides a clean rollback: if construction fails or exceeds memory limits, the old matcher remains active.
+
+The exact swap mechanism can be an `RwLock<Arc<_>>`, an atomic-arc crate, a watch channel to workers, or immutable process replacement. The product's update frequency and consistency rule decide the choice.
+
+## Define configuration identity
+
+When a result needs explanation, I attach a matcher version or pattern-set hash. Without it, a match produced just before an update can be interpreted using metadata from just after the update.
+
+I version the ordered pattern list, match kind, ASCII case setting, prefilter choice if forced, and requested automaton kind. Pattern order is especially important for leftmost-first semantics because it defines priority.
+
+Workers should report both `pattern_id` and configuration identity. A numeric pattern ID alone is meaningful only inside the matcher that produced it.
+
+## Untrusted patterns need limits
+
+Construction can fail when patterns are too large or numerous. The docs recommend handling build errors when input is untrusted. I add operational bounds before construction:
+
+- maximum pattern count;
+- maximum combined bytes;
+- maximum individual length;
+- acceptable matcher `memory_usage()`;
+- construction timeout or isolated build budget;
+- allowed match semantics and case behavior.
+
+The completed matcher can use less memory than the peak build. For large dynamic corpora, I measure process peak and avoid running many builds concurrently.
+
+Reusing a matcher does not make malicious output cheap either. Dense overlapping matches can still overwhelm downstream consumers.
+
+## Reuse changes benchmarking
+
+I benchmark two real paths:
+
+1. steady-state search through a reused compiled matcher;
+2. configuration update including parsing, construction, validation, and publication.
+
+Combining both into one average can hide a terrible update pause or make the normal search path look slower than it is.
+
+For request latency, I test while an update happens. Building outside the read lock is not enough if allocator or memory pressure from a very large construction disrupts all workers.
+
+The matcher exposes `kind()` and `memory_usage()`. I log these once per version rather than per request.
+
+## Per-stream state still belongs somewhere
+
+Sharing the compiled automaton does not mean different network streams share one offset or partial-match state. Each stream needs its own mutable scanning state or streaming iterator.
+
+This is the same pattern used by regular expressions, parsers, compression dictionaries, and database query plans: expensive immutable structure is shared; execution state remains per operation.
+
+When one search borrows a temporary chunk, its results must not outlive the chunk unless they contain owned metadata or retained storage. Sharing the matcher changes none of those lifetime rules.
+
+## My review questions
+
+I ask:
+
+1. Where and how often is the matcher constructed?
+2. Which fields are immutable and shareable?
+3. Is each search's cursor and output state local?
+4. Can a failed update leave the old version active?
+5. Do results carry configuration identity?
+6. Are peak build memory and output volume bounded?
+7. Does the benchmark match the intended reuse lifetime?
+
+“Build once” is not only a performance trick. It creates a useful architectural boundary between configuration and execution. Rust's immutable sharing makes that boundary both efficient and visible.
+
+For representation choices during construction, see [Aho–Corasick DFA or NFA](/blog/aho-corasick-dfa-or-nfa-rust). The cluster starts at [Zero-Copy Does Not Mean Zero Memory Access](/blog/zero-copy-does-not-mean-zero-memory-access-aho-corasick-rust).

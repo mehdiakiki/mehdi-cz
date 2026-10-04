@@ -1,0 +1,83 @@
+---
+caseId: "RFA-292"
+title: "RangeInclusive Endpoints Are Unspecified After Exhaustion"
+date: "2026-09-06T01:12:00+01:00"
+lastmod: "2026-09-06T01:12:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "75829fc000b92425d47d90b5ddcf5ce9dcb13fd9bd9a6cd893b16dad50b40970"
+area: "upgrades-compatibility"
+symptom: "After iterating 3..=5 to exhaustion, comparing start() and end() does not reliably reveal that the range is empty."
+summary: "RangeInclusive is both a bounds value and a stateful iterator. Once iteration is exhausted, Rust leaves its exposed endpoint values unspecified; use is_empty for state or preserve original bounds separately."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust RangeInclusive start end after iteration", "exhausted inclusive range endpoints unspecified", "RangeInclusive is_empty after collect"]
+evidence: ["Rust 1.98.1 inclusive integer range", "full iterator exhaustion", "is_empty state check"]
+sources: ["https://doc.rust-lang.org/std/ops/struct.RangeInclusive.html#method.start", "https://doc.rust-lang.org/std/ops/struct.RangeInclusive.html#method.into_inner", "https://doc.rust-lang.org/std/ops/struct.RangeInclusive.html#method.is_empty"]
+---
+
+I used one `RangeInclusive` first as an iterator and later as a record of its original bounds. After the loop, those were no longer two safe uses of the same value. Iteration had changed its internal state.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-292/fail.rs) exhausts `3..=5`, then expects `start() > end()` to prove emptiness. Rust tells callers not to depend on the endpoint values after exhaustion.
+
+## An inclusive range carries iterator state
+
+`3..=5` looks like two stored endpoints, but [`RangeInclusive`](https://doc.rust-lang.org/std/ops/struct.RangeInclusive.html) also implements `Iterator`. Each call to `next` advances the remaining range.
+
+The inclusive endpoint creates a special final state. After yielding `5`, the implementation must remember that `5` has already been produced. Merely keeping equal endpoints cannot express both “one value remains” and “no value remains,” so the range contains additional exhaustion state.
+
+This is why checking only `start() > end()` is insufficient. Equal bounds can describe the one-item range `5..=5`, or exposed values after the item was already consumed.
+
+## The documentation deliberately leaves endpoints unspecified
+
+The [`start`](https://doc.rust-lang.org/std/ops/struct.RangeInclusive.html#method.start), `end`, and [`into_inner`](https://doc.rust-lang.org/std/ops/struct.RangeInclusive.html#method.into_inner) documentation says their values are unspecified after iteration ended.
+
+“Unspecified” is different from random and different from unsafe. A particular compiler version may consistently show one pair. That observation is not a portable contract for program logic. Another implementation can represent the exhausted state differently while remaining correct.
+
+I do not lock tests to today’s endpoint pair. I test the documented state through the method intended for it.
+
+## `is_empty` observes the semantic state
+
+[`RangeInclusive::is_empty`](https://doc.rust-lang.org/std/ops/struct.RangeInclusive.html#method.is_empty) answers whether the range contains no items. After complete iteration, it returns true even if comparing the visible endpoints would suggest otherwise.
+
+Before iteration, it also handles ordinary inverted bounds. For partially ordered types such as floats, incomparable endpoints make the range empty, which has its own domain considerations described in RFA-283.
+
+Using `is_empty` lets the implementation consult its exhaustion flag as well as its bounds. This is the important difference from reconstructing an answer manually.
+
+## Preserve original bounds when they are evidence
+
+Sometimes I need both traversal and the original request interval for logs, pagination, or a database query. I copy or clone the bounds before consuming the range, or store them in a domain type separate from the iterator.
+
+For copyable integers this is inexpensive:
+
+```rust
+let requested = 3..=5;
+let original = requested.clone();
+for value in requested { /* work */ }
+// original still describes 3 through 5
+```
+
+With expensive endpoint types, I design ownership explicitly instead of assuming the consumed iterator remains a free audit record.
+
+The general lesson is that a value implementing `Iterator` is a cursor. Its methods can mutate what remains even when its name looks like static configuration.
+
+## Partial consumption has a separate meaning
+
+Before exhaustion, the current start generally follows the remaining frontier. This can be useful, but it is not the original lower bound. If a loop stops at `4`, a later user of the same range receives only what remains.
+
+I name variables `remaining` when this behavior is intended. If a retry must restart from the original boundary, I keep that checkpoint separately.
+
+For inclusive numeric loops near a type maximum, I also avoid implementing my own `current += 1` termination logic. The standard iterator can represent yielding the maximum value without requiring an overflowing increment in application code.
+
+Cloning after partial consumption creates a copy of the remaining iterator state, not a copy of the original request. This is useful for speculative work from the current frontier, but it is too late for audit data. I choose the checkpoint moment deliberately: clone before any consumption for replay, or clone during consumption only when both branches should start from what remains.
+
+## What I test
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-292/fixed.rs) collects all three values and then asserts `range.is_empty()`. It never makes a claim about the exhausted endpoints.
+
+My table includes a one-item range, increasing range, inverted range, partial forward consumption, partial backward consumption where available, and complete exhaustion. I verify original bounds only on a preserved clone.
+
+If serialization is needed, I serialize the domain interval rather than a partially consumed iterator. This keeps persisted meaning independent from implementation state.
+
+The core principle is that representation observations are weaker than semantic queries. After `RangeInclusive` becomes exhausted, its endpoints are unspecified, while `is_empty` remains the supported answer. Preserve bounds before traversal when those bounds must remain evidence.

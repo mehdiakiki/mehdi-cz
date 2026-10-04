@@ -1,0 +1,95 @@
+---
+caseId: "RFA-127"
+title: "Why Box<dyn Trait> Defaults to 'static for a Borrowed Value"
+date: "2026-09-05T12:27:00+01:00"
+lastmod: "2026-09-05T12:27:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "14a4c34f0949178e732aae25a414b84882c822d38b4449c41281cbd642af4208"
+area: "diagnostics-macros"
+symptom: "Returning a boxed trait object that contains a borrow fails because Rust requires the borrowed value to outlive 'static."
+summary: "An omitted trait-object lifetime is not always inferred from nearby input lifetimes. In Box<dyn Trait>, default object lifetime rules commonly select 'static; write dyn Trait + 'a when the object may contain an 'a borrow."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets"]
+profiles: ["check", "dev", "release", "test"]
+searchTerms: ["Box dyn Trait borrowed value must outlive static Rust", "Rust default trait object lifetime Box static", "return boxed trait object with lifetime"]
+evidence: ["Rust 1.98.1 lifetime compile failure", "default trait-object lifetime", "explicit + 'a repair"]
+sources: ["https://doc.rust-lang.org/reference/lifetime-elision.html#default-trait-object-lifetimes", "https://doc.rust-lang.org/std/boxed/struct.Box.html"]
+---
+
+The [failing program](/rust-failure-atlas/evidence/RFA-127/fail.rs) creates a small `Borrowed<'a>` value and returns it behind `Box<dyn Label>`. The function input clearly has lifetime `'a`, yet rustc says that `'a` must outlive `'static`.
+
+This error is confusing when I expect ordinary function lifetime elision to connect the input borrow and the returned object. The missing detail is that trait objects have their own default object lifetime rules.
+
+## The hidden lifetime inside dyn Trait
+
+A trait object can hide a concrete type that contains references. Rust therefore needs a bound describing how long those hidden references remain valid:
+
+```rust
+dyn Label + 'a
+```
+
+When the bound is omitted, the compiler follows the [default trait-object lifetime rules](https://doc.rust-lang.org/reference/lifetime-elision.html#default-trait-object-lifetimes). These rules are separate from the usual lifetime-elision rules used in function signatures.
+
+For a boxed object in this return position, `Box<dyn Label>` becomes, in effect:
+
+```rust
+Box<dyn Label + 'static>
+```
+
+`'static` does not mean the box itself lives forever. It means the concrete value stored behind the trait object cannot contain a reference shorter than `'static`. `Borrowed<'a>` contains the caller's `&'a str`, so it does not satisfy that contract.
+
+## The repair states the real object lifetime
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-127/fixed.rs) returns this instead:
+
+```rust
+fn boxed<'a>(text: &'a str) -> Box<dyn Label + 'a>
+```
+
+Now the box owns the `Borrowed` structure, while that structure still borrows `text` for `'a`. Ownership of the outer allocation and lifetime of the inner data are two different facts.
+
+This is one reason I avoid saying “the box owns everything.” The [`Box` documentation](https://doc.rust-lang.org/std/boxed/struct.Box.html) describes owned heap allocation, but a boxed value can itself contain borrowed references. Moving the box does not extend those references.
+
+The return value cannot outlive the source string, and Rust makes that limitation visible to callers. That is the desired safety contract.
+
+## A reference to a trait object is a different shape
+
+These types express different ownership:
+
+```rust
+&'a dyn Label
+Box<dyn Label + 'a>
+Box<dyn Label + 'static>
+```
+
+The first borrows an already existing implementer. The second owns the concrete implementer but permits it to borrow other data for `'a`. The third owns an implementer containing no non-static borrows.
+
+I choose among them based on who should destroy the implementer and whether it needs to share another value's lifetime. I do not choose `Box` only to make a type error disappear.
+
+## Owning the text is another valid repair
+
+Sometimes the returned object should be independent of the input. Then I change the hidden implementation to own a `String` or another owned representation. A `Box<dyn Label>` with its default `'static` bound can be correct because no borrowed input remains inside it.
+
+This costs an allocation or copy depending on how the data arrives, but it simplifies storage in long-lived services, task queues, and registries. The explicit `+ 'a` version avoids that ownership cost but transfers the lifetime relationship into the caller's API.
+
+Neither design is universally better. I use the lifetime error to expose the product decision: should the object remain tied to the request data, or should it become independent?
+
+## Why adding 'static to the input is usually wrong
+
+A tempting response is changing `text: &'a str` into `text: &'static str`. This makes the example compile for string literals, but it rejects ordinary strings created at runtime. It turns a local representation problem into a much stronger caller requirement.
+
+I only require `'static` when the system truly stores the object without any enclosing lifetime, such as a process-wide registry or a spawned task that may outlive the current stack. Even then, owning the data is often more useful than demanding a static borrow.
+
+## My debugging sequence
+
+When a trait object unexpectedly asks for `'static`, I do this:
+
+1. Write the omitted bound explicitly as `dyn Trait + 'static`.
+2. Inspect the hidden concrete type for references and their real owners.
+3. Decide whether the returned object should borrow or own that data.
+4. Use `+ 'a` and expose the lifetime when borrowing is intended.
+5. Move or clone data into an owned implementation when independence is intended.
+6. Check every storage boundary, thread, and callback that may require a longer lifetime.
+
+The core principle is simple: type erasure hides the concrete type, but it cannot erase the lifetime of references inside that type. Writing the object lifetime explicitly makes this invisible part of `dyn Trait` readable again.

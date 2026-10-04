@@ -1,0 +1,158 @@
+---
+title: "An SLO for Data Freshness Is Not an HTTP Availability SLO"
+date: "2026-12-20T09:00:00+01:00"
+tags: ["data freshness", "SLO", "data pipeline", "observability", "reliability engineering"]
+draft: false
+reviewed: true
+reviewedHash: "d2904e2bf354d2d48702065c0b446e0a285165fd40607aded8fbb4ab7eace5d5"
+cluster: "reliable-data-integrations"
+campaign: "authority-2026"
+opportunity: "DATA-085"
+summary: "A synchronization API can return 200 while serving yesterday's truth. I define freshness from source evidence to product visibility, with coverage, lag, error budgets, and sparse-source handling."
+---
+
+A data service can be 99.99% available and quietly six hours behind.
+
+I learned to separate these signals because HTTP health checks often stay green while a synchronization worker is stuck. The API reads its database correctly. The database simply contains yesterday's version of the world.
+
+For a data product, availability answers “can I read a response?” Freshness answers “how close is this response to the authoritative state I promised?”
+
+## Start from the user-visible promise
+
+“Near real time” is not measurable. I write something like:
+
+> During each 30-day window, 99.5% of eligible source changes become visible in the product within 10 minutes.
+
+This sentence names:
+
+```text
+event population: eligible source changes
+good condition: product-visible within 10 minutes
+target: 99.5%
+window: rolling 30 days
+```
+
+The [Google SRE Workbook chapter on SLOs](https://sre.google/workbook/implementing-slos/) frames an SLO around a measurable service-level indicator and target. For a pipeline, I make the indicator follow data, not requests alone.
+
+## I keep four times when they exist
+
+```text
+source_event_time  when the authoritative change became effective
+source_seen_time   when our boundary observed it
+processed_time     when normalization/storage committed
+visible_time       when the product could read the new state
+```
+
+These produce different lags:
+
+```text
+source delivery lag = source_seen_time - source_event_time
+processing lag      = processed_time - source_seen_time
+projection lag      = visible_time - processed_time
+end-to-end freshness= visible_time - source_event_time
+```
+
+The decomposition shows who can act. A provider delay is different from our queue backlog, but the user still experiences the end-to-end result.
+
+If the source does not provide a trustworthy event time, I do not invent precision. I measure from the earliest reliable observation and document the blind interval.
+
+## `now - max(updated_at)` can lie
+
+A common dashboard calculates:
+
+```text
+current time - newest source updated_at
+```
+
+This works only when the source changes often and its timestamps are trustworthy. A quiet tenant with no changes for a day appears stale even if synchronization is perfect. A stuck pipeline can appear fresh if one malformed record keeps updating its timestamp.
+
+I prefer source progress evidence:
+
+- a provider cursor or sequence with known head position;
+- a heartbeat/sentinel changed at a controlled interval;
+- event backlog age;
+- periodic complete-list comparison;
+- per-partition high-water marks;
+- sampled source-versus-product probes.
+
+Sparse sources need explicit heartbeats or synthetic probes. Absence of data is not evidence of freshness.
+
+## Freshness, coverage, and correctness are separate
+
+A pipeline may process recent records quickly while silently dropping 5% of them. Its latency histogram looks excellent.
+
+I track:
+
+```text
+freshness: how late accepted changes become visible
+coverage: which expected changes or entities were observed
+correctness: whether visible meaning matches authority
+availability: whether the product can serve the data
+```
+
+No single number replaces the others. Reconciliation provides coverage and correctness evidence that a streaming-lag metric cannot.
+
+The [reconciliation article](/blog/reconciliation-is-the-repair-loop-of-a-distributed-system) shows how I close that loop.
+
+## The SLI can be event-based
+
+For event `e`:
+
+```text
+good(e) = visible_time(e) - source_event_time(e) <= 10 minutes
+```
+
+Then:
+
+```text
+freshness SLI = good eligible events / all eligible events
+```
+
+I define “eligible” carefully. Backfills, historical corrections, test tenants, and provider events already older than their retention promise may need separate classes. Excluding them silently would make the number dishonest.
+
+For current-state snapshots without events, I can sample entities and compare observed versions at fixed intervals. The unit becomes a probe interval or entity-time window rather than a source event.
+
+## Percentiles and the SLO answer different questions
+
+p95 lag is useful for diagnosis, but it does not directly express how many changes violated a ten-minute promise over the objective window.
+
+I display:
+
+- SLO compliance and remaining error budget;
+- p50, p95, and p99 end-to-end lag;
+- oldest unprocessed item;
+- backlog size and estimated drain time;
+- missing partitions or silent tenants;
+- freshness by provider, partition, and product tier.
+
+High-cardinality dimensions stay in traces or event analytics, not permanent metric labels.
+
+## Error budget changes operational choices
+
+With a 99.5% target, 0.5% of eligible changes may exceed the threshold during the window. That allowance is not permission to ignore slow records. It is a budget for imperfect operation and planned change.
+
+When the budget burns quickly, I may pause risky releases, reduce replay traffic, increase worker capacity within downstream limits, or degrade a non-critical projection. The action depends on the lag stage.
+
+A freshness alert should link to a runbook that starts with: is the source silent, delivery late, processing stuck, projection behind, or observation broken?
+
+## Backfills need their own objective
+
+Historical backfill can make “oldest item age” enormous while live updates remain healthy. Conversely, prioritizing live traffic can leave the backfill unfinished forever.
+
+I separate lanes and promises:
+
+```text
+live changes: visible within 10 minutes
+repair queue: resolved within 24 hours by severity
+approved backfill: completes by stated deadline without violating live SLO
+```
+
+Capacity is reserved so one lane cannot starve another. Both appear in the same operational view because they can compete for providers, databases, and workers.
+
+## My verification test
+
+I inject a synthetic source change with a unique safe identity and record every timestamp until it becomes visible through the same read path users call. Then I delay each stage deliberately and verify the correct component of lag increases.
+
+I also stop a partition without stopping the API. The HTTP availability monitor should stay green while the freshness alert turns red. If both dashboards remain green, the SLO is not observing the product risk it claims to measure.
+
+This distinction has become one of my basic system-design checks. A healthy endpoint can serve stale truth perfectly. I monitor the journey from authoritative change to user-visible state, and I make freshness a promise with a population, threshold, target, and window—not a vague adjective beside an uptime graph.

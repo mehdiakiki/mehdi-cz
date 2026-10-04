@@ -1,0 +1,106 @@
+---
+caseId: "RFA-206"
+title: "collect::<Result<Vec<_>, _>>() Stops at the First Error"
+date: "2026-09-05T17:45:00+01:00"
+lastmod: "2026-09-05T17:45:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "c228b2a21a9be31c1c3098d93a3b502089ec8c587f9f87aaf90c9c3ce0113dd2"
+area: "concurrency-memory"
+symptom: "Collecting an iterator into Result<Vec<_>, _> returns the first error while later input records remain completely unvisited."
+summary: "Result's FromIterator implementation short-circuits at the first Err. This is good fail-fast behavior, but it cannot validate every input or collect every error without a different traversal policy."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets with alloc"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust collect Result stops first error",
+    "collect all errors iterator Rust",
+    "Result FromIterator short circuit remaining items",
+  ]
+evidence: ["Rust 1.98.1 three-item iterator", "unvisited post-error value", "exhaustive loop repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/std/result/#collecting-into-result",
+    "https://doc.rust-lang.org/std/result/enum.Result.html#impl-FromIterator%3CResult%3CA,+E%3E%3E-for-Result%3CV,+E%3E",
+    "https://doc.rust-lang.org/std/iter/trait.Iterator.html#method.by_ref",
+  ]
+---
+
+I like the compact Rust pattern that turns many `Result` values into one `Result<Vec<_>, _>`. I also need to remember what it promises: the first error ends collection.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-206/fail.rs) contains `Ok(1)`, `Err("bad record")`, and `Ok(3)`. After collecting through a borrowed iterator, `Ok(3)` is still the next item. It was never visited.
+
+This is fail-fast traversal, not complete validation.
+
+## `Result` implements the collection policy
+
+The standard library's [`FromIterator` implementation for Result](https://doc.rust-lang.org/std/result/enum.Result.html#impl-FromIterator%3CResult%3CA,+E%3E%3E-for-Result%3CV,+E%3E) takes successful values until it encounters `Err`. It returns that error and takes no further elements.
+
+Conceptually, the operation is:
+
+```text
+Ok(a), Ok(b), Ok(c)  -> Ok([a, b, c])
+Ok(a), Err(e), ...   -> Err(e), stop here
+```
+
+It does not allocate a partial successful vector for the caller to recover through the returned `Err`. Values already collected are dropped when the operation fails.
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-206/fixed.rs) needs every record to be inspected, so it loops over every result and stores successes and errors separately.
+
+## Short-circuiting is often the correct choice
+
+For a chain of dependent steps, continuing after the first failure can be wasteful or unsafe. If I cannot build object three because object two is invalid, `collect::<Result<_, _>>()` gives a concise transaction-like boundary in memory.
+
+It also mirrors the `?` operator: return one error immediately and do not execute later work in the current function.
+
+I use this behaviour for loading a set that is useful only when every member is valid. The first clear error is enough, and later parsing may be expensive.
+
+The failure occurs when the product requirement is “show the user all invalid rows” or “perform an action for every independent record.” That requires exhaustive traversal.
+
+## Side effects after the error do not happen
+
+Iterator adapters are lazy. A mapping closure that parses, logs, counts, sends, or mutates state runs only when the iterator requests an item. Once collection sees `Err`, later closures are not called.
+
+This can be a benefit: no unnecessary external actions occur after failure. It can also make metrics misleading if code assumes every input increments a counter.
+
+I keep irreversible side effects out of a validation map when possible. First I parse into owned plans, then I apply actions after the complete policy is known. If I intentionally execute while iterating, I document the prefix that may have completed before an error.
+
+There is no automatic rollback of earlier side effects.
+
+## `by_ref` reveals the remaining iterator
+
+Normally `collect` consumes the iterator value, so I cannot ask it what remains. [`Iterator::by_ref`](https://doc.rust-lang.org/std/iter/trait.Iterator.html#method.by_ref) temporarily borrows the iterator, letting the fixture call `next()` afterward.
+
+This is a useful diagnostic technique. It proves the exact boundary without adding counters inside several adapters.
+
+In production code, resuming the remainder after the error can be valid, but I must also decide what happened to successful items before it. The returned `Result` no longer exposes them. A custom loop is clearer when prefix recovery matters.
+
+## Collecting all errors changes the output type
+
+If I need every outcome, useful shapes include:
+
+```text
+Vec<Result<T, E>>
+(Vec<T>, Vec<E>)
+Vec<Validated<T, E>> with input position
+domain report containing successes, warnings, and errors
+```
+
+A `Result<Vec<T>, E>` cannot represent several errors or partial success. No iterator trick can add states that the output type does not contain.
+
+For user-facing validation, I usually attach a row number or stable record identity to each error. A bag of messages without positions is difficult to repair. For large streams I may cap retained diagnostics while continuing to count failures, otherwise “collect all errors” creates an unbounded memory promise.
+
+## Parallel processing needs an explicit cancellation story
+
+With concurrent futures or worker threads, “first error” does not automatically mean no later work started. Tasks may already be running. The sequential iterator guarantee demonstrated here cannot be copied onto a concurrent executor.
+
+I define whether in-flight work is cancelled, allowed to finish, or drained. Then I test external effects, not only the returned error. A fail-fast return and fail-fast execution are different properties.
+
+## My regression checks the unseen value
+
+A final assertion of `Err("bad record")` proves which error was returned, but not whether the source stopped. The Atlas fixture borrows the source and verifies that `Ok(3)` remains.
+
+For exhaustive validation, I assert the success IDs, error IDs, and number of visits. I include consecutive errors and an error at the first and last positions.
+
+The core principle is that collection chooses control flow as well as a container. Collecting into `Result` means stop at the first `Err`. I keep it for all-or-nothing parsing and use an explicit exhaustive representation when every input must be observed.

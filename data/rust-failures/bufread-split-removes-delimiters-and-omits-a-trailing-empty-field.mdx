@@ -1,0 +1,94 @@
+---
+caseId: "RFA-414"
+title: "BufRead::split Removes Delimiters and Omits a Trailing Empty Field"
+date: "2026-09-06T03:54:00+01:00"
+lastmod: "2026-09-06T03:54:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "d240370b6c37e6e3e4d07c3af0d2b648236decc309b8fbf191448b112ae301ad"
+area: "ffi-targets"
+symptom: "Splitting a,b, with BufRead::split yields byte vectors a and b, without comma bytes and without a final empty vector."
+summary: "BufRead::split treats its byte as a record terminator: it removes delimiters from yielded buffers and a trailing delimiter does not create another empty record. Use read_until or explicit framing when separator evidence matters."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust BufRead split removes delimiter trailing empty", "BufRead split final delimiter no empty field", "binary fields split delimiter Rust"]
+evidence: ["Rust 1.98.1 Cursor a comma b comma", "two delimiter-free fields", "no synthetic trailing item"]
+sources: ["https://doc.rust-lang.org/std/io/trait.BufRead.html#method.split", "https://doc.rust-lang.org/std/io/trait.BufRead.html#method.read_until", "https://doc.rust-lang.org/std/primitive.slice.html#method.split"]
+---
+
+I used `BufRead::split` as if it behaved exactly like splitting an in-memory slice. A trailing delimiter exposed the difference I had ignored.
+
+The [failing fixture](/rust-failure-atlas/evidence/RFA-414/fail.rs) reads `a,b,`. The iterator yields `a` and `b`. It removes both commas and does not manufacture a third empty field after the final comma.
+
+## This split reads terminated records
+
+[`BufRead::split`](https://doc.rust-lang.org/std/io/trait.BufRead.html#method.split) consumes a buffered reader and creates an iterator of byte vectors separated by one delimiter byte.
+
+Each successful item excludes the delimiter. Internally, the delimiter marks where a returned record ends; it is not part of that record's payload.
+
+The trailing comma terminates `b`. On the next iterator step, the reader is already at EOF and supplies zero bytes, so there is no further item.
+
+This is terminator behavior, not the boundary-field behavior some in-memory splitting APIs expose.
+
+## Slice splitting can preserve a trailing empty segment
+
+[`slice::split`](https://doc.rust-lang.org/std/primitive.slice.html#method.split) divides an already available slice around matches. A separator at the end represents a boundary followed by an empty suffix, so that empty slice can be yielded.
+
+`BufRead::split` drives a stream one record at a time and stops on immediate EOF. The similar method name does not guarantee identical terminal behavior.
+
+I test the exact API instead of transferring edge rules from strings, slices, shell tools, or CSV libraries.
+
+## Leading and repeated delimiters still produce empties
+
+A delimiter encountered as the first byte terminates an empty record that was actually read. Repeated delimiters can therefore produce empty items between them.
+
+The special trailing observation is that, after consuming the final delimiter as part of the previous read operation, a subsequent immediate EOF does not add another item.
+
+I include leading, repeated, and trailing cases because “empty field” has several different origins. A protocol may assign different meaning to each.
+
+## The delimiter byte is consumed
+
+Although it is omitted from the yielded Vec, the delimiter is no longer in the reader. Dropping the split item does not put it back.
+
+If I need the exact framed bytes for checksums, diagnostics, or forwarding, [`read_until`](https://doc.rust-lang.org/std/io/trait.BufRead.html#method.read_until) retains the delimiter in the destination. The neighbouring Atlas case documents that it also appends instead of replacing.
+
+Choosing `split` discards separator evidence intentionally. I make that choice only when a one-byte delimiter has no payload meaning.
+
+## Each item can be an I/O error
+
+The iterator item type is `io::Result<Vec<u8>>`. Collection into `io::Result<Vec<_>>` stops at the first error. It does not turn failures into empty fields.
+
+If the underlying source fails after returning partial bytes, application recovery needs to follow the documented I/O behavior and framing policy. A delimiter-based stream can be desynchronized after an error even if reading later becomes possible.
+
+I preserve the error and enough record context to decide whether the connection or file should be abandoned.
+
+## One byte is not a general delimiter grammar
+
+The method accepts a single `u8`. It is suitable for newline-like or null-like byte separators. It does not parse multi-byte tokens, escaping, quoting, or nested structures.
+
+Using comma split for CSV is incorrect when quoted values may contain commas or line breaks. A domain parser must implement those grammar rules and input limits.
+
+Similarly, splitting UTF-8 bytes at an arbitrary value can produce fragments that are not independently valid text. I validate or decode after confirming the protocol's byte boundaries.
+
+## Unbounded records can grow memory
+
+Until a delimiter or EOF appears, the adaptor accumulates bytes for one returned Vec. An attacker can omit the delimiter and force a large allocation.
+
+I enforce a maximum record length at external boundaries. A hand-written `fill_buf` and `consume` loop can reject early without retaining an unlimited segment, or a limited reader can bound consumption according to protocol rules.
+
+The convenience iterator is not a resource policy.
+
+## The repaired evidence proves only public behavior
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-414/fixed.rs) collects the complete iterator and asserts exactly two delimiter-free byte vectors.
+
+It does not depend on internal buffer capacity, number of underlying reads, or allocation growth. Those are implementation and source-specific details.
+
+For production parser tests I add empty input, no delimiter before EOF, delimiter-only input, repeated delimiters, read errors, and maximum-length enforcement.
+
+## The core principle
+
+Splitting is a framing decision. `BufRead::split` treats a byte as a consumed terminator and yields payloads without that byte. Immediate EOF after a trailing terminator ends iteration rather than synthesizing another record.
+
+I select the API based on whether delimiters and trailing empty fields carry information. When they do, I retain and interpret them explicitly instead of assuming all methods named `split` share one boundary model.

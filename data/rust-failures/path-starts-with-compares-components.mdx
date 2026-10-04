@@ -1,0 +1,104 @@
+---
+caseId: "RFA-194"
+title: "Why Path::starts_with Is Not a String Prefix Check"
+date: "2026-09-05T17:33:00+01:00"
+lastmod: "2026-09-05T17:33:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "3cc5ec4de111170e38004f4678c587d1eddf1019181861f434473384a90c4aa3"
+area: "ffi-targets"
+symptom: "Path::starts_with returns false for /srv/application-cache against /srv/application although the raw text begins with that string."
+summary: "Path::starts_with compares complete path components, which correctly separates a child path from a sibling whose filename shares the same text. It is a lexical operation, however, and does not resolve parent components, symlinks, or filesystem races."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets; path syntax remains platform-specific"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust Path starts_with component not string",
+    "Path starts_with returns false textual prefix",
+    "Rust path prefix directory containment",
+  ]
+evidence: ["Rust 1.98.1 lexical path fixture", "sibling-name rejection", "child-component repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/std/path/struct.Path.html#method.starts_with",
+    "https://doc.rust-lang.org/std/path/struct.Path.html#method.components",
+    "https://doc.rust-lang.org/std/path/struct.Path.html#method.canonicalize",
+  ]
+---
+
+Path prefixes often appear in access checks: “is this output under the allowed directory?” Using a raw string prefix for that question creates the classic sibling-name bug. Rust's `Path::starts_with` deliberately does something stricter.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-194/fail.rs) compares `/srv/application-cache` with `/srv/application`. The first text begins with the second text, but `Path::starts_with` returns false. `application-cache` is one component, not a child named `cache` below an `application` component.
+
+## Paths have components, not only characters
+
+[`Path::starts_with`](https://doc.rust-lang.org/std/path/struct.Path.html#method.starts_with) only considers whole path components. A real child passes:
+
+```text
+/srv/application/cache
+components: /, srv, application, cache
+base:       /, srv, application
+```
+
+The sibling name does not:
+
+```text
+/srv/application-cache
+components: /, srv, application-cache
+base:       /, srv, application
+```
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-194/fixed.rs) tests both cases. This is a useful regression pair because testing only a valid child proves little about prefix-collision rejection.
+
+The same principle applies to `/data/user-10` and `/data/user-1`. String matching would mix two identities. Component matching keeps their boundaries visible.
+
+## `components` explains surprising comparisons
+
+When a result is unclear, I print or collect [`Path::components`](https://doc.rust-lang.org/std/path/struct.Path.html#method.components) for both operands. This exposes roots, prefixes, current-directory markers, parent-directory markers, and normal names without requiring UTF-8 conversion.
+
+Rust performs limited lexical normalization for component iteration. Repeated separators and most non-leading `.` components do not create distinct normal components. Trailing separators are also disregarded in these comparisons.
+
+It does not generally resolve `..`. The path `a/b/../secret` cannot be simplified to `a/secret` safely from text alone because `b` might be a symbolic link. Filesystem meaning is different from lexical shape.
+
+This is why I avoid implementing path logic with `to_string_lossy().starts_with(...)`. Apart from losing component boundaries, an operating-system path does not have to be valid Unicode.
+
+## Lexical prefix is not full containment proof
+
+Component-aware comparison fixes one important bug, but it does not access the filesystem. A path that lexically starts below an allowed directory may traverse a symlink that points elsewhere. A `..` component may also change the eventual location.
+
+[`Path::canonicalize`](https://doc.rust-lang.org/std/path/struct.Path.html#method.canonicalize) resolves an existing path to an absolute canonical form, including symbolic links. Comparing canonical base and candidate paths can answer a stronger question at one moment.
+
+It still does not automatically make a security-sensitive open safe. Another process can change parts of the directory tree between checking and opening: a time-of-check/time-of-use race. Strong sandboxing often needs directory handles and operating-system-specific relative-open facilities rather than two path strings.
+
+I describe the guarantee honestly:
+
+- `starts_with` answers a lexical component-prefix question.
+- canonicalization asks the filesystem for a resolved path snapshot.
+- secure containment during use may require handle-based operating-system primitives.
+
+One method should not be credited with all three jobs.
+
+## Platform syntax belongs in the test matrix
+
+`Path` uses platform-specific rules. Unix has one root separator. Windows also has drive and network prefixes, and drive-letter behaviour needs special treatment.
+
+A test written only with `/srv/...` checks the component principle but not every platform case. For a cross-platform application I add cases for relative paths, roots, trailing separators, Windows prefixes where applicable, and names that differ only by case.
+
+The standard path comparisons are normally case-sensitive even if the deployed filesystem is case-insensitive. Filesystem identity and lexical equality can therefore disagree.
+
+I keep pure component tests platform-neutral where possible and gate syntax-specific cases with the target family. The evidence here makes no filesystem call and is deterministic on the pinned environment.
+
+## Decide whether the input is a path or a namespace key
+
+Sometimes a slash-separated value is not a filesystem path at all. Object-store keys, URL paths, package names, and routing prefixes have their own normalization rules. Converting them to `Path` borrows host-platform semantics that may be wrong.
+
+I use `Path` for operating-system paths. I use URL or domain-specific types for other namespaces. This prevents a Linux build and a Windows build from interpreting the same protocol key differently.
+
+For an ordinary text autocomplete feature, string prefix matching may be exactly right. The failure comes from asking a path-containment question with text semantics, or asking a text-search question with path semantics, without noticing the difference.
+
+## My prefix-check sequence
+
+When a path prefix test surprises me, I first inspect components rather than displayed text. I then classify the desired claim as textual, lexical-path, resolved-filesystem, or security containment. I add a sibling with the same textual prefix, include `.` and `..`, check roots and platform prefixes, and decide whether symlinks or concurrent tree changes are in scope.
+
+The core principle is that boundaries carry meaning. `Path::starts_with` refuses to split a filename component just because its characters share a prefix. That makes it safer and more useful than a string check, while still remaining a lexical tool rather than proof about the live filesystem.

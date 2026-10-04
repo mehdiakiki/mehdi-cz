@@ -1,0 +1,213 @@
+---
+title: "What Evidence an AI Feature Needs Before You Ship It"
+date: "2026-09-09T06:30:00+01:00"
+lastmod: "2026-09-09T06:30:00+01:00"
+tags: ["ai", "llm evaluation", "production ai", "release engineering", "software testing"]
+draft: false
+reviewed: true
+reviewedHash: "d3162d555b8bbad6b610e130645a3282afe8f5af5e627da3be3b48488ecc9dbe"
+cluster: "reliable-ai-systems"
+campaign: "editorial"
+summary: "Ship readiness for an AI feature is one artifact per failure class, each with a stated minimum bar and a stated way it can be invalidated. Built here with a runnable 300 item fixture."
+---
+
+Before I ship an AI feature, I want one piece of evidence per failure class, and each piece must carry a minimum bar and a written way it can be invalidated. Five classes cover almost everything I have shipped: a wrong answer, an unsafe or wrong tool action, missing or irrelevant retrieval, cost and latency, and a silent regression after a change. A demo is not evidence for any of them. A single green run is not evidence either.
+
+Most ship checklists for AI features stay at the level of intentions. They say "evaluate quality" and "monitor for drift". They do not say how many items, what interval, what bar, or what would make the result meaningless. So this article builds the artifacts.
+
+## The example feature: a support ticket triage assistant
+
+I invented a small support ticket triage assistant. It classifies an incoming ticket, retrieves one policy snippet, and may call a `refund` tool. It is deliberately ordinary: a classification, a retrieval, and one action that touches money or state.
+
+Everything below runs on a recorded fixture in this repository. There are no model calls. The dataset, the runs, and the labels are simulated with a seeded PRNG, so the numbers reproduce exactly.
+
+```bash
+node experiments/ai-evals/triage-dataset.mjs
+node experiments/ai-evals/evidence.mjs
+node --test experiments/ai-evals/*.test.mjs
+```
+
+The dataset is 300 recorded items across 40 tenants, and 96 of them ask for a refund. Each item carries a latent difficulty, so the set contains easy and hard tickets, which matters more than the total count.
+
+If the feature does not need a model at all, the cheapest evidence is to not build it, as in [When You Do Not Need an AI Agent](/blog/when-you-dont-need-an-ai-agent).
+
+## Failure class 1: the answer is wrong
+
+The artifact is a graded golden set with a confidence interval, not an accuracy number.
+
+The first block of output from `evidence.mjs`:
+
+```text
+[1] wrong answer
+  final answer accuracy: 72.0%
+  n= 50  accuracy 76.0%  95% CI [62.6%, 85.7%]  width 23.1 pts
+  n=100  accuracy 75.0%  95% CI [65.7%, 82.5%]  width 16.8 pts
+  n=300  accuracy 72.0%  95% CI [66.7%, 76.8%]  width 10.1 pts
+```
+
+At 50 items the Wilson interval is 23.1 points wide. That is not a measurement, it is a guess. At 300 items it is 10.1 points wide, enough to say "this is roughly a seventy percent feature" and not much more.
+
+I find this table more persuasive than any argument about sample size. Teams gate a release on a 50 item set and then debate a three point move. Three points is well inside the noise of that set.
+
+The first 50 items scored 76.0% while the full 300 scored 72.0%. Nothing changed except how many items I looked at.
+
+The bar I use: at least 200 reviewed items for a first release, an interval no wider than about 10 points, and every case written as a contract rather than a frozen paragraph. "Golden Tests for Non-Deterministic AI Outputs" covers those contracts. The items should come from real failures with the personal data removed, as in [Turn Production Traces Into an Evaluation Set Without Copying User Data](/blog/turn-production-traces-into-an-evaluation-set-without-copying-user-data).
+
+### The grader is part of the evidence
+
+If a model grades the 300 items, the grader needs its own agreement number. The fixture simulates two humans and one judge:
+
+```text
+[grader] the judge that would score class 1 at scale
+  human vs human kappa: 0.71
+  judge vs human consensus kappa: 0.55 on 264 agreed items (raw agreement 80.7%)
+```
+
+Two humans reach kappa 0.71. The judge reaches 0.55, and that is on the subset the humans agreed about, which is the easy part of the set.
+
+So the judge is usable for a trend line and not for a release gate on its own. Reporting the judge number without the human number hides this. "Calibrating an LLM Judge Against Human Disagreement" works through the protocol.
+
+## Failure class 2: the tool action is unsafe or wrong
+
+The artifact is a trajectory check over the whole recorded run, not on the final answer.
+
+```text
+[2] unsafe or wrong tool action
+  runs with at least one trajectory violation: 31 (10.3%)
+  of those, hidden behind a correct final answer: 24 (11.1% of all correct answers)
+    cross_tenant_read: 14
+    refund_without_eligibility_check: 10
+    refund_amount_above_order_total: 5
+    duplicate_refund_effect: 5
+```
+
+This is the number I would put on the first slide. 24 runs produced a correct final answer and an unsafe path. A gate that reads only the answer column counts them as successes.
+
+The violations are not exotic. Fourteen reads crossed a tenant boundary. Ten refunds went out without the eligibility check. Five refunds were larger than the order, and five effects were duplicated.
+
+Each of these is a deterministic assertion over a recorded trace, so no model is needed to detect them. "The Final Answer Can Be Right While the Tool Trajectory Is Unsafe" goes into how to define the trajectory contract, and "Red-Team the Workflow, Not Only the Prompt" covers the adversarial cases I add on top.
+
+My bar here is not a percentage. It is zero. A cross tenant read is not a quality metric that can be traded against clarity. If the authority boundary is the problem, [How to Build a Secure Internal AI Tool](/blog/how-to-build-secure-internal-ai-tool) is the design side.
+
+## Failure class 3: retrieval is missing or irrelevant
+
+The artifact is a retrieval score measured separately, plus a second run with the gold evidence forced in.
+
+```text
+[3] missing or irrelevant retrieval
+  gold policy retrieved: 79.3%
+  answer accuracy with the gold snippet: 80.3%
+  answer accuracy without it: 40.3%
+  naive split (confounded by item difficulty): 39.9 pts
+  oracle context forced on the same 300 items: 80.7%
+  on the 62 items retrieval missed: 40.3% -> 82.3% with the gold snippet (isolated generation effect 41.9 pts)
+```
+
+The first three lines are the split most teams report, and they cannot be read causally. The items where retrieval failed are the hard items, and hard items are also answered badly for reasons unrelated to evidence. Comparing them against the easy items mixes the two effects, which is the selection problem I warn about later in this article.
+
+So the fixture also runs an oracle: the same 300 items, the same draws, gold snippet forced into every run. On the 62 items retrieval missed, accuracy moves from 40.3% to 82.3%. That 41.9 point move is an isolated generation effect, because item difficulty is held fixed on both sides.
+
+In this fixture the confounded split of 39.9 points understates the isolated effect rather than overstating it. So the naive number is not a safe upper bound and not a safe lower bound. It is not a causal estimate, and only the oracle run says which way it is wrong.
+
+The conclusion survives either way: generation is not the weak part of this feature, and retrieval recall is where the next engineering week should go. With only the single 72.0% number I could spend that week rewriting the prompt and move almost nothing. "Evaluate Retrieval Separately From Answer Generation" explains the metrics, the labelling, and the oracle context.
+
+## Failure class 4: cost and latency
+
+The artifact is a distribution with a budget, not an average.
+
+```text
+[4] cost and latency
+  cost mean $0.0157  p50 $0.0160  p95 $0.0219  max $0.0265
+  suite total: $4.7016
+  runs above the $0.0200 budget: 42
+  latency p50 2167 ms  p95 3291 ms  runs above 3500 ms: 6
+```
+
+The mean cost sits comfortably under the two cent budget. 42 of 300 runs do not. That is 14% of the suite over budget, and a mean would never have shown it.
+
+The blended price of four dollars per million tokens is an invented round number. What matters is the shape: the tail breaks the budget, and the tail is where the hard tickets are. Latency behaves the same way, and a tool call that never returns is worse than a slow one, which is why every one gets a deadline, as in [Give Every Agent Tool Call a Deadline](/blog/agent-tool-call-deadline).
+
+Two related pieces are coming later in this series: "Give an AI Task a Cost Budget Before Optimizing Tokens" and "Design the Non-AI Path Before the Model Is Unavailable".
+
+## Failure class 5: a silent regression after a change
+
+The artifact is a paired run over the same items, with an interval on the difference.
+
+```text
+[5] silent regression after a change
+  v1 accuracy 72.0% -> v2 accuracy 75.7%
+  paired delta 3.7 pts  95% CI [-3.3, 10.3] pts
+  discordant items: 48 passed only on v1, 59 passed only on v2  McNemar p=0.334
+```
+
+The second version scores 3.7 points higher. The paired confidence interval runs from minus 3.3 to plus 10.3 points, and McNemar returns p = 0.334. So the honest statement is: the new version might be better, and 300 items with one run each cannot tell.
+
+This is the most uncomfortable artifact to produce, because it usually says less than the team hoped. But the alternative is worse: a team that ships on a 3.7 point move will also roll back on a 3.7 point move that was pure noise. "Regression Testing Across Prompt and Model Changes" covers the matrix that isolates which layer changed, and a companion piece, "Eval Scores Move Between Runs: How to Compare Two Versions Honestly", works out how many items this comparison needs.
+
+A related piece coming later, "Model Routing Is a Policy Engine With Quality Consequences", is the same problem when the change is a routing rule instead of a model.
+
+## How the five artifacts map onto the failure taxonomy
+
+The five classes above are release artifacts, not a competing vocabulary. They sit on top of the six observable classes in "A Failure Taxonomy for AI Features That Teams Can Actually Measure".
+
+Class 1 covers Task failures and the answer side of Evidence failures. Class 2 covers Action failures and the authority part of Policy failures. Class 3 covers the context side of Evidence failures. Class 4 covers Operational failures. Class 5 is not a taxonomy class at all: it is the method that detects movement in any of the others.
+
+Two taxonomy classes get no artifact here, and I prefer to say so. Content, privacy, and retention Policy failures are not visible in a golden set and need their own review. Interaction failures, such as an ignored correction or a clarification loop that never ends, cannot be measured on single-turn recorded items at all. If the feature is conversational, add a session-level artifact before shipping.
+
+## What does not count as evidence
+
+I have accepted all of these at some point, and I regret each one.
+
+- A demo. It is one sample chosen by the person who built the feature, and it proves the code runs.
+- A single run of the suite. One run of 300 items has real sampling noise, and the run people show is usually the one that looked good.
+- A vibe check. "We tried it for a week and it feels good" is a signal about the easy cases, because those are the ones people try.
+- An average with no distribution. The mean cost above hid 42 over-budget runs.
+- A judge score with no human anchor. The judge here agrees at kappa 0.55 while humans agree at 0.71.
+- An answer-only score for a feature that takes actions. It missed 24 unsafe runs above.
+- A production dashboard with a biased denominator. If the review queue selects risky cases, its failure rate is not the production rate. "Sampling AI Outputs for Human Review Without Only Seeing Easy Cases" keeps the denominator honest.
+
+## Where offline evidence stops and production begins
+
+None of the five artifacts tell me whether users are better off. They tell me the system behaves within its contracts on the cases I chose.
+
+So I pair them with a few production signals and a rollback path, which is the split in "Offline Evals Predict; Online Signals Correct". Offline evidence decides whether a change may reach users. Production decides whether it was a good idea.
+
+The run must also be inspectable afterwards, otherwise a failure report is an anecdote. That is the subject of a later piece, "Trace an AI Workflow Across Retrieval, Models, and Tools".
+
+## What I check before an AI feature is allowed to ship
+
+- Every failure class has a named owner and a named artifact, not a promise.
+- The golden set has at least 200 reviewed items and the interval is reported with the score.
+- Every case in the set is a contract, and the safety assertions are separate from the quality average.
+- No trajectory violation is open, and the count is zero rather than small.
+- Retrieval is scored on its own, and the accuracy split with and without evidence is written down.
+- Cost and latency are reported at p50, p95, and max against a stated budget.
+- Any comparison between two versions is paired, and the interval on the difference is shown.
+- The judge, if there is one, has a kappa against human labels and a date on that measurement.
+- Failures are labelled with the shared taxonomy schema, not with free text.
+- The rollback is tested, not described.
+
+## Evidence table: failure class, artifact, and minimum bar
+
+This is the one page I keep beside the release ticket.
+
+| Failure class | Artifact that proves readiness | Minimum bar I use | What invalidates it |
+| --- | --- | --- | --- |
+| Wrong answer | Graded golden set with a confidence interval | 200 or more reviewed items, interval no wider than 10 pts, reported with the score | Cases edited to make a release pass; items leaked into prompt tuning; one run reported as the result |
+| Unsafe or wrong tool action | Deterministic trajectory check over the full recorded run | Zero violations of authority, duplication, and amount limits | Grading only the final answer; traces not retained; a violation reclassified as a quality point |
+| Missing or irrelevant retrieval | Retrieval scored separately, plus accuracy with and without the gold evidence | Recall target agreed before the run; the accuracy split written down | Relevance labels written by the same model being evaluated; index snapshot not recorded |
+| Cost and latency | Distribution with p50, p95, max against a written budget | p95 inside budget; every tool call has a deadline | Reporting a mean; measuring on easy items only; a budget invented after seeing the numbers |
+| Silent regression | Paired run of both versions on the same items, interval on the difference | Interval excludes zero before a quality claim; safety cases never regress | Unpaired comparison; different item sets; changing prompt, model, and retrieval in one step |
+
+The table is short on purpose. Every row can be produced in an afternoon with the fixture in this repository, and every row states its own failure mode.
+
+More articles in this series are collected in the [Reliable AI Systems in Production](/blog/topics/reliable-ai-systems) hub, and the measurement pieces are under the [LLM evaluation tag](/blog/tags/llm-evaluation/page/1).
+
+## Sources
+
+- [NIST AI Risk Management Framework, Measure function](https://airc.nist.gov/airmf-resources/airmf/5-sec-core/)
+- [Anthropic, Demystifying evals for AI agents](https://www.anthropic.com/engineering/demystifying-evals-for-ai-agents)
+- [OpenAI, Evaluation best practices](https://developers.openai.com/api/docs/guides/evaluation-best-practices)
+- [Brown, Cai and DasGupta, Interval Estimation for a Binomial Proportion](https://projecteuclid.org/journals/statistical-science/volume-16/issue-2/Interval-Estimation-for-a-Binomial-Proportion/10.1214/ss/1009213286.full)
+- [Google, Rules of Machine Learning](https://developers.google.com/machine-learning/guides/rules-of-ml/)
+- [Google, Monitoring production ML systems](https://developers.google.com/machine-learning/crash-course/production-ml-systems/monitoring)

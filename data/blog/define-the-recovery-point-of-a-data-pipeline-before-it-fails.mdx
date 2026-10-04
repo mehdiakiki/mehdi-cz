@@ -1,0 +1,158 @@
+---
+title: "Define the Recovery Point of a Data Pipeline Before It Fails"
+date: "2026-12-09T09:00:00+01:00"
+tags: ["recovery point objective", "data pipeline", "disaster recovery", "checkpoints", "data engineering"]
+draft: false
+reviewed: true
+reviewedHash: "2634cba345f9f323dfb299b19f4cfe446734d332f7b6a5e03bc35618c4642785"
+cluster: "reliable-data-integrations"
+campaign: "authority-2026"
+opportunity: "DATA-080"
+summary: "A pipeline recovery point is more than its database backup. I calculate it across source retention, cursors, raw evidence, mapping versions, deduplication, and replay capacity."
+---
+
+The worst time to discover the recovery point of a data pipeline is while the pipeline is already down.
+
+I have worked on systems where the database backup looked healthy, yet recovery was uncertain. The database contained derived records, but the external source had already expired old pages. A cursor was backed up without the mapping version that interpreted the data. Duplicate protection retained fewer days than the replay window.
+
+From this I learned to define the recovery point as a property of the whole data path, not one storage product.
+
+## RPO and RTO answer different questions
+
+Recovery point objective, or RPO, is the maximum acceptable data loss measured backward in time. Recovery time objective, or RTO, is how long restoration may take.
+
+```text
+failure at 14:00
+RPO = 15 minutes  -> restore data to at least 13:45
+RTO = 2 hours     -> service restored by 16:00
+```
+
+The [NIST contingency-planning guide](https://csrc.nist.gov/pubs/sp/800/34/r1/upd1/final) treats recovery requirements as part of planning and system impact, not something to improvise after an incident.
+
+For a pipeline, I add a third question: can the missing interval be reconstructed correctly from authoritative evidence?
+
+## I draw the recovery chain
+
+A typical synchronization path may be:
+
+```text
+provider API
+  -> fetched page
+  -> raw/sanitized landing record
+  -> normalized event
+  -> canonical entity
+  -> product projection
+```
+
+Every arrow can have a different durable point. A database snapshot may protect the canonical entity but not the external-to-internal identity map. A queue may retain normalized events for seven days while the provider retains deletions for only one day.
+
+I make a worksheet for each stage:
+
+| Stage | Authority | Durable interval | Replay available | Missing dependency |
+| --- | --- | --- | --- | --- |
+| provider | external | provider policy | maybe | access and retention |
+| landing record | us | 30 days | yes | decryption key |
+| normalized event | us | 14 days | yes | mapping version |
+| canonical store | us | daily + log | yes | identity table |
+| projection | derived | rebuildable | yes | source versions |
+
+The effective recovery point is constrained by the weakest necessary row.
+
+## A cursor is not a backup
+
+A cursor tells the reader where it believes progress stopped. It does not contain records before that position.
+
+If I restore yesterday's cursor but the source only permits six hours of replay, I have not recovered. If I restore today's cursor with yesterday's database, I may skip a day of records.
+
+I checkpoint progress atomically with the durable effects it represents, or I make replay overlap deliberately:
+
+```text
+read from last durable high-water mark minus overlap
+deduplicate by stable source identity and version
+advance checkpoint only after effects are committed
+```
+
+My article on [high-water marks and overlap windows](/blog/high-water-marks-overlap-windows-and-the-records-between-them) goes deeper into this mechanism.
+
+## Recovery needs interpretation, not only bytes
+
+Suppose I preserved every raw event. Can I rebuild the same result?
+
+Only if I also know:
+
+```text
+schema or payload version
+mapping/normalization version
+reference data version
+tenant configuration at the time
+identity mappings
+ordering or partition key
+deletion/tombstone semantics
+```
+
+I may choose to rebuild with today's corrected logic instead of the historical logic. That is valid, but it is a migration decision. The recovery run should record which version interpreted each input.
+
+Secrets and encryption keys are dependencies too. A perfectly retained encrypted archive is not recoverable after its only key disappears. Conversely, key retention must follow security policy; “keep every key forever” is not a recovery design.
+
+## My RPO calculation
+
+For each business data product I record:
+
+```text
+acceptable_loss_window
+latest_restorable_snapshot
+continuous_log_gap
+source_replay_window
+raw_evidence_window
+deduplication_window
+maximum_rebuild_throughput
+required_dependencies
+```
+
+Then I ask a concrete question:
+
+> If the primary store and active workers disappear at this minute, what is the newest business state I can reconstruct without guessing?
+
+If a snapshot is 20 minutes old, logs are current to 2 minutes ago, but the identity-map backup is 45 minutes old, the answer may be 45 minutes. The best database number does not win.
+
+## Deletions are the usual blind spot
+
+Current-state APIs can recreate live objects. They often cannot tell me what was deleted during the missing interval.
+
+I preserve tombstones or another deletion feed long enough to cover the recovery window. A full comparison can sometimes detect absence, but only if the source exposes a complete authoritative set and I can afford the scan.
+
+The same applies to transient states. If a workflow entered and left a state between snapshots, rebuilding only current rows cannot reconstruct the events that should have triggered side effects.
+
+## Test the restore as a data product
+
+A backup-success notification proves that bytes were written. I need a restore exercise:
+
+1. Start from an isolated empty environment.
+2. Restore the chosen snapshot and logs.
+3. Recreate identities, schemas, and configuration.
+4. Replay an overlap window.
+5. Rebuild projections.
+6. Reconcile counts, checksums, deletions, and sampled business invariants.
+7. Measure achieved recovery point and elapsed time.
+
+I include deliberately difficult records: late events, duplicate versions, unknown enums, deleted entities, and a mapping change near the boundary.
+
+The result is evidence such as:
+
+```text
+exercise_id
+failure_instant
+recovered_through
+unrecoverable_intervals
+reconciliation_differences
+mapping_versions
+elapsed_time
+```
+
+## Recovery is a product promise
+
+Different data deserves different objectives. Losing an hour of an approximate search index may be acceptable if it can rebuild. Losing one accepted payment instruction is not.
+
+I set the objective with the people who own the consequence, then make every pipeline dependency meet it. If one provider cannot supply the required replay window, the architecture needs earlier capture, stronger local evidence, or a more honest promise.
+
+For me, a recovery point is not the timestamp printed by the backup service. It is the newest point where source evidence, interpretation, identity, and side effects can be brought back into a consistent story. I want that story written and rehearsed before the first real failure asks me to tell it.

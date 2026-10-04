@@ -1,0 +1,128 @@
+---
+title: "Runtime Type Tags: What Dynamic Languages Keep That Static Ones Throw Away"
+date: "2026-09-11T07:40:00+01:00"
+lastmod: "2026-09-11T07:40:00+01:00"
+tags: ["types", "python", "javascript", "v8", "performance", "types under the hood"]
+draft: false
+reviewed: true
+reviewedHash: "b938894cf299a5d1f44f80b6a02b254630d55dc8bd83e9a323db3c630b561190"
+cluster: "rust-under-the-hood"
+campaign: "editorial"
+summary: "A Python integer with the value 1 takes 28 bytes, and a million of them cost 36 MB where Rust would use 4. I expected mixed arrays to be slow in V8 and they were not. The cost that did show up was object shape, and it arrives as a cliff at the fifth shape."
+---
+
+The number 1 costs 28 bytes in Python. In Rust the same number in a `u32` costs 4, and in a `u8` costs 1. The extra bytes are the type: every Python object carries a pointer to its type and a reference count before it gets to the value. That is what a language keeps at runtime when it has no compile-time checker to delete.
+
+This is a spoke of [What Is a Type?](/blog/what-is-a-type-a-set-of-values-a-promise-about-operations-or-both). I went in expecting the cost of dynamic typing to show up as slow arithmetic, and it did not. The measurements moved my opinion twice, so this article is also a record of being wrong.
+
+The programs and a script that reproduces every output are in the `types-under-the-hood` fixture of the site repository. I used CPython 3.14 and Node 22, which is V8 12.4, on x86-64 Linux. The Python sizes are exact and repeat every run. The JavaScript timings are medians of 41 passes, and they still move by a few tenths of a millisecond between runs, so read them as shapes rather than as constants.
+
+## What a Python value carries
+
+The program prints one more line at the end, naming the type of the value, which I come back to below:
+
+```text
+int 1:            28 bytes
+int 2**70:        36 bytes
+float 1.0:        24 bytes
+bool True:        28 bytes
+empty list:       56 bytes
+```
+
+A CPython integer object holds a reference count, a pointer to its type object, a tag word that packs the sign and the number of digits, and then the digits themselves. That is the 28 bytes. The number 2 to the power 70 needs one more digit and costs 36, which shows that the value is the smallest part of the object.
+
+The interesting number is the aggregate:
+
+```text
+list of 1000000 ints: 8000056 bytes of pointers, about 28000000 bytes of int objects
+the same numbers as Rust u32 would be: 4000000 bytes
+```
+
+A list of one million integers is eight megabytes of pointers, because a Python list is an array of pointers to objects, plus about twenty eight megabytes of objects for the integers to point at. Thirty six megabytes, against four megabytes for the same numbers in a Rust `Vec<u32>`. Nine times the memory, and the numbers are not even large.
+
+That final line of the program says `type(1) is int, and every object carries a pointer to it`, which is the same fact seen from the other side.
+
+This cost does not go away with a faster interpreter. The values are not next to each other, so every element is a pointer chase, and a cache line holds nine times fewer of them.
+
+## The first thing I was wrong about
+
+My assumption was that a mixed array of integers and floats would be visibly slower to sum than a uniform one, because each element would need a check. So I summed two million numbers per pass, no strings anywhere:
+
+```text
+summing 2000000 numbers, by what the array holds:
+  small integers: 1.5 ms per pass
+  doubles       : 1.2 ms per pass
+  both          : 1.0 ms per pass
+```
+
+There is no penalty for the mixed array. Across several runs the mixed array is never the slowest, and the uniform array of small integers is consistently a little slower than the other two, by more than the spread of any single number. V8 tracks what an array holds, and once an array contains both small integers and doubles it stores everything as doubles, so the loop runs on one uniform representation. My mental model, a tag check on every element, is not what happens.
+
+## The second thing I was wrong about
+
+Where I did find a cost was object shape. The loop reads one field from two million objects:
+
+```js
+let s = 0;
+for (let i = 0; i < objects.length; i++) s += objects[i].x;
+return s;
+```
+
+Every object has `x` first, every object has two fields, and every `x` is the number 1. The only thing I varied is how many different shapes the array holds:
+
+```text
+summing objects[i].x over 2000000 objects, by number of shapes:
+  1 shape : 5.6 ms per pass
+  2 shapes: 5.2 ms per pass
+  3 shapes: 5.5 ms per pass
+  4 shapes: 5.7 ms per pass
+  5 shapes: 7.8 ms per pass
+  6 shapes: 8.0 ms per pass
+```
+
+The step is not a gradient. One shape to four shapes all land within a few tenths of each other. The fifth costs about 40 percent more than the first, and the sixth stays at that level. I have run this many times and the step is always between the fourth and the fifth.
+
+My first explanation was that the engine has to work out where `x` lives in each object. That is wrong, and the measurement above rules it out: `x` is at the same position in every shape, and the objects are all the same size, so there is no offset to compute and no memory locality difference.
+
+The real reason is the limit of a cache that sits at the call site. V8 remembers, for each place in the code that reads a property, which shapes it has seen and where the field was in each. That cache holds a small number of shapes, four in the V8 that ships with Node 22, and when a fifth arrives it gives up on the list and falls back to a slower general lookup. The number four is a default in one engine version and not a law, but the shape of the curve is the point: cheap while the call site stays predictable, and a step down when it does not.
+
+Each of my measurements uses its own freshly built copy of the loop, because the cache belongs to the call site and not to the data. My first version of this benchmark reused one function for both arrays, and the second measurement inherited the slow state of the first. That version would have told me the one-shape case takes as long as the five-shape case, which is not true.
+
+## What the static language did with the same information
+
+In [Where a Type Becomes a Layout](/blog/where-a-type-becomes-a-layout-fields-padding-and-reordering) I measured the static version of this question. A struct field has one offset, decided at compile time, and reading it is an address plus a constant. There is no cache, because there is nothing to learn, and nothing in the value says what it is.
+
+So the trade is not "checks versus no checks". A static compiler learns every field offset once and deletes the type. A dynamic engine learns the offsets again at every call site, keeps them in a cache, and works well exactly as long as that cache is enough.
+
+## The opinion: annotations do not give the bytes back
+
+The conclusion I take from this is about adding types to a dynamic language later, which I have done on several projects.
+
+TypeScript deletes its types before the program runs, which I measured in the first article of this series. Python keeps its annotations as runtime metadata, readable through `__annotations__`, which is how libraries like dataclasses use them. Neither of them changes how a value is stored. A `list[int]` annotated in Python is still a list of pointers to 28 byte objects, and a TypeScript interface is still an object whose shape the engine has to learn at each call site.
+
+So when someone says a dynamic language with annotations is now as good as a static one, my answer is that it helps with finding mistakes and does nothing at all for memory. It is also weaker at finding mistakes than a static checker, because the annotations are optional, unchecked at the boundary, and escapable with one `Any`. If the program is a web handler moving a few thousand objects, none of that matters and the annotations are the right investment. If it is a million rows in memory, no amount of annotation will close a nine times gap, and the answer is a library that stores data outside the object model, like NumPy or Arrow, or a different language.
+
+The measurements also made me stop saying that dynamic languages are slow because of type checks. In a modern engine they mostly are not. They are slow because values are scattered across the heap with a header on each one, and because the engine has to keep relearning shapes that a compiler would have known for free. This is my reading of two benchmarks on one machine, not a general claim about either language.
+
+## The model I take from this
+
+1. A dynamic language stores the type with the value. In CPython that is a type pointer and a reference count on every object, which is most of the 28 bytes of a small integer.
+2. The aggregate cost is memory and pointer chasing. A million integers cost nine times more than the same numbers in a static array.
+3. A good engine removes most per-value type checks. Mixing integers and doubles in one JavaScript array cost nothing measurable.
+4. What costs time is the number of shapes a single call site sees. Up to four was free on this engine, and the fifth cost about 40 percent.
+5. Type annotations recover some of the checking, not the layout.
+
+## What I check when a dynamic program is too slow or too big
+
+- How many objects are alive at once? Multiply by the header size before blaming the algorithm.
+- Are the hot objects all built the same way, with the same fields in the same order? If not, that is a shape problem, and it is fixable where the objects are built.
+- Is the data really an object graph, or a table pretending to be one? Tables belong in arrays of primitives.
+- Am I measuring one call site or several? A benchmark that reuses one function across two datasets measures the second one wrongly.
+
+## Sources
+
+- [Python documentation: sys.getsizeof](https://docs.python.org/3/library/sys.html#sys.getsizeof)
+- [Python documentation: common object structures and PyObject](https://docs.python.org/3/c-api/structures.html)
+- [PEP 649: deferred evaluation of annotations](https://peps.python.org/pep-0649/)
+- [Mathias Bynens: JavaScript engine fundamentals, shapes and inline caches](https://mathiasbynens.be/notes/shapes-ics)
+- [V8: elements kinds in V8](https://v8.dev/blog/elements-kinds)
+- [The Rust Reference: type layout](https://doc.rust-lang.org/reference/type-layout.html)

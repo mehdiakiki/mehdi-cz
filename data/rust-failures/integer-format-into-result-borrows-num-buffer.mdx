@@ -1,0 +1,97 @@
+---
+caseId: "RFA-701"
+title: "An Integer format_into Result Borrows Its NumBuffer"
+date: "2026-09-07T09:32:00+01:00"
+lastmod: "2026-09-07T09:32:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "2f728d40acc4be0d1a098cd7a5b54bcda5c45cfbbf62af6ffb7840565cd7ddc3"
+area: "upgrades-compatibility"
+symptom: "Formatting a second integer into one NumBuffer fails with E0499 while the first returned &str is still used later."
+summary: "Rust 1.98 integer format_into avoids a String allocation by returning text inside a caller-owned NumBuffer. That view keeps the mutable buffer borrowed until its last use."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust NumBuffer format_into borrow E0499", "reuse NumBuffer while formatted str alive", "integer format_into returned str lifetime Rust 1.98"]
+evidence: ["Rust 1.98.1 E0499 compile failure", "two live format_into views share one mutable buffer", "sequential consumption repair without allocation"]
+sources: ["https://doc.rust-lang.org/core/fmt/struct.NumBuffer.html", "https://doc.rust-lang.org/std/primitive.u32.html#method.format_into", "https://doc.rust-lang.org/releases.html#version-1980-2026-08-20"]
+---
+
+Rust 1.98 gives primitive integers a `format_into` method. It is useful when I need decimal text briefly and do not want to allocate a `String` for every number. The performance property comes with an ownership property: the returned `&str` lives inside the buffer supplied by the caller.
+
+The [compile-fail fixture](/rust-failure-atlas/evidence/RFA-701/fail.rs) tries to keep two formatted views:
+
+```rust
+use core::fmt::NumBuffer;
+
+let mut buffer = NumBuffer::new();
+let first = 1972_u32.format_into(&mut buffer);
+let second = 2026_u32.format_into(&mut buffer);
+println!("{first} -> {second}");
+```
+
+Rust reports E0499 on the second call. `first` is used later, so its mutable borrow of `buffer` is still live. A second formatting operation would overwrite the same storage while `first` claims to view it.
+
+## No allocation means no independent owner
+
+`format!` returns a new `String`. That string owns its bytes, so several formatted results can coexist. `format_into` instead writes digits into `NumBuffer<T>` and returns a slice of those bytes as `&str`.
+
+The returned view is cheap because it does not own anything. Its lifetime is connected to the mutable buffer borrow. The borrow checker is protecting a real invalidation, not applying an arbitrary rule.
+
+In a language without this lifetime check, the second write could silently make both variables display `2026`, or leave the first view describing bytes which no longer contain its promised value. Rust stops the overwrite while the earlier view is observable.
+
+## Consume, copy, or use separate buffers
+
+The right repair depends on how long I need the text.
+
+For streaming output, I consume each view before reusing the buffer. The [repaired program](/rust-failure-atlas/evidence/RFA-701/fixed.rs) does exactly this:
+
+```rust
+let mut buffer = NumBuffer::new();
+println!("{}", 1972_u32.format_into(&mut buffer));
+println!("{}", 2026_u32.format_into(&mut buffer));
+```
+
+Non-lexical lifetimes end the first borrow after the first `println!`, so the next write is accepted.
+
+If both strings must coexist, I give them ownership:
+
+```rust
+let first = 1972_u32.format_into(&mut buffer).to_owned();
+let second = 2026_u32.format_into(&mut buffer).to_owned();
+```
+
+That allocates, which may be completely reasonable. Avoiding an allocation was an implementation goal, not a correctness requirement.
+
+For two simultaneously borrowed views without allocation, I need two buffers. This can make sense in a fixed protocol encoder, but I measure the extra storage and complexity before doing it.
+
+## The buffer is typed for the integer
+
+`NumBuffer<T>` is sized for the maximum decimal representation of its integer type. Type inference normally selects `T` from the first `format_into` call. A buffer for one integer type is not a universal formatter for every numeric type.
+
+I make the type explicit in generic code:
+
+```rust
+let mut buffer = NumBuffer::<u64>::new();
+let text = 42_u64.format_into(&mut buffer);
+```
+
+The type-specific design lets the library reserve enough inline space without heap allocation. It also keeps signed formatting, including the minus sign, within the documented capacity.
+
+One small discovery issue is that the type lives at `core::fmt::NumBuffer`. Importing `std::fmt::NumBuffer` does not work on Rust 1.98. A normal `std` program can still import the `core` path; `core` is available there too.
+
+## The view belongs at the edge
+
+I use this API near an immediate consumer: writing into a byte buffer, adding a short field to a protocol message, calculating a checksum over the decimal form, or passing the text to a parser which finishes before the next reuse.
+
+I avoid returning the borrowed text from an object that plans to reuse its buffer freely. That creates a lending-style interface where every caller borrow delays the next mutation. It can be valid, but it should be visible in the type and documentation.
+
+For long-lived values, caches, collections, or values crossing async suspension points, owned strings are usually clearer.
+
+## Measure the claimed benefit
+
+`format_into` removes a particular allocation and some formatting machinery. It does not guarantee that a whole request becomes faster. The following write, buffer copies, system calls, and surrounding parser may dominate.
+
+I benchmark the complete hot path with realistic integer distributions and consumers. I also keep a regression test that exercises minimum, maximum, zero, and negative signed values.
+
+The central rule is not about a new formatter. It is the same rule behind every reusable buffer: a view remains valid only while the storage is not overwritten. Rust 1.98 exposes that relation directly, and E0499 tells me that my desired lifetimes require either earlier consumption, another owner, or another buffer.

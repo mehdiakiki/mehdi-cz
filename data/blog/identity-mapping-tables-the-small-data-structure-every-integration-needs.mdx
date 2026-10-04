@@ -1,0 +1,247 @@
+---
+title: "Identity Mapping Tables: The Small Data Structure Every Integration Needs"
+date: "2026-09-07T19:00:00+01:00"
+tags: ["data integration", "databases", "synchronization", "identity", "system design"]
+draft: false
+reviewed: true
+reviewedHash: "7589d99ed2834beccd7c4b8fb216fc6613f60f756a08454b79796a943ddb19b4"
+cluster: "reliable-data-integrations"
+campaign: "authority-2026"
+opportunity: "DATA-005"
+summary: "A concrete schema and concurrency model for mapping external IDs to internal entities without duplicates, cross-tenant collisions, or unsafe retries."
+---
+
+After building synchronization and integration flows, I have learned to be suspicious of one apparently innocent assignment:
+
+```text
+external customer 123 is our customer 8f4a...
+```
+
+Then a second provider arrives. A test account uses the same external ID as production. A retry creates the mapping twice. Two workers discover the same customer at the same time. One source merges records while another reuses a deleted ID.
+
+At that point, identity is no longer a string copied between APIs. It is a data model.
+
+I use an identity mapping table in most systems that synchronize independent sources. It is a small structure, but it decides whether updates reach the correct entity. I therefore design it before the first large import.
+
+## The key needs a namespace
+
+An external ID such as `123` is almost never meaningful alone. I normally need at least:
+
+```text
+tenant + provider + environment + object type + external ID
+```
+
+The environment may be implicit when test and production use separate databases. If they share storage, it must be explicit.
+
+This compound key prevents collisions such as:
+
+- customer `123` and invoice `123` from the same provider;
+- customer `123` from two connected accounts;
+- sandbox customer `123` and live customer `123`;
+- the same ID format issued by two unrelated providers.
+
+I do not assume provider IDs are globally unique unless the provider contract says so.
+
+## A practical relational schema
+
+This is a useful starting point in PostgreSQL:
+
+```sql
+create table external_identity (
+    tenant_id uuid not null,
+    provider text not null,
+    provider_account_id text not null,
+    object_type text not null,
+    external_id text not null,
+    internal_id uuid not null,
+    source_version text,
+    first_seen_at timestamptz not null default now(),
+    last_seen_at timestamptz not null default now(),
+    deleted_at timestamptz,
+
+    primary key (
+        tenant_id,
+        provider,
+        provider_account_id,
+        object_type,
+        external_id
+    )
+);
+
+create index external_identity_by_internal
+    on external_identity (tenant_id, object_type, internal_id);
+```
+
+The primary key protects the external side: one source identity maps to one current internal entity.
+
+I do **not** automatically make `(tenant_id, object_type, internal_id)` unique. Several external records may legitimately map to one internal entity. For example, two provider contacts may have been merged into one product user. If the business contract is strictly one-to-one, then I add a unique constraint deliberately.
+
+This is the first important lesson: database constraints should describe the identity relationship, not our hope that the import behaves.
+
+## Creation must survive a race
+
+Consider two workers receiving the same new external record:
+
+```text
+worker A: mapping not found
+worker B: mapping not found
+worker A: creates internal entity X
+worker B: creates internal entity Y
+worker A: inserts external → X
+worker B: insert conflicts
+```
+
+The unique primary key prevents two mappings, but it does not automatically remove the extra internal entity Y. A check-then-insert sequence is not enough.
+
+I normally choose one of three strategies.
+
+### Strategy 1: create inside one database transaction
+
+When the internal entity and mapping live in the same database, create both in one transaction. Insert the mapping using the unique key. On conflict, discard the attempted transaction and load the winner.
+
+The transaction makes the losing internal entity disappear as well.
+
+### Strategy 2: reserve the mapping first
+
+Insert a mapping row in a `creating` state, then let one worker own completion:
+
+```text
+external identity → state=creating, operation_id=...
+```
+
+Other workers see the reservation and wait, retry, or help finish it. A lease or recovery job is needed when the owner crashes.
+
+### Strategy 3: use a deterministic internal ID
+
+Derive the internal identifier from the full external namespace using a collision-resistant name-based UUID. Repeated workers then propose the same ID.
+
+This can simplify creation, but it permanently couples internal identity to the external namespace. It is a design choice, not a general default.
+
+## An upsert is not the whole solution
+
+This SQL looks attractive:
+
+```sql
+insert into external_identity (...)
+values (...)
+on conflict (...) do update
+set internal_id = excluded.internal_id;
+```
+
+It is also dangerous. A retry carrying a different `internal_id` can silently rewire identity. Every later update for the external object now reaches another internal entity.
+
+I prefer conflict behaviour that checks the invariant:
+
+```text
+if mapping does not exist:
+    create it
+else if mapping.internal_id == requested.internal_id:
+    treat as idempotent success
+else:
+    stop and report an identity conflict
+```
+
+Identity conflicts deserve a visible state and an operator decision. Last-write-wins is usually the wrong policy.
+
+## Keep source version separate from identity
+
+The mapping tells us **which entity** an external record represents. A source version tells us **which update is newer**. These are related but different questions.
+
+I may store the latest source version on the mapping for convenience, but I do not make identity depend on mutable fields such as email, display name, or update timestamp.
+
+Email is especially tempting and often wrong:
+
+- people change email addresses;
+- shared mailboxes represent teams;
+- providers normalize case differently;
+- an address can be reassigned;
+- two contacts can intentionally share it.
+
+An email can be matching evidence. It is not automatically identity.
+
+## Deletion needs a tombstone policy
+
+When a source object disappears, deleting the mapping immediately loses useful history. A late retry may then recreate a second internal entity because the system no longer remembers the old relationship.
+
+I usually retain a tombstone:
+
+```text
+deleted_at = source deletion time
+source_version = deletion version
+```
+
+An older update cannot clear a newer tombstone. A later legitimate recreation needs an explicit provider rule:
+
+- the provider guarantees IDs are never reused, so resurrection maps to the same entity;
+- the provider may reuse IDs, so a generation or creation timestamp must join the key;
+- the product requires manual review before resurrection.
+
+The right answer comes from the source contract. [Tombstones: Deleting Data Across Systems](/blog/tombstones-deleting-across-systems) explains the wider deletion problem.
+
+## Merges and splits should be events
+
+Real identity changes are not always corrections. Two external contacts may be merged. One organization may split into two accounts. An administrator may discover that the first mapping was wrong.
+
+Overwriting a row hides this history. I record identity operations:
+
+```text
+mapping_created
+mapping_conflict_detected
+mapping_reassigned
+entities_merged
+entity_split
+mapping_tombstoned
+```
+
+Each operation includes actor, reason, previous target, new target, and timestamp. This is useful for audit, but also for recovery: derived search documents, permissions, and analytics may need to be rebuilt after a merge.
+
+## The concurrency tests I run
+
+The useful tests are not only happy-path insert and lookup.
+
+### Two workers discover the same identity
+
+Start both workers after the lookup but before insertion. Assert that:
+
+- one mapping exists;
+- one internal entity exists when creation is transactional;
+- both callers receive the same internal ID.
+
+### A retry proposes another internal ID
+
+Insert the original mapping, repeat with a different target, and assert a visible conflict. The test must prove the target was not overwritten.
+
+### The same external ID exists in two tenants
+
+Assert both mappings coexist and never cross during lookup.
+
+### Delete races with update
+
+Deliver a newer tombstone before an older update. Assert that the record remains deleted.
+
+### Provider account is reconnected
+
+Disconnect and reconnect the same provider account. Decide whether the namespace remains stable or receives a new generation, then test that decision.
+
+These tests are small. They protect some of the most expensive mistakes an integration can make.
+
+## Identity mapping is also an operational tool
+
+A good mapping table answers support questions quickly:
+
+- Which external object produced this internal record?
+- Does this customer have records in more than one provider?
+- Which mappings have not been seen in the latest full scan?
+- Which mappings are stuck in `creating`?
+- Which identity conflicts need review?
+- What changed after a merge?
+
+I add indexes and dashboards for these questions. A table that is correct but impossible to inspect will still slow incident response.
+
+## My rule for integrations
+
+I do not let provider IDs spread through the product as if they were internal identity. I translate them at the boundary and keep the relationship explicit.
+
+The mapping table is not glamorous. It gives us a place for namespace, cardinality, concurrency, deletion, and audit rules. Without it, those rules still exist—they are simply hidden in application code and discovered during incidents.
+
+For the surrounding architecture, see [Reconciliation Across Systems](/blog/reconciliation-cross-system-sync). The database mechanics used here are documented in PostgreSQL's guides to [multi-column unique constraints](https://www.postgresql.org/docs/current/ddl-constraints.html) and [`INSERT ... ON CONFLICT`](https://www.postgresql.org/docs/current/sql-insert.html). RFC 9562 explains the guarantees and limits of [name-based UUID namespaces](https://www.rfc-editor.org/rfc/rfc9562.html#name-based-uuid-generation).

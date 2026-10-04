@@ -1,0 +1,88 @@
+---
+caseId: "RFA-351"
+title: "BinaryHeap::peek_mut Repairs Heap Order When the Guard Drops"
+date: "2026-09-06T02:11:00+01:00"
+lastmod: "2026-09-06T02:11:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "75c00e1e208a62659da496e32eafd3690bc14446829cbabb846dc354a2e3be57"
+area: "concurrency-memory"
+symptom: "After the greatest BinaryHeap item is lowered through PeekMut, another item becomes the root as soon as the guard leaves scope."
+summary: "PeekMut offers mutable access to a BinaryHeap root while preserving the heap invariant. Mutating the root can defer O(log n) repair until the guard is dropped, so the edited value is not guaranteed to remain at peek()."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust BinaryHeap peek_mut drop repair", "BinaryHeap change maximum value", "PeekMut value no longer heap root"]
+evidence: ["Rust 1.98.1 three-item BinaryHeap", "root changed from nine to one", "eight promoted after PeekMut drop"]
+sources: ["https://doc.rust-lang.org/std/collections/struct.BinaryHeap.html#method.peek_mut", "https://doc.rust-lang.org/std/collections/binary_heap/struct.PeekMut.html", "https://doc.rust-lang.org/std/collections/struct.BinaryHeap.html#method.into_sorted_vec"]
+---
+
+I once updated the highest-priority job through [`BinaryHeap::peek_mut`](https://doc.rust-lang.org/std/collections/struct.BinaryHeap.html#method.peek_mut) and then expected `peek()` to return the same job. This was wrong after I lowered its priority. The guard had repaired the heap, and another job correctly became the root.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-351/fail.rs) begins with `9`, `8`, and `7`. It changes the greatest value from `9` to `1`. After the `PeekMut` guard is dropped, `peek()` returns `8`, not `1`.
+
+## A heap promises an extremum, not a stable position
+
+A [`BinaryHeap`](https://doc.rust-lang.org/std/collections/struct.BinaryHeap.html) maintains enough ordering to expose and remove the greatest item efficiently. It does not keep the complete collection sorted, and a value does not own a permanent array index.
+
+For a max-heap, every parent must be at least as great as its children according to `Ord`. Lowering the root to `1` breaks that invariant because `8` and `7` are now greater. Before normal heap operations continue, the modified value has to move down and a larger value has to move up.
+
+This movement is the data structure doing its job, not an unexpected copy or replacement.
+
+## PeekMut is a repair guard
+
+`peek_mut` returns `Option<PeekMut<'_, T>>`, not an unrestricted `&mut T`. [`PeekMut`](https://doc.rust-lang.org/std/collections/binary_heap/struct.PeekMut.html) dereferences like a mutable reference, but its lifetime and destructor give the heap a boundary around the edit.
+
+If I only inspect the value, the operation stays cheap. The standard documentation states that an unmodified item is O(1), while modification can make the worst case O(log n). That extra work is the repair needed to restore ordering.
+
+The important moment is the guard's drop. An explicit `drop(greatest)` makes it easy to see in a small example, while ordinary code usually ends a block and lets Rust drop it automatically.
+
+## The edited item can stop being greatest
+
+Mutable access does not grant a special identity rule. Once I change fields that participate in `Ord`, the value is judged using its new order. Lowering priority can move it down. Raising the current greatest value leaves it greatest, though the guard still tracks the possibility of modification.
+
+If I change fields that do not participate in comparison, the logical order should stay the same. But I need `Ord`, `Eq`, and related implementations to agree about which fields define priority. An inconsistent ordering implementation can make any ordered collection difficult to reason about.
+
+## Keep the guard's scope small
+
+The mutable guard borrows the heap. I cannot use the heap normally until the guard is gone, which protects the temporary broken state from being observed through safe APIs.
+
+I put the edit in a small block:
+
+```rust
+{
+    let mut root = heap.peek_mut().unwrap();
+    root.priority = new_priority;
+}
+// heap order is restored here
+```
+
+This shape also tells a reviewer when the O(log n) repair may happen. Holding the guard across unrelated work extends the borrow and hides the transition.
+
+## Do not leak a guard to avoid repair
+
+The documentation has a specific warning about leaking `PeekMut`, for example with `mem::forget`. Rust keeps the remaining heap memory-safe, but elements may be leaked and the normal completion behavior is lost.
+
+Leaking a destructor-bearing guard is not an optimization. The destructor is part of the safe abstraction's protocol, just as it is for lock guards, draining iterators, and buffered writers. I let it finish or use a collection operation whose contract better matches what I need.
+
+## Sometimes pop, modify, and push is clearer
+
+If an edit changes priority and I also need ownership of the job, `pop`, mutate, then `push` can communicate the workflow better. It performs explicit heap operations and makes it easy to handle a replacement or cancellation.
+
+`peek_mut` is useful when I want in-place access to the current maximum and keep the value in the collection. It can also support replacing the root through APIs on `PeekMut`. My choice is about ownership and clarity, not only line count.
+
+For a scheduler with IDs, I avoid pretending that `BinaryHeap` supports arbitrary efficient priority updates. Finding a non-root item is not what this structure indexes. I may use generations, lazy stale-entry removal, or another indexed data structure depending on the workload.
+
+## Tests should verify logical order after the guard
+
+Inspecting `as_slice()` is a weak test because the slice is heap-ordered, not globally sorted. Internal representation is not the public priority sequence.
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-351/fixed.rs) checks that the original root is `9`, lowers it, lets the guard drop, and then observes `8` at the root. It consumes the heap with [`into_sorted_vec`](https://doc.rust-lang.org/std/collections/struct.BinaryHeap.html#method.into_sorted_vec) to prove all three values remain in ascending order as `[1, 7, 8]`.
+
+In application tests I pop repeatedly and assert the domain priority order. I also cover equal priorities and confirm the tie rule, because `BinaryHeap` does not promise stable ordering between equal items.
+
+## The core principle is guarded invariant restoration
+
+Some safe Rust APIs permit a temporary state that would be invalid for the surrounding data structure. They return a guard so cleanup can restore the invariant before access resumes.
+
+With `BinaryHeap::peek_mut`, the greatest item may be edited, but its old position is not promised afterward. Once the guard drops, the heap again promises that `peek()` is the greatest current value. That promise is stronger and more useful than keeping the edited value at the root.

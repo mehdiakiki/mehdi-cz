@@ -1,0 +1,199 @@
+---
+title: "Rust's v0 Symbol Mangling: What Changed in Rust 1.97"
+date: "2026-09-22T17:00:00+01:00"
+tags: ["rust", "rust 1.97", "symbol mangling", "compiler internals", "debugging"]
+draft: false
+reviewed: true
+reviewedHash: "73ab178b6c66adf3fa2ebeb476f736307651eeaebde69378abac68e02a28a4bf"
+cluster: "rust-under-the-hood"
+campaign: "authority-2026"
+opportunity: "RUST-012"
+summary: "Rust 1.97 made v0 symbol mangling the stable default. Compare real nm output, read the encoding, and know what changes for profilers, debuggers, and ABI boundaries."
+---
+
+Rust 1.97 changed the names that Rust functions receive inside object files and binaries. The compiler now uses Rust's `v0` symbol-mangling scheme by default on stable.
+
+Most application code does not notice. The linker still links, calls still call, and a normal Rust backtrace is demangled. The difference becomes visible in profilers, debuggers, crash pipelines, binary-inspection scripts, and tools that parse raw symbols.
+
+I wanted to see the change at the object-file boundary instead of stopping at the release note.
+
+## Why symbols need mangling
+
+A native linker works with a mostly flat collection of symbol names. Rust source has namespaces, crates, generic instantiations, closures, associated functions, and many items with the same short name.
+
+These two functions cannot both become a linker symbol named `parse`:
+
+```rust
+mod json {
+    pub fn parse() {}
+}
+
+mod toml {
+    pub fn parse() {}
+}
+```
+
+Generic code adds another identity problem:
+
+```rust
+fn identity<T>(value: T) -> T {
+    value
+}
+```
+
+Machine code generated for `identity::<u64>` must be distinguishable from another instantiation. A mangling scheme encodes enough context into an allowed linker name. A demangler turns that encoding back into something readable.
+
+## What Rust used before v0
+
+The legacy Rust scheme grew from the Itanium C++ ABI style. It was extended for Rust concepts, but important type information could remain behind an opaque hash. It also had inconsistencies and characters that were awkward on some platforms.
+
+The `v0` design was created for Rust. Its goals include:
+
+- an unambiguous encoding of Rust items;
+- reversible generic parameters;
+- a grammar that tooling can implement without copying compiler internals;
+- a portable alphabet of letters, digits, and underscores;
+- recognizable Rust symbols beginning with `_R`.
+
+Rust supported opting into `v0` from 1.59. It became the nightly default in November 2025, then the stable default in Rust 1.97. The [Rust 1.97 announcement](https://blog.rust-lang.org/2026/07/09/Rust-1.97.0/) records this rollout.
+
+## A real object-file comparison
+
+I compiled this small library:
+
+```rust
+#![crate_type = "lib"]
+
+#[inline(never)]
+pub fn identity<T>(value: T) -> T {
+    value
+}
+
+#[no_mangle]
+pub extern "C" fn call_identity_u64() -> u64 {
+    identity(42_u64)
+}
+```
+
+The unmangled C entry point keeps the generic Rust instantiation reachable. I used one codegen unit and retained otherwise-dead code, then inspected both objects with `nm`.
+
+```bash
+rustc --crate-name symbol_demo \
+  --emit=obj -Ccodegen-units=1 -Clink-dead-code=yes \
+  -o symbol-v0.o symbol_demo.rs
+
+nm symbol-v0.o
+```
+
+For comparison, a nightly compiler can still request the legacy scheme while it remains available:
+
+```bash
+rustc +nightly --crate-name symbol_demo \
+  --emit=obj -Ccodegen-units=1 -Clink-dead-code=yes \
+  -Csymbol-mangling-version=legacy -Zunstable-options \
+  -o symbol-legacy.o symbol_demo.rs
+```
+
+I repeated the experiment on x86-64 Linux. The exact disambiguators are build-dependent, but the structural difference is clear:
+
+| Scheme | Raw `identity::<u64>` symbol |
+| --- | --- |
+| v0, rustc 1.98.0 stable | `_RINvCsiVNbt5LifCQ_11symbol_demo8identityyEB2_` |
+| legacy, rustc 1.95.0 nightly | `_ZN11symbol_demo8identity17h986eb01add5e0fe3E` |
+
+These observed strings are evidence from one build, not stable ABI promises. Crate disambiguators and other implementation-defined parts can change.
+
+## Reading enough of a v0 symbol
+
+The complete grammar is detailed, but a few markers already help during debugging.
+
+```text
+_R I Nv ... 11symbol_demo 8identity y ...
+│  │ │        │             │        └─ u64 type code
+│  │ │        │             └────────── identifier and byte length
+│  │ │        └──────────────────────── crate path component
+│  │ └───────────────────────────────── nested value path
+│  └─────────────────────────────────── generic instantiation
+└────────────────────────────────────── Rust v0 prefix
+```
+
+I do not decode production symbols manually. I use this only to recognize that a symbol is v0 and to see why a tool without v0 support is showing raw text.
+
+The [rustc v0 format](https://doc.rust-lang.org/rustc/symbol-mangling/v0.html) defines paths, generic arguments, types, constants, lifetimes, back-references, and Unicode identifier encoding. It also makes an important boundary explicit: the format helps a demangler produce a useful name, but it is not a stable Rust ABI.
+
+## The practical benefit is better type information
+
+The legacy symbol above ends with a hash. It identifies the monomorphization, but the raw encoding does not expose that `T` is `u64`.
+
+In v0, the generic arguments are reversibly encoded. A compatible demangler can show a concrete instantiation rather than only a path plus opaque hash. This is useful for:
+
+- flame graphs containing generic functions;
+- async backtraces with nested future types;
+- debugger breakpoints on monomorphized code;
+- size and duplicate-code investigations;
+- post-processing crash symbols.
+
+The benefit exists only when every tool in the chain understands v0.
+
+## What can break after Rust 1.97
+
+Source-level Rust compatibility is not the concern. I audit tools that consume raw binary symbols.
+
+### Old demanglers
+
+A tool that recognizes only `_ZN...E` Rust names may display `_R...` without decoding. Update the debugger, profiler, symbolizer, or its Rust-demangling library.
+
+The official [symbol mangling documentation](https://doc.rust-lang.org/rustc/symbol-mangling/index.html) points to `rustc-demangle` and `rustfilt` for programmatic and command-line decoding. Modern GDB and LLDB versions also include Rust support, but the version packaged by an older operating system may lag.
+
+### Regexes over raw names
+
+Scripts sometimes classify functions by matching `_ZN` or a legacy suffix. These are parsing an implementation format by accident. I replace the workflow with:
+
+```text
+raw symbol → supported demangler → structured or readable name → classification
+```
+
+If exact raw bytes are required, the code should declare which mangling versions it supports and fail visibly on an unknown version.
+
+### Stored symbol identifiers
+
+A performance service may persist a raw symbol as the identity of a function. After the toolchain update, the same source function can receive a different raw name and appear as a new time series.
+
+I store build identity with symbols and perform comparisons on demangled, normalized data only when that normalization matches the analysis goal. Two monomorphizations must not be collapsed merely because a pretty printer hides their generic arguments.
+
+### Native interfaces
+
+Rust mangled names must not become an accidental cross-language ABI. For a C-facing boundary, export a deliberate C ABI and deliberate name:
+
+```rust
+#[no_mangle]
+pub extern "C" fn library_version() -> u32 {
+    1
+}
+```
+
+In Edition 2024, unsafe attributes such as `no_mangle` use the `#[unsafe(no_mangle)]` form. Whichever edition is used, the safety obligation is the same: the exported name must be globally unique and the signature must obey the promised ABI.
+
+`v0` is not a replacement for a stable external ABI.
+
+## A migration check I can automate
+
+Before changing the production toolchain, I capture one representative binary and test the complete symbol path:
+
+1. list raw symbols with `nm` or the platform equivalent;
+2. verify the demangler recognizes `_R` symbols;
+3. open the binary in the supported debugger;
+4. collect a small CPU profile and render a flame graph;
+5. symbolize a controlled crash;
+6. compare stored profile grouping before and after the compiler update;
+7. verify intentionally exported C symbols remain unchanged.
+
+I also keep a raw v0 fixture containing modules, a closure, a generic function, and a Unicode identifier. This catches tooling that handles the `_R` prefix but fails on a less common grammar production.
+
+## Symbol names are identities for tools, not for applications
+
+The change in Rust 1.97 is mostly good news. Rust's default encoding now represents Rust concepts directly, especially generic instantiations that matter in performance and debugging work.
+
+The important limitation remains: a Rust symbol name is not a contractual application identifier and not a stable ABI. It belongs to a particular build and compiler toolchain.
+
+I let supported tooling demangle it, keep build provenance beside it, and give external interfaces explicit names. With these boundaries, moving to v0 is a tooling upgrade rather than a production surprise.

@@ -1,0 +1,101 @@
+---
+caseId: "RFA-425"
+title: "Why an async Function Argument May Need Content<'_> Explicitly"
+date: "2026-09-06T04:15:00+01:00"
+lastmod: "2026-09-06T04:15:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "21025a5899aa1416c7d2e5b894d5e35b1b21b0908f254ee6771c3547c23251b0"
+area: "async-runtime"
+symptom: "An async function taking Content without writing its lifetime argument fails with E0726 even though a similar-looking ordinary function may permit elision."
+summary: "An async function returns a future that stores its arguments, so a lifetime-bearing container type must expose the relevant lifetime in the signature. Write Content<'_> or a named lifetime and propagate it when the future escapes."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust E0726 implicit elided lifetime not allowed async fn", "async function Content expected lifetime parameter", "lifetime-bearing struct async argument underscore"]
+evidence: ["Rust 1.98.1 E0726 compile failure", "lifetime omitted from async container argument", "Content underscore lifetime repair"]
+sources: ["https://doc.rust-lang.org/error_codes/E0726.html", "https://doc.rust-lang.org/reference/lifetime-elision.html", "https://doc.rust-lang.org/reference/items/functions.html#async-functions"]
+---
+
+I wrote an async function accepting a borrowed-content wrapper and omitted the wrapper's lifetime parameter. Rust reported E0726: an implicit elided lifetime is not allowed there.
+
+The [failing fixture](/rust-failure-atlas/evidence/RFA-425/fail.rs) defines `Content<'a> { body: &'a str }` and then writes `async fn publish(content: Content)`. The compiler asks for a lifetime parameter and suggests `Content<'_>`.
+
+## The future stores the argument
+
+An async function does not execute its whole body when called. It creates a future that can be polled later. Conceptually, arguments and state used across suspension become fields of that generated future.
+
+The [Reference on async functions](https://doc.rust-lang.org/reference/items/functions.html#async-functions) describes an async function as returning an anonymous future. The borrow inside `Content` therefore participates in the returned future's validity.
+
+Writing the lifetime makes that relationship visible to type checking and to readers.
+
+## The anonymous lifetime is often enough
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-425/fixed.rs) uses:
+
+```rust
+async fn publish(content: Content<'_>) -> usize {
+    content.body.len()
+}
+```
+
+`'_` says there is a lifetime here and lets the compiler infer its particular identity from the call. This is useful when the lifetime does not need to be named elsewhere in the signature.
+
+The fixture creates the future while the borrowed string literal remains valid, then drops the future. No executor dependency is needed to prove that the signature compiles.
+
+## Name the lifetime when relationships matter
+
+If the function returns borrowed data, accepts several related borrows, or exposes the future through another API, I use a named lifetime:
+
+```rust
+async fn publish<'a>(content: Content<'a>) -> &'a str {
+    content.body
+}
+```
+
+The name does not extend the data's life. It states that the output is tied to the same lifetime carried by the input.
+
+I avoid adding `'static` as a reflex. Requiring `Content<'static>` rejects ordinary request-local strings and can push callers toward leaks or unnecessary ownership. `'static` is correct only when the API truly requires data valid for the program's remaining duration, or when an owned future bound requires no non-static borrows.
+
+## Elision applies through specific rules
+
+The [lifetime elision Reference](https://doc.rust-lang.org/reference/lifetime-elision.html) defines where omitted reference lifetimes receive inferred parameters. A type path such as `Content` has its own lifetime argument; leaving that path argument implicit in this async position is what E0726 rejects.
+
+I distinguish these forms:
+
+```rust
+&str          // reference lifetime can be elided by function rules
+Content<'_>   // container has an explicit anonymous lifetime argument
+Content<'a>   // container has a named lifetime relationship
+```
+
+They can describe similar data while presenting different information to the signature.
+
+## Ownership can remove the borrow
+
+If a task must outlive the request that created it, borrowing may be the wrong model. An owned `String`, `Arc<str>`, or application record can let the future own its state.
+
+Changing to ownership has costs and benefits: allocation or reference counting versus simpler spawning and fewer lifetime ties. I make that choice from task lifetime and data volume, not merely from the compiler error.
+
+For a short future awaited immediately, `Content<'_>` is often precise and cheap. For a background task stored behind a `'static` bound, ownership is commonly necessary.
+
+## The error reveals an API boundary
+
+At service boundaries, this question is practical. Can work continue after the input buffer is released? If yes, parsing should produce owned state or a shared immutable allocation. If no, the future's borrow should remain explicit so the compiler prevents accidental escape.
+
+This is not special to network servers. Stream processors, compiler queries, file parsers, and UI tasks all benefit from an honest answer.
+
+I test cancellation as well as completion. Dropping a future releases the borrows and owned fields it carries, but it does not reverse external effects already performed during earlier polls. The lifetime describes memory validity; it does not provide transactional rollback. Keeping those two guarantees separate makes async resource design much clearer.
+
+## My diagnostic checklist
+
+When E0726 appears, I check:
+
+- Which type in the parameter list declares a lifetime?
+- Is `'_` enough, or must two positions share a named lifetime?
+- Does the future escape the scope that owns the borrowed data?
+- Will it be spawned under a `'static` requirement?
+- Should the boundary parse or clone into owned data?
+- Is a return borrow tied to the same input lifetime?
+
+The core principle is that async code separates creation from completion. A future may carry its input across that interval, so lifetime-bearing wrapper types cannot hide the relevant relationship. I write the lifetime explicitly, then choose borrowing or ownership according to how long the work must live.

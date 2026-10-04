@@ -1,0 +1,146 @@
+---
+caseId: "RFA-722"
+title: "bool::ok_or Constructs Its Error Even When the Condition Is True"
+date: "2026-09-07T12:08:00+01:00"
+lastmod: "2026-09-07T12:08:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "b6afa7367623aa9d6ab2f22abe83da6505fe6f1363e73c814559c50ddcfe8ed9"
+area: "upgrades-compatibility"
+symptom: "true.ok_or(build_error()) returns Ok(()), but build_error still runs and can allocate, mutate state, log, or perform other unnecessary work."
+summary: "Rust evaluates the error argument before calling bool::ok_or. Use ok_or_else when creating the error is expensive or observable, because its closure runs only when the boolean is false."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets"]
+profiles: ["dev", "release"]
+searchTerms: ["Rust bool ok_or eager error construction", "true ok_or still evaluates error expression", "bool ok_or versus ok_or_else Rust 1.98"]
+evidence: ["Rust 1.98.1 runtime assertion after eager error construction", "true.ok_or returns Ok but increments the construction counter", "ok_or_else skips construction for true and invokes it once for false"]
+sources: ["https://doc.rust-lang.org/releases.html#version-1980-2026-08-20", "https://doc.rust-lang.org/std/primitive.bool.html#method.ok_or", "https://doc.rust-lang.org/std/primitive.bool.html#method.ok_or_else"]
+---
+
+Rust 1.98 added a convenient way to convert a boolean condition into a `Result`. A true condition becomes `Ok(())`, while a false condition becomes an error. The short form can still do work on the successful path which is easy to miss.
+
+This program returns `Ok(())`, but it also builds the error:
+
+```rust
+use std::cell::Cell;
+
+fn build_error(constructions: &Cell<u32>) -> String {
+    constructions.set(constructions.get() + 1);
+    "feature is disabled".to_owned()
+}
+
+fn main() {
+    let constructions = Cell::new(0);
+    let result = true.ok_or(build_error(&constructions));
+
+    assert_eq!(result, Ok(()));
+    assert_eq!(constructions.get(), 0); // panics: the value is 1
+}
+```
+
+The boolean did not fail. The surprising part is that `build_error` ran before `ok_or` could inspect that boolean.
+
+The [failing fixture](/rust-failure-atlas/evidence/RFA-722/fail.rs) makes this visible with a counter on Rust 1.98.1. The [repaired fixture](/rust-failure-atlas/evidence/RFA-722/fixed.rs) proves both branches: a true condition constructs no error with `ok_or_else`, and a false condition constructs exactly one.
+
+## `ok_or` receives a value, not a recipe
+
+The relevant signatures describe the difference:
+
+```rust
+pub fn ok_or<E>(self, err: E) -> Result<(), E>
+
+pub fn ok_or_else<E, F>(self, f: F) -> Result<(), E>
+where
+    F: FnOnce() -> E
+```
+
+`ok_or` needs an `E` as its argument. If I write `build_error()`, Rust must evaluate that expression to produce the `E` before the method is called. Only then can `ok_or` return `Ok(())` and discard the already-created error.
+
+`ok_or_else` receives a closure. The closure is a recipe for creating `E`, so the method can first inspect the boolean. It calls the recipe only for `false`:
+
+```rust
+let result = condition.ok_or_else(|| build_error());
+```
+
+This is ordinary function-call evaluation, not a special defect in `bool`. The same reasoning applies when an API offers value and closure variants such as `Option::ok_or` and `Option::ok_or_else`, or `bool::then_some` and `bool::then`.
+
+I use one simple reading rule: an argument like `make_value()` is work now; an argument like `|| make_value()` is work the callee may choose to do later.
+
+## The result does not reveal the unnecessary work
+
+Looking only at `result` hides the failure:
+
+```rust
+let result = true.ok_or(load_detailed_error());
+assert_eq!(result, Ok(()));
+```
+
+The assertion passes. A test which checks only the return value says everything is correct. But `load_detailed_error` may format a large message, clone owned context, capture a backtrace, read configuration, increment a metric, or write a log. Its value is then dropped unused.
+
+This is why the case belongs in a failure atlas even though the compiler reports no error. The type and value are correct, yet the runtime behavior can be wrong for the application's performance or observability contract.
+
+For a literal or cheap enum variant, eager construction is often fine:
+
+```rust
+is_ready.ok_or(StateError::NotReady)?;
+```
+
+There is no reason to turn every small error into a closure. I choose `ok_or_else` when construction has meaningful cost, owns data, or has any observable effect:
+
+```rust
+is_ready.ok_or_else(|| StateError::NotReady {
+    resource: resource_name.clone(),
+    detail: format!("attempt {attempt} did not become ready"),
+})?;
+```
+
+The closure keeps the clone and formatting on the error path.
+
+## Error construction should normally be boring
+
+The counter in the fixture is deliberate because it proves evaluation. It is not a recommendation to put mutation inside error builders.
+
+I prefer error construction to be free of important side effects. A log written while creating an error can become a false incident when the surrounding operation actually succeeds. A metric increment can overcount failures. A retry token consumed there may change behavior. `ok_or_else` fixes when the construction runs, but keeping policy outside the constructor makes the code easier to reason about.
+
+When a side effect is part of the real failure policy, I often make the branch explicit:
+
+```rust
+if !condition {
+    record_rejection();
+    return Err(build_error());
+}
+```
+
+This is longer, but it tells the reader that recording is intentional. Combinators are useful when they make the data flow clearer; they are not a requirement.
+
+## This conversion keeps `()` on the success side
+
+`bool::ok_or` and `bool::ok_or_else` produce `Result<(), E>`, not `Result<bool, E>`. Once the condition is true, the boolean itself carries no additional information. The unit value says only that the condition passed.
+
+This fits validation and guard code:
+
+```rust
+fn require_capacity(remaining: usize) -> Result<(), String> {
+    (remaining > 0).ok_or_else(|| {
+        format!("no capacity remains: {remaining}")
+    })
+}
+```
+
+If the success path needs to return data, a boolean-to-unit conversion may be the wrong abstraction. I may use `if`, `match`, or validate the value directly. The new method makes a guard compact; it does not replace domain modelling.
+
+There is also no asynchronous short-circuit hidden here. Calling an ordinary function inside `ok_or(...)` runs that function before the method. Creating an async future may only create the future without polling it, but allocation or other work performed while constructing that future can still happen. I inspect the actual expression rather than assuming that “async” makes eager evaluation harmless.
+
+## How I test this boundary
+
+For a lazy error path, I test behavior as well as return values:
+
+1. A true condition returns `Ok(())`.
+2. A true condition does not invoke the error closure.
+3. A false condition returns the expected error.
+4. A false condition invokes the closure exactly once.
+5. Expensive context is cloned or formatted only in the false branch.
+
+A counter, mock, or deliberately panicking closure can prove laziness in a small unit test. The counter is usually the clearest because it can verify both zero calls and one call without making the test depend on panic handling.
+
+The core principle goes beyond this method: distinguish a value from a computation which can produce a value. `bool::ok_or` accepts an error that already exists. `bool::ok_or_else` accepts a computation and controls whether it runs. When success is common and the error is not trivial, that one closure keeps failure work on the failure path.

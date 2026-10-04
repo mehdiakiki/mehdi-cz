@@ -1,0 +1,613 @@
+---
+title: "gRPC from the Ground Up: The Real Parsing Stack"
+date: "2026-03-17"
+tags:
+  [
+    "grpc",
+    "system design",
+    "backend development",
+    "networking",
+    "protobuf",
+    "http2",
+    "architecture",
+  ]
+draft: false
+cluster: "reliable-data-integrations"
+summary: "What actually happens between bytes arriving on a socket and your gRPC handler running? This article walks one real request through every parsing layer — TCP, HTTP/2 frames, HPACK, gRPC envelope, protobuf — so the magic disappears."
+---
+
+Most people learn gRPC by writing a `.proto` file, generating some code, and calling a method. It works. But the moment something goes wrong — a weird status code, a connection that stalls, a message that won't decode — they have no mental model for what is actually happening underneath.
+
+This article fixes that. We will walk a single gRPC request through every layer of the stack, from raw bytes on a socket to your handler function running. No hand-waving.
+
+**Contents**
+
+1. [The high-level chain](#1-the-high-level-chain)
+2. [Walking one request through every layer](#2-walking-one-request-through-every-layer)
+3. [Where strings actually appear](#3-where-strings-actually-appear)
+4. [Why it feels magical](#4-why-it-feels-magical)
+5. [The postal system mental model](#5-the-postal-system-mental-model)
+6. [Pseudo-code for the real flow](#6-pseudo-code-for-the-real-flow)
+7. [The six things to study in order](#7-the-six-things-to-study-in-order)
+8. [FAQ](#8-faq)
+
+---
+
+## 1. The high-level chain
+
+Here is the real stack, top to bottom, for a gRPC call over HTTP/2:
+
+1. **IP packets arrive** — Network card and kernel receive packets.
+
+2. **TCP reconstructs an ordered byte stream** — Your process does not deal with raw packets. It gets a socket that yields bytes in order.
+
+3. **TLS decrypts bytes** — If TLS is used, the TLS layer turns encrypted bytes into plaintext HTTP/2 bytes.
+
+4. **HTTP/2 parser reads frames from the byte stream** — This is the first major parsing stage.
+
+5. **HEADERS frame is decoded** — Headers are compressed using HPACK. After decoding, the system learns things like:
+
+```text
+:method = POST
+:path = /mypackage.UserService/GetUser
+content-type = application/grpc
+```
+
+6. **DATA frames arrive** — These carry the gRPC request message bytes.
+
+7. **gRPC layer parses the DATA payload** — It reads the gRPC message envelope: a compressed flag, message length, and protobuf bytes.
+
+8. **Protobuf decoder parses message bytes** — Now the bytes become a typed request struct:
+
+```text
+GetUserRequest { user_id: 123 }
+```
+
+9. **gRPC router matches path to method** — `/mypackage.UserService/GetUser` is mapped to your handler.
+
+10. **Your method runs** — Finally:
+
+```rust
+async fn get_user(req: Request<GetUserRequest>) -> Result<Response<GetUserResponse>, Status>
+```
+
+That is the first point where it feels like normal application code.
+
+---
+
+## 2. Walking one request through every layer
+
+Let's trace a real call. A client calls `GetUser(user_id = 42)`.
+
+### Stage 1: socket gives bytes
+
+At the lowest useful level, the server is repeatedly doing something like:
+
+```rust
+let n = socket.read(&mut buf).await?;
+```
+
+This gives raw bytes. Not strings. Not requests. Just bytes.
+
+Maybe the first chunk contains some HTTP/2 frame header bytes, part of a frame payload, maybe multiple frames, maybe half a frame.
+
+**This is a huge point:** `read()` boundaries are not protocol boundaries. One `read()` call does not mean "one request arrived." You may get half a frame, one full frame, or three frames jammed together. So the protocol parser must accumulate bytes in a buffer and parse incrementally.
+
+### Stage 2: HTTP/2 frame parsing
+
+HTTP/2 uses binary frames. Each frame has a **9-byte header** followed by a payload:
+
+| Bytes | Field |
+|-------|-------|
+| 3 | Payload length |
+| 1 | Frame type |
+| 1 | Flags |
+| 4 | Stream ID |
+
+Then comes the payload.
+
+The parser does roughly:
+
+**Step A:** Check if the buffer has at least 9 bytes. If not, wait for more.
+
+**Step B:** Read those 9 bytes as binary fields. Not strings. Something like:
+- `length = 37`
+- `type = HEADERS`
+- `flags = END_HEADERS`
+- `stream_id = 1`
+
+**Step C:** Check if the buffer has the full payload too. If not, wait for more.
+
+**Step D:** A complete frame exists. Dispatch by type.
+
+The parser is just reading binary fields from a byte buffer.
+
+### Stage 3: HEADERS frame — what it contains
+
+The HEADERS frame payload is **not** plain text like HTTP/1.1. It is encoded with HPACK, a binary compression format for HTTP/2 headers.
+
+Another parser runs:
+
+1. Read HPACK-encoded header block bytes
+2. Decode into header key/value pairs
+
+This produces something like:
+
+```text
+:method = POST
+:scheme = https
+:path = /mypackage.UserService/GetUser
+content-type = application/grpc
+te = trailers
+```
+
+Now the system knows this is gRPC traffic targeting `/mypackage.UserService/GetUser`.
+
+But your handler has not run yet. The request body has not been decoded.
+
+### Stage 4: DATA frames and stream multiplexing
+
+Next, DATA frames arrive on the same stream ID.
+
+Remember: HTTP/2 multiplexes streams. Stream 1 might be this request. Stream 3 might be another request happening at the same time on the same TCP connection. The parser must track state per stream.
+
+The DATA frame payload contains the gRPC message bytes. But we are not at protobuf yet — there is another framing layer in between.
+
+### Stage 5: gRPC message envelope
+
+gRPC wraps every message in a small envelope inside the HTTP/2 DATA payload:
+
+| Bytes | Field | Example |
+|-------|-------|---------|
+| 1 | Compression flag | `0x00` (not compressed) |
+| 4 | Message length | `0x00000008` (8 bytes) |
+| N | Protobuf message bytes | (the actual payload) |
+
+So if the DATA payload starts with `0x00 0x00 0x00 0x00 0x08`, the gRPC layer knows: one uncompressed message, 8 bytes long. It extracts those 8 bytes and passes them to the protobuf decoder.
+
+We have gone from TCP byte stream → HTTP/2 frames → gRPC message framing, layer by layer.
+
+### Stage 6: protobuf decoding
+
+This is where bytes finally become typed data.
+
+Protobuf is a binary serialization format. It encodes fields by field number, wire type, and value bytes. Suppose your `.proto` says:
+
+```proto
+message GetUserRequest {
+  int32 user_id = 1;
+}
+```
+
+The protobuf decoder reads the 8 bytes and interprets them as:
+
+- Field 1
+- Wire type: varint
+- Value: `42`
+
+Now it constructs the typed request object:
+
+```text
+GetUserRequest { user_id: 42 }
+```
+
+**This is the first time your business-level request exists.** Before this moment, it was just bytes being interpreted through multiple protocol layers.
+
+### Stage 7: method routing
+
+The framework now has two things:
+
+- **Path:** `/mypackage.UserService/GetUser`
+- **Typed request:** `GetUserRequest { user_id: 42 }`
+
+The gRPC server maps the path to a registered handler. Conceptually:
+
+```rust
+match path {
+    "/mypackage.UserService/GetUser" => call_get_user_handler(decoded_message),
+    _ => return Status::Unimplemented,
+}
+```
+
+This mapping is usually generated from `.proto` definitions by codegen. The generated code registers service names, method names, and exposes a dispatch function.
+
+### Stage 8: your method runs
+
+Only now does your real code run:
+
+```rust
+async fn get_user(
+    &self,
+    request: Request<GetUserRequest>,
+) -> Result<Response<GetUserResponse>, Status> {
+    let user_id = request.into_inner().user_id;
+    // query database, build response...
+}
+```
+
+This feels simple because the framework has already done all of the heavy lifting:
+
+- Socket reading
+- Byte buffering
+- HTTP/2 frame parsing
+- HPACK header decoding
+- Stream multiplexing
+- gRPC envelope parsing
+- Protobuf decoding
+- Route dispatch
+
+That is the "magic." But it is really just layers of parsers.
+
+---
+
+## 3. Where strings actually appear
+
+A common misconception is that the parsing is mainly "on strings." It is not.
+
+**In HTTP/2:** Frame parsing is entirely binary. Header names and values become byte slices after HPACK decoding and *may* be treated as strings if they are valid text. Examples: `:path`, `content-type`. These are protocol metadata fields.
+
+**In protobuf:** Usually not strings unless the message schema contains `string` fields. If your message has:
+
+```proto
+string name = 2;
+```
+
+then the protobuf decoder interprets some bytes as a UTF-8 string for that field. But fields like `int32`, `enum`, `bytes`, and nested messages are never strings.
+
+**The rule:** bytes first, typed values later, strings only where the schema says strings.
+
+---
+
+## 4. Why it feels magical
+
+Because frameworks hide all the incremental parsing. Real protocol handling involves:
+
+- Partial reads from sockets
+- Partial frame payloads
+- Byte buffering and reassembly
+- Per-stream state machines
+- Header continuation frames
+- Compression negotiation
+- Flow control windows
+- Message boundary detection
+
+Frameworks collapse all of this behind request objects, handler functions, and generated service code. So it looks like "request came in, method ran." But underneath it is a multi-stage parser pipeline.
+
+---
+
+## 5. The postal system mental model
+
+Think of a gRPC request like a package moving through a postal system:
+
+| Layer | Analogy |
+|-------|---------|
+| **TCP** | A truck dumps sacks of mail at the building. Sacks do not correspond neatly to one letter each. |
+| **HTTP/2 parser** | A sorting machine opens sacks and identifies envelopes by conversation (stream ID). |
+| **HPACK decoder** | Another machine reads the labels on each envelope. |
+| **gRPC parser** | Another machine opens the envelope and finds a structured form inside. |
+| **Protobuf decoder** | Another machine reads the form according to a schema and fills a typed record. |
+| **Router** | The system says: "This form is for the GetUser department." |
+| **Your handler** | The GetUser clerk finally processes it. |
+
+---
+
+## 6. Pseudo-code for the real flow
+
+This is not production code, but it is much closer to what actually happens inside a gRPC server than most people imagine:
+
+```rust
+loop {
+    read_more_bytes_into_buffer();
+
+    while let Some(frame) = try_parse_http2_frame(&mut buffer) {
+        match frame.kind {
+            Headers => {
+                let headers = decode_hpack(frame.payload)?;
+                stream_state[frame.stream_id].headers = Some(headers);
+            }
+            Data => {
+                stream_state[frame.stream_id].body.extend(frame.payload);
+
+                if is_complete_grpc_message(&stream_state[frame.stream_id]) {
+                    let headers = stream_state[frame.stream_id].headers.take().unwrap();
+                    let path = headers.path();
+                    let grpc_bytes = extract_grpc_payload(
+                        &stream_state[frame.stream_id].body
+                    )?;
+                    let request = decode_protobuf_for_path(path, grpc_bytes)?;
+                    dispatch_to_handler(path, request).await;
+                }
+            }
+            _ => { /* settings, ping, flow control, etc. */ }
+        }
+    }
+}
+```
+
+The key insight: it is a loop that reads bytes, tries to parse frames, accumulates state per stream, and only calls your handler when every layer has been successfully decoded.
+
+---
+
+## 7. The six things to study in order
+
+If you want the magic to disappear, study these in order:
+
+1. **TCP is a byte stream, not a message stream.** This alone removes a lot of confusion. One `read()` call does not equal one message.
+
+2. **HTTP/2 frame format.** Learn the 9-byte header, HEADERS frames, DATA frames, and stream IDs.
+
+3. **HPACK at a high level.** Enough to know that headers are binary-encoded, not plain text lines like HTTP/1.1.
+
+4. **gRPC message envelope.** The 1-byte compression flag + 4-byte length + protobuf bytes.
+
+5. **Protobuf decoding.** Understand field numbers, wire types, and typed decoding at a high level.
+
+6. **Generated service dispatch.** How a path like `/mypackage.UserService/GetUser` maps to your handler function.
+
+Once you understand these six layers, the path from socket bytes to handler call is no longer magic:
+
+```text
+socket bytes → HTTP/2 frame parser → HPACK header decode → gRPC message framing → protobuf decode → route dispatch → handler call
+```
+
+It is just parsers, all the way down.
+
+---
+
+## 8. FAQ
+
+### How is gRPC different from REST in practice?
+
+It is not just "binary vs JSON." The differences show up in real code:
+
+| | REST (HTTP/1.1 + JSON) | gRPC (HTTP/2 + Protobuf) |
+|---|---|---|
+| **Contract** | OpenAPI spec (optional, often out of date) | `.proto` file (required, generates code) |
+| **Serialization** | JSON text, ~2-10x larger on the wire | Protobuf binary, compact |
+| **HTTP version** | Usually HTTP/1.1 (one request per connection at a time) | HTTP/2 (multiplexed streams on one connection) |
+| **Streaming** | Awkward (SSE, WebSockets, chunked) | Native: server-stream, client-stream, bidirectional |
+| **Code generation** | Optional | Built-in — clients and servers are generated from `.proto` |
+| **Browser support** | Native | Needs grpc-web proxy or Connect protocol |
+
+**When REST is simpler:** public APIs, browser-first clients, teams that want curl-friendly endpoints.
+
+**When gRPC wins:** service-to-service communication, high-throughput internal calls, streaming data, polyglot codebases where generated clients save time.
+
+### What do the four gRPC method types actually look like?
+
+Every gRPC method is one of four patterns. Here they are with `.proto` definitions and concrete use cases:
+
+**Unary** — one request, one response (the most common):
+
+```proto
+// Client sends one order ID, server returns one order
+rpc GetOrder(GetOrderRequest) returns (GetOrderResponse);
+```
+
+**Server streaming** — one request, server sends multiple responses:
+
+```proto
+// Client asks for live price updates, server streams them
+rpc WatchPrice(WatchPriceRequest) returns (stream PriceUpdate);
+```
+
+**Client streaming** — client sends multiple messages, server responds once:
+
+```proto
+// Client uploads chunks of a file, server responds with metadata
+rpc UploadFile(stream FileChunk) returns (UploadResult);
+```
+
+**Bidirectional streaming** — both sides send streams simultaneously:
+
+```proto
+// Real-time chat: both sides send and receive messages
+rpc Chat(stream ChatMessage) returns (stream ChatMessage);
+```
+
+Under the hood, all four use the same HTTP/2 stream. The difference is just whether the DATA frames flow in one direction or both, and whether `END_STREAM` is sent after one message or many.
+
+### What does a `.proto` file actually produce?
+
+Suppose you have this `.proto`:
+
+```proto
+syntax = "proto3";
+package orders;
+
+service OrderService {
+  rpc GetOrder(GetOrderRequest) returns (GetOrderResponse);
+  rpc ListOrders(ListOrdersRequest) returns (stream OrderSummary);
+}
+
+message GetOrderRequest {
+  int32 order_id = 1;
+}
+
+message GetOrderResponse {
+  int32 order_id = 1;
+  string status = 2;
+  repeated Item items = 3;
+}
+
+message Item {
+  string name = 1;
+  int32 quantity = 2;
+  float price = 3;
+}
+```
+
+Running `protoc` (or `tonic-build`, `protoc-gen-go`, etc.) generates:
+
+- **Struct types** for every `message` — with serialization and deserialization built in
+- **A client stub** — you call `client.get_order(request)` and the generated code handles framing, HTTP/2, and protobuf encoding
+- **A server trait/interface** — you implement `get_order()` and the framework handles everything else
+- **Routing code** — maps `/orders.OrderService/GetOrder` to your handler automatically
+
+You never write HTTP paths, serialize JSON, or parse request bodies. The contract is the `.proto` file and everything flows from it.
+
+### What are gRPC status codes and when do I use which?
+
+gRPC has its own status codes, separate from HTTP status codes. These are the ones you will actually use:
+
+| Code | Name | When to use it |
+|------|------|----------------|
+| 0 | `OK` | Success |
+| 3 | `INVALID_ARGUMENT` | Client sent bad input (like HTTP 400) |
+| 5 | `NOT_FOUND` | Resource doesn't exist (like HTTP 404) |
+| 7 | `PERMISSION_DENIED` | Caller lacks permission (like HTTP 403) |
+| 12 | `UNIMPLEMENTED` | Method not implemented on server |
+| 13 | `INTERNAL` | Server bug, unexpected error (like HTTP 500) |
+| 14 | `UNAVAILABLE` | Transient failure, client should retry |
+| 4 | `DEADLINE_EXCEEDED` | Request took too long |
+| 16 | `UNAUTHENTICATED` | No valid credentials (like HTTP 401) |
+
+Common mistake: returning `INTERNAL` for everything. Use `INVALID_ARGUMENT` when the client sent bad data — it tells the client not to retry without changing the request.
+
+In Rust with tonic:
+
+```rust
+// Bad input
+return Err(Status::invalid_argument("order_id must be positive"));
+
+// Not found
+return Err(Status::not_found(format!("order {} not found", order_id)));
+
+// Server bug
+return Err(Status::internal("database connection failed"));
+```
+
+### How do deadlines and timeouts actually work?
+
+gRPC deadlines propagate across services. This is one of its best features.
+
+```text
+Client sets deadline: 5 seconds
+  → Service A receives it, has 5s left
+    → Service A calls Service B, forwards deadline: 3.2s left
+      → Service B calls Service C, forwards deadline: 1.1s left
+        → Service C sees 1.1s, knows it must finish fast
+```
+
+In practice:
+
+```rust
+// Client side — set a 5 second deadline
+let mut client = OrderServiceClient::connect("http://localhost:50051").await?;
+let mut request = tonic::Request::new(GetOrderRequest { order_id: 42 });
+request.set_timeout(Duration::from_secs(5));
+let response = client.get_order(request).await?;
+```
+
+If any service in the chain exceeds the remaining time, the caller gets `DEADLINE_EXCEEDED`. No more hanging requests silently waiting forever.
+
+**Rule of thumb:** always set deadlines on the outermost call. If you don't, a broken downstream service can hold connections open indefinitely.
+
+### How do I add authentication to gRPC?
+
+gRPC uses metadata (similar to HTTP headers) for auth. The most common pattern is sending a bearer token:
+
+```rust
+// Client — attach token to every request via interceptor
+let channel = Channel::from_static("http://localhost:50051").connect().await?;
+let mut client = OrderServiceClient::with_interceptor(channel, |mut req: Request<()>| {
+    req.metadata_mut().insert(
+        "authorization",
+        MetadataValue::try_from("Bearer eyJhbG...").unwrap(),
+    );
+    Ok(req)
+});
+```
+
+```rust
+// Server — extract and validate token in handler
+async fn get_order(
+    &self,
+    request: Request<GetOrderRequest>,
+) -> Result<Response<GetOrderResponse>, Status> {
+    let token = request.metadata().get("authorization")
+        .ok_or_else(|| Status::unauthenticated("missing token"))?
+        .to_str()
+        .map_err(|_| Status::unauthenticated("invalid token encoding"))?;
+
+    if !validate_token(token) {
+        return Err(Status::unauthenticated("invalid token"));
+    }
+    // proceed...
+}
+```
+
+For mTLS (mutual TLS), both client and server present certificates. This is common in service-to-service communication where you don't want token management overhead.
+
+### Can I use gRPC from a browser?
+
+Not directly. Browsers cannot make raw HTTP/2 requests with the control gRPC needs (custom framing, trailers, etc.).
+
+Two solutions exist:
+
+**grpc-web** — A proxy (like Envoy) sits between the browser and your gRPC server. The browser sends a slightly modified HTTP request, the proxy translates it to real gRPC:
+
+```text
+Browser → HTTP/1.1 or HTTP/2 POST → Envoy proxy → real gRPC → your server
+```
+
+**Connect protocol** (from Buf) — Your server speaks both gRPC and a browser-friendly protocol on the same port. Unary calls work as simple `POST` requests with JSON or protobuf bodies. No proxy needed:
+
+```text
+Browser → POST /orders.OrderService/GetOrder (JSON body) → Connect-enabled server
+```
+
+Connect is increasingly popular because it removes the proxy requirement and lets the same server handle both gRPC clients and browser clients.
+
+### How do I debug gRPC calls?
+
+You cannot just use `curl`. But there are practical tools:
+
+**grpcurl** — like curl but for gRPC:
+
+```bash
+# List all services on a server (requires reflection enabled)
+grpcurl -plaintext localhost:50051 list
+
+# Call a method
+grpcurl -plaintext -d '{"order_id": 42}' \
+  localhost:50051 orders.OrderService/GetOrder
+```
+
+**Server reflection** — enable it so tools can discover your API without the `.proto` file:
+
+```rust
+// tonic (Rust)
+Server::builder()
+    .add_service(tonic_reflection::server::Builder::configure()
+        .register_encoded_file_descriptor_set(FILE_DESCRIPTOR_SET)
+        .build()?)
+    .add_service(OrderServiceServer::new(my_service))
+    .serve(addr)
+    .await?;
+```
+
+**Logging interceptors** — log every request and response in development:
+
+```rust
+let layer = tower::ServiceBuilder::new()
+    .layer(tonic::service::interceptor(|req: Request<()>| {
+        println!("gRPC call: {:?}", req.metadata());
+        Ok(req)
+    }));
+```
+
+### gRPC vs REST vs GraphQL — which should I pick?
+
+Quick decision framework:
+
+| Situation | Pick |
+|-----------|------|
+| Public API consumed by many unknown clients | REST |
+| Frontend needs flexible queries over many entities | GraphQL |
+| Service-to-service, high throughput, typed contracts | gRPC |
+| Real-time bidirectional streaming | gRPC |
+| Team is small, one language, wants simplicity | REST |
+| Polyglot microservices that need generated clients | gRPC |
+
+Many production systems use **gRPC internally** between services and expose a **REST or GraphQL gateway** to external clients. These are not competing choices — they solve different problems at different boundaries.

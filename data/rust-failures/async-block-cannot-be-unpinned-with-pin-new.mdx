@@ -1,0 +1,104 @@
+---
+caseId: "RFA-088"
+title: "E0277: Why Pin::new Rejects an Async Block"
+date: "2026-09-05T09:08:00+01:00"
+lastmod: "2026-09-05T09:08:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "5bc630db279c6c9f9aa4b0cf741de2f2737c38fd7dc93b7d7ea723296d22b6cf"
+area: "async-runtime"
+symptom: "Pin::new(&mut future) rejects an async block with E0277 because its anonymous future is not Unpin."
+summary: "Pin::new is safe only when moving the pointee would already be harmless. Anonymous async futures may rely on stable addresses after polling, so use Box::pin or pin! and keep the pinned handle."
+rustVersions: ["Rust 1.98.1"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust async block cannot be unpinned E0277",
+    "Pin new future requires Unpin",
+    "Box pin async future",
+  ]
+evidence: ["Rust 1.98.1 compile failure", "pinning contract", "Box::pin repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/std/pin/struct.Pin.html",
+    "https://doc.rust-lang.org/std/boxed/struct.Box.html#method.pin",
+  ]
+---
+
+The word `Pin` appears in both the attempted code and the suggested repair, which can hide the actual difference:
+
+```rust
+use std::pin::Pin;
+
+fn main() {
+    let mut future = async { 42 };
+    let _pinned = Pin::new(&mut future);
+}
+```
+
+Rust 1.98.1 reports E0277: the async block cannot be unpinned. The compiler suggests `pin!` or `Box::pin`. The [failing fixture](/rust-failure-atlas/evidence/RFA-088/fail.rs) keeps the error independent from any runtime.
+
+The question is not whether the variable currently sits at a stable stack address. The question is whether safe code could move the value after a Pin is constructed and whether such movement would violate the value's contract.
+
+## Pin is a promise about future movement
+
+`Pin<Ptr>` wraps a pointer-like type and restricts access to its pointee. For a type that is `Unpin`, moving after pinning is harmless, so the safe constructor `Pin::new` is available. For a type that is not Unpin, creating a valid Pin requires placing the value in storage and ensuring it will not move for the rest of its pinned lifetime.
+
+The standard-library [`Pin` documentation](https://doc.rust-lang.org/std/pin/struct.Pin.html) explains this contract in detail. [`Box::pin`](https://doc.rust-lang.org/std/boxed/struct.Box.html#method.pin) allocates a value and returns a pinned box without exposing a moment where safe code can move the pointee out.
+
+Anonymous futures from async blocks are not generally Unpin. Their generated state may contain references into itself after polling. Rust conservatively protects the address even when this particular small future does not look self-referential in source.
+
+## Box::pin creates owned pinned storage
+
+The verified repair is:
+
+```rust
+fn main() {
+    let future = async { 42 };
+    let _pinned = Box::pin(future);
+}
+```
+
+The [fixed fixture](/rust-failure-atlas/evidence/RFA-088/fixed.rs) compiles on Rust 1.98.1. The future is moved once into its heap allocation before the pinned handle is returned. Moving the `Pin<Box<_>>` later moves the box pointer, not the future stored in the allocation.
+
+This is useful when the pinned future must be returned, stored in a collection, or kept beyond the current stack frame. It does allocate.
+
+## pin! is for local pinned storage
+
+When the future is used only in the current scope, `std::pin::pin!` can pin it locally without a heap allocation:
+
+```rust
+let future = async { 42 };
+let mut pinned = std::pin::pin!(future);
+```
+
+The resulting handle must remain within the lifetime of that local storage. I do not return a Pin pointing into a stack frame that is about to disappear.
+
+Choosing between `Box::pin` and `pin!` is therefore about ownership and lifetime, not just performance. One owns stable heap storage; the other borrows stable local storage.
+
+## Do not move the original after pinning
+
+A common mistake is to create a pinned handle and then continue using the original variable as though nothing changed. Correct pinning APIs structure access so the original value is shadowed or borrowed for the pinned lifetime. Combinators and poll methods should receive the `Pin`, not a fresh mutable reference created by moving the future.
+
+Unsafe constructors such as `Pin::new_unchecked` place the entire guarantee on the caller. Using one only to bypass E0277 is dangerous because ordinary safe code may still move the value later.
+
+## Why executors care
+
+The `Future::poll` receiver is `Pin<&mut Self>`. Before a future is first polled, its internal state is not yet suspended around an await. After polling, it may hold relationships that assume a stable address. Executors therefore pin futures before repeatedly polling them.
+
+Most application code does not call poll manually, but this contract appears when implementing future combinators, storing heterogeneous futures, selecting between operations, or writing executor infrastructure.
+
+## My diagnosis checklist
+
+When I see “cannot be unpinned,” I identify:
+
+1. Who owns the value.
+2. How long it must remain pinned.
+3. Whether it must be returned or stored.
+4. Which API truly requires `Unpin` and whether it can accept `Pin` instead.
+5. Whether a heap allocation is acceptable.
+
+I use `Box::pin` for an owned long-lived future and `pin!` for a local one. I avoid adding an `Unpin` bound just to satisfy `Pin::new`, because that can exclude exactly the normal async futures the API should support.
+
+E0277 here is enforcing a temporal promise: once polling can make location matter, the value must not move. The correct repair creates stable storage and routes future access through its pinned handle.

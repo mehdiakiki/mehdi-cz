@@ -1,0 +1,90 @@
+---
+caseId: "RFA-697"
+title: "A build.rs Environment Input Needs rerun-if-env-changed"
+date: "2026-09-07T10:35:00+01:00"
+lastmod: "2026-09-07T10:35:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "b6d8c1bab44ffa6943dc6addd429c39b3181fb494bb3d529b7513c48156c63c8"
+area: "cargo-dependencies"
+symptom: "Changing an environment variable used by build.rs leaves the generated Rust constant at its previous value."
+summary: "Once a build script narrows Cargo's change detection, every ambient input that affects output needs an explicit rerun contract. Track global variables with rerun-if-env-changed and prove it with two builds sharing one target directory."
+rustVersions: ["Rust 1.98.1", "Cargo 1.98.1", "edition 2024"]
+targets: ["all Cargo targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Cargo build.rs environment change not rebuilding", "rerun-if-env-changed generated file stale", "build script cached environment variable old value"]
+evidence: ["Cargo 1.98.1 two-build sequence", "unchanged target directory and changed RFA_BUILD_MODE", "tracked environment repair regenerates output"]
+sources: ["https://doc.rust-lang.org/cargo/reference/build-scripts.html#rerun-if-env-changed", "https://doc.rust-lang.org/cargo/reference/build-scripts.html#change-detection", "https://doc.rust-lang.org/cargo/reference/environment-variables.html"]
+---
+
+A build script can read an environment variable correctly and still produce the wrong output on the next build. The problem is not reading the value. It is telling Cargo when that value makes cached build output stale.
+
+The [failing project](/rust-failure-atlas/evidence/RFA-697/fail/Cargo.toml) reads `RFA_BUILD_MODE`, writes it into a Rust file under `OUT_DIR`, and includes that constant in the binary. The evidence runner builds with `alpha`, then builds again in the same target directory with `beta`.
+
+The second binary still prints `alpha`. Cargo did not rerun the script because the script declared only `build.rs` as its change input.
+
+## Build scripts have a cache contract
+
+Cargo does not understand arbitrary reads performed by a program. If `build.rs` opens a configuration file, checks a tool version, reads an environment variable, queries Git, or probes a native SDK, Cargo needs a stable description of which changes invalidate its output.
+
+Without any `rerun-if` instruction, Cargo uses a broad package scan. Once the script prints at least one narrow change instruction, that broad default is replaced by the declared set. This is where a well-meant optimization can create stale generated code.
+
+The [Cargo change-detection documentation](https://doc.rust-lang.org/cargo/reference/build-scripts.html#change-detection) is the source I return to. I treat every input read as one line in a dependency ledger, not as an implementation detail.
+
+## Track the variable that actually changes output
+
+The [repaired project](/rust-failure-atlas/evidence/RFA-697/fixed/Cargo.toml) adds:
+
+```rust
+println!("cargo::rerun-if-env-changed=RFA_BUILD_MODE");
+```
+
+The [specific instruction](https://doc.rust-lang.org/cargo/reference/build-scripts.html#rerun-if-env-changed) asks Cargo to rerun when the named environment value changes between Cargo invocations. The same two-build sequence now prints `alpha` and then `beta`.
+
+I emit this line even when the variable is currently absent. Presence, absence, and a changed value are different inputs. Hiding the instruction inside `if let Ok(value)` would fail to track the transition from missing to present.
+
+I also avoid tracking variables that do not affect output. Every declared input creates rebuild work. The goal is an exact dependency set, not the longest list possible.
+
+## Cargo-provided variables are a different category
+
+The instruction is intended for global environment inputs such as a compiler path, SDK selection, or an explicit product mode. Variables such as `TARGET` are supplied and tracked by Cargo's own build model. Cargo's documentation says not to use `rerun-if-env-changed` for its build-script variables.
+
+This distinction prevents a script from restating only part of Cargo's target logic. I read `TARGET`, `HOST`, and `CARGO_CFG_*` at run time, but I reserve custom rerun declarations for external inputs Cargo cannot infer.
+
+For Rust source, `env!` and `option_env!` have their own automatic rebuild tracking. That does not cover a build script calling `std::env::var`, because Cargo cannot inspect arbitrary executable behaviour.
+
+## A clean build cannot detect this bug
+
+Deleting `target` before every CI job makes the failing project appear correct. The script always runs after a clean build and captures the current value.
+
+The bug exists only across reuse. This is why the Atlas fixture deliberately shares one target directory for two builds. It tests the cache invalidation contract rather than only the generated source.
+
+I keep both kinds of CI:
+
+- clean builds prove all outputs can be created from declared source inputs;
+- warm rebuild tests prove relevant changes invalidate exactly the right work;
+- no-change rebuilds prove the script does not run for unrelated edits.
+
+For important generated configuration, the binary or library test asserts the embedded value. Merely seeing “Compiling package” in logs is weaker because it does not prove which generated artifact reached the final crate.
+
+## Ambient discovery can damage reproducibility
+
+An environment variable may point at a developer's local SDK, contain a timestamp, identify a Git checkout, or leak a machine path into output. Correct reruns do not make such builds reproducible.
+
+I ask whether the input should exist at all. A manifest feature, checked-in configuration, lockfile, or command-line contract may be more reviewable. If ambient discovery is required, I record the value category without logging secrets and make failures explicit.
+
+I never embed credentials through generated Rust. Build outputs, compiler diagnostics, caches, and binaries can all retain them.
+
+## My invalidation review
+
+For each build script I list:
+
+1. every file, directory, environment value, tool, and target fact it reads;
+2. which of those inputs can change its emitted instructions or generated bytes;
+3. the `rerun-if-changed` or `rerun-if-env-changed` rule owning that change;
+4. inputs Cargo already tracks itself;
+5. a warm two-build test for each important transition;
+6. a no-change test guarding against unnecessary work;
+7. whether absolute paths, timestamps, or secrets enter output.
+
+The core principle is cache honesty. A build script is a function only if I describe its inputs. `rerun-if-env-changed` turns an ambient variable into one declared edge in Cargo's build graph, and the shared-target two-build fixture proves that the edge really works.

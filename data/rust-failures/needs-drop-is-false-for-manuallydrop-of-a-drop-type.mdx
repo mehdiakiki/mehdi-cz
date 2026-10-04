@@ -1,0 +1,110 @@
+---
+caseId: "RFA-412"
+title: "needs_drop Is False for ManuallyDrop of a Drop Type"
+date: "2026-09-06T03:52:00+01:00"
+lastmod: "2026-09-06T03:52:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "3a1d99ddfce854f6014c5051d48fc5a0206d5361b34b84f79adb5741a3951c79"
+area: "concurrency-memory"
+symptom: "needs_drop::<ManuallyDrop<Tracked>>() returns false even though Tracked has a destructor that increments a counter."
+summary: "needs_drop asks whether the queried outer type requires compiler-run drop glue. ManuallyDrop suppresses that automatic destruction, so its result is false while the programmer still owns an explicit and unsafe cleanup obligation."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust needs_drop ManuallyDrop false", "ManuallyDrop suppresses drop glue", "needs_drop inner type implements Drop"]
+evidence: ["Rust 1.98.1 custom Drop type", "false outer needs_drop result", "explicit ManuallyDrop destruction counter"]
+sources: ["https://doc.rust-lang.org/std/mem/fn.needs_drop.html", "https://doc.rust-lang.org/std/mem/struct.ManuallyDrop.html", "https://doc.rust-lang.org/std/mem/struct.ManuallyDrop.html#method.drop"]
+---
+
+I saw a type containing a resource with `Drop` and expected `needs_drop` to report true. The resource was wrapped in `ManuallyDrop`, so the outer type deliberately had no automatic destructor work.
+
+The [failing fixture](/rust-failure-atlas/evidence/RFA-412/fail.rs) checks `needs_drop::<ManuallyDrop<Tracked>>()`. Rust returns false even though `Tracked` itself implements Drop.
+
+## The query is about the exact type
+
+[`std::mem::needs_drop`](https://doc.rust-lang.org/std/mem/fn.needs_drop.html) asks whether dropping values of `T` requires drop glue. The type parameter in this case is not `Tracked`; it is `ManuallyDrop<Tracked>`.
+
+[`ManuallyDrop`](https://doc.rust-lang.org/std/mem/struct.ManuallyDrop.html) has one central job: prevent Rust from automatically running the inner value's destructor. The wrapper has the same layout as its inner value, but its lifecycle contract changes.
+
+Therefore these two queries can differ:
+
+```rust
+assert!(std::mem::needs_drop::<Tracked>());
+assert!(!std::mem::needs_drop::<std::mem::ManuallyDrop<Tracked>>());
+```
+
+The result describes compiler-managed destruction at that layer.
+
+## False does not mean no resource exists
+
+The wrapped value can still own memory, a file, a lock, or another external resource. `needs_drop == false` does not prove that forgetting the value matches application policy. It says Rust will not automatically invoke drop glue for the queried type.
+
+With `ManuallyDrop`, the programmer accepted responsibility for deciding whether and when the inner destructor runs. That responsibility is invisible to a generic automatic-drop query by design.
+
+I avoid translating `needs_drop` into the phrase “contains nothing to clean up.” The stronger phrase is “requires no automatic drop glue for this type.”
+
+## Explicit destruction is unsafe because state must be proven
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-412/fixed.rs) constructs one tracked value and calls [`ManuallyDrop::drop`](https://doc.rust-lang.org/std/mem/struct.ManuallyDrop.html#method.drop). The call is unsafe because the caller must know that the inner value is currently initialized and has not already been dropped.
+
+After the call, the wrapper's bytes must not be exposed as a live `Tracked`. Calling drop twice would destroy one value twice. Forgetting the call leaks the resource. Dropping uninitialized bytes is also invalid.
+
+The real invariant is a state machine:
+
+```text
+uninitialized -> live -> manually dropped
+```
+
+Only the live state permits exactly one explicit destruction.
+
+## needs_drop is an optimization hint with a one-way guarantee
+
+The documentation allows `needs_drop` to conservatively return true in cases where no destructor would ultimately run. A false result is the useful guarantee: dropping `T` has no side effects requiring drop glue.
+
+I do not use a true result as proof that a custom `Drop` method exists. Types can require recursive field destruction or be treated conservatively.
+
+Most ordinary code should simply let Rust drop values. The query is useful in low-level collection implementations that may skip iteration when element destruction is definitely unnecessary.
+
+It is rarely a reason to add unsafe lifecycle code to application logic.
+
+## ManuallyDrop should not be a public footgun
+
+Public structures with accessible `ManuallyDrop<T>` fields can let safe callers observe or move bytes after an unsafe internal drop. Generic derives may also read fields in ways incompatible with a manually destroyed state.
+
+I keep the wrapper private, store an explicit state when needed, and expose safe operations that preserve the state machine. I review trait derivations such as Debug, Clone, and equality instead of assuming layout transparency implies behavioral transparency.
+
+The standard documentation contains important warnings around generic parameters and moving a manually dropped value. I treat those warnings as part of the API contract, not edge trivia.
+
+## Often Option or ordinary ownership is safer
+
+If I need to take a value once, `Option<T>` often models the state directly:
+
+```rust
+let value = slot.take();
+```
+
+`Some` means live and `None` means absent. Rust then handles destruction of the remaining live case automatically.
+
+`ManuallyDrop` is appropriate for low-level unions, specialized containers, and carefully proven destruction ordering. It is not a faster general replacement for Option without measurement and a complete unsafe proof.
+
+## Panic paths are part of the state machine
+
+If code changes its state flag before manual destruction and the destructor panics, or constructs a replacement between transitions, unwinding can expose inconsistent state.
+
+I order state changes so every panic point leaves a representation that later cleanup understands. For resources with fallible close, I use an explicit finalization method because Drop cannot return the error.
+
+The fixture uses a simple counter and no panic so it isolates the automatic-versus-manual property.
+
+## My audit questions
+
+When `needs_drop` and intuition disagree, I ask:
+
+- What exact outer type is queried?
+- Which wrapper suppresses or owns destruction?
+- Who proves initialization state?
+- Can cleanup occur exactly once on every exit path?
+- Can safe public code observe a post-drop value?
+- Would Option or a separate owner type encode the state safely?
+
+The core principle is that a resource and its automatic drop glue are different facts. `ManuallyDrop<Tracked>` still contains the tracked resource bytes, but Rust has been told not to destroy them automatically. `needs_drop` correctly reports that outer compiler contract as false, leaving explicit cleanup to the unsafe protocol.

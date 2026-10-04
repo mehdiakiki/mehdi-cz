@@ -1,0 +1,151 @@
+---
+caseId: "RFA-046"
+title: "Memory Allocated on One Side of Rust FFI Was Freed on the Other"
+date: "2026-09-04T21:00:00+01:00"
+lastmod: "2026-09-07T14:55:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "07f06b43c363642236cd51bfcc6e140ee7bcb01a2e72f73ff0d9fd894835a1fc"
+area: "ffi-targets"
+symptom: "Memory allocated by Rust or a native library corrupts the heap when the other side releases it."
+summary: "A pointer does not carry its allocator, layout, length, or ownership. Export matching destroy functions and return memory to the component that created it."
+rustVersions: ["stable Rust"]
+targets: ["all FFI targets; allocator identity is deployment-specific"]
+profiles: ["dev", "release"]
+searchTerms:
+  [
+    "Rust FFI free different allocator",
+    "heap corruption Rust C ownership",
+    "CString foreign free allocator mismatch",
+  ]
+evidence: ["allocator ownership trace", "boundary API audit", "sanitizer fixture"]
+sources:
+  [
+    "https://doc.rust-lang.org/std/ffi/struct.CString.html#method.into_raw",
+    "https://doc.rust-lang.org/std/vec/struct.Vec.html#method.from_raw_parts",
+  ]
+---
+
+A raw pointer carries an address. It does not carry which allocator created the allocation, its layout, its capacity, the number of initialized elements, or which function is allowed to destroy the contained values.
+
+Across FFI, these missing facts must live in the API contract.
+
+## The CString rule is explicit
+
+Rust documents the ownership pair for `CString`:
+
+```rust
+let text = std::ffi::CString::new("hello").unwrap();
+let raw = text.into_raw();
+```
+
+The pointer must come back to Rust and be reconstructed with `CString::from_raw`. The C side must not call ordinary `free`, and it must not move the terminating nul or change the string length before returning it.
+
+A safe exported pair can look like:
+
+```rust
+use std::ffi::{CStr, CString, c_char};
+
+#[unsafe(no_mangle)]
+pub extern "C" fn make_message() -> *mut c_char {
+    CString::new("ready").unwrap().into_raw()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn destroy_message(value: *mut c_char) {
+    if !value.is_null() {
+        drop(unsafe { CString::from_raw(value) });
+    }
+}
+```
+
+The C header names `destroy_message` next to `make_message`. Ownership should not depend on somebody remembering that a `char *` secretly came from Rust.
+
+## Why matching `malloc` is not a complete proof
+
+Rust may use a system allocator in a particular build, but assuming C `free` matches it couples the API to that executable, target, runtime, and link arrangement. Windows runtimes and plugin architectures make mismatches especially visible, but the rule should be portable.
+
+Even with the same underlying allocator, deallocation must use a compatible layout. Rust collections may track capacity and alignment not present in a C pointer.
+
+I define ownership at the component API: whoever allocates also exposes the matching destroy operation.
+
+The Atlas fixture makes the wrong deallocation observable under AddressSanitizer. Its [Rust allocator API](/rust-failure-atlas/evidence/RFA-046/allocator.rs) reserves a private header and returns the payload address after that header. The caller can read and write 32 payload bytes, but that address is not the allocation base accepted by `free`.
+
+The [failing C host](/rust-failure-atlas/evidence/RFA-046/fail/host.c) records `creator=rust destroyer=c-free`, then passes the payload directly to C `free`. It runs only in a Clang ASan subprocess, which aborts with an attempted free of an address that was not returned by the allocator. The [repaired host](/rust-failure-atlas/evidence/RFA-046/fixed/host.c) calls `rfa_deallocate`; Rust recovers its header, reconstructs the original layout, and returns the allocation through `System.dealloc` cleanly.
+
+This fixture does not claim that Rust's system allocator and C `malloc` always differ. It demonstrates the broader contract which remains true even when they share a runtime: a payload pointer is not enough to reconstruct the allocator's base address and layout. Different CRTs or custom allocators add another way to violate the same ownership rule.
+
+## Buffers need length and capacity semantics
+
+Passing a `Vec<u8>` as pointer plus length and later rebuilding it requires the original capacity too:
+
+```rust
+let mut bytes = Vec::<u8>::with_capacity(1024);
+bytes.extend_from_slice(b"payload");
+
+let pointer = bytes.as_mut_ptr();
+let length = bytes.len();
+let capacity = bytes.capacity();
+std::mem::forget(bytes);
+```
+
+Reconstruction with `Vec::from_raw_parts` is unsafe and requires the same allocation, element type, alignment, capacity, and initialized length rules. Letting C change any of these silently breaks the contract.
+
+An easier API returns an opaque handle:
+
+```rust
+#[repr(C)]
+pub struct ByteBuffer {
+    data: *const u8,
+    len: usize,
+    private_owner: *mut std::ffi::c_void,
+}
+```
+
+The foreign side reads `data[..len]` under documented lifetime rules and passes the complete handle to a Rust destroy function. It never reconstructs a Rust `Vec`.
+
+## Object destruction must run too
+
+Freeing bytes is not always enough. A `Box<T>` may contain strings, file descriptors, reference counts, or nested allocations. Its Rust destructor must run before the backing memory is released.
+
+I export a typed opaque pointer and matching destroy function:
+
+```rust
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn engine_destroy(engine: *mut Engine) {
+    if !engine.is_null() {
+        drop(unsafe { Box::from_raw(engine) });
+    }
+}
+```
+
+The pointer must be passed exactly once. Double destruction and use after destroy are caller contract violations, so the C wrapper can null its local handle after a successful destroy.
+
+## Memory crossing callbacks
+
+Sometimes foreign code lends a buffer only for the duration of a callback. Rust may create a slice after checking pointer and length, but it must not retain that slice after the callback unless the protocol transfers ownership and guarantees lifetime.
+
+Conversely, a pointer into a Rust vector is invalid if Rust grows or drops the vector while foreign code retains it. A borrow-style API needs a visible start/end scope.
+
+## The first discriminating trace
+
+I record an allocation identity and lifecycle without logging sensitive contents:
+
+```text
+allocation=42 creator=rust size=128 layout=message
+allocation=42 transferred_to=c
+allocation=42 returned_to=rust_destroy
+allocation=42 destroyed
+```
+
+A foreign `free` or a second destroy becomes obvious. Sanitizers and allocator diagnostics can then confirm the failing boundary. I keep a deliberately invalid deallocation in a short-lived child process, never in the normal test runner itself.
+
+## False repairs
+
+Changing `*mut T` to `*const T` affects mutation, not ownership. Casting a pointer to `void *` removes type information but does not make any allocator valid. Leaking every object avoids the incorrect free but creates an unbounded resource problem.
+
+## The regression proof
+
+My two-language fixture allocates and destroys zero, one, and many objects; checks null handling; and runs under memory diagnostics. It tests repeated create/destroy cycles and rejects operations after destroy at the wrapper level.
+
+The API documentation states creator, destroyer, mutability, lifetime, and whether the foreign side may change contents or length. Once those five facts are explicit, allocator mismatches stop being mysterious heap corruption.

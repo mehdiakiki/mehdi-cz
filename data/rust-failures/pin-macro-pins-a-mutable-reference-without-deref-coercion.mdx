@@ -1,0 +1,105 @@
+---
+caseId: "RFA-713"
+title: "pin!(&mut T) Pins the Reference, Not Its Pointee"
+date: "2026-09-07T10:56:00+01:00"
+lastmod: "2026-09-07T10:56:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "cc3ff611caa0a33fd98126262a8bcfffb4f4e0ded03e734ff1c1007360df5811"
+area: "upgrades-compatibility"
+symptom: "Passing pin!(&mut_value) where Pin<&mut T> is expected now produces Pin<&mut &mut T> and fails with E0308."
+summary: "Since Rust 1.97, pin! no longer deref-coerces a mutable-reference input. The macro pins the expression value, so an &mut T input produces Pin<&mut &mut T>. Choose the intended pin layer explicitly."
+rustVersions: ["Rust 1.97", "Rust 1.98.1", "edition 2024"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust pin macro &mut gives Pin &mut &mut E0308", "pin macro no deref coercion Rust 1.97", "expected Pin mut T found Pin mut reference"]
+evidence: ["Rust 1.98.1 E0308 compile failure", "pinning &mut String preserves reference layer", "explicit Pin::new repair for Unpin String"]
+sources: ["https://doc.rust-lang.org/releases.html#version-1970-2026-07-09", "https://doc.rust-lang.org/std/pin/macro.pin.html", "https://doc.rust-lang.org/std/pin/struct.Pin.html", "https://doc.rust-lang.org/std/marker/trait.Unpin.html"]
+---
+
+This call has one more reference layer than it first appears:
+
+```rust
+use std::pin::{pin, Pin};
+
+fn consume(_: Pin<&mut String>) {}
+
+let mut value = String::from("ready");
+let reference = &mut value;
+consume(pin!(reference));
+```
+
+On Rust 1.98.1 it fails with E0308. `reference` has type `&mut String`. The `pin!` macro pins the value of that expression in local storage, so its result is `Pin<&mut &mut String>`. The function wants `Pin<&mut String>`.
+
+Rust 1.97 stopped allowing a dereference coercion inside this use because that coercion could produce an unsound pinning result. The new behavior preserves the input layer instead of silently changing what is pinned.
+
+The [failing fixture](/rust-failure-atlas/evidence/RFA-713/fail.rs) records the mismatch. The [repair](/rust-failure-atlas/evidence/RFA-713/fixed.rs) uses `Pin::new(reference)` because `String` implements `Unpin`.
+
+## The macro pins its expression value
+
+I read `pin!(expression)` as: evaluate this expression into local storage and produce a pinned mutable reference to that stored value.
+
+If the expression produces `FutureType`, the result is approximately `Pin<&mut FutureType>`. If the expression produces `&mut FutureType`, the stored value is a mutable reference, and the result has the extra layer: `Pin<&mut &mut FutureType>`.
+
+The macro cannot infer that I “really meant” the pointee. Both are valid types with different meanings. Pinning a reference value prevents moving that stored reference slot through the pinned handle. It does not automatically establish the pin guarantee for the object elsewhere that the reference points to.
+
+## Ownership and pinning need a precise layer
+
+Pinning does not mean a value can never move anywhere. `Pin<P>` constrains access to the pointee through a pointer type `P` according to the `Pin` contract. Whether moving the pointee matters depends strongly on `Unpin`.
+
+Most ordinary Rust types, including `String`, implement `Unpin`. For them, pinning does not add a meaningful movement restriction. `Pin::new(&mut value)` is safe and explicit.
+
+Self-referential futures and other address-sensitive types may be `!Unpin`. Their pin boundary matters. I cannot replace the failed call with `Pin::new_unchecked` merely to force the desired type. That unsafe constructor would require me to prove the pointee will not be moved in ways forbidden by its pin contract for the full relevant lifetime.
+
+## Three common shapes and their repairs
+
+When I own an expression which must be pinned on the current stack, I pin the owned expression directly:
+
+```rust
+let mut task = pin!(make_task());
+task.as_mut().poll(/* context */);
+```
+
+When I already have `&mut T` and `T: Unpin`, I wrap that reference explicitly:
+
+```rust
+let pinned: Pin<&mut T> = Pin::new(reference);
+```
+
+When I need owned pinned storage that can move as a pointer while its pointee remains stable, I often use `Box::pin(value)`. The allocation has different cost and lifetime behavior, so it is not a mechanical replacement for stack pinning.
+
+For an already pinned value, I use reborrowing methods such as `as_mut` rather than trying to pin the `Pin` wrapper again.
+
+## Why deref coercion was dangerous here
+
+Rust deref coercions normally make APIs pleasant. A mutable reference to a wrapper can often coerce to a mutable reference to its target. Around pinning, an implicit layer change can claim that a pointee has been placed under a stable-address contract even though the macro only controlled the temporary reference value it stored.
+
+The compiler now makes me choose the layer. The E0308 message may mention “expected `String`, found `&mut String`,” which is the useful clue: the macro's inferred inner value is the reference, not the string.
+
+I do not solve this by sprinkling dereference operators until the types align. `pin!(*reference)` would try to evaluate or move through the reference and can be impossible or wrong, especially for non-`Copy` values. The ownership story comes first.
+
+## A type annotation is a good diagnostic tool
+
+When nested `Pin` and reference types become difficult to see, I ask the compiler with an explicit annotation:
+
+```rust
+let pinned_reference: Pin<&mut &mut String> = pin!(reference);
+```
+
+If this compiles, the extra layer is confirmed. I then write the type required by the consumer and decide how that value should be created.
+
+This approach is better than reasoning from variable names such as `pinned` or `reference`. The complete type shows the pointer, the mutable borrow, and the pinned pointee layer.
+
+## The lifetime is local too
+
+The storage created by `pin!` is local to its enclosing scope. Returning the pinned reference or storing it beyond that scope is rejected. Pinning gives a movement promise; it does not extend a lifetime.
+
+For async code, I also distinguish pinning the future value from pinning a mutable reference to a future. Executor APIs often accept `Pin<&mut F>` or own a boxed future. Passing `Pin<&mut &mut F>` may work through some method layers for `Unpin` cases and then fail for the important `!Unpin` case, so I keep the expected type visible.
+
+## My upgrade review
+
+I search for `pin!` calls whose argument is already a reference. For each, I write the exact input type and desired output type. Then I choose among direct stack pinning, `Pin::new` for `Unpin`, reborrowing an existing pin, or owned pinned allocation.
+
+The Atlas reduction uses `String` so the safe repair is unambiguous. A production `!Unpin` type needs a separate proof based on how it was created and who can move it.
+
+The core principle is that macros do not erase type layers. Pinning `T` and pinning `&mut T` are different operations. Rust 1.97 made that difference visible, which removes an implicit coercion from one of the places where precision matters most.

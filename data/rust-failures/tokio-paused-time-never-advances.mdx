@@ -1,0 +1,146 @@
+---
+caseId: "RFA-029"
+title: "A Tokio Test With Paused Time Never Advances"
+date: "2026-09-04T21:00:00+01:00"
+lastmod: "2026-09-07T11:00:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "94111739f4c39a7bbb5cbaecdad592a264dbccea4549cc8b3ffc8414db9dc3ad"
+area: "async-runtime"
+symptom: "A Tokio test uses start_paused, awaits a timer, and hangs even though paused time normally jumps to the next deadline."
+summary: "Tokio paused time advances only when the runtime has no other work. Learn how blocking work keeps the virtual clock still and how to prove which condition is holding the test."
+rustVersions: ["stable Rust", "Tokio 1.x"]
+targets: ["host test target"]
+profiles: ["test"]
+searchTerms:
+  [
+    "tokio test start_paused hangs",
+    "tokio paused time not advancing",
+    "tokio time pause spawn_blocking",
+  ]
+evidence: ["virtual and wall-clock timestamps", "task-removal comparison", "explicit time advance"]
+sources:
+  [
+    "https://docs.rs/tokio/latest/tokio/time/fn.pause.html",
+    "https://docs.rs/tokio/latest/tokio/time/fn.advance.html",
+  ]
+---
+
+When I first use Tokio's paused time, the behavior feels almost magical. A test can ask for one hour of sleep and finish immediately. Then one test waits forever, and adding a longer timeout does nothing.
+
+The useful fact is small: paused time is not a wall clock running faster. Tokio moves its virtual clock to the next timer only when the runtime has no other work to do. If another operation tells the runtime that work is still active, the automatic jump does not happen.
+
+## The smallest healthy case
+
+This test should complete without waiting five real seconds:
+
+```rust
+use tokio::time::{Duration, Instant, sleep};
+
+#[tokio::test(start_paused = true)]
+async fn virtual_sleep_finishes_immediately() {
+    let before = Instant::now();
+
+    sleep(Duration::from_secs(5)).await;
+
+    assert_eq!(before.elapsed(), Duration::from_secs(5));
+}
+```
+
+The timer is registered. The current-thread runtime has nothing useful to poll before that deadline, so Tokio advances its saved time and wakes the timer.
+
+This is different from `std::time::Instant`. Tokio's pause controls `tokio::time::Instant`; it does not freeze the operating system clock.
+
+## The condition that changes the result
+
+A running `spawn_blocking` task deliberately prevents automatic time advancement. This matters when a test waits for virtual time and for a blocking operation at the same time.
+
+```rust
+use std::sync::{Arc, Barrier};
+use tokio::time::{Duration, sleep};
+
+#[tokio::test(start_paused = true)]
+async fn blocking_work_holds_virtual_time() {
+    let barrier = Arc::new(Barrier::new(2));
+    let worker_barrier = barrier.clone();
+
+    let worker = tokio::task::spawn_blocking(move || {
+        worker_barrier.wait();
+    });
+
+    // This timer cannot auto-advance while the blocking task stays active.
+    let timer = tokio::spawn(async {
+        sleep(Duration::from_secs(5)).await;
+    });
+
+    barrier.wait();
+    worker.await.unwrap();
+    timer.await.unwrap();
+}
+```
+
+The example releases the barrier, so it ends. Replace that release with blocking I/O which never returns and the test can remain stuck. The five-second duration is virtual. Waiting five more seconds of wall time does not satisfy it.
+
+Tokio documents this behavior because it is sometimes exactly what a test needs. A program can wait for real I/O inside `spawn_blocking` while keeping its simulated clock stationary. The same feature becomes surprising when the blocking task was not part of the timing model.
+
+The [deadline-isolated failure](/rust-failure-atlas/evidence/RFA-029/fail/src/main.rs) pins Tokio 1.53.1, confirms that its blocking closure has started, and then waits for one virtual hour. The verifier builds it from the [locked manifest](/rust-failure-atlas/evidence/RFA-029/fail/Cargo.lock) before requiring the child process to exceed a wall-clock deadline. The [repaired program](/rust-failure-atlas/evidence/RFA-029/fixed/src/main.rs) stops and awaits the blocking worker, advances registered virtual time explicitly, and must finish inside its own deadline. Compilation time is outside both measurements.
+
+## My first discriminating check
+
+I record both clocks around the failing await:
+
+```rust
+let virtual_before = tokio::time::Instant::now();
+let wall_before = std::time::Instant::now();
+
+// Operation which appears stuck.
+
+eprintln!(
+    "virtual={:?}, wall={:?}",
+    virtual_before.elapsed(),
+    wall_before.elapsed()
+);
+```
+
+If wall time moves while Tokio time remains at zero, I know I am not looking at an ordinary slow timer. I then remove or stub active blocking work. If the timer immediately completes, this single change is stronger evidence than adding logs to every task.
+
+I also search dependencies and helpers for `spawn_blocking`, `block_in_place`, real sockets, filesystem operations, and wait primitives. The blocking task is not always next to the timer assertion.
+
+## Explicit advance is a probe, not always the repair
+
+Tokio provides `time::advance` for moving the virtual clock by a chosen duration:
+
+```rust
+use tokio::time::{self, Duration};
+
+let timeout = tokio::spawn(async {
+    time::sleep(Duration::from_secs(30)).await;
+});
+
+time::advance(Duration::from_secs(30)).await;
+tokio::task::yield_now().await;
+timeout.await.unwrap();
+```
+
+This is a good diagnostic. If explicit advancement wakes the timer, timer registration probably works and auto-advance eligibility is the interesting difference.
+
+I do not automatically leave `advance` everywhere as the final fix. A large jump makes all deadlines crossed by that jump ready together, and the runtime may poll them in any order. A test that cares about ordering should advance in meaningful stages or await the timer behavior directly.
+
+## Repairs that preserve the test's meaning
+
+The repair depends on what the test is proving:
+
+- If blocking work is accidental, replace it with an async test double or make it finish before awaiting virtual timers.
+- If real blocking I/O is intentional, drive virtual time explicitly and keep the two time domains visible in the test.
+- If the scenario depends on real elapsed time, do not pause Tokio time for that test.
+- If several timers express a protocol, advance through the protocol boundaries instead of making one huge jump.
+
+Paused time requires Tokio's current-thread runtime. If a custom test runtime uses another flavor, that is a separate failure and should be checked before investigating auto-advance.
+
+## The regression check I keep
+
+I keep one assertion for the observed property, not only an assertion that the test returned. For example, I check that a retry count changes only after the intended virtual deadline, or that wall time stays below a small generous bound while virtual time moves by minutes.
+
+This catches two regressions: accidentally returning to real sleeps, and introducing a new active task that prevents auto-advance.
+
+The final mental model is simple: paused time advances when the runtime becomes idle enough to jump. A timer being ready in the future is not sufficient by itself.

@@ -1,0 +1,97 @@
+---
+caseId: "RFA-202"
+title: "File::set_len Can Leave the Rust Cursor Past EOF"
+date: "2026-09-05T17:41:00+01:00"
+lastmod: "2026-09-05T17:41:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "964c52fd7e52301c80bf62f526bd304593b46852afa437f77e38bcaae4237580"
+area: "ffi-targets"
+symptom: "After File::set_len shrinks a file, stream_position still reports the old end and the cursor is now beyond the new file length."
+summary: "File::set_len changes file size but not the handle's logical cursor. After shrinking, seek explicitly before the next read or write when your protocol requires the new end."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets with filesystem support"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust File set_len cursor unchanged",
+    "file cursor past EOF after truncate Rust",
+    "set_len stream_position Rust",
+  ]
+evidence: ["Rust 1.98.1 temporary file", "cursor beyond new EOF", "explicit seek repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/std/fs/struct.File.html#method.set_len",
+    "https://doc.rust-lang.org/std/io/trait.Seek.html#method.stream_position",
+    "https://doc.rust-lang.org/std/io/enum.SeekFrom.html",
+  ]
+---
+
+I had a file handle positioned at the old end, shortened the file, and assumed the cursor followed the new end. The following write did not begin where I had pictured it.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-202/fail.rs) creates six bytes, seeks to position `6`, and calls `set_len(2)`. The file is now two bytes long, but `stream_position()` still returns `6`.
+
+File size and cursor position are separate state.
+
+## `set_len` changes one state only
+
+[`File::set_len`](https://doc.rust-lang.org/std/fs/struct.File.html#method.set_len) truncates or extends the underlying file to the requested size. The documentation is explicit that the cursor is not changed.
+
+After shrinking, this state is valid:
+
+```text
+file length:      2
+cursor position:  6
+```
+
+EOF is not a clamp on every open handle. It is the current end of the file. A seek position can be beyond it.
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-202/fixed.rs) first verifies the unchanged position, then seeks to byte `2` because the application's next operation should start at the new end.
+
+## A later write may create a gap
+
+If I write while positioned beyond EOF, filesystems normally create a gap between the current end and the new data. The bytes in an extended region are read as zeroes according to the file API contract, though physical storage details such as sparse allocation belong to the operating system and filesystem.
+
+That means a mistaken cursor can turn a truncation-and-rewrite operation into:
+
+```text
+kept prefix | zero-filled gap | new bytes
+```
+
+The program compiles and the write can succeed. Testing only the final suffix may miss the gap, so I assert the full byte content and metadata length.
+
+If I want to replace a file safely, I usually prefer writing a new temporary file and performing the platform-appropriate replacement protocol. Mutating a live file in place has crash, visibility, and reader-coordination questions beyond cursor position.
+
+## Extending also leaves the cursor alone
+
+When `set_len` increases the length, the new region is filled with zeroes from the file API perspective, but the cursor remains where it was. If the cursor was at byte `2` and I extend to byte `100`, the next write still begins at `2`, not at `100`.
+
+This is the mirror image of the shrink case. I do not infer the next write position from the new length in either direction.
+
+When I truly want the end, I call `seek(SeekFrom::End(0))`. When I want a known record offset, I use `SeekFrom::Start(offset)`. The explicit seek is part of the operation, not cleanup for a strange API.
+
+## Cloned handles can make this harder
+
+Elsewhere in this Atlas, `File::try_clone` demonstrates that cloned handles may share underlying cursor state. A seek through one handle can affect operations through another.
+
+`set_len` itself takes `&self`, which is a reminder that changing the underlying file is different from mutating only a Rust struct field. Other handles and processes can observe file-size changes. The cursor associated with an open description follows platform rules, while file length belongs to the file object.
+
+For code with several handles, my trace records handle creation, clone versus separate open, every seek, every size change, and every write. Logging only the path hides the important state.
+
+## `stream_position` is evidence, not synchronization
+
+[`Seek::stream_position`](https://doc.rust-lang.org/std/io/trait.Seek.html#method.stream_position) reports the current position. It helps prove the local assumption, but it does not reserve that offset against other writers.
+
+If several actors change a file, a sequence of “read length, seek, write” may race. Append mode offers a different operating-system contract for writes at the current end, but append mode has its own interaction with seeking, covered by the next case.
+
+I distinguish a diagnostic observation from an atomic protocol. Knowing the cursor is `2` does not guarantee another actor cannot change the file before my write.
+
+## My regression test crosses the boundary
+
+I test shrink with the cursor before, at, and beyond the new end. I test extension with the cursor at the old end. When the real code reads and writes, I assert the next operation as well as `stream_position`.
+
+Temporary-file fixtures must remove their file before the deliberate assertion panic. The Atlas fixture does this so repeating the evidence does not leave misleading state behind.
+
+I also run platform-specific tests where the application depends on replacement, sparse files, or concurrent visibility. The portable standard-library guarantee is narrower than a complete storage protocol.
+
+The core principle is that a file handle carries several independent pieces of state. Changing length does not imply changing position. After `set_len`, I seek deliberately whenever the next operation depends on the new boundary.

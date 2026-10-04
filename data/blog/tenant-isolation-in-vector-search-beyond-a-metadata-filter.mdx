@@ -1,0 +1,200 @@
+---
+title: "Tenant Isolation in Vector Search Beyond a Metadata Filter"
+date: "2026-11-25T09:00:00+01:00"
+tags: ["vector database", "multi-tenancy", "tenant isolation", "RAG security", "operations"]
+draft: false
+reviewed: true
+reviewedHash: "30dbaf6c08477c82b917059d69d6d7fe3181970283a53a9e16625dc5855d5f85"
+cluster: "reliable-ai-systems"
+campaign: "authority-2026"
+opportunity: "AI-032"
+summary: "A tenant_id filter protects one query path. Real vector-search isolation also covers ingestion, credentials, caches, quotas, backups, deletion, observability, and incident containment."
+---
+
+Adding `tenant_id = ?` to a vector query is useful. It is not a complete multi-tenant isolation design.
+
+Tenant data also passes through ingestion queues, embedding calls, caches, backups, evaluation sets, logs, and operator tools. One forgotten path can cross the boundary even when the main search endpoint filters correctly.
+
+I review isolation as an end-to-end invariant.
+
+## Choose the physical boundary deliberately
+
+Common designs are:
+
+| Boundary | Strength and cost |
+| --- | --- |
+| metadata filter in shared index | efficient, but every path must inject it correctly |
+| namespace or tenant shard | stronger query routing and resource accounting |
+| collection/index per tenant | clearer operations, more objects to manage |
+| database/cluster per tenant | strongest blast-radius reduction, highest cost |
+
+Some vector stores implement tenant data in separate shards. Weaviate, for example, documents [multi-tenancy with a separate shard per tenant](https://docs.weaviate.io/weaviate/manage-collections/multi-tenancy).
+
+I choose by sensitivity, tenant count, corpus size, noisy-neighbour risk, regional requirements, and recovery model—not by the shortest SDK example.
+
+## Tenant identity comes from authentication
+
+The request must not choose an arbitrary tenant:
+
+```json
+{ "query": "roadmap", "tenant": "another-company" }
+```
+
+The trusted gateway derives tenant and subject from authentication and passes a constrained context:
+
+```ts
+type TenantContext = {
+  tenantId: string;
+  subjectId: string;
+  capabilityHash: string;
+  region: string;
+};
+```
+
+Repositories, queues, and vector clients accept this context rather than a free-form optional filter. Missing tenant identity fails closed.
+
+Per-user document authorization is a narrower layer. [Filter Before Retrieval: Permissions Are Part of Relevance](/blog/filter-before-retrieval-permissions-are-part-of-relevance) covers user and group ACLs inside one tenant.
+
+## Ingestion can contaminate the index
+
+A query filter cannot repair chunks written under the wrong tenant.
+
+I put tenant identity on:
+
+```text
+source connector and checkpoint
+document and document version
+chunk and embedding request
+index write and manifest
+dead-letter or repair item
+```
+
+The indexer verifies that source ownership matches destination namespace. A worker must not reuse mutable “current tenant” state between queue messages.
+
+Batch APIs are tested with alternating tenants and a partial failure in the middle. Retry identity includes tenant so a failed batch cannot replay into the previous destination.
+
+## Caches are a frequent cross-tenant path
+
+Unsafe:
+
+```text
+retrieval cache key = hash(query)
+embedding cache key = hash(text)
+answer cache key = hash(prompt)
+```
+
+Embedding vectors for identical public text may be reusable if permissions and provider contracts allow it. The occurrence metadata, retrieval results, and answers usually are not.
+
+I include tenant and all policy-bearing versions in cache identity, or keep caches physically scoped. Cache invalidation and deletion also operate by tenant.
+
+## Credentials decide who can bypass the application
+
+If the application credential can query every tenant without server-enforced constraints, one injection bug has a large blast radius.
+
+Options include:
+
+```text
+tenant-scoped credentials or tokens
+gateway-only database access
+separate service accounts by environment and region
+database-native tenant or document policy
+separate projects/clusters for sensitive tiers
+```
+
+Operator consoles and notebooks follow the same controls. “Only engineers use it” is not isolation.
+
+I log privileged cross-tenant access as an explicit audited operation.
+
+## Isolation includes capacity
+
+One tenant can degrade others by:
+
+```text
+bulk indexing
+very large vectors or metadata
+high-cardinality filters
+expensive top-k queries
+repeated embedding jobs
+backup or restore work
+```
+
+I apply per-tenant admission, concurrency, storage, and cost limits before shared resources saturate. Fair scheduling matters even when data never leaks.
+
+Availability is one dimension of tenant isolation.
+
+## Backup and restore are part of the boundary
+
+Backups may have different tenant semantics from live queries. Weaviate's [backup documentation](https://docs.weaviate.io/deploy/configuration/backups), for example, calls out special handling for offloaded tenants.
+
+I test:
+
+```text
+selective backup if supported
+whole-cluster backup encryption and access
+restore into an empty isolated environment
+tenant identity preserved after restore
+offloaded/inactive tenant coverage
+deletion propagation to retained backups
+```
+
+A restore script that loads tenant A into a default shared namespace is still a data incident.
+
+## Deletion must find every derived copy
+
+Deleting a tenant means more than deleting active vectors:
+
+```text
+source connector state
+chunks and embeddings
+keyword and reranker indexes
+query and answer caches
+evaluation and feedback samples
+dead-letter payloads
+backups according to retention policy
+logs and traces according to their policy
+```
+
+I maintain a manifest of tenant-bearing stores and produce deletion evidence from each. Silent best-effort fan-out is not enough.
+
+## My failure and threat matrix
+
+| Failure | Expected protection |
+| --- | --- |
+| query omits tenant filter | repository or database rejects it |
+| caller supplies another tenant ID | trusted context overrides/rejects it |
+| batch mixes tenant records | per-item validation prevents write |
+| cache key omits tenant | isolation test fails before release |
+| operator token is leaked | scope and environment limit blast radius |
+| noisy bulk import starts | tenant quota and fair queue contain it |
+| restore uses wrong namespace | manifest verification blocks activation |
+| tenant is deleted | reconciliation proves derived copies removed |
+| metrics label exposes tenant name | opaque bounded identifiers only |
+
+I place a control and an observable signal beside each row.
+
+## Test with attractive forbidden data
+
+My test corpus gives tenant B a document that is the exact title match for tenant A's query. Weakly relevant allowed data is not a good isolation test.
+
+I verify every interface:
+
+```text
+vector, keyword, and hybrid search
+fetch by chunk/document ID
+recommend/similar APIs
+batch get and export
+admin and debug endpoints
+cache and evaluation capture
+backup and restore
+deletion and reindexing
+```
+
+Results, counts, latency, and error messages must not reveal another tenant's document existence.
+
+## My design question
+
+I ask: if one line forgets a filter, what else prevents disclosure?
+
+For low-risk corpora, a trusted repository enforcing metadata filters may be proportionate. For sensitive or regulated tenants, namespaces, scoped credentials, or separate infrastructure may be required. The answer can differ by tier.
+
+Tenant isolation is a property of the whole data lifecycle. A metadata filter is one control inside it, not the definition.

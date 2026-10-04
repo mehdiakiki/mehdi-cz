@@ -1,0 +1,124 @@
+---
+caseId: "RFA-169"
+title: "Why thread::scope Propagates an Unjoined Child Panic"
+date: "2026-09-05T17:08:00+01:00"
+lastmod: "2026-09-05T17:08:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "2fda77965c51224713c36cd76aeb0528587d4b1803b3db1785717dfe5805b1b9"
+area: "concurrency-memory"
+symptom: "thread::scope panics after its closure appears to finish because an automatically joined scoped child panicked."
+summary: "A scope waits for every scoped thread before returning. If a child left for automatic joining panics, scope propagates a panic; join handles explicitly when individual failure is part of the result model."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["targets supporting std::thread"]
+profiles: ["dev", "release with panic=unwind", "test"]
+searchTerms:
+  [
+    "Rust thread scope panics child automatically joined",
+    "scoped thread panic propagation join handle",
+    "catch panic from std thread scope",
+  ]
+evidence: ["Rust 1.98.1 caught scope panic", "unjoined scoped child", "explicit-join repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/std/thread/fn.scope.html",
+    "https://doc.rust-lang.org/std/thread/struct.ScopedJoinHandle.html#method.join",
+    "https://doc.rust-lang.org/std/thread/fn.spawn.html",
+  ]
+---
+
+Scoped threads make borrowing safe by guaranteeing completion before the scope returns. That guarantee also means the scope must account for every child panic.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-169/fail.rs) spawns one child that panics and ignores its handle. The scope closure reaches its end, but `thread::scope` automatically joins the child and panics. An outer `catch_unwind` observes the scope-level failure.
+
+## A scope has two lifetimes
+
+[`thread::scope`](https://doc.rust-lang.org/std/thread/fn.scope.html) separates the lifetime during which threads may run from the lifetime of data they may borrow. The borrowed data outlives the complete scope, and all scoped threads finish before the function returns.
+
+This enables safe code such as parallel work over borrowed slices without moving them into `'static` ownership.
+
+The completion guarantee requires a join barrier. Handles not joined by the closure are joined automatically before `scope` returns.
+
+## Automatic joining propagates panic
+
+The documentation states that if any automatically joined thread panics, `scope` itself panics after all threads have been joined. This prevents an ignored handle from silently turning worker failure into success.
+
+The sequence is:
+
+```text
+scope closure returns
+runtime joins remaining children
+one child has a panic result
+scope propagates panic
+```
+
+That is why the apparent source line around `scope` may fail after work in the closure looks complete.
+
+## Explicit join gives a result channel
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-169/fixed.rs) retains the [`ScopedJoinHandle`](https://doc.rust-lang.org/std/thread/struct.ScopedJoinHandle.html#method.join) and calls `join` itself. It asserts that the result is `Err`, handling the child failure as data. Because the child is already joined, the scope does not automatically re-propagate it.
+
+In production I do more than `is_err`. I decide whether to:
+
+- propagate the panic after collecting other results;
+- convert known panic payloads into a structured operation error;
+- cancel cooperative sibling work;
+- finish joining every child, then fail the parent;
+- treat the worker as best-effort with explicit reporting.
+
+The scope guarantees lifetime safety, not one universal failure policy.
+
+## Every child still completes before exit
+
+If one scoped worker panics, other workers are not forcibly killed. Automatic joining waits for them too. A sibling blocked forever can therefore prevent scope exit even after another child failed.
+
+For concurrent operations I design cooperative cancellation and bounded external waits. A shared stop flag or channel can tell siblings to stop at safe points. I still join them to establish completion.
+
+This mirrors the Atlas case [dropping JoinHandle detaches instead of cancelling](/rust/failures/dropping-joinhandle-detaches-instead-of-cancelling): joining and cancellation are separate capabilities.
+
+## Catching the scope panic is not worker recovery
+
+An outer `catch_unwind` can prevent the current thread from unwinding further, but it gives only a panic payload. It does not reconstruct partial results or undo side effects performed before the child failed.
+
+If worker failure is expected, a `Result<T, E>` return from the child is usually clearer than panic. Joining then produces nested outcomes:
+
+```text
+join failed because child panicked
+or child returned Result::Err
+or child returned Result::Ok
+```
+
+I reserve panic for broken assumptions and keep operational failures in typed results.
+
+## Scoped borrowing does not mean sequential work
+
+The safety relationship sometimes gets misunderstood as “the parent keeps variables alive, so children finish in declaration order.” They run concurrently. Only scope exit waits for all of them.
+
+Shared mutation still needs disjoint borrowing or synchronization. The borrow checker can prove disjoint slice partitions, while shared structures may need mutexes or atomics.
+
+The automatic join barrier also has performance consequences: the slowest child determines when the scope returns.
+
+## Deterministic testing
+
+The minimal fixture needs no timing because a child always panics. For multi-worker policies, I add channels or barriers to establish:
+
+1. every worker started;
+2. one worker failed or returned an error;
+3. siblings observed cancellation;
+4. all handles were joined;
+5. the parent reported the intended combined result.
+
+I avoid sleeps because they test scheduler luck rather than lifecycle rules.
+
+## My review checklist
+
+For each scoped spawn, I ask:
+
+- Is its handle joined explicitly or automatically?
+- Can the worker return an operational `Result` instead of panicking?
+- What happens to siblings after one failure?
+- Can any child block scope exit indefinitely?
+- Which borrowed data remains valid, and who mutates it?
+- Does the parent report all relevant failures?
+
+The core principle is structured completion. `thread::scope` will not let child execution escape the borrowing boundary, and it will not silently ignore a panic from a child it joins automatically. If I need another policy, I take ownership of each join result inside the scope and make that policy explicit.

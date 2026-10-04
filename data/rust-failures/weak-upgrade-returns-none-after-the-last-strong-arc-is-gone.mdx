@@ -1,0 +1,81 @@
+---
+caseId: "RFA-658"
+title: "Weak upgrade Returns None After the Last Strong Arc Is Gone"
+date: "2026-09-06T08:18:00+01:00"
+lastmod: "2026-09-06T08:18:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "78437e39ffb1148b4632e1849f4d2359f209aa7edb578a210619f6ed82f0dc70"
+area: "concurrency-memory"
+symptom: "A Weak handle cannot upgrade after the final strong Arc is dropped because the allocation no longer contains a live value."
+summary: "Weak observes without keeping a value alive. Upgrade for each use and handle None as normal lifecycle state; keep a strong owner only where continued liveness is required."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust Weak upgrade returns None", "last strong Arc dropped Weak", "Arc Weak lifecycle cache"]
+evidence: ["Rust 1.98.1 runtime assertion", "last strong owner dropped before upgrade", "Some while live and None after destruction"]
+sources: ["https://doc.rust-lang.org/std/sync/struct.Weak.html#method.upgrade", "https://doc.rust-lang.org/std/sync/struct.Arc.html#method.downgrade", "https://doc.rust-lang.org/book/ch15-06-reference-cycles.html#preventing-reference-cycles-using-weakt"]
+---
+
+A `Weak<T>` points toward an Arc allocation without counting as strong ownership of its value. It prevents neither value destruction nor lifecycle completion. The [failing fixture](/rust-failure-atlas/evidence/RFA-658/fail.rs) drops the last Arc and shows that the remaining Weak cannot upgrade.
+
+## Upgrade is a liveness check and ownership acquisition
+
+[`Weak::upgrade`](https://doc.rust-lang.org/std/sync/struct.Weak.html#method.upgrade) returns `Some(Arc<T>)` only if the value is still alive. The returned Arc becomes a strong owner and keeps it alive for that use. None is an expected result, not corruption.
+
+[`Arc::downgrade`](https://doc.rust-lang.org/std/sync/struct.Arc.html#method.downgrade) creates the Weak. The [repaired fixture](/rust-failure-atlas/evidence/RFA-658/fixed.rs) verifies Some before the last strong drop and None afterward.
+
+I match on the Option close to use and define what disappearance means to the operation.
+
+## Checking strong_count is not a substitute
+
+A count observed before an operation can change immediately on another thread. Even in single-threaded code, a callback may release an owner. Calling upgrade atomically attempts to acquire strong ownership under the type’s guarantees.
+
+I do not write “if count > 0, then upgrade must work” logic. Counts are mainly diagnostic snapshots and can be misleading for synchronization decisions.
+
+Once upgrade returns an Arc, that Arc protects liveness until it is dropped. I keep it for the complete critical operation rather than extracting a raw pointer and releasing ownership early.
+
+## Weak breaks ownership cycles
+
+Parent/child graphs often use strong edges from parent to child and weak back-references from child to parent. This lets the graph be destroyed when external strong roots disappear.
+
+The Book explains [preventing reference cycles with Weak](https://doc.rust-lang.org/book/ch15-06-reference-cycles.html#preventing-reference-cycles-using-weakt). If both directions use Arc, reference counts can keep an unreachable cycle alive.
+
+Code following a weak parent must handle the parent already being gone. That can mean skip notification, return a closed error, or rebuild attachment. Panicking on None makes ordinary teardown race with child work.
+
+## Weak caches do not guarantee hits
+
+A cache storing Weak values avoids extending object lifetime. A lookup may find the key but fail to upgrade because all real users released the value. The cache then removes or replaces the stale entry.
+
+Concurrent cache misses can create duplicate equivalent values unless construction is coordinated. This may be acceptable for pure immutable objects or harmful for unique resources. I specify deduplication separately from liveness.
+
+An upgraded Arc can become stale in a semantic sense even while memory stays alive. Configuration versioning or invalidation still needs explicit data, because reference counts know only ownership.
+
+## Allocation and value lifetimes differ
+
+Weak handles can keep allocation bookkeeping alive after T is dropped, but they cannot access the destroyed value. This is why Weak itself remains valid enough to return None.
+
+Unsafe raw-pointer conversions around Arc/Weak require exact balancing of strong and weak counts and allocator identity. I prefer safe APIs and isolate unavoidable FFI handles behind one ownership protocol.
+
+`Arc::make_mut` can dissociate Weak pointers in documented circumstances. Code using Weak as allocation identity should test this interaction.
+
+## Async tasks need intentional liveness
+
+A background task holding Weak does not keep its service alive. This is useful when work should stop naturally during shutdown. Each loop upgrades, exits on None, and avoids creating a hidden strong cycle.
+
+If work must finish once accepted, the task should receive an Arc or owned job data for that bounded operation. Holding one permanent Arc in an immortal task prevents shutdown. I distinguish service liveness from per-job completion.
+
+Tests coordinate drops rather than rely on timing. They cover upgrade before and after last strong ownership, task exit, stale cache cleanup, and cycle destruction with counters.
+
+## My Weak checklist
+
+- Which component owns the strong Arc that defines liveness?
+- Is None from upgrade normal shutdown, cache miss, or a domain error?
+- Does the code retain the upgraded Arc for the complete operation?
+- Is strong_count being misused as a synchronization guarantee?
+- Does Weak intentionally break a parent, callback, or task cycle?
+- Can cache reconstruction create duplicate resources?
+- Could make_mut or replacement change allocation identity?
+- Do deterministic tests prove destruction and background-task exit?
+
+The core principle is that Weak is a non-owning opportunity to acquire liveness, not a promise that liveness remains. I upgrade at the point of use, keep the resulting Arc while needed, and let None participate normally in shutdown and cache behaviour.

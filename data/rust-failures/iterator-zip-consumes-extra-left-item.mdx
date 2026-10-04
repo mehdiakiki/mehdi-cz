@@ -1,0 +1,111 @@
+---
+caseId: "RFA-191"
+title: "Why Iterator::zip Can Consume One Extra Left-Hand Item"
+date: "2026-09-05T17:30:00+01:00"
+lastmod: "2026-09-05T17:30:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "df7bda3dd1c8c164c97828099fd58c6c8dd4e8cd120eb3e28780f2a9f123bdc3"
+area: "concurrency-memory"
+symptom: "After zip ends because its second general iterator is exhausted, the first iterator has unexpectedly lost one unpaired item."
+summary: "A general zip probes its first iterator before its second, so discovering that the right side ended can leave one unmatched left item consumed. Exact-size specializations may avoid this; preserve unknown remainders with an explicit peek-based loop."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust Iterator zip consumes extra element",
+    "zip loses item from longer iterator Rust",
+    "recover remainder after Iterator zip",
+  ]
+evidence: ["Rust 1.98.1 non-exact iterator", "one unpaired item consumed", "shorter-first repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/std/iter/trait.Iterator.html#method.zip",
+    "https://doc.rust-lang.org/std/iter/struct.Zip.html",
+    "https://doc.rust-lang.org/std/iter/fn.zip.html",
+  ]
+---
+
+`zip` returns pairs until one input ends. This familiar description says how many pairs come out, but it does not fully describe what happened to the two input iterators.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-191/fail.rs) borrows a three-item iterator with `by_ref` and zips it with a one-item array. One pair is produced. When I inspect the longer iterator afterward, `20` is already gone and the next value is `30`.
+
+The terminal call pulled `20` from the left, then discovered that the right side had no matching item.
+
+## Pair production and input consumption are different facts
+
+[`Iterator::zip`](https://doc.rust-lang.org/std/iter/trait.Iterator.html#method.zip) must ask both inputs for a value before it can return one pair. For the general forward iterator, it probes the first iterator and then the second.
+
+The last attempt is therefore roughly:
+
+```text
+left.next()  -> Some(20)
+right.next() -> None
+zip.next()   -> None
+```
+
+There is no general `Iterator` operation that puts `20` back. Ownership of that item has already moved out of the first input.
+
+This does not change the basic output rule: the number of pairs is the shorter input length. It changes what remains available if code expects to continue using a borrowed input after the zipper ends.
+
+## Why a simple array test can show something else
+
+While building this case, I first used two array iterators. Rust 1.98.1 did not lose the extra item in that fixture. Their exact lengths allowed a specialized `Zip` implementation to stop without the same probe sequence.
+
+That is useful optimization, but it is not a promise I can extend to every iterator. I added `filter(|_| true)` to the left input. The values remain the same, while the adapter no longer provides an exact length. The general behaviour becomes visible.
+
+This is exactly why the case records the iterator capabilities and toolchain. A test that passes for `ExactSizeIterator` can hide a bug that returns when the source becomes a parser, channel, filter, or other general stream.
+
+I avoid writing a regression test that demands the extra pull from every implementation. The safe application assumption is that a general zip may consume it.
+
+## Put the known shorter input first only when it is truly known
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-191/fixed.rs) puts the one-item input on the left. When it ends, `zip` sees `None` before advancing the right-hand values, leaving `20` and `30` available.
+
+This is a small repair when one input is structurally the limiter, for example one value per fixed schema field. It is not a general solution for two streams whose end order is unknown. Reversing them only moves which remainder is at risk.
+
+It also reverses the output tuple, so I map the pair if the original field order matters.
+
+## Use peekable inputs when both remainders matter
+
+If I must preserve the first unpaired item from either side, I do not use ordinary `zip` as the owner of discovery. I make both inputs `peekable`, check that each has a next value, and only then consume both:
+
+```rust
+while left.peek().is_some() && right.peek().is_some() {
+    let pair = (left.next().unwrap(), right.next().unwrap());
+    process(pair);
+}
+```
+
+`peek` may itself advance the underlying iterator into its private cache, as RFA-158 demonstrates, but the cached value remains available through the `Peekable`. This preserves it at the adapter level.
+
+For fallible or async sources I use the equivalent explicit state machine. The key is that readiness of both sides is established before ownership of either item is committed to a pair.
+
+## Side effects make the lost item more serious
+
+An iterator item is not always a copied integer. Calling `next` may read a line, update a cursor, acknowledge a record, or run an `inspect` closure. Even if the unpaired value is discarded, the source-side effect already happened.
+
+I keep irreversible acknowledgment outside iterator adapters when exact recovery matters. A stream processing protocol needs an explicit commit point, not an assumption that no output means no input was consumed.
+
+This is related to `take_while`, which consumes its first rejected element, but the reason differs. `take_while` needs an item to test a predicate. `zip` needs a left item before it can discover the right side ended.
+
+## Repeated calls after termination are another boundary
+
+The official documentation explains that further calls after the zipper has no pair may try the first input at most once and then the second at most once. With non-fused iterators, a later `Some` is possible after a previous `None` in the underlying source.
+
+Most standard iterators are fused or behave like they are, but I do not build a recovery protocol from repeated calls to an ended zipper. If permanent termination is required, `fuse` states that requirement directly.
+
+## What I record when debugging zip
+
+I record more than the collected pairs:
+
+1. Which source is the left input?
+2. Which iterator ended first?
+3. Does either source implement `ExactSizeIterator`?
+4. What does each source yield immediately after zip ends?
+5. Does calling `next` have side effects beyond returning a value?
+6. Must either unpaired remainder be preserved?
+7. Would a peek-based state machine express the real protocol better?
+
+The core principle is that adapter output does not reveal every input transition. `zip` can return no pair after already consuming one side. When leftovers have value, I design their ownership explicitly instead of treating the shortest-output rule as a remainder guarantee.

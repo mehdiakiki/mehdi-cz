@@ -1,0 +1,104 @@
+---
+caseId: "RFA-173"
+title: "Why Command::output Is Ok After a Non-Zero Exit"
+date: "2026-09-05T17:12:00+01:00"
+lastmod: "2026-09-05T17:12:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "6a71f7bf521b7649d0b2671bbd7f33f6b412d5a785083567964f55e3862ed3c7"
+area: "ffi-targets"
+symptom: "Command::output returns Ok(Output) for a child that exits with status 7, while application code interpreted Ok as command success."
+summary: "Command::output uses Result for spawning and collecting the process. The child program's outcome is a separate ExitStatus inside Output, so callers must define success from status and retain useful diagnostics."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["Unix fixture using sh; process principle is cross-platform"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust Command output Ok nonzero exit status",
+    "std process Command check exit code",
+    "Command output Result does not mean success",
+  ]
+evidence:
+  ["Rust 1.98.1 Unix child exit 7", "successful process transport", "explicit-status repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/std/process/struct.Command.html#method.output",
+    "https://doc.rust-lang.org/std/process/struct.Output.html",
+    "https://doc.rust-lang.org/std/process/struct.ExitStatus.html#method.success",
+  ]
+---
+
+Rust uses `Result` to make failure visible, but `Ok` cannot always mean that the external work achieved its purpose. A child process is a good example.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-173/fail.rs) runs a Unix shell that exits with status 7. `Command::output()` returns `Ok`, and the program panics because it expected an `Err`.
+
+The operating-system interaction worked: Rust created the process, waited for it, and collected its output. The child itself reported failure separately.
+
+## There are two outcome layers
+
+[`Command::output`](https://doc.rust-lang.org/std/process/struct.Command.html#method.output) returns `io::Result<Output>`. The outer `Result` covers the process operation performed by Rust. For example, an executable may not exist, permission may be denied, or waiting may fail.
+
+[`Output`](https://doc.rust-lang.org/std/process/struct.Output.html) then contains three important pieces:
+
+```text
+status   how the child terminated
+stdout   bytes captured from standard output
+stderr   bytes captured from standard error
+```
+
+The child can start and finish perfectly from the operating system's perspective while returning a status that its own contract defines as unsuccessful.
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-173/fixed.rs) unwraps the process operation and then checks [`ExitStatus::success`](https://doc.rust-lang.org/std/process/struct.ExitStatus.html#method.success). For the fixture, it also verifies that `status.code()` is `Some(7)`.
+
+## An exit code is part of the tool's protocol
+
+Zero conventionally means success, and `status.success()` expresses the platform definition Rust exposes. Some programs use several non-zero codes to distinguish “not found,” “partial result,” bad input, or internal failure.
+
+I therefore do not always reduce the status to one boolean immediately. At an integration boundary I map the documented codes into a small domain enum:
+
+```rust
+enum SearchOutcome {
+    Match(Vec<u8>),
+    NoMatch,
+}
+```
+
+Unexpected codes become an error carrying the status and a bounded part of stderr. This preserves meaning without leaking raw process details through the entire application.
+
+## `status.code()` can be absent
+
+A process may terminate without an ordinary numeric exit code, for example because of a signal on Unix. `ExitStatus::code()` therefore returns an `Option<i32>`.
+
+Code that treats `None` as zero creates exactly the wrong result. I keep the full `ExitStatus` for logging and use target-specific extensions only when the application truly needs more termination detail.
+
+This distinction also belongs in tests. A test that checks only code 7 is useful for this case, but a production process wrapper should have a policy for missing codes and forced termination.
+
+## Output is bytes, not guaranteed text
+
+`stdout` and `stderr` are byte vectors. External programs are not required to emit UTF-8. `String::from_utf8_lossy` can be appropriate for human diagnostics, while a machine protocol may need strict decoding or direct byte parsing.
+
+I also bound what I retain in errors. A failed command can emit a very large stream or include secrets. Capturing output is convenient, but error reporting still needs a size and redaction policy.
+
+For long-running or high-volume children, `output()` may be the wrong shape entirely because it waits and collects. Spawning with configured pipes and consuming streams gives more control, but it adds deadlock, cancellation, and lifecycle concerns. The two-layer status rule remains unchanged.
+
+## Shells add another protocol layer
+
+The fixture uses `sh -c` only to produce a portable Unix failure code. In normal Rust code I invoke an executable with separate arguments when possible. That avoids shell parsing, quoting differences, and injection risks.
+
+If I intentionally use a shell, I am now interpreting both the shell's behaviour and the underlying command's behaviour. Pipelines can further change which exit is reported. This must be explicit in the wrapper rather than assumed from `Command`.
+
+## My process wrapper checklist
+
+When external command handling is unreliable, I inspect:
+
+1. Did spawning or waiting fail, or did the child report failure?
+2. What statuses does this specific tool document?
+3. Can termination occur without an exit code?
+4. Are stdout and stderr text, structured bytes, or untrusted diagnostics?
+5. Could captured output be too large or sensitive?
+6. Is timeout or cancellation allowed to leave another process running?
+7. Is a shell changing quoting or exit semantics?
+
+I usually centralise these answers in one typed wrapper. Callers then receive a domain result instead of repeating partial status checks.
+
+The core principle is that transport success and operation success are different. `Ok(Output)` says Rust completed its side of the process interaction. Only the child's status, interpreted according to that program's contract, says whether the requested work succeeded.

@@ -1,0 +1,313 @@
+---
+title: "Does a Type Exist at Runtime? Following One Value From Source to Register"
+date: "2026-09-09T08:10:00+01:00"
+lastmod: "2026-09-09T08:10:00+01:00"
+tags: ["types", "rust", "compilers", "assembly", "types under the hood"]
+draft: false
+reviewed: true
+reviewedHash: "d70ff0aa2af83d8ff105a7c545925c741366452a85c3031d52b93f11409f32e3"
+cluster: "rust-under-the-hood"
+campaign: "editorial"
+summary: "I followed one u8 through the four stages of the Rust compiler: HIR, MIR, LLVM IR, and assembly. The type is a word, then a field, then a width, then nothing. The u8 and u32 versions of the same function compile to the same two instructions, and the one check a type does produce is the debug overflow guard."
+---
+
+A type exists at runtime exactly as long as some stage of the compiler still needs it. I followed one small value, a `u8`, through the four stages of rustc to see where it stops being needed. In the source it is a word. In the first intermediate form it is still a word. In the second it is attached to every value.
+
+In LLVM it is a width, `i8`, and the fact that it is unsigned is already gone. In the final assembly it is nothing at all: the `u8` version and the `u32` version of the same function are the same two instructions.
+
+There is one exception, and it is the most interesting part. In a debug build the compiler reads the type and adds a check that guards its edge. I show that guard with a running program and a test file that passes in both build modes.
+
+This is a spoke of [What Is a Type?](/blog/what-is-a-type-a-set-of-values-a-promise-about-operations-or-both). There I showed that a type is a set of allowed values and a set of allowed operations, and that both halves disappear before the processor runs. Here I want to see the disappearance happen, stage by stage.
+
+## The program
+
+I could not make it smaller:
+
+```rust
+#[no_mangle]
+pub fn bump(age: u8) -> u8 {
+    age + 1
+}
+
+#[no_mangle]
+pub fn bump_wide(age: u32) -> u32 {
+    age + 1
+}
+```
+
+Two functions, same body, different types. The `no_mangle` attribute only keeps the names readable in the output. I used rustc 1.95 nightly on x86-64 Linux, and every stage below is one command away: `-Z unpretty=hir`, `--emit mir`, `--emit llvm-ir`, `--emit asm`. The files and a script that reproduces every output are in the `types-under-the-hood` fixture of the site repository.
+
+Some outputs are shortened here, and I say so each time.
+
+The first two stages are also the subject of "HIR, THIR, and MIR: The Same Rust Function at Three Compiler Stages", another article on this site, which goes deeper into what each form is for. Here I only follow the type.
+
+## Stage 1: HIR, the type is still a word
+
+HIR is the high-level intermediate representation. It is the source after macros are expanded and names are resolved, printed back as Rust:
+
+```rust
+fn bump(age: u8) -> u8 { age + 1 }
+```
+
+Nothing changed. The type is exactly where I wrote it. At this stage the compiler has checked that `age` is a `u8`, that `1` can be a `u8`, and that `+` is allowed between two of them. That is the behavior half of the type doing its job: the operation was allowed.
+
+If I had written `age + true`, this is the stage that would have refused.
+
+## Stage 2: MIR, the type is on every value
+
+MIR is the mid-level representation. Variables become numbered locals, and every operation is one line:
+
+```text
+fn bump(_1: u8) -> u8 {
+    debug age => _1;
+    let mut _0: u8;
+
+    bb0: {
+        _0 = Add(copy _1, const 1_u8);
+        return;
+    }
+}
+```
+
+`_1` is the argument and `_0` is the return value. `bb0` is a basic block, a straight run of instructions with one entry and, at the end, one decision about where to go next. The type is now on every local. Even the constant is spelled `1_u8`.
+
+At this stage the program carries more type information than at any other. This is the level where the borrow checker and the optimizer both run, and both need to know what every local holds.
+
+In a debug build this stage gains a local, an operation, and a check, and that check is the most important thing in this article. It gets its own section below, after the type has finished disappearing.
+
+## Stage 3: LLVM IR, the type is a width
+
+LLVM is the backend that most of rustc's optimization and all of its machine code go through. Rust hands it this:
+
+```llvm
+define noundef i8 @bump(i8 noundef %age) unnamed_addr #0 {
+start:
+  %_0 = add i8 %age, 1
+  ret i8 %_0
+}
+```
+
+The word `u8` is gone. In its place is `i8`, which in LLVM means "an integer of 8 bits" and nothing more. LLVM does not have signed and unsigned integer types. It has widths, and the sign lives in the operation when it matters: a signed division is `sdiv`, an unsigned one is `udiv`.
+
+For addition it does not matter. Computers store signed numbers in two's complement, a representation chosen so that adding signed and unsigned values is the same bit operation. So `add i8` is the whole story.
+
+This is the stage where the type lost half of its meaning. `u8` said "8 bits, never negative". LLVM keeps "8 bits" and forgets "never negative", because for this operation the difference does not change a single bit of the result.
+
+## Stage 4: assembly, the type is nothing
+
+The final stage, the assembly of both functions in a release build:
+
+```asm
+bump:
+    leal    1(%rdi), %eax
+    retq
+
+bump_wide:
+    leal    1(%rdi), %eax
+    retq
+```
+
+They are the same two instructions.
+
+A register is a small storage slot inside the processor. `leal 1(%rdi), %eax` reads the register `rdi`, where the argument arrives, adds 1, and writes the result to `eax`, where the return value goes. It is a 32-bit instruction.
+
+It does not know the argument was a `u8`. It does not cut the result to 8 bits. It does the same work for the `u8` and the `u32`.
+
+So where did the 8 bits go? They went into the calling convention, the agreement between the caller and the function about which registers carry what. For x86-64 the agreement puts a small integer argument in `rdi` and the return value in `rax`, and only the low 8 bits carry a `u8`. What happens to the bits above them is a compiler convention, not a rule the processor knows.
+
+I looked at the caller in the release build of the program below, and rustc does two things around the call. The call target is shortened here, since this program does not use `no_mangle`:
+
+```asm
+    movzbl  8(%rsp), %edi      # -> load the byte, zero the bits above it
+    callq   bump
+    movb    %al, 4(%rsp)       # -> keep only the low byte of the result
+```
+
+Extend before the call, read one byte after. That is the last trace of the type: a promise between two pieces of code about which bits to read. The processor does not check it. It adds 32 bits.
+
+## The one check a type produces: the overflow guard
+
+Everything so far says the type gets thinner at each stage. There is one place where the opposite happens, where the compiler looks at the type and adds something to the program. I want to show it with a running program, not only with compiler output.
+
+The program defines the same two functions again, marked `#[inline(never)]` so they stay separate functions, and calls both on the last value that fits in a `u8`. `black_box` hides the constant from the optimizer, and I come back to why below:
+
+```rust
+fn main() {
+    let build = if cfg!(debug_assertions) { "debug" } else { "release" };
+    println!("{build} build: bump_wide(255) = {}", bump_wide(std::hint::black_box(255)));
+    println!("{build} build: bump(255)      = {}", bump(std::hint::black_box(255)));
+}
+```
+
+Compiled with `rustc age_run.rs`, which is a debug build. The output is shortened: the real panic line also carries a thread id and a note about backtraces.
+
+```text
+debug build: bump_wide(255) = 256
+
+thread 'main' panicked at age_run.rs:4:26:
+attempt to add with overflow
+```
+
+Compiled with `rustc -O age_run.rs`, a release build:
+
+```text
+release build: bump_wide(255) = 256
+release build: bump(255)      = 0
+```
+
+Same source, same processor, two different answers for `bump(255)`. The debug build stops the program. The release build returns 0. The `u32` version returns 256 in both, because 256 is inside its type.
+
+Here is where the difference comes from. The debug MIR for `bump` is not one `Add`. The long `assert` line is one line in the real output, wrapped here:
+
+```text
+fn bump(_1: u8) -> u8 {
+    debug age => _1;
+    let mut _0: u8;
+    let mut _2: (u8, bool);
+
+    bb0: {
+        _2 = AddWithOverflow(copy _1, const 1_u8);
+        assert(!move (_2.1: bool), "attempt to compute `{} + {}`, which would overflow",
+               copy _1, const 1_u8) -> [success: bb1, unwind continue];
+    }
+
+    bb1: {
+        _0 = move (_2.0: u8);
+        return;
+    }
+}
+```
+
+`AddWithOverflow` returns two things into `_2`: the sum and a boolean that says whether the sum left the type. The `assert` reads the boolean. If it is true, the program panics, and `unwind continue` means the panic then unwinds through the callers as usual. If it is false, execution continues in `bb1`, which returns the sum.
+
+In the debug assembly the same thing is visible. This is the start of the function, cut just after the guard:
+
+```asm
+bump:
+    pushq   %rax
+    movb    %dil, %cl
+    movb    %cl, %al
+    addb    $1, %al
+    movb    %al, 7(%rsp)
+    cmpb    %cl, %al
+    jb      .LBB0_2          # -> jump to the overflow panic
+```
+
+The original byte is copied into `cl`, one is added into `al`, and then the guard is two instructions: compare the result with the original, and jump to the panic if the result is below it as an unsigned number. For an addition of 1, the result is below the input only when it wrapped from 255 to 0.
+
+This is the moment I wanted to see. The type `u8` says the value has 256 members. The compiler read that, and in debug mode it wrote instructions that watch the edge of the set. In release mode it read the same type and wrote no guard at all.
+
+Two details make the release case precise. First, the rule: overflow checks are on when debug assertions are on, which is the default at optimization level 0, and off otherwise, and they can be switched independently with `-C overflow-checks`. When the checks are off, the result is defined as wrapping, and this was decided in RFC 560. It is not undefined behavior.
+
+Second, the mechanism: `leal` wraps at 32 bits, so after `bump(255)` the register `eax` actually holds 256. The 0 that the program prints appears because the caller reads only the low byte, exactly as stage 4 showed. No instruction masks the value to 8 bits inside `bump`. The wrap comes from which bits the caller looks at.
+
+So the guard is something the compiler added after reading the type, and it is optional: the same type produces it in one build and not in the other. The processor executing `cmpb` has no idea it is protecting a `u8`. It compares two bytes and sets a flag.
+
+There is a third option, which is the one I use in real code when I mean to wrap or mean to check. `255u8.wrapping_add(1)` returns 0 in both builds. `255u8.checked_add(1)` returns `None` in both builds. Here the decision moves from the build mode into the source, where the reader can see it.
+
+And there is a case where the compiler does not wait for runtime at all. When the overflow is visible inside one function body, it refuses to build, in every mode:
+
+```rust
+let x: u8 = 255;
+let y = x + 1;
+```
+
+The error is shortened to its three important lines:
+
+```text
+error: this arithmetic operation will overflow
+  |     let y = x + 1;
+  |             ^^^^^ attempt to compute `u8::MAX + 1_u8`, which would overflow
+  = note: `#[deny(arithmetic_overflow)]` on by default
+```
+
+This is the type's shape used at compile time, before any instruction exists. It is also why the running program needs `black_box`.
+
+Without it, the release build computed `bump(255)` at compile time, printed the same 0, and its assembly contains no call to `bump` at all. The result was the same, but the processor never did the work I am describing. With `black_box` the value is only known at runtime and the call is really made. The standard library says `black_box` is a best-effort hint and not a guarantee, so I checked the assembly rather than trusting it.
+
+## The tests that pin this
+
+I put the claims of the previous section into one test file, compiled once as a debug build and once as a release build. The same file passes in both, because each test says what its own build mode promises:
+
+```rust
+#[test]
+fn inside_the_type_both_builds_agree() {
+    assert_eq!(bump(41), 42);
+    assert_eq!(bump_wide(41), 42);
+}
+
+#[test]
+fn the_wide_type_has_room_for_256() {
+    assert_eq!(bump_wide(255), 256);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "attempt to add with overflow")]
+fn debug_build_refuses_to_leave_the_type() {
+    let _ = bump(std::hint::black_box(255));
+}
+
+#[cfg(not(debug_assertions))]
+#[test]
+fn release_build_wraps_around_to_zero() {
+    assert_eq!(bump(std::hint::black_box(255)), 0);
+}
+
+#[test]
+fn wrapping_add_makes_the_wrap_explicit_in_both_builds() {
+    assert_eq!(255u8.wrapping_add(1), 0);
+    assert_eq!(255u8.checked_add(1), None);
+}
+```
+
+`rustc --test age_tests.rs`, the debug build. The test harness runs tests in parallel, so the order varies, and the result lines are shortened:
+
+```text
+test debug_build_refuses_to_leave_the_type - should panic ... ok
+test inside_the_type_both_builds_agree ... ok
+test wrapping_add_makes_the_wrap_explicit_in_both_builds ... ok
+test the_wide_type_has_room_for_256 ... ok
+test result: ok. 4 passed; 0 failed
+```
+
+`rustc --test -O age_tests.rs`, the release build:
+
+```text
+test inside_the_type_both_builds_agree ... ok
+test the_wide_type_has_room_for_256 ... ok
+test release_build_wraps_around_to_zero ... ok
+test wrapping_add_makes_the_wrap_explicit_in_both_builds ... ok
+test result: ok. 4 passed; 0 failed
+```
+
+## The model I take from this
+
+1. A type is carried by the compiler from stage to stage, and each stage keeps only the part it needs.
+2. HIR keeps the whole type, because it checks operations. MIR keeps the whole type on every local, because the borrow checker and the optimizer run there.
+3. LLVM keeps the width and forgets the sign, because for most instructions the sign does not change the bits.
+4. Assembly keeps nothing. The last trace is a calling convention, a promise about which bits matter, which the processor never checks.
+5. The one place a type produces an instruction is a check the compiler decides to emit, like the debug overflow guard. The check depends on the build mode, and the same type produces it in one build and not in the other.
+
+Looking back at the pillar's question, this is what "a type has no real representation at the lower levels" means in practice. It is not that the type is deleted at one moment. It is that every stage forgets a little more, until the processor receives instructions that would be the same for a different type.
+
+## What I check when I read compiler output
+
+- Which stage am I looking at? A type that is present in MIR and absent in assembly is normal, not a bug.
+- Is this a debug or a release build? The overflow guard is the most common difference, and it is the type's shape appearing and disappearing.
+- Where is the width enforced? If the function does not cut the result, the caller is doing it, as the `movb %al` above shows.
+- Does the instruction depend on the sign? For `add` and `sub` it does not. For comparison, division, and shifts it does, and that is where a `u8` and an `i8` finally compile differently.
+- Did I mean to wrap? If yes, `wrapping_add` says so in the source. If no, `checked_add` keeps the guard in every build.
+- Did the processor really run it? If a constant went in, check the assembly for the call before trusting a measurement.
+
+## Sources
+
+- [rustc dev guide: overview of the compiler](https://rustc-dev-guide.rust-lang.org/overview.html)
+- [rustc dev guide: the HIR](https://rustc-dev-guide.rust-lang.org/hir.html)
+- [rustc dev guide: the MIR](https://rustc-dev-guide.rust-lang.org/mir/index.html)
+- [LLVM language reference](https://llvm.org/docs/LangRef.html)
+- [The Rust Reference: operator expressions, including overflow](https://doc.rust-lang.org/reference/expressions/operator-expr.html)
+- [The rustc book: codegen options, overflow-checks](https://doc.rust-lang.org/rustc/codegen-options/index.html)
+- [Rust standard library: std::hint::black_box](https://doc.rust-lang.org/std/hint/fn.black_box.html)
+- [RFC 560: integer overflow](https://rust-lang.github.io/rfcs/0560-integer-overflow.html)
+- [System V x86-64 psABI](https://gitlab.com/x86-psABIs/x86-64-ABI)

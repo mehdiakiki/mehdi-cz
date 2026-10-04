@@ -1,0 +1,106 @@
+---
+caseId: "RFA-076"
+title: "E0606: Why a Rust `*const str` Cannot Be Cast Directly to `usize`"
+date: "2026-09-05T08:40:00+01:00"
+lastmod: "2026-09-05T08:40:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "04e5e0a2f13ee54a534f92ab75da0ae3380fc0584b44760ba0058b11f43f8320"
+area: "concurrency-memory"
+symptom: "Casting a const str pointer directly to usize fails with E0606 because the raw string-slice pointer is wide."
+summary: "A pointer to str carries a data address and length metadata, while usize can hold only one address-sized component. Extract the thin byte pointer and preserve metadata separately according to the operation."
+rustVersions: ["Rust 1.98.1"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust E0606 casting const str pointer as usize invalid",
+    "cast through thin pointer first Rust",
+    "fat pointer str address metadata",
+  ]
+evidence: ["Rust 1.98.1 compile failure", "pointer-component model", "thin data-pointer repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/error_codes/E0606.html",
+    "https://doc.rust-lang.org/reference/type-layout.html#pointers-and-references-layout",
+  ]
+---
+
+A reference to `str` points to dynamically sized data. Converting it to a raw pointer does not remove the information needed to describe that data:
+
+```rust
+fn main() {
+    let text: &str = "atlas";
+    let address = text as *const str as usize;
+    println!("{address}");
+}
+```
+
+Rust 1.98.1 reports E0606 and suggests casting through a thin pointer first. The [failing fixture](/rust-failure-atlas/evidence/RFA-076/fail.rs) records this exact diagnostic.
+
+## A string-slice pointer contains metadata
+
+`str` has no size known in its type. A particular `&str` value needs two pieces of runtime information:
+
+```text
+data address: where the UTF-8 bytes begin
+length: how many bytes belong to this slice
+```
+
+A raw `*const str` remains a wide pointer containing equivalent metadata. One `usize` has room for an address-sized integer, not both the address and length. A direct cast would silently discard information without saying which component is wanted.
+
+The [Reference layout section](https://doc.rust-lang.org/reference/type-layout.html#pointers-and-references-layout) explains that pointers to unsized types are sized and generally at least as large as a pointer, with slice pointers currently represented using a pointer and length. Code should rely on documented operations rather than freezing an unspecified aggregate layout.
+
+## Extract the byte address deliberately
+
+If I need the address of the first byte for diagnostics or identity during one execution:
+
+```rust
+let text: &str = "atlas";
+let address = text.as_ptr() as usize;
+let length = text.len();
+```
+
+`str::as_ptr` returns `*const u8`, a thin pointer. Its conversion to `usize` is well formed. The length remains a separate value. The [repaired fixture](/rust-failure-atlas/evidence/RFA-076/fixed.rs) verifies that the extracted address is nonzero on Rust 1.98.1.
+
+This does not create a portable serialized pointer. Process addresses can change between runs, become invalid when storage moves or is freed, and are meaningless in another process.
+
+Even the numeric value is mainly diagnostic evidence, not durable application data.
+
+## Trait objects carry different metadata
+
+A `*const dyn Trait` is also wide, but its metadata identifies a vtable rather than a byte length. Casting through `*const ()` can extract the data-pointer component:
+
+```rust
+let data_address = object as *const dyn Trait as *const () as usize;
+```
+
+Discarding the vtable means the integer is not enough to reconstruct a usable trait object. The same “wide” category therefore does not imply interchangeable metadata.
+
+When code needs to preserve and reconstruct metadata, I use APIs designed for raw pointer metadata and verify their stability on the selected Rust version. For ordinary application code, retaining the original reference or a safe owner is better.
+
+## Address exposure is not a dereference permission
+
+Converting a pointer to an integer exposes an address. Converting that number back later does not by itself prove that the allocation is still live, aligned, initialized, or legal to access under Rust's aliasing model.
+
+Strict-provenance APIs distinguish address manipulation from the provenance needed for memory access. Hash tables, tagged-pointer structures, and FFI handles need a complete safety argument beyond matching numeric addresses.
+
+The repaired case only prints or compares the data address. It does not dereference a reconstructed pointer, which would add lifetime and provenance obligations unrelated to E0606.
+
+## Hashing content and hashing identity are different
+
+If the goal is a stable key for text, the pointer address is usually wrong. Two equal strings can live at different addresses, and one allocation can later reuse an old address. Hashing the string contents expresses value identity.
+
+Pointer identity is useful only while allocation identity is meaningful and the owner remains alive. Even then, I normally keep a typed raw pointer or a safe stable handle rather than erase it to `usize` early.
+
+## My first check
+
+When E0606 names a wide pointer, I write down:
+
+1. The pointee type and why it is dynamically sized.
+2. The metadata kind: slice length or trait vtable.
+3. Which component the operation actually needs.
+4. Who keeps the pointee alive.
+5. Whether the value is only observed or later dereferenced.
+
+The official [E0606 page](https://doc.rust-lang.org/error_codes/E0606.html) covers invalid casts broadly. In this case the compiler prevents an information-losing conversion from masquerading as an ordinary address cast. Extract a thin data pointer only when that is truly the value needed, and keep metadata and ownership visible for every later operation.

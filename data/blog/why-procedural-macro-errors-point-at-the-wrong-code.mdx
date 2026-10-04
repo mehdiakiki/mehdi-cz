@@ -1,0 +1,277 @@
+---
+title: "Why Procedural Macro Errors Point at the Wrong Code"
+date: "2026-09-15T19:00:00+01:00"
+tags: ["rust", "procedural macros", "compiler diagnostics", "spans", "trybuild"]
+draft: false
+reviewed: true
+reviewedHash: "5122322628eb52c9dbb8d40078fa0a2b2c1e620a3e8e9cf437cc2765a2f2bcde"
+cluster: "rust-under-the-hood"
+campaign: "authority-2026"
+opportunity: "RUST-007"
+summary: "A span comparison harness showing why generated Rust errors point at the macro invocation, how to preserve input spans, and how to test diagnostics with compile-fail fixtures."
+---
+
+When a procedural macro generates invalid Rust, the compiler sometimes underlines the macro invocation instead of the field, type, or attribute that caused the problem.
+
+The compiler is not guessing randomly. Every token has a `Span`, and the generated error points to the span attached to the token involved. If my macro gives generated tokens a broad call-site span, the best location rustc can show is the macro call.
+
+Good procedural macro diagnostics begin before code generation. I validate the input syntax, attach each error to the smallest meaningful source node, and test the rendered compiler output as part of the macro's public interface.
+
+## A span is location plus expansion context
+
+Procedural macros receive and return token streams. Each identifier, punctuation mark, literal, and group carries an opaque `Span`.
+
+The Rust Reference describes spans as source extents used primarily for error reporting. They also participate in name resolution and macro expansion context, so a span is more than line and column. See [Procedural Macros in the Rust Reference](https://doc.rust-lang.org/reference/procedural-macros.html).
+
+Stable APIs let me inspect or replace spans in controlled ways, but not construct arbitrary source locations. The main choices include:
+
+- preserve the span from an input token;
+- use `Span::call_site()` for generated tokens resolved around the invocation;
+- use `Span::mixed_site()` for behaviour closer to declarative macro hygiene in supported cases;
+- apply one existing span to quoted generated tokens.
+
+The diagnostic quality depends on which source token I preserve.
+
+## The unhelpful version validates too late
+
+Suppose a derive macro requires every field to implement `Display`. The macro can generate:
+
+```rust
+impl Describe for User {
+    fn describe(&self) -> String {
+        format!("{}", self.payload)
+    }
+}
+```
+
+If `payload` has no `Display` implementation, rustc reports an error in expanded code. Depending on the spans, it may highlight `#[derive(Describe)]` or a generated expression the user never wrote.
+
+The user sees a trait-bound error but does not know whether the macro rejected the field name, type, or attribute.
+
+I prefer to validate the macro's own requirements before emitting the implementation. When the macro contract permits only selected types, I return a focused error on `field.ty`:
+
+```rust
+return Err(syn::Error::new_spanned(
+    &field.ty,
+    "Describe fields must use a supported display type",
+));
+```
+
+Then the error underlines the type the user can change.
+
+For an open-ended trait bound, I may instead generate an explicit `where FieldType: Display` bound using the field type's span. Rustc can then explain the unsatisfied constraint in a familiar way.
+
+## Do not panic for user input errors
+
+A panic becomes a procedural macro failure and commonly points at the invocation. It is suitable for a macro implementation bug, not an invalid attribute supplied by the user.
+
+I parse into `Result` and convert expected errors into `compile_error!` tokens:
+
+```rust
+#[proc_macro_derive(Describe, attributes(describe))]
+pub fn derive_describe(input: TokenStream) -> TokenStream {
+    match expand(syn::parse_macro_input!(input as syn::DeriveInput)) {
+        Ok(tokens) => tokens.into(),
+        Err(error) => error.to_compile_error().into(),
+    }
+}
+```
+
+`syn::Error::new_spanned` accepts syntax implementing `ToTokens` and covers its token range. `syn::Error::new(span, message)` is better when I already have the exact token span.
+
+The user receives an ordinary compile error at their source instead of a custom-attribute panic.
+
+## Compare four span strategies
+
+I use a small harness with the same invalid input and four macro implementations:
+
+```rust
+#[derive(Validate)]
+struct Request {
+    #[validate(range = "not a number")]
+    retries: u8,
+}
+```
+
+The error should point at the invalid string literal, not the whole struct.
+
+| Strategy | Span used | Typical underline | Quality |
+| --- | --- | --- | --- |
+| `panic!(...)` | macro invocation | `#[derive(Validate)]` | Poor for user mistakes |
+| `compile_error!` from plain `quote!` | generated/call site | derive invocation or expansion | Message useful, location broad |
+| `Error::new_spanned(attribute, ...)` | complete attribute | `#[validate(...)]` | Better |
+| `Error::new(literal.span(), ...)` | value literal | invalid string literal | Best actionable location |
+
+The exact renderer can change across compiler releases, which is why I keep compile-fail snapshots. The stable intention is to attach the error to the smallest source token that contains the correction.
+
+## Preserve spans while parsing attributes
+
+A common mistake is converting input to strings too early:
+
+```text
+TokenStream → string → custom parser → error message
+```
+
+The string may preserve text but loses the original token objects I need for precise spans.
+
+With `syn`, I keep parsed literals and paths until validation is complete:
+
+```rust
+let value: syn::LitStr = meta.value()?.parse()?;
+let parsed = value.value().parse::<u32>().map_err(|_| {
+    syn::Error::new(value.span(), "expected an integer from 0 to 255")
+})?;
+```
+
+The semantic value comes from `value()`, while the diagnostic keeps `value.span()`.
+
+If parsing nested metadata produces several errors, I combine them instead of stopping at the first field:
+
+```rust
+let mut errors: Option<syn::Error> = None;
+
+if let Err(error) = validate_one(field) {
+    if let Some(all) = &mut errors {
+        all.combine(error);
+    } else {
+        errors = Some(error);
+    }
+}
+```
+
+One compilation can then show independent mistakes at their individual spans.
+
+## Generated tokens should inherit meaningful input spans
+
+Sometimes validation is impossible until rustc type-checks generated code. I still control which generated token receives which span.
+
+`quote!` preserves spans for interpolated input tokens. Tokens written directly inside the quote use the macro's default generated context. `quote_spanned!` applies one chosen span to the tokens it creates:
+
+```rust
+let ty = &field.ty;
+let span = ty.span();
+
+let check = quote::quote_spanned! {span=>
+    const _: fn() = || {
+        fn require_display<T: ::core::fmt::Display>() {}
+        require_display::<#ty>();
+    };
+};
+```
+
+If the bound fails, rustc has a path back to the field type.
+
+I use this carefully. Applying one field span to a large generated implementation can make unrelated errors point at that field. Small generated checks give more predictable diagnostics.
+
+## Hygiene and diagnostics interact
+
+Procedural macros are unhygienic in the sense documented by the Rust Reference: output behaves largely as if written inline. Generated names and paths can collide with the caller's scope.
+
+I use absolute paths such as `::core::option::Option` for standard items and generated identifiers unlikely to collide. When referring to my own companion crate, I account for dependency renaming rather than assuming one source-level crate name.
+
+A wrong path can produce a confusing error at a generated token. Better spans do not repair wrong hygiene; both the generated name and its span need deliberate design.
+
+I do not copy the user's span onto every internal identifier merely to make it resolve at the call site. Span choice affects both diagnostics and resolution.
+
+## Error messages should name the macro contract
+
+This message is accurate but weak:
+
+```text
+error: invalid input
+```
+
+I include:
+
+- what the macro expected;
+- which value or syntax violated it;
+- the allowed alternatives;
+- a correction when it is short and unambiguous.
+
+For example:
+
+```text
+error: range expects an integer from 0 to 255
+  --> tests/ui/bad_range.rs:5:24
+   |
+ 5 |     #[validate(range = "not a number")]
+   |                        ^^^^^^^^^^^^^^
+```
+
+I avoid printing a complete generated type or token stream unless it helps. Large debug dumps push the useful line out of view.
+
+## Compile-fail tests are part of the API
+
+For procedural macros, compiler diagnostics are user-facing output. I test them.
+
+The `trybuild` crate compiles small fixture crates and compares stderr with reviewed snapshots:
+
+```rust
+#[test]
+fn ui() {
+    let cases = trybuild::TestCases::new();
+    cases.compile_fail("tests/ui/fail/*.rs");
+    cases.pass("tests/ui/pass/*.rs");
+}
+```
+
+My fixtures cover:
+
+- malformed attribute syntax;
+- unsupported item kinds;
+- duplicate options;
+- mutually exclusive options;
+- invalid literal values;
+- missing trait bounds discovered by rustc;
+- several independent errors combined in one run;
+- renamed dependencies and hostile caller imports;
+- generics, lifetimes, raw identifiers, and nested modules.
+
+I review `.stderr` changes after compiler upgrades. Some formatting changes are expected, but an underline moving from the bad literal to the derive attribute is a real usability regression.
+
+For span assertions that are too fragile across toolchains, I test the message and source fragment semantically in addition to keeping one pinned compiler snapshot.
+
+## Expansion tools help diagnose the macro itself
+
+When an error still points badly, I inspect:
+
+1. the input token and its original span;
+2. the parsed `syn` node retained for validation;
+3. the span assigned by `quote!` or `quote_spanned!`;
+4. the expanded Rust;
+5. whether the first error is parse, resolution, or type checking.
+
+`cargo expand` helps me see generated code, and nightly `-Z macro-backtrace` can show expansion context. These are debugging aids for the author; the released macro should still give a useful stable error without requiring users to inspect expansion internals.
+
+## The span harness I keep
+
+I create one miniature workspace containing:
+
+```text
+macro crate
+fixture crate
+four feature-selected span strategies
+trybuild snapshots
+one script that runs the pinned and current stable toolchains
+```
+
+The same invalid source is compiled against every strategy. This makes improvement visible and protects it later. The evidence is not that the new message feels nicer; it is a before-and-after underline on the same token.
+
+I also keep a pass fixture for every failure. A validation improvement should not accidentally reject legal generics or attributes.
+
+## My practical rules
+
+When a procedural macro error points at the wrong code, I check these in order:
+
+```text
+Did I panic for a user error?
+Did I preserve the original syntax node?
+Did I attach the error to the smallest fixable token?
+Did generated checking code receive that token's span?
+Did hygiene create the error before my intended validation?
+Does a compile-fail fixture protect the rendered diagnostic?
+```
+
+The macro author cannot control every compiler diagnostic, and span APIs intentionally keep some source details opaque. Still, most bad macro errors improve when I validate earlier and stop throwing away input spans.
+
+The [`proc_macro::Span` documentation](https://doc.rust-lang.org/proc_macro/struct.Span.html), [`syn::Error`](https://docs.rs/syn/latest/syn/struct.Error.html), and [`quote_spanned!`](https://docs.rs/quote/latest/quote/macro.quote_spanned.html) are the main API references. Together they let me turn a failure in generated code into an error that points at what the user can actually fix.

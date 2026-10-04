@@ -1,0 +1,135 @@
+---
+caseId: "RFA-059"
+title: "E0038: Why a Generic Method Makes a Rust Trait Not Dyn Compatible"
+date: "2026-09-05T08:30:00+01:00"
+lastmod: "2026-09-05T08:30:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "25b8b2cbfaa7e44fcc30d15e598ef95da7ee0a3b8cda1b4a31104372ec327808"
+area: "diagnostics-macros"
+symptom: "A trait works as a generic bound but Rust rejects dyn Trait because a method has its own type parameter."
+summary: "Static generic dispatch can monomorphize a method for each type, but a trait object needs one finite vtable shape. Move generic work outside the object-safe boundary or exclude it from dynamic dispatch."
+rustVersions: ["Rust 1.98.1"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust trait is not dyn compatible E0038 generic method",
+    "trait cannot be made into an object vtable",
+    "Rust object safety method has generic type parameters",
+  ]
+evidence: ["Rust 1.98.1 compile failure", "vtable-slot model", "object-safe interface repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/error_codes/E0038.html",
+    "https://doc.rust-lang.org/reference/items/traits.html#dyn-compatibility",
+  ]
+---
+
+A trait can work perfectly in generic code and fail as soon as I write `dyn Trait`. This one is enough:
+
+```rust
+trait Repository {
+    fn get<T>(&self, key: &str) -> Option<T>;
+}
+
+fn use_repository(repository: &dyn Repository) {
+    let _: Option<String> = repository.get("name");
+}
+```
+
+Rust 1.98.1 reports E0038 and says `Repository` is not dyn compatible. The [failing fixture](/rust-failure-atlas/evidence/RFA-059/fail.rs) captures the compiler result.
+
+The word “dyn” changes the dispatch model. A generic bound such as `R: Repository` keeps the concrete repository type known to the compiler. A trait object erases that concrete type and calls methods through runtime metadata.
+
+## A vtable needs a finite set of callable entries
+
+For a trait object, a pointer conceptually carries a data address and a vtable address. The vtable contains function pointers appropriate for the erased concrete type. A non-generic method like this has one clear slot:
+
+```rust
+fn get_text(&self, key: &str) -> Option<String>;
+```
+
+But the original method describes an open family:
+
+```text
+get::<String>
+get::<u64>
+get::<MyApplicationType>
+...
+```
+
+Static dispatch can generate only the instantiations used by the program. A vtable cannot contain one slot for every type which any downstream crate might request. Rust therefore excludes a method with type parameters from dyn dispatch and, unless the method is restricted, the trait itself cannot form a trait object.
+
+The [Reference rules for dyn compatibility](https://doc.rust-lang.org/reference/items/traits.html#dyn-compatibility) list this requirement alongside receiver, associated constant, `Self`, and opaque-return restrictions.
+
+## Repair the dynamic boundary, not only the syntax
+
+In the reduced case I make the operation concrete:
+
+```rust
+trait Repository {
+    fn get_text(&self, key: &str) -> Option<String>;
+}
+```
+
+Now every implementation contributes one function with one known signature to the vtable. The [repaired fixture](/rust-failure-atlas/evidence/RFA-059/fixed.rs) builds a memory repository, calls it through `&dyn Repository`, and checks the result on Rust 1.98.1.
+
+This repair is appropriate when the dynamic consumers really ask for text. It would be weak if the repository must return many unrelated domain types, because encoding and decoding policy would become hidden in a vaguely named method.
+
+## Keep generic convenience outside the object
+
+A useful design is an object-safe core plus generic extension helpers:
+
+```rust
+trait Repository {
+    fn get_bytes(&self, key: &str) -> Option<Vec<u8>>;
+}
+
+trait RepositoryExt: Repository {
+    fn decode<T: Decode>(&self, key: &str) -> Option<T> {
+        self.get_bytes(key).and_then(|bytes| T::decode(&bytes))
+    }
+}
+
+impl<R: Repository + ?Sized> RepositoryExt for R {}
+```
+
+The erased repository handles one byte-oriented operation. Generic decoding is statically dispatched at the call site. This separates the part needing runtime substitution from the part needing compile-time type selection.
+
+## Excluding one method with `Self: Sized`
+
+If a generic method is only a convenience for concrete implementors, it can opt out of trait-object calls:
+
+```rust
+trait Repository {
+    fn get_bytes(&self, key: &str) -> Option<Vec<u8>>;
+
+    fn get<T: Decode>(&self, key: &str) -> Option<T>
+    where
+        Self: Sized,
+    {
+        self.get_bytes(key).and_then(|bytes| T::decode(&bytes))
+    }
+}
+```
+
+The trait can then be dyn compatible because callers cannot invoke `get<T>` through `dyn Repository`. The method remains available for sized concrete types. This is an honest restriction, not a loophole: the vtable does not need an entry for the excluded method.
+
+## Dynamic dispatch may not be required
+
+Sometimes `Box<dyn Repository>` was introduced only to put different values behind one field. An enum can represent a closed set of repository implementations, and a generic parameter can represent one implementation selected by the caller. Both keep more type information and may support generic methods naturally.
+
+I choose `dyn Trait` when runtime substitution and an open implementation set matter. I do not treat trait objects as the automatic way to use every trait.
+
+## Read E0038 as a dispatch mismatch
+
+The official [E0038 explanation](https://doc.rust-lang.org/error_codes/E0038.html) covers each rule and the reasons behind them. My debugging sequence is:
+
+1. Find the exact method or associated item named by the diagnostic.
+2. Draw the vtable slot it would require.
+3. Decide which behavior truly needs dynamic dispatch.
+4. Move generic or `Self`-dependent behavior to a sized extension when appropriate.
+5. Test through an actual `&dyn Trait`, not only a generic bound.
+
+The compiler is not saying the trait is badly designed in every context. It says that its current API cannot be represented by the runtime dispatch mechanism requested at this call site. Once I separate those two models, the repair becomes an API decision rather than a fight with E0038.

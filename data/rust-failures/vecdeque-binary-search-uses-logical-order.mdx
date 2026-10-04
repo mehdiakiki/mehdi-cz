@@ -1,0 +1,86 @@
+---
+caseId: "RFA-339"
+title: "VecDeque Binary Search Works Across Split Storage"
+date: "2026-09-06T01:59:00+01:00"
+lastmod: "2026-09-06T01:59:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "2938859fbc040d5106fcc29d13eeda77e002be042d38984305f292bec719cbf9"
+area: "concurrency-memory"
+symptom: "A sorted VecDeque successfully finds an item even though as_slices shows its ring storage split into two physical regions."
+summary: "VecDeque indexing and binary search follow front-to-back logical order, not physical allocation order. The deque must be logically sorted, but it need not be made contiguous merely to search it."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust VecDeque binary_search split storage", "binary search wrapped ring buffer Rust", "VecDeque make_contiguous before binary_search"]
+evidence: ["Rust 1.98.1 capacity-eight wrapped deque", "two physical slices", "logical index four search result"]
+sources: ["https://doc.rust-lang.org/std/collections/struct.VecDeque.html#method.binary_search", "https://doc.rust-lang.org/std/collections/struct.VecDeque.html#method.as_slices", "https://doc.rust-lang.org/std/collections/struct.VecDeque.html#method.make_contiguous"]
+---
+
+I saw a ring buffer split across two slices and assumed binary search required a call to `make_contiguous`. Rust's `VecDeque` search API works on the logical sequence directly.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-339/fail.rs) constructs sorted logical values `[3, 4, 5, 6, 7, 8]` in wrapped storage. It confirms the second physical slice is non-empty, then successfully finds seven.
+
+## VecDeque exposes one logical index space
+
+A `VecDeque` is usually backed by a ring buffer. Its front can sit in the middle of the allocation, so the logical sequence may wrap from the allocation's end to its beginning.
+
+[`as_slices`](https://doc.rust-lang.org/std/collections/struct.VecDeque.html#method.as_slices) exposes that representation as two slices. Concatenating the first returned slice with the second produces front-to-back logical order.
+
+Index zero means the logical front, not physical allocation offset zero.
+
+## binary_search follows logical sortedness
+
+[`VecDeque::binary_search`](https://doc.rust-lang.org/std/collections/struct.VecDeque.html#method.binary_search) assumes the deque is sorted. That assumption refers to iteration and indexing order from front to back.
+
+The method handles wrapped storage internally. In the fixture, seven appears at logical index four even though its physical location belongs to the ring representation.
+
+Calling `make_contiguous` only to search adds mutation and potential data movement without strengthening the sortedness guarantee.
+
+## Physical split does not make the data unsorted
+
+Looking at the two slices independently can be misleading. The first slice may end with eight while the second begins with three in physical address order, yet the logical concatenation is still `3..8` depending on where the front lies.
+
+I never sort each `as_slices` half independently and assume the deque becomes globally sorted. The boundary between the halves also needs the ordering invariant.
+
+When external code needs one slice, [`make_contiguous`](https://doc.rust-lang.org/std/collections/struct.VecDeque.html#method.make_contiguous) rotates storage and returns the full logical sequence as a mutable slice.
+
+## Mutation can break sortedness without changing storage shape
+
+Pushes at either end, indexed mutation, rotation, and swaps can make the logical sequence unsorted. Being contiguous says nothing about ordering, and being split says nothing against it.
+
+I wrap a sorted deque behind methods that preserve its invariant or re-establish sorting before search. Exposing unrestricted `&mut VecDeque<T>` makes binary-search correctness a convention every caller must remember.
+
+For a normal priority queue, `BinaryHeap` may match operations better. For arbitrary ordered lookup, a tree or map may remove the need to maintain a sorted ring manually.
+
+## Duplicate matches do not promise the first index
+
+As with slice binary search, duplicate equal elements may yield any matching position allowed by the documented method. If I need the full equal range, I use partition points for lower and upper boundaries.
+
+I do not build stable identity from whichever duplicate index the current implementation returns. Logical ordering and duplicate selection are separate contracts.
+
+If the deque is not sorted, the returned result is unspecified and meaningless rather than a reliable “not found.”
+
+## Why avoiding make_contiguous can matter
+
+Making a deque contiguous may move elements within its allocation and requires mutable access. Search itself can work through shared access.
+
+In a read-heavy component, unnecessary rotation increases work and prevents simultaneous readers at the application locking layer. It can also invalidate assumptions held by unsafe code about element addresses, though safe references already constrain mutation.
+
+I measure before optimizing, but the narrower non-mutating operation is a better default when it already expresses the task.
+
+## Test logical and physical properties separately
+
+The fixture gives the deque a fixed capacity, fills and pops values to move the front, then pushes enough data to wrap. It asserts both slices are used so the test really exercises split storage.
+
+It separately asserts iteration order and search result. If construction changes and the deque no longer wraps, the representation assertion fails rather than silently becoming an ordinary contiguous search test.
+
+My wider table covers targets at the front, split boundary, back, absent interior position, before all values, after all values, duplicates, and empty input.
+
+## Representation-aware code needs a narrow boundary
+
+FFI and vectored I/O may benefit from the two physical slices. Most application algorithms should use iteration, indexing, and collection methods in logical order.
+
+Mixing those views casually creates bugs where a physical prefix is mistaken for the logical beginning. I name variables `front_slice` and `wrapped_slice` and retain their required concatenation order.
+
+The core principle is that an abstract data structure owns the mapping from logical order to physical layout. `VecDeque::binary_search` searches the abstraction, so split storage is not a failure. I require logical sortedness and touch the representation only when an external interface truly needs it.

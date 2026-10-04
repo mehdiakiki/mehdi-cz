@@ -1,0 +1,126 @@
+---
+caseId: "RFA-047"
+title: "A Self-Referential Rust Value Breaks Only After It Moves"
+date: "2026-09-04T21:00:00+01:00"
+lastmod: "2026-09-07T10:45:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "551a1f9b9cc5e802d6598f6b628a28f19316a56589fb38d3388645ce842515d7"
+area: "concurrency-memory"
+symptom: "A self-referential Rust value works in place but its internal pointer becomes invalid after the value moves."
+summary: "Rust moves may relocate a value without notifying it. Establish pinning before creating internal pointers, opt out of Unpin, and audit every projected field and destructor."
+rustVersions: ["stable Rust"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust self referential struct move invalid pointer",
+    "Pin self reference address changes",
+    "Rust internal pointer after move",
+  ]
+evidence: ["address trace", "move-forcing fixture", "pinning invariant"]
+sources:
+  [
+    "https://doc.rust-lang.org/std/pin/index.html#address-sensitive-values-aka-when-we-need-pinning",
+    "https://doc.rust-lang.org/std/marker/struct.PhantomPinned.html",
+  ]
+---
+
+Most Rust values can move freely. Assignment, returning from a function, pushing into a container, and replacing a value may copy its bytes to another address. Rust does not call a “moved” callback which could update pointers stored inside the value.
+
+A self-referential value becomes address-sensitive after one field points to another field in the same allocation. Moving it after that moment leaves the pointer aimed at the old location.
+
+## The broken lifecycle
+
+The dangerous shape is:
+
+```rust
+struct Record {
+    text: String,
+    text_ptr: *const String,
+}
+```
+
+Creating `text_ptr` while `Record` is a local variable and then returning the record can move it. The heap allocation containing the string bytes may stay stable, but `text_ptr` points to the `String` control value inside `Record`, and that control value moved.
+
+The first check logs both addresses before and after each transfer:
+
+```rust
+eprintln!("record={:p} text={:p}", &record, &record.text);
+```
+
+I do not dereference a pointer after evidence shows its pointee moved. The address trace is enough to prove the invalidation.
+
+That is also how the downloadable proof stays safe. The [failing lifecycle](/rust-failure-atlas/evidence/RFA-047/fail.rs) creates the interior pointer on the stack, moves the value into a `Box`, and compares the old and current field addresses without dereferencing the stale pointer. The [repaired lifecycle](/rust-failure-atlas/evidence/RFA-047/fixed.rs) pins first, creates the pointer second, then proves that moving the `Pin<Box<_>>` handle does not relocate its pointee.
+
+## Pin before creating the self-reference
+
+Pinning is a library contract that the pointee will not be moved or otherwise invalidated until it is dropped. A type relying on this contract must opt out of the automatic `Unpin` trait, commonly with `PhantomPinned`:
+
+```rust
+use std::marker::PhantomPinned;
+use std::pin::Pin;
+use std::ptr::NonNull;
+
+struct Record {
+    text: String,
+    text_ptr: Option<NonNull<String>>,
+    _pin: PhantomPinned,
+}
+
+impl Record {
+    fn new(text: String) -> Pin<Box<Self>> {
+        let mut value = Box::pin(Self {
+            text,
+            text_ptr: None,
+            _pin: PhantomPinned,
+        });
+
+        let pointer = NonNull::from(&value.text);
+
+        // SAFETY: the value is already pinned, and assigning the pointer does
+        // not move `text` or any structurally pinned field.
+        unsafe {
+            value.as_mut().get_unchecked_mut().text_ptr = Some(pointer);
+        }
+
+        value
+    }
+}
+```
+
+The ordering is essential: allocate and pin first, then derive the internal pointer. `Box::pin` before initialization does not help if a later safe API can move the inner value out.
+
+## `Pin<Box<T>>` pins T, not the Box handle
+
+The `Box` handle itself can move between variables. Its heap pointee remains at the same address. `Pin<Ptr>` constrains the pointee reached through `Ptr`.
+
+If `T: Unpin`, pinning does not restrict moving `T` through safe access. That is why an address-sensitive implementation adds `PhantomPinned` or otherwise ensures `!Unpin`.
+
+Adding `PhantomPinned` without restricting constructors and mutation methods is not enough. Every safe method must preserve the invariant after initialization.
+
+## Projection is part of the proof
+
+A method receiving `Pin<&mut Record>` may need access to fields. Returning an ordinary `&mut` to a structurally pinned field could let safe code move it with `mem::replace`.
+
+I decide which fields participate in address sensitivity and expose either pinned projections or ordinary references accordingly. Projection helpers can encode this pattern, but their generated safety argument still depends on the field decision.
+
+The destructor also runs while the value remains conceptually pinned. A custom `Drop` implementation must not move structurally pinned fields before invalidating internal pointers or linked structures.
+
+## Prefer avoiding self-reference
+
+Many designs can store an index, offset, key, or owned clone instead of an interior pointer. Parsing can return ranges into a separately owned buffer. Graph nodes can use stable arena identifiers. Async state machines are generated with pin-aware interfaces, but application structs rarely need to copy that pattern.
+
+I choose pinning only when stable address is a real requirement, not as a way around a borrow-checker message.
+
+## False repairs
+
+Putting the value in a `Box` after the pointer is created can move it during boxing. Reserving capacity in a `Vec` is a temporary capacity promise, not a type-level address invariant. Marking a type `!Unpin` does not retroactively make an earlier pointer valid.
+
+Leaking the value can preserve an allocation address but abandons destruction and still requires correct initialization and aliasing.
+
+## The regression proof
+
+My fixture forces moves through return, assignment, `Vec` insertion, and `mem::swap` before the address-sensitive state begins, then confirms the pinned pointee stays stable after initialization. APIs which would move out of the pinned value must fail to compile.
+
+I also run the unsafe dereference path under Miri when supported and audit `Drop` and field projection. The proof is lifecycle-based: freely movable before initialization, pinned before the internal pointer exists, and never moved until destruction completes.

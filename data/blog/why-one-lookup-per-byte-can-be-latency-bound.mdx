@@ -1,0 +1,113 @@
+---
+title: "Why a One-Lookup-Per-Byte Loop Can Still Be Latency-Bound"
+date: "2026-10-05T08:50:00+01:00"
+lastmod: "2026-09-05T12:00:00+01:00"
+tags: ["rust", "aho-corasick", "cpu performance", "dfa", "instruction-level parallelism", "optimization"]
+draft: false
+reviewed: true
+reviewedHash: "9934350a523238ad00c9e23247cb1ef68e9ea3e133260af515fdf3aaafed99ed"
+cluster: "rust-under-the-hood"
+campaign: "editorial"
+summary: "A DFA inner loop looks tiny, yet every next transition depends on the previous one. I explain dependency chains, cache locality, and why fewer instructions need not mean huge speedups."
+---
+
+A dense DFA scanning loop can look almost too simple to be slow:
+
+```rust
+for &byte in input {
+    state = transitions[state][usize::from(byte)];
+}
+```
+
+There is one byte load and one transition lookup. The loop has no obvious allocation, lock, or system call. Still, it may not reach anything close to memory-copy throughput.
+
+The missing idea is a dependency chain. The next table address needs the state returned by the previous table lookup.
+
+## The next iteration cannot run freely ahead
+
+Write the data dependency explicitly:
+
+```text
+s1 = table[s0][b0]
+s2 = table[s1][b1]
+s3 = table[s2][b2]
+```
+
+The processor can load nearby input bytes early. It can update loop counters and predict branches. But it cannot know the address of `table[s1][b1]` until the first lookup produces `s1`.
+
+Modern out-of-order processors are good at overlapping independent work. This chain removes much of that independence from the central transition sequence.
+
+I avoid assigning one universal cycle count. Lookup latency depends on the microarchitecture and where the table entry is found in the cache hierarchy. The durable statement is that the dependency makes that latency harder to hide.
+
+## Throughput and latency are different limits
+
+A processor may be able to start several independent loads per cycle. That is load throughput. It does not mean a sequence where every load needs the previous result finishes at the same rate.
+
+This is similar to following pointers through a linked structure. Many independent linked lists can be traversed in parallel, but one list exposes its next address only step by step.
+
+A DFA state table is usually more compact and predictable than an arbitrary linked list. The analogy is about dependency, not identical memory layout.
+
+## A larger table makes the chain more expensive
+
+If useful transition entries stay in a nearby cache, dependent lookups can complete quickly. If a large automaton spreads accesses across a much bigger working set, the chain waits on slower levels more often.
+
+This connects representation to execution. A dense DFA may use a direct transition but occupy far more memory. A contiguous NFA may require somewhat more transition logic but keep more state close to the processor.
+
+The Rust `aho-corasick` crate documents this space-time balance in its [resource-usage section](https://docs.rs/aho-corasick/latest/aho_corasick/struct.AhoCorasick.html#resource-usage) and detailed [design document](https://github.com/BurntSushi/aho-corasick/blob/master/DESIGN.md).
+
+I benchmark both rather than concluding from the number of source-level operations.
+
+## Why deleting a copy may give a modest result
+
+Suppose the old pipeline copies an input chunk into a scanner-owned buffer and then runs the dependent DFA loop. Removing the copy clearly removes memory-to-memory work. It does not remove the state-transition chain.
+
+An optimized bulk copy can have high throughput. Its destination may also remain warm for the scan. Therefore the copy can be real overhead without representing half of the total runtime.
+
+I describe the result through fractions. If copying occupied a small share of end-to-end time, eliminating it can improve only that share. The next bottleneck remains.
+
+This is more accurate than claiming the copy and later scan were somehow executing simultaneously. If they are separate sequential loops, they are separate work. Their hardware costs simply are not equal to the number of source lines or logical byte movements.
+
+## A prefilter breaks the per-byte transition pattern
+
+A successful prefilter changes the hot path. Instead of entering the automaton for every byte, a specialized byte or substring search examines a wide region and jumps to plausible candidates.
+
+If candidates are rare, the dependent transition chain runs only near them. The search can then move much closer to the throughput of the candidate finder. At this point, an old staging copy occupies a larger fraction of total time even though its own cost did not change.
+
+This is why I re-profile after each major optimization. Removing one bottleneck changes the importance of the others.
+
+## How I investigate the loop
+
+I begin with correctness and a stable benchmark. Then I compare:
+
+- automatic, contiguous NFA, and forced DFA representations;
+- small and large pattern sets;
+- prefilter enabled and disabled;
+- warm repeated input and larger cache-cold input;
+- no-match and dense-match cases.
+
+I inspect generated assembly to confirm what Rust and LLVM produced, but I do not count assembly instructions as a performance result. A short loop can wait on memory; a longer loop can overlap independent operations.
+
+Hardware counters can help distinguish the stories: cycles, instructions, cache misses, and branch misses. Counter names and interpretation vary by processor. I keep the CPU model and command with the result.
+
+For static analysis of a small assembly region, [`llvm-mca`](https://llvm.org/docs/CommandGuide/llvm-mca.html) can model throughput and resource pressure for supported targets. Its own documentation warns that it estimates steady-state machine behavior; it does not replace measuring the complete application and memory system.
+
+## Can several streams restore parallelism?
+
+If I have independent haystacks, their automaton states do not depend on each other. In theory, interleaving several scans creates independent transition chains. Whether that helps depends on API overhead, cache pressure, compiler code generation, and how results are collected.
+
+I do not complicate a single-stream API just for theoretical instruction-level parallelism. But batched workloads—many records searched with one shared matcher—are worth measuring separately from one large stream.
+
+Thread-level parallelism has similar constraints. Splitting one haystack introduces boundary correctness and result ordering. Searching independent documents is simpler.
+
+## My practical mental model
+
+When I see a small hot loop, I ask four questions:
+
+1. Which operations depend on results from the previous iteration?
+2. Where does their data live in the cache hierarchy?
+3. Which independent work can execute while they wait?
+4. Does another algorithm avoid entering this loop for most input?
+
+“One lookup per byte” describes the algorithmic shape of a dense DFA path. It does not describe lookup latency, cache locality, output work, or how much parallel execution the CPU can find.
+
+This is the CPU side of [Zero-Copy Does Not Mean Zero Memory Access](/blog/zero-copy-does-not-mean-zero-memory-access-aho-corasick-rust). For the algorithm that can skip this chain, continue with [When Aho–Corasick Prefilters Help—and When They Hurt](/blog/when-aho-corasick-prefilters-help-or-hurt).

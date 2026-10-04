@@ -1,0 +1,105 @@
+---
+caseId: "RFA-071"
+title: "E0594: A Rust Closure Mutates Its Capture but the API Requires `Fn`"
+date: "2026-09-05T08:40:00+01:00"
+lastmod: "2026-09-05T08:40:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "a967a9ce3af8361192b00008b5bccabbdc08cc901c22d6d8e2a16e082e68c118"
+area: "diagnostics-macros"
+symptom: "A closure that changes a captured variable is rejected because the receiving API requires Fn instead of FnMut."
+summary: "Mutating captured state needs exclusive access to the closure environment. Match the callback bound to the receiver access the API can provide, or move mutation behind an explicit synchronization or interior-mutability boundary."
+rustVersions: ["Rust 1.98.1"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust E0594 cannot assign captured variable Fn closure",
+    "expected Fn instead of FnMut callback",
+    "closure mutate captured variable trait bound",
+  ]
+evidence: ["Rust 1.98.1 compile failure", "closure receiver model", "FnMut bound repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/error_codes/E0594.html",
+    "https://doc.rust-lang.org/book/ch13-01-closures.html#moving-captured-values-out-of-closures-and-the-fn-traits",
+  ]
+---
+
+A callback can be callable twice and still need mutable access to itself. This API loses that distinction:
+
+```rust
+fn call_twice<F: Fn()>(callback: F) {
+    callback();
+    callback();
+}
+
+fn main() {
+    let mut count = 0;
+    call_twice(|| count += 1);
+}
+```
+
+Rust 1.98.1 reports E0594: `count` cannot be assigned because it is captured in an `Fn` closure. The [failing fixture](/rust-failure-atlas/evidence/RFA-071/fail.rs) records the full compiler explanation and its suggestion to use `FnMut`.
+
+The callback count is not the problem. `FnMut` can be called repeatedly. The problem is which kind of reference the receiving API promises to use for each call.
+
+## Call traits describe access to the closure environment
+
+A closure is a value containing captured state. Its call traits can be understood through their receiver:
+
+| Trait    | Conceptual receiver | What a call may do                                           |
+| -------- | ------------------- | ------------------------------------------------------------ |
+| `Fn`     | `&self`             | read captures without requiring exclusive environment access |
+| `FnMut`  | `&mut self`         | mutate captures and call repeatedly                          |
+| `FnOnce` | `self`              | consume captures and call at least once                      |
+
+The closure `|| count += 1` captures `count` mutably. Calling it requires access to that mutable borrow, so the closure implements `FnMut` and `FnOnce`, but not `Fn`.
+
+The [Rust book explanation of closure call traits](https://doc.rust-lang.org/book/ch13-01-closures.html#moving-captured-values-out-of-closures-and-the-fn-traits) derives the trait from what the body does with captured values. The caller does not choose the weakest trait by annotation; the body determines what is available.
+
+## Match the API to the actual call behavior
+
+The direct repair is:
+
+```rust
+fn call_twice<F: FnMut()>(mut callback: F) {
+    callback();
+    callback();
+}
+```
+
+The parameter binding is `mut` because each call uses the callback through mutable access. The [repaired fixture](/rust-failure-atlas/evidence/RFA-071/fixed.rs) calls it twice and asserts that the captured counter reaches two under Rust 1.98.1.
+
+An `FnMut` bound still accepts closures which also implement `Fn`. It expresses the maximum access the helper may need, not a requirement that every callback actually mutate something.
+
+Passing the callback by value does not change this receiver rule. Ownership of the closure lets the helper obtain mutable access, but the generic bound must still permit using that access when the call operator is invoked.
+
+## Why an API may deliberately require `Fn`
+
+Changing the bound is not always possible. A parallel library may call one closure concurrently through shared references. An event subscription may retain a callback behind `&self`. A retry component may require reentrant invocation. Those designs cannot simply provide one exclusive `&mut` receiver for each call.
+
+If mutation is still required, the state needs an appropriate interior boundary. Single-threaded code can use `Cell` for Copy state or `RefCell` for dynamically checked borrowing:
+
+```rust
+let count = std::cell::Cell::new(0);
+call_twice(|| count.set(count.get() + 1));
+```
+
+The closure itself only shares `&Cell<_>`, so it can implement `Fn`; `Cell` owns the mutation protocol. For multi-threaded callbacks, an atomic or lock may be required depending on the operation. Choosing one is a concurrency design, not just a trait fix.
+
+## `move` does not turn `FnMut` into `Fn`
+
+Adding `move` transfers `count` into the closure environment. The body still assigns to the captured field, so calling still needs `&mut self`. Capture mode and call trait are related but separate.
+
+For a Copy integer, `move` also means the outer `count` is no longer the state being observed; the closure changes its private copy. That can compile after other changes while silently breaking the intended result.
+
+## The strongest bound reduces usable callbacks
+
+An API requiring `Fn` is accepting a narrower set of closure behaviors than one requiring `FnMut`. An API requiring `FnOnce` can accept all closures, but it promises only that it consumes the callback and cannot call it twice. I pick the least restrictive bound compatible with the implementation:
+
+- Calls only once: `FnOnce` is often enough.
+- Calls repeatedly with exclusive access: `FnMut`.
+- Calls through shared access, potentially concurrently: `Fn` plus any necessary `Send` and `Sync` bounds.
+
+The official [E0594 page](https://doc.rust-lang.org/error_codes/E0594.html) covers assignment through an immutable context generally. For closures, my first check is to replace the syntax with the receiver table. The body mutates its environment, so either the API provides `&mut` access or the mutable state moves behind a type designed to support mutation through shared access.

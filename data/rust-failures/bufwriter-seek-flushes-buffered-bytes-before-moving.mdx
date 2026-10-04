@@ -1,0 +1,95 @@
+---
+caseId: "RFA-407"
+title: "BufWriter Flushes Buffered Bytes Before Seeking"
+date: "2026-09-06T03:47:00+01:00"
+lastmod: "2026-09-06T03:47:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "6a776b20f21c4a13c7a674f2d42c3f109935332e1274fa2c2fb939c3a3104465"
+area: "ffi-targets"
+symptom: "An instrumented writer observes a write operation before seek even though the application never called flush explicitly."
+summary: "BufWriter's Seek implementation flushes pending bytes before delegating the position change. Seek is therefore a fallible write boundary, preserving byte placement but making buffered errors visible during cursor movement."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets implementing the underlying Write and Seek contracts"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust BufWriter seek flushes buffer", "BufWriter Seek write before seek", "buffered writer seek error flush Rust"]
+evidence: ["Rust 1.98.1 instrumented writer", "buffered one-byte write", "write-before-seek event trace"]
+sources: ["https://doc.rust-lang.org/std/io/struct.BufWriter.html", "https://doc.rust-lang.org/std/io/trait.Seek.html", "https://doc.rust-lang.org/std/io/trait.Write.html#tymethod.flush"]
+---
+
+I buffered one byte, changed the cursor, and expected the byte to remain pending until a later flush. That would write it at the wrong logical position. Rust prevents this by flushing `BufWriter` before it seeks.
+
+The [failing fixture](/rust-failure-atlas/evidence/RFA-407/fail.rs) wraps an instrumented writer. `write_all(b"x")` stays in the buffer. The next seek produces an inner `write` event followed by an inner `seek` event.
+
+## Buffered bytes belong to the old position
+
+[`BufWriter`](https://doc.rust-lang.org/std/io/struct.BufWriter.html) delays small writes so they can be sent to the underlying writer in larger operations. The pending bytes were accepted while the inner cursor had one particular position.
+
+If the cursor moved first and the bytes were flushed later, their destination would change. A buffered writer cannot preserve ordinary sequential write meaning that way.
+
+Its `Seek` implementation therefore establishes this order:
+
+```text
+pending bytes -> inner write
+then          -> inner seek
+```
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-407/fixed.rs) asserts this event trace directly.
+
+## Seek can fail because a write failed
+
+[`Seek`](https://doc.rust-lang.org/std/io/trait.Seek.html) returns an `io::Result<u64>`. Around a `BufWriter`, an error can arise before the underlying seek happens because flushing pending output failed.
+
+I do not label every seek error as “invalid offset.” The error may mean that earlier buffered data could not be written. Diagnostics should retain the operation context and the underlying error rather than replacing it with a cursor-only message.
+
+This also means seeking is an output commit boundary. Code that wants to retry needs to understand the buffer state after partial or failed writes, not blindly issue the seek again.
+
+## flush has two layers
+
+[`Write::flush`](https://doc.rust-lang.org/std/io/trait.Write.html#tymethod.flush) asks a writer to ensure buffered content reaches its destination as defined by that writer. For `BufWriter`, flushing first drains its Rust-side buffer and then calls the underlying writer's flush behavior.
+
+That does not universally mean durable storage. Filesystems and devices may maintain additional caches. Durability can require platform-specific synchronization operations.
+
+I use precise language: flushed from `BufWriter`, written to the file handle, or synchronized to stable storage. These are different guarantees.
+
+## The wrapper's position includes pending intent
+
+Applications often reason about where the next logical write will occur, not only the raw inner handle's current cursor. Buffered data creates distance between those views until it is drained.
+
+I avoid querying or mutating the inner writer behind the buffer unless the API explicitly coordinates state. Direct inner access can observe a position that excludes buffered bytes or reorder output, as another Atlas case demonstrates with `get_mut`.
+
+The wrapper should own sequencing while it is active.
+
+## Repeated small seeks can defeat buffering
+
+Every seek with pending data forces a flush. A workload that alternates tiny writes and seeks may turn a large buffer into many small inner writes.
+
+Correctness comes first, but the event trace also explains performance. For patching structured files I may assemble sections in memory, write sequentially, or batch edits so cursor movement happens less often.
+
+I benchmark actual I/O patterns. Increasing buffer capacity cannot help when each operation forces the pending bytes out immediately.
+
+## SeekFrom::Current needs extra care
+
+`SeekFrom::Current(offset)` is relative to the current stream position. The buffered writer must reconcile pending output before delegating so “current” has a coherent meaning for the underlying object.
+
+When I already know an absolute format offset, `SeekFrom::Start` can make intent easier to review. It does not remove the flush requirement, but it avoids arithmetic based on a misunderstood cursor.
+
+I validate offset calculations separately from buffering behavior.
+
+## Drop is not an error-reporting flush strategy
+
+`BufWriter` attempts cleanup when dropped, but errors during drop cannot be returned normally. If output correctness matters, I explicitly flush or finish at a point where an `io::Error` can reach the caller.
+
+A successful seek already proves the pre-seek buffer flush succeeded under the wrapper's contract. A final explicit flush still matters for bytes written after the last seek.
+
+## My test writer separates events
+
+The evidence writer records `write` and `seek` through shared test state. Its `write` accepts all bytes so partial-write behavior does not obscure the ordering claim.
+
+For production adapters I also test partial writes, interrupted errors, flush failure, and seek failure. Each failure boundary can leave different progress. The minimal Atlas case proves only the public ordering needed for this misconception.
+
+## The core principle
+
+Buffering separates application writes from underlying writes, but it cannot change where bytes logically belong. Before moving the cursor, `BufWriter` drains bytes associated with the old position. This makes seek both a position operation and a possible write-error boundary.
+
+I keep the writer wrapped, propagate the complete result, and design seek-heavy formats with the forced flush cost in mind.

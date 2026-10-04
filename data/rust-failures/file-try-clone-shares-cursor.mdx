@@ -1,0 +1,106 @@
+---
+caseId: "RFA-195"
+title: "Why File::try_clone Shares the File Cursor"
+date: "2026-09-05T17:34:00+01:00"
+lastmod: "2026-09-05T17:34:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "c229a7bc93d565e2c02a3c9c90d11e6a87458bb575274fd10ae2cf7274221903"
+area: "ffi-targets"
+symptom: "Reading two bytes through a File returned by try_clone begins at byte three rather than at the start of the file."
+summary: "File::try_clone creates another handle to the same underlying open file state, so reads and seeks affect both Rust values. Open the path again for an independent cursor, or synchronize deliberately when sharing one cursor is the goal."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets with std and a filesystem"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust File try_clone shared cursor",
+    "try_clone file offset changed",
+    "independent file cursor Rust",
+  ]
+evidence: ["Rust 1.98.1 temporary file", "shared sequential reads", "second-open repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/std/fs/struct.File.html#method.try_clone",
+    "https://doc.rust-lang.org/std/fs/struct.File.html#method.open",
+    "https://doc.rust-lang.org/std/io/trait.Seek.html",
+  ]
+---
+
+Two Rust `File` values can still share one logical cursor. That was the part I missed when I first read the name `try_clone`.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-195/fail.rs) opens a temporary file containing `abcdef`, clones the file, and reads two bytes from each handle. The first read returns `ab`. The cloned handle returns `cd`, not another `ab`.
+
+The values are distinct, but the open-file state underneath them is shared.
+
+## `try_clone` duplicates access to the same handle state
+
+[`File::try_clone`](https://doc.rust-lang.org/std/fs/struct.File.html#method.try_clone) creates a new `File` instance sharing the same underlying file handle. The documentation states directly that reads, writes, and seeks affect both instances simultaneously.
+
+After the original reads two bytes, the shared cursor is at offset two. Reading through the clone continues from there. Seeking either instance would also change where the other instance's next ordinary read begins.
+
+The method is fallible because duplicating an operating-system handle can fail. This is also why `File` does not simply derive the ordinary infallible `Clone` trait.
+
+The clone is valuable when two owners need separate Rust lifetimes, ownership transfer, or thread placement while intentionally addressing the same open resource. It is not equivalent to opening the pathname again.
+
+## Reopen for an independent cursor
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-195/fixed.rs) calls [`File::open`](https://doc.rust-lang.org/std/fs/struct.File.html#method.open) twice. Each open operation creates its own logical cursor, so both first reads return `ab`.
+
+This repair assumes the path still identifies the intended file and that opening it twice is acceptable. Between opens, another process could replace the path. Permissions, sharing flags, and filesystem behaviour may also make reopening different from duplicating a verified handle.
+
+I choose from the required identity:
+
+```text
+same verified open resource + shared offset  -> try_clone
+same path resolved again + independent offset -> File::open again
+```
+
+Neither choice is universally stronger. They preserve different facts.
+
+## Shared does not mean coordinated
+
+The operating system maintains the cursor, but a multi-step application protocol around it still needs synchronization. If two threads read variable-sized records through cloned handles, their calls can interleave. Each individual system call advances the shared state, while “read one complete logical message” may require several calls.
+
+I wrap shared sequential access in a mutex or give one owner responsibility for reading and distributing records. Cloning a file is not a work-queue abstraction.
+
+For random-access workloads, platform-specific `FileExt` operations can read at explicit offsets without changing the shared cursor. That design makes position part of each request. Because those APIs differ between Unix and Windows, I isolate them behind a small tested boundary.
+
+## Buffering can move the cursor farther than expected
+
+Putting separate `BufReader` values around cloned files adds another layer. One buffer may read ahead from the shared underlying handle. The application consumes only a few bytes from that buffer, but the operating-system cursor may already have advanced by a full buffer.
+
+A second reader then starts after the read-ahead region, making data appear skipped. This is not corruption by `BufReader`; it is the result of two private buffers competing over one shared cursor.
+
+I avoid independent buffering over cloned sequential file handles unless access is carefully coordinated. One buffered reader with explicit distribution is easier to reason about.
+
+The distinction mirrors the Atlas `BufRead` cases: application-visible consumption and lower-level reads do not always happen at the same boundary.
+
+## Seeking is a shared state transition
+
+The [`Seek`](https://doc.rust-lang.org/std/io/trait.Seek.html) trait takes `&mut self`, which prevents two calls through the same Rust value at once. It does not promise that another cloned handle cannot change the shared offset between operations.
+
+A common fragile pattern is:
+
+```text
+seek to record offset
+read record
+```
+
+If another owner shares the cursor and seeks between these calls, the read can target a different location. A mutex must cover the complete seek-and-read sequence, not each method call separately.
+
+Explicit-offset reads avoid this compound cursor transition where the platform supports them.
+
+## The path is no longer the complete identity
+
+Once a file is open, renaming or unlinking the pathname does not necessarily invalidate the handle. Exact behaviour is platform-specific, but the larger lesson holds: the open handle represents a resource, not a string lookup performed again for every operation.
+
+`try_clone` preserves that open-resource identity. Reopening preserves the pathname request. This difference matters in log rotation, atomic replacement, temporary files, and security-sensitive validation.
+
+My evidence drops both handles before deleting the temporary file so the fixture behaves cleanly on platforms that do not allow removing an open file.
+
+## My cloned-file checks
+
+When a cloned reader begins at a surprising location, I record every read and seek across every clone, check for buffering and read-ahead, and decide whether the intended model is shared sequential progress or independent positions. I synchronize compound operations, prefer explicit-offset I/O for parallel random access, and test handle identity separately from pathname identity.
+
+The core principle is that cloning a handle and recreating a resource are different operations. `File::try_clone` gives another owner access to the same open-file state. If I need a fresh cursor, I must request a separate open or use position-explicit I/O.

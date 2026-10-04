@@ -1,0 +1,186 @@
+---
+title: "A Runbook for a Synchronization Job That Has Stopped Moving"
+date: "2026-12-28T09:00:00+01:00"
+tags: ["data synchronization", "incident runbook", "data pipeline", "operations", "recovery"]
+draft: false
+reviewed: true
+reviewedHash: "342e17362880e20853cacc52402a6244a21645fe614c18163f5754b4121f2308"
+cluster: "reliable-data-integrations"
+campaign: "authority-2026"
+opportunity: "DATA-089"
+summary: "When synchronization stops, I preserve the recovery boundary, identify whether observation, source, reader, queue, writer, or checkpoint failed, and verify freshness before reopening traffic."
+---
+
+A synchronization worker can be running without moving. CPU looks normal. The process answers health checks. The queue is not obviously full. Only later does somebody notice that the product is showing old data.
+
+This is the runbook I want beside that alert. Its first rule is not “restart the job”. Its first rule is to preserve enough evidence that recovery does not skip or duplicate unknown work.
+
+## The alert states what stopped
+
+I avoid “sync unhealthy” as the only signal. The incident begins with:
+
+```text
+pipeline and partition
+last source progress
+last durable checkpoint
+last product-visible version
+oldest pending record
+normal freshness objective
+current lag and error-budget burn
+```
+
+The [freshness SLO](/blog/an-slo-for-data-freshness-is-not-an-http-availability-slo) should detect a green HTTP service serving stale truth.
+
+If the observability itself is delayed, that is the first branch of the runbook.
+
+## Step 1: protect the recovery boundary
+
+Before changing workers, I capture:
+
+```text
+checkpoint/cursor and its version
+active lease owners
+queue head and oldest item age
+last successful source request identity
+last committed destination transaction
+recent deployment and configuration versions
+provider status and rate-limit observations
+```
+
+I pause automatic cursor rewrites and broad redrive operations. If a worker may still be alive behind a network partition, I fence its lease before starting another writer.
+
+I do not reset the cursor to zero. That turns one stopped job into an uncontrolled replay.
+
+## Step 2: prove the signal is real
+
+The dashboard can stop moving because:
+
+- source traffic is legitimately quiet;
+- metrics export is broken;
+- one partition label disappeared;
+- clocks differ;
+- the source head itself is unknown.
+
+I use a synthetic probe or compare the provider/source head with our last durable point. A current-state sample can confirm whether product data is actually stale.
+
+If only observation failed, I still repair it promptly. Operating blind is a degraded state even when data is moving.
+
+## Step 3: walk the pipeline in order
+
+I follow one known record or progress marker:
+
+```text
+source -> reader -> durable queue -> transformer -> writer -> projection -> read API
+```
+
+At each boundary I ask one binary question: did the expected identity/version cross?
+
+This locates the first missing transition. Starting at random error logs often finds noise from downstream symptoms.
+
+The [per-record tracing design](/blog/trace-one-record-across-a-data-pipeline-without-logging-its-secrets) gives me safe identities and versions for this walk.
+
+## Branch A: the source is not advancing
+
+I check provider status, authentication, permissions, subscription/webhook configuration, and whether the source has genuinely changed.
+
+For polling, I inspect the exact request and cursor without logging secrets. For webhooks, I check delivery status and whether signature or replay protection began rejecting valid requests after a key or clock change.
+
+If the provider is down, I enter the predefined capability-specific degraded mode. I do not hammer it with synchronized retries.
+
+## Branch B: the reader cannot advance
+
+Common causes include:
+
+```text
+expired or invalid cursor
+one malformed page
+pagination loop
+token refresh stampede/failure
+rate limit with ignored Retry-After
+source response too large
+lease held by dead worker
+```
+
+I preserve the failing page or safe evidence reference. If one record blocks a page, I use a reviewed quarantine path only if the contract permits progress past it. Silently skipping is not recovery.
+
+An expired cursor may require a bounded overlap or backfill from a known high-water mark. The chosen interval becomes a replay manifest.
+
+## Branch C: the queue or transformer is stuck
+
+I compare enqueue and dequeue rates, oldest age, partition ownership, and retry class. One poison record can loop rapidly while useful progress remains zero.
+
+I separate delivery attempts from semantic attempts. Permanent mapping failures move to an owned [repair queue](/blog/a-repair-queue-needs-ownership-evidence-and-an-exit); transient dependency failures use bounded backoff.
+
+If a new mapping deployment caused the stop, rollback is safe only if old code can read the new stored/event shape. Otherwise I fix forward or run a compatibility translator.
+
+## Branch D: writes are slow or ambiguous
+
+Database contention, constraint failures, provider throttling, and connection-pool exhaustion can stop commits.
+
+I inspect transaction time, lock wait, batch size, error class, and downstream capacity. For external writes, a timeout after sending is outcome-unknown. I query by operation identity before retry.
+
+Increasing worker count can make this branch worse. Capacity is limited by the slowest governed destination, not by how many processes I can start.
+
+## Branch E: checkpoint and data disagree
+
+The dangerous state is a checkpoint ahead of durable effects. Restarting from it skips data. A checkpoint behind effects creates duplicates but can be safe if all effects are idempotent.
+
+I compare:
+
+```text
+checkpoint transaction/version
+last committed record/effect ledger
+source high-water mark
+deduplication retention
+```
+
+Recovery begins from the last point I can prove, with an overlap when identity and idempotency allow it. The [pipeline recovery-point article](/blog/define-the-recovery-point-of-a-data-pipeline-before-it-fails) explains how that proof should be prepared before the incident.
+
+## Recovery is throttled and observed
+
+After fixing the cause, I do not immediately open maximum concurrency.
+
+```text
+start one partition or canary batch
+verify output and checkpoint
+increase within provider/database limits
+reserve capacity for live traffic
+watch oldest age and estimated drain time
+pause if error class changes
+```
+
+The backlog may contain work whose deadline expired or whose authority version is stale. I classify it rather than applying every old intent.
+
+## Closing requires a data check
+
+Process health is not closure. I verify:
+
+1. Source head and durable checkpoint move normally.
+2. Product-visible freshness is back within objective.
+3. No partition remains silent.
+4. Quarantined and repair records have owners.
+5. Counts/checksums or sampled records reconcile.
+6. Ambiguous effects have terminal outcomes.
+7. Backlog drain is complete or separately owned.
+
+The incident timeline records the first stale point, detection delay, data interval affected, repair/replay manifests, and final verification evidence.
+
+## The follow-up fixes detection and recovery
+
+I ask why normal correctness controls did not prevent the stop, why freshness detection took as long as it did, and why recovery needed manual knowledge not present in the runbook.
+
+Useful actions might be:
+
+```text
+atomic checkpoint/effect commit
+per-partition freshness alert
+bounded poison-record quarantine
+cursor-expiry rehearsal
+dependency capacity limit
+synthetic end-to-end probe
+automated reconciliation
+```
+
+A restart can be part of the action, after fencing and evidence capture. It is not the diagnosis.
+
+The runbook's purpose is to make me calm and precise when data has already stopped. I preserve the last provable point, locate the first broken boundary, recover within idempotency and capacity limits, and close only when user-visible truth is moving again.

@@ -1,0 +1,120 @@
+---
+caseId: "RFA-162"
+title: "Why Arc::make_mut Can Make Existing Weak Pointers Unupgradeable"
+date: "2026-09-05T16:52:00+01:00"
+lastmod: "2026-09-05T16:52:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "5c0b1555ccbd88e40b88715e7f6a44cc32b96688169fd8c7fd54348e7d36e131"
+area: "concurrency-memory"
+symptom: "A Weak pointer returns None after Arc::make_mut even though application code did not explicitly drop the corresponding strong Arc."
+summary: "When one strong Arc and only Weak pointers share an allocation, make_mut may dissociate the weak observers instead of cloning T. Preserve a strong snapshot or use shared interior mutability when observer identity must survive updates."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["targets supporting atomic pointer operations"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust Arc make_mut Weak upgrade None", "Arc make_mut dissociates Weak pointers", "Weak invalid after clone on write Arc"]
+evidence: ["Rust 1.98.1 runtime assertion", "one-strong one-weak allocation", "retained-snapshot repair"]
+sources: ["https://doc.rust-lang.org/std/sync/struct.Arc.html#method.make_mut", "https://doc.rust-lang.org/std/sync/struct.Weak.html#method.upgrade", "https://doc.rust-lang.org/std/sync/struct.Arc.html#method.strong_count"]
+---
+
+Clone-on-write sounds as if cloning is the only surprising event. `Arc::make_mut` has a cheaper branch when the allocation has one strong owner and some weak observers: it can dissociate those observers.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-162/fail.rs) creates one `Arc<String>` and one `Weak<String>`. It mutates through `Arc::make_mut`, then tries to upgrade the weak pointer. Upgrade returns `None`.
+
+No explicit `drop(current)` appears in the program, yet the observer no longer reaches an owned value.
+
+## Weak ownership does not force cloning
+
+[`Arc::make_mut`](https://doc.rust-lang.org/std/sync/struct.Arc.html#method.make_mut) guarantees mutable access to the inner value. Its strategy depends on ownership counts.
+
+There are three useful cases:
+
+```text
+one strong, no weak  -> mutate the existing allocation directly
+several strong      -> clone T into a new allocation, then mutate the clone
+one strong + weak   -> dissociate weak pointers, then mutate without cloning T
+```
+
+The third branch is documented explicitly. Because weak pointers do not keep `T` alive, the sole strong owner can become unique without copying the value. Existing `Weak` handles remain associated with an allocation that no longer has a strong `T` to upgrade.
+
+This preserves memory safety and clone-on-write semantics for strong owners. It may violate an application assumption that a weak registration remains connected through every in-place-looking update.
+
+## Count both strong and weak owners
+
+The decision cannot be understood from [`Arc::strong_count`](https://doc.rust-lang.org/std/sync/struct.Arc.html#method.strong_count) alone. A count of one is enough for `get_mut` only when there are no weak pointers, while `make_mut` can handle the weak-only-sharing case by dissociation.
+
+Before a surprising update, I record:
+
+```rust
+Arc::strong_count(&current)
+Arc::weak_count(&current)
+```
+
+These counts are diagnostic snapshots, not synchronization proofs in concurrent code. Another thread may clone or drop between observing a count and acting. `make_mut` performs the real safe ownership transition internally.
+
+The numbers help explain which branch a controlled reproduction enters.
+
+## Keeping another strong owner preserves the old snapshot
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-162/fixed.rs) clones a strong `Arc` before calling `make_mut`. The method must now clone the inner `String` for the mutating owner. The weak pointer still upgrades through the retained strong snapshot and sees `"before"`; the current owner sees `"before-after"`.
+
+This repair is appropriate when weak observers are allowed to refer to the old immutable snapshot. It makes version separation explicit:
+
+```text
+observer allocation -> old value
+writer allocation   -> cloned and updated value
+```
+
+It does **not** make the weak observer follow the latest value. That requires a different data model.
+
+## Use shared interior mutability for stable identity
+
+If observers must keep one identity and see updates, clone-on-write is the wrong abstraction. I may use:
+
+```rust
+Arc<Mutex<T>>
+Arc<RwLock<T>>
+Arc<Atomic...>
+```
+
+depending on the state and contention pattern. The outer allocation remains shared, and mutation happens through a synchronization primitive inside it. A `Weak<Mutex<T>>` can upgrade while some strong owner exists and then observe protected current state.
+
+This introduces locking or atomic protocol costs. It also communicates the requirement honestly: the value is shared and changes in place.
+
+Clone-on-write instead says strong owners may diverge into independent versions.
+
+## Weak is an observation capability, not a subscription
+
+[`Weak::upgrade`](https://doc.rust-lang.org/std/sync/struct.Weak.html#method.upgrade) returns an option because the value may no longer have a strong owner. A weak pointer avoids ownership cycles; it does not promise a permanent route to whichever allocation an `Arc` variable later points at.
+
+An `Arc` variable can be reassigned, cloned into another allocation by `make_mut`, or dropped. The `Weak` remains tied to its original allocation identity.
+
+For registries and caches, I decide what weak membership means:
+
+- observe one immutable version while it exists;
+- reach a stable mutable entity;
+- act as a best-effort cache hint;
+- receive explicit replacement when versions change.
+
+Only the first and third fit naturally with a weak pointer plus clone-on-write.
+
+## This differs from `Arc::get_mut`
+
+The Atlas case [Arc::get_mut fails while a Weak pointer exists](/rust/failures/arc-get-mut-fails-while-weak-pointer-exists) covers the stricter API. `get_mut` returns `None` when weak pointers exist because it will not invalidate their relationship to provide `&mut T`.
+
+`make_mut` has a different contract: it is allowed to clone or dissociate to create uniqueness. Choosing between them also chooses what happens to observers.
+
+I use `get_mut` when mutation is valid only under complete uniqueness. I use `make_mut` when version divergence or weak dissociation is acceptable. I do not treat one as a more convenient spelling of the other.
+
+## My debugging sequence
+
+For a weak upgrade that starts returning `None` near clone-on-write code, I check:
+
+1. Which allocation created the weak pointer?
+2. How many strong and weak owners existed before mutation?
+3. Did `make_mut` run with one strong owner?
+4. Should the observer see an old snapshot or current mutable identity?
+5. Would retaining a strong snapshot or using interior mutability express that policy?
+6. Do tests assert both upgrade behaviour and the value version observed?
+
+The central principle is identity versus value. `Arc::make_mut` promises a mutable value to one strong owner, not stable allocation identity for weak observers. When only weak handles prevent uniqueness, dissociation is legal and efficient. If my system needs observers to survive updates, I must encode that stronger relationship explicitly.

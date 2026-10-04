@@ -1,0 +1,155 @@
+---
+title: "rustc's Query System: Why the Compiler Computes Facts on Demand"
+date: "2026-09-18T09:00:00+01:00"
+tags: ["rustc query system", "Rust compiler", "incremental compilation", "compiler internals", "memoization"]
+draft: false
+reviewed: true
+reviewedHash: "2f8a020afa4afa589f2a84cf62dbada5e3b857122ba11d81c84ac1b66ed1f61e"
+cluster: "rust-under-the-hood"
+campaign: "authority-2026"
+opportunity: "RUST-009"
+summary: "A practical model of rustc queries, providers, memoization, dependency tracking, cycles, and red-green incremental reuse."
+---
+
+It is tempting to imagine rustc as one long pipeline that computes every fact in order: parse everything, resolve everything, type-check everything, optimize everything. The real compiler needs a more flexible unit of work.
+
+rustc represents much of its work as queries. A consumer asks for a fact about a key. The query system returns a cached answer or invokes the function that knows how to compute it. While doing this, it records which other facts were needed.
+
+This design gives the compiler three useful properties together: work happens when demanded, repeated work can be memoized, and dependencies can support incremental compilation.
+
+## A query is a keyed compiler question
+
+Conceptually, a query looks like this:
+
+```text
+question: type_of
+key:      DefId for `parse_config`
+answer:   fn(&str) -> Result<Config, Error>
+```
+
+The query name alone is not one cached value. `type_of(A)` and `type_of(B)` are different invocations with different keys.
+
+Each query has a provider: the compiler function that computes the answer when it is not available. A provider may ask the query context for other facts instead of directly reaching into another pass's private state.
+
+The official [query evaluation model](https://rustc-dev-guide.rust-lang.org/queries/query-evaluation-model-in-detail.html) describes this database as being built lazily. It also explains why providers should behave like pure functions of tracked inputs: memoization is unsafe if an untracked global value can silently change the result.
+
+## One requested fact grows a dependency graph
+
+Imagine the compiler driver eventually needs optimized MIR for one function:
+
+```text
+optimized_mir(parse_config)
+├── mir_built(parse_config)
+│   ├── thir_body(parse_config)
+│   │   ├── typeck(parse_config)
+│   │   └── hir_body(parse_config)
+│   └── borrowck(parse_config)
+└── optimization configuration
+```
+
+This is illustrative, not an exact stable list of current query names. The important structure is real: computing one fact requests other facts, and those reads create dependency edges.
+
+If `typeck(parse_config)` is requested again in the same session with the same key, the memoized result can be returned. If no later compiler work asks for a particular fact, the query need not be computed just because it exists.
+
+Demand-driven does not mean rustc compiles only the function that will execute at runtime. Crate checking and code generation demand broad sets of facts. It means the architecture expresses those demands through keyed computations instead of requiring every pass to eagerly materialize one global table.
+
+## Memoization and dependency tracking solve different problems
+
+Memoization avoids repeating a computation during a compiler session:
+
+```text
+first type_of(ItemA)  → run provider → cache result
+next type_of(ItemA)   → return cached result
+```
+
+Dependency tracking records why a result was computed:
+
+```text
+typeck(ItemB) read type_of(ItemA)
+```
+
+The first feature improves repeated access. The second lets a later compilation reason about whether an old result is still valid.
+
+I keep this distinction because “it is cached” does not explain invalidation.
+
+## Red and green across compilations
+
+At the end of an incremental compilation, rustc can preserve query results and the dependency graph. On the next run it assigns meaning to two colours:
+
+- green: this query invocation has the same result as the previous compilation;
+- red: its result changed.
+
+If all dependencies of a query are green, a deterministic query must also remain green and does not need to run. If one dependency is red, rustc may recompute the query and compare its result. The recomputed result can still be equal, making the query green and preventing change from propagating farther.
+
+```text
+source input changed
+       ↓ red
+parse(ItemA) recomputed, output is equivalent
+       ↓ green
+dependents can remain green
+```
+
+This is more precise than invalidating everything downstream of an edited file. The compiler's [incremental compilation guide](https://rustc-dev-guide.rust-lang.org/queries/incremental-compilation.html) calls it the red-green algorithm and explains the query dependency DAG behind it.
+
+## Why an untracked read is serious
+
+Suppose a provider reads an environment variable directly:
+
+```text
+query key and tracked inputs unchanged
+environment variable changed
+cached answer reused
+```
+
+The result is now stale even though the query system did what its graph allowed. The bug is the missing dependency edge.
+
+This is why compiler code should obtain relevant inputs through tracked mechanisms and why query providers should avoid hidden mutable state. A cache can only be correct about dependencies it can see.
+
+The same lesson applies outside compilers. Build systems, data pipelines and application caches fail in similar ways when an output depends on an undeclared file, clock, flag or network response.
+
+## Cycles are architectural information
+
+A query can request itself indirectly:
+
+```text
+A → B → C → A
+```
+
+This is not ordinary recursion over a smaller input. It means the requested facts form a dependency cycle. Some language questions legitimately need fixed-point style handling; others are program errors or compiler bugs.
+
+The query engine can detect a repeated query on the active stack and use the query's cycle policy to report or recover. The useful point for a contributor is that replacing query access with a direct call does not solve the semantic dependency. It only hides the cycle from the engine that was meant to track it.
+
+## Queries are not a free abstraction
+
+Breaking work into queries has costs:
+
+- keys and results need stable representations where incremental reuse is expected;
+- hashing and dependency recording take time;
+- large cached results use memory;
+- very coarse queries invalidate too much;
+- very fine queries add overhead and complex dependency graphs;
+- diagnostics must remain deterministic when work is reused.
+
+The right boundary is a compiler engineering decision. A query should represent a reusable fact with understandable dependencies, not merely wrap every helper function.
+
+## How I read query-heavy rustc code
+
+When exploring compiler code, I follow this order:
+
+1. Identify the fact and its key type.
+2. Find the provider that computes it.
+3. List the queries the provider reads.
+4. Check whether the result is cached, serialized or intentionally ephemeral.
+5. Look for cycle handling and diagnostics.
+6. Ask which inputs should invalidate it.
+7. Inspect callers to learn who actually demands the fact.
+
+This turns a large compiler into a graph I can traverse one edge at a time. The previous [HIR, THIR and MIR walkthrough](/blog/hir-thir-and-mir-the-same-rust-function-at-three-compiler-stages) helps identify which representation a query result belongs to.
+
+## My practical model
+
+I think of rustc's query system as an incremental, memoized fact engine.
+
+A query is a question plus a key. A provider computes the answer. Reads between providers form dependency edges. Memoization avoids duplicate work now. Red-green dependency checking reuses safe work in the next compilation.
+
+The system is powerful because the compiler makes dependencies observable. When those dependencies are too coarse, too fine or hidden, both correctness and performance become harder. Understanding that graph is the shortest route I know from a mysterious `tcx.some_query(key)` call to the compiler architecture around it.

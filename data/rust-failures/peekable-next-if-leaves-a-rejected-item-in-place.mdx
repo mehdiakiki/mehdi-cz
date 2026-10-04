@@ -1,0 +1,88 @@
+---
+caseId: "RFA-393"
+title: "Peekable::next_if Leaves a Rejected Item in Place"
+date: "2026-09-06T03:33:00+01:00"
+lastmod: "2026-09-06T03:33:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "b7f5b395f47855cffa12d5b0e5911517ef23b35560739d1fc0ffc18ba0afebbb"
+area: "upgrades-compatibility"
+symptom: "Peekable::next_if returns None for a rejected predicate but the same next element appears on the following next call."
+summary: "next_if means conditional consumption, not consume-and-filter. It returns Some only when the predicate accepts the next item; a rejection returns None and preserves that item for peek, next, or another condition."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust Peekable next_if rejected item", "next_if returns None does it consume", "conditional consume iterator Rust"]
+evidence: ["Rust 1.98.1 two-item Peekable", "predicate rejects first value", "first value remains then next_if_eq consumes second"]
+sources: ["https://doc.rust-lang.org/std/iter/struct.Peekable.html#method.next_if", "https://doc.rust-lang.org/std/iter/struct.Peekable.html#method.next_if_eq", "https://doc.rust-lang.org/std/iter/struct.Peekable.html#method.peek"]
+---
+
+I first read `next_if` like a one-item filter: inspect the next value, consume it, and return `Some` only if it matches. Rust gives it a more useful parser meaning. A rejected value stays in the iterator.
+
+The [failing fixture](/rust-failure-atlas/evidence/RFA-393/fail.rs) rejects the first value `1` while looking for `9`. The following `next()` returns `1`, not `2`.
+
+## Conditional consumption preserves lookahead
+
+[`Peekable::next_if`](https://doc.rust-lang.org/std/iter/struct.Peekable.html#method.next_if) tests the next item. When the predicate is true, it consumes and returns that item. When false, it returns `None` without consuming it.
+
+This supports parsing optional tokens. I can consume a comma only if one is next, then let the main parser handle whatever non-comma token remains.
+
+If rejection discarded the token, lookahead would be destructive and every caller would need its own pushback buffer.
+
+## None means condition not satisfied now
+
+The returned `None` does not mean the underlying iterator is exhausted. It can mean a next item exists but failed the predicate.
+
+I distinguish these states when diagnostics matter. Calling [`peek`](https://doc.rust-lang.org/std/iter/struct.Peekable.html#method.peek) afterward can show whether an item remains. Alternatively, parser state already knows which condition failed and can inspect the next token through its normal path.
+
+This is another example where `Option` alone compresses several situations. The surrounding operation defines what None means.
+
+## The predicate borrows the candidate
+
+`next_if` gives the predicate a reference to the iterator's item. For an iterator yielding references, the closure may receive an extra reference layer. The item cannot be moved out during the check because it may need to remain stored after rejection.
+
+I keep the condition small and avoid external side effects. A rejected predicate can be called again through another `next_if`, so hidden work could repeat.
+
+Once accepted, ownership of the item is returned according to the underlying iterator's item type.
+
+## next_if_eq is the equality shorthand
+
+[`next_if_eq`](https://doc.rust-lang.org/std/iter/struct.Peekable.html#method.next_if_eq) compares the next item with an expected value and follows the same conditional-consumption rule.
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-393/fixed.rs) first rejects `1`, verifies it with `peek`, consumes it with `next`, then accepts `2` with `next_if_eq`.
+
+This sequence proves state explicitly instead of relying only on one return value.
+
+## It is different from find
+
+`find` consumes items until a match and discards rejected candidates from that iterator's future. `next_if` examines at most one candidate and preserves it on rejection.
+
+For token parsers, `next_if` is suitable for an optional immediate token. For searching a sequence, `find` is suitable. Replacing one with the other can skip meaningful syntax.
+
+Similarly, `filter` is a persistent adaptor and `take_while` defines a boundary. Each predicate-based API carries a different state machine.
+
+## Peekable may already have advanced the underlying source
+
+Calling `peek` can call `next` on the underlying iterator and store that item inside `Peekable`. Rejection preserves the logical next item in the adaptor, not necessarily an untouched lower-level source.
+
+This matters if the source's `next` has visible side effects. External code should treat `Peekable` as the owner of iteration state after wrapping it, rather than inspecting the original source independently.
+
+Logical non-consumption and physical source access are different facts.
+
+## Parser loops must still make progress
+
+A loop repeatedly calling the same rejecting `next_if` without another state change will see `None` forever while the same item remains. I ensure every loop either consumes an item, changes the accepted grammar state, returns, or reports an error.
+
+This progress invariant prevents a useful pushback behavior from becoming an infinite loop.
+
+My tests include acceptance, rejection followed by `peek`, rejection followed by `next`, and exhaustion. For a tokenizer I also test consecutive optional tokens and malformed input.
+
+The core principle is that lookahead should not destroy information. `next_if` turns a predicate into a conditional state transition: acceptance advances and returns the item; rejection reports None and leaves the same logical next value ready for another part of the program.
+
+## Why I prefer this over manual peek logic
+
+I can spell the operation as `peek`, test, and then `next`, but that spreads one decision across several statements and makes borrow lifetimes easier to complicate. `next_if` packages the conditional transition in one call. I still keep the rejected-item test because a future refactor to `filter`, `find`, or an unconditional `next` would change cursor behavior while looking superficially similar. For parsers, the difference is often whether the next grammar rule receives its first token or starts one token too late.
+
+## The debugging probe
+
+When a `Peekable` parser skips data, I log or assert the item before the call, the boolean decision, and the item after it. I avoid advancing merely to inspect state; `peek` is the observation tool. This separates a predicate mistake from a cursor mistake and usually reduces a large parsing failure to one local transition.

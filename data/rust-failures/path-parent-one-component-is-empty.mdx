@@ -1,0 +1,120 @@
+---
+caseId: "RFA-199"
+title: "Why Path::parent Returns Some Empty Path for config.toml"
+date: "2026-09-05T17:38:00+01:00"
+lastmod: "2026-09-05T17:38:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "36d5df6b169197e5c7942bfd8dba46baa5e526b327d87d5c45856ecbe0ab6398"
+area: "ffi-targets"
+symptom: "Path::parent returns Some containing an empty path for config.toml instead of returning None for the one-component relative path."
+summary: 'Removing the final component of a one-component relative path leaves an empty relative path, so parent returns Some("") and only the following parent is None. Normalize empty to dot explicitly when application code means the current directory.'
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets; roots and prefixes remain platform-specific"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust Path parent returns empty path",
+    "Path parent Some empty string",
+    "one component relative path parent Rust",
+  ]
+evidence: ["Rust 1.98.1 relative path", "Some empty parent", "current-directory normalization"]
+sources:
+  [
+    "https://doc.rust-lang.org/std/path/struct.Path.html#method.parent",
+    "https://doc.rust-lang.org/std/path/struct.Path.html#method.ancestors",
+    "https://doc.rust-lang.org/std/path/struct.Path.html#method.components",
+  ]
+---
+
+I had code that used `path.parent().is_none()` to recognize a filename without a directory. It did not recognize `config.toml`.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-199/fail.rs) asks for the parent of that one-component relative path. Rust returns `Some(Path::new(""))`, not `None`.
+
+An empty path and the absence of a parent are distinct states in the lexical path model.
+
+## Removing one relative component leaves an empty path
+
+[`Path::parent`](https://doc.rust-lang.org/std/path/struct.Path.html#method.parent) returns the path without its final component. For `assets/config.toml`, the result is `assets`. For `config.toml`, removing the only component leaves an empty relative path.
+
+The documentation explicitly promises `Some("")` in this case. Asking for the parent of that empty path then returns `None`.
+
+The sequence is:
+
+```text
+config.toml
+-> ""
+-> no parent
+```
+
+For an absolute path the boundary is different. `/config.toml` has `/` as its parent, and the root has no parent. Windows prefixes add platform-specific cases.
+
+The `Option` answers whether one component could be removed. It does not answer whether the remaining displayed path contains characters.
+
+## Empty path is not automatically dot
+
+Application code often wants “the directory containing this relative filename,” and operationally that means the current directory. It is tempting to treat an empty `Path` and `.` as universally interchangeable.
+
+They are related lexical ideas, but they are not the same input to every API. The standard documentation notes that passing an empty path to most operating-system filesystem APIs results in an error. `.` explicitly names the current directory.
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-199/fixed.rs) first accepts the real parent result, then normalizes an empty parent to `Path::new(".")` because that is the application's chosen meaning.
+
+I keep this conversion near the filesystem operation rather than changing the meaning of `parent` globally.
+
+## `ancestors` includes the empty step
+
+[`Path::ancestors`](https://doc.rust-lang.org/std/path/struct.Path.html#method.ancestors) repeatedly yields the current path and its parents. For a relative path such as `foo/bar`, the sequence includes `foo/bar`, `foo`, and the empty path before ending.
+
+This can create an extra iteration in upward-search code. A configuration search may try:
+
+```text
+foo/bar/tool.toml
+foo/tool.toml
+tool.toml derived from the empty parent
+```
+
+That last step may be exactly right: search the current working directory. It may also be wrong if the algorithm intended to stop before leaving a logical project prefix.
+
+I test the complete ancestor sequence for relative and absolute starts. A loop that only checks the first two levels will not expose the empty boundary.
+
+## Option presence is the wrong directory test
+
+If I need to know whether a path was written with more than one normal component, I inspect [`Path::components`](https://doc.rust-lang.org/std/path/struct.Path.html#method.components) or examine the returned parent's emptiness. I do not overload `parent().is_some()` with that meaning.
+
+For example:
+
+```rust
+let has_named_parent = path
+    .parent()
+    .is_some_and(|parent| !parent.as_os_str().is_empty());
+```
+
+This still describes lexical syntax, not whether a directory exists. Filesystem metadata is a separate query and can change concurrently.
+
+I also avoid converting to UTF-8 just to check emptiness. `as_os_str().is_empty()` works for native paths that are not valid Unicode.
+
+## Relative paths depend on execution context
+
+`config.toml` resolves relative to the process's current directory when passed to ordinary filesystem operations. A service, test runner, editor, and shell may start with different working directories.
+
+Normalizing the empty parent to `.` makes that dependency explicit but does not make it stable. For reliable configuration, I often resolve a trusted base directory once and join the relative path to it.
+
+This is different from calling `canonicalize`: canonicalization accesses the filesystem, requires relevant components to exist, and resolves symbolic links. Parent traversal itself is lexical and does not prove existence.
+
+When a process can change its current directory, relative operations need even more care. Most applications are easier to reason about when startup converts important roots to owned absolute paths.
+
+## Roots, prefixes, and parent components need tests
+
+I include cases for an empty input, one relative component, multiple relative components, an absolute root, a file directly below root, leading `.`, and literal `..` components. On Windows I add drive-relative, drive-absolute, and network prefix cases.
+
+`components` performs limited normalization, but it does not resolve `..` through the filesystem. A lexical parent of a path containing `..` should not be mistaken for the resolved parent of its eventual target.
+
+The fixture stays with a simple relative name so its one disputed transition is visible on every target.
+
+## Why this small distinction matters
+
+An extra `Some` can affect loops, base-directory selection, archive extraction, module discovery, and upward configuration lookup. The code remains type-correct and normally does not panic. It simply performs one more policy step than the author expected.
+
+My debugging record includes the original native path, its components, every ancestor, whether the parent is empty, and the base directory eventually used for I/O. Displaying only `parent={}` can hide the state because an empty path prints as nothing.
+
+The core principle is that an empty value is still a value. `Path::parent` models component removal, so a one-component relative path has an empty parent. If my application wants that state to mean the current directory or termination, I translate it explicitly and test that policy.

@@ -1,0 +1,81 @@
+---
+caseId: "RFA-689"
+title: "OnceLock Remains Uninitialized After an Initializer Panic"
+date: "2026-09-06T08:49:00+01:00"
+lastmod: "2026-09-06T08:49:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "6412883432d1ea88d6d171378032ebd3457b04a633b1c101eafb730986c9a3ab"
+area: "concurrency-memory"
+symptom: "After get_or_init panics, OnceLock::get returns None and a later initializer can successfully publish a value."
+summary: "Unlike Once, OnceLock is not poisoned by a panicking value constructor. No value is published, so a later call may try initialization again."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["targets supporting std threads"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust OnceLock panic not poisoned", "get_or_init panic retry", "Once versus OnceLock poisoning"]
+evidence: ["Rust 1.98.1 caught initializer panic", "cell remains None after unwind", "later initializer publishes seven"]
+sources: ["https://doc.rust-lang.org/std/sync/struct.OnceLock.html", "https://doc.rust-lang.org/std/sync/struct.OnceLock.html#method.get_or_init", "https://doc.rust-lang.org/std/sync/struct.Once.html#method.call_once"]
+---
+
+`OnceLock` is not poisoned when its initializer panics. No value is published, the cell remains uninitialized, and a later `get_or_init` may try again. The [failing fixture](/rust-failure-atlas/evidence/RFA-689/fail.rs) expects a stored value after the panic and instead sees `None`.
+
+## Publication is all or nothing for the cell value
+
+The [`OnceLock` documentation](https://doc.rust-lang.org/std/sync/struct.OnceLock.html) explicitly contrasts its behaviour with poisoned synchronization primitives. During `get_or_init`, other callers wait as needed. If the closure returns normally, its complete `T` is published. If it panics, that value is not installed.
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-689/fixed.rs) catches the panic, confirms None, then publishes seven through another call.
+
+This safe container can avoid exposing a partially constructed `T`. It cannot undo effects the closure performed elsewhere.
+
+## Retry may repeat external side effects
+
+An initializer can write a file, register with a service, allocate a foreign resource, or increment a remote counter before panicking. OnceLock discards no published local value, but a later retry can repeat those actions.
+
+I make constructors locally self-contained where possible. External operations are idempotent, transactional, or completed before one small publication step. Resources owned by local temporaries are cleaned during unwinding through Drop, but Drop cannot roll back every remote effect.
+
+“Not poisoned” means the cell permits retry. It does not mean every initializer is safely retryable.
+
+## This differs deliberately from Once
+
+`Once::call_once` records a panicking one-time action as poisoned because it may have mutated arbitrary state. OnceLock controls a value slot and publishes only a completed value, so it can remain uninitialized.
+
+Choosing the primitive changes recovery semantics. For a global value, OnceLock often gives a narrower and safer contract. For an action whose effects live elsewhere, Once poison may better warn that something started.
+
+I do not generalise a rule such as “all once initialization poisons” or “all once initialization retries.” I read the exact type.
+
+## Panics should not replace fallible initialization
+
+Network failure, invalid configuration, unavailable files, and permission errors are expected `Result` cases. Stable `get_or_try_init` availability depends on the Rust version and API, so an application may perform fallible startup before setting, store a Result intentionally, or use another cell implementation with the required contract.
+
+Storing `Result<T, E>` caches failure permanently, which is correct only if failures should not retry. Retrying every request can create storms. The policy needs explicit backoff, readiness, and observability.
+
+Panic remains for broken invariants, and catch_unwind is an isolation boundary rather than ordinary branching.
+
+## Waiting callers need a latency policy
+
+While one initializer runs, others may block. If it panics, one of the callers may later become another initializer. A repeatedly panicking constructor can serialize many requests and create high tail latency.
+
+I initialise critical resources before accepting traffic or expose readiness. Runtime lazy initialization is best for deterministic bounded construction, not uncontrolled remote dependency recovery.
+
+Recursive initialization of the same cell is an error and may deadlock under current behaviour. Dependency injection and an acyclic startup graph prevent this.
+
+## Tests observe attempts and effects
+
+The fixture proves cell state after panic and later success. Additional tests count attempts, verify temporary resource cleanup, and make remote fakes detect duplicated operations.
+
+Concurrent tests assert one successful publication without assuming which thread supplies it. Panic hooks can print during caught failures, so exit status and assertions remain the evidence.
+
+I also avoid returning references from temporary helper state during construction. The value stored in a static OnceLock must satisfy its real lifetime requirements, and hiding leaked allocations inside an initializer makes cleanup impossible. Owned values and explicit shared handles usually keep publication and shutdown semantics understandable.
+
+## My OnceLock panic checklist
+
+- Does a panic leave the cell uninitialized as expected?
+- Which external effects may already have happened?
+- Is retry safe, idempotent, and bounded?
+- Should expected failures be Results rather than panics?
+- Would caching an error be correct or too permanent?
+- Can lazy initialization block request-serving threads?
+- Is the initializer dependency graph acyclic?
+- Do tests inspect both local publication and external side effects?
+
+The core principle is that OnceLock protects publication of its contained value, not every effect in its constructor. After panic it can retry because no `T` was published. I make the surrounding work safe for that exact retry contract.

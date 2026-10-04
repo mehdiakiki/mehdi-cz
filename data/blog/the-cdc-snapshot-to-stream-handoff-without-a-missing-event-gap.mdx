@@ -1,0 +1,191 @@
+---
+title: "The CDC Snapshot-to-Stream Handoff Without a Missing-Event Gap"
+date: "2026-10-14T09:00:00+01:00"
+tags: ["change data capture", "CDC", "database snapshot", "streaming", "data pipeline"]
+draft: false
+reviewed: true
+reviewedHash: "0b2418893742a0cc29aee08a932b3fe5239a6fec170926e7a2ced5562580eda7"
+cluster: "reliable-data-integrations"
+campaign: "authority-2026"
+opportunity: "DATA-047"
+summary: "An initial CDC load needs a database-consistent snapshot paired with a retained log position. Buffer changes after that boundary, apply the base, then drain without stale overwrite."
+---
+
+A new change-data-capture consumer needs two things:
+
+```text
+the rows that already exist
+the changes that happen from now on
+```
+
+Reading a table and then starting the stream looks natural. It creates a gap where writes can happen after the scan passes a row but before streaming begins.
+
+Starting the stream first is safer, but it creates duplicates and a race between old snapshot values and newer changes. The handoff needs one explicit log boundary.
+
+## The naive snapshot-first sequence loses data
+
+Suppose Account 17 contains version 4.
+
+```text
+10:00 snapshot scans Account 17 as version 4
+10:02 application updates it to version 5
+10:05 snapshot finishes
+10:06 CDC subscription starts from "now"
+```
+
+The consumer never sees version 5. It has a complete snapshot and a healthy live stream, with a silent hole between them.
+
+Increasing the scan speed reduces the window. It does not remove it.
+
+## The handoff contract
+
+The safe abstraction is:
+
+```text
+S = a consistent database snapshot
+P = a change-log position aligned with S
+
+S contains state as of P
+the stream contains every committed change after P
+```
+
+The database or CDC connector must provide the mechanism that pairs them. Taking an arbitrary timestamp before `SELECT *` is not enough: clocks do not define a transaction-log position, and rows in a long scan do not all represent that timestamp unless the database gives snapshot consistency.
+
+PostgreSQL logical decoding, for example, uses replication slots and log sequence positions. Its [logical decoding documentation](https://www.postgresql.org/docs/current/logicaldecoding-explanation.html) explains that slots retain required WAL and track the position already delivered. Production connectors build a coordinated snapshot protocol on top of these primitives.
+
+## A generic safe sequence
+
+The platform details differ, but the state machine is:
+
+```text
+1. establish a durable stream position P0 and retention
+2. open the database-consistent snapshot associated with P0
+3. start retaining or reading changes after P0
+4. copy snapshot rows
+5. apply the snapshot base
+6. drain retained changes after P0 in source order
+7. record a durable live checkpoint
+8. switch to continuous streaming
+```
+
+Steps 1 and 2 are the critical handshake. I use a connector-supported snapshot mode or a database protocol designed for it rather than assembling unrelated commands and hoping they describe one boundary.
+
+Debezium's [PostgreSQL connector snapshot documentation](https://debezium.io/documentation/reference/stable/connectors/postgresql.html#postgresql-snapshots) is a concrete implementation reference: the connector records a WAL position, scans a consistent snapshot, then continues from that position.
+
+## Buffering prevents the log from disappearing
+
+The snapshot may take hours. Changes after `P0` must remain available until the base load reaches them.
+
+Depending on the design, they are retained in:
+
+- the database log through a replication slot;
+- the CDC platform's durable queue;
+- a broker topic;
+- or an explicit handoff buffer.
+
+This retention has an operational limit. If the snapshot is slower than incoming changes and the database retains all required WAL, disk can fill.
+
+I monitor:
+
+```text
+snapshot rows and bytes remaining
+snapshot throughput
+change-log bytes retained since P0
+available disk or broker retention margin
+estimated time until retention limit
+```
+
+“No gap” can transfer pressure to the source database. The capacity plan belongs in the protocol.
+
+## Do not let the snapshot overwrite a newer change
+
+Suppose live changes are applied while snapshot chunks are still arriving:
+
+```text
+stream applies Account 17 version 5
+snapshot later writes Account 17 version 4
+```
+
+The final state becomes stale even though no event was missing.
+
+I use one of two clear strategies.
+
+The simple strategy is phase ordering:
+
+```text
+write all snapshot rows
+then drain changes after P0
+then go live
+```
+
+The lower-latency strategy permits overlap but stores source positions or versions and rejects an older write:
+
+```sql
+insert into account_projection (id, balance, source_position)
+values (:id, :balance, :position)
+on conflict (id) do update
+set balance = excluded.balance,
+    source_position = excluded.source_position
+where account_projection.source_position < excluded.source_position;
+```
+
+Snapshot rows need a position comparable with streamed rows, or they need a separate “base” rank below all changes after `P0`.
+
+## Deletes prove whether the design works
+
+An entity may exist in the snapshot view and be deleted while the scan runs.
+
+```text
+snapshot contains Customer 9
+delete Customer 9 commits after P0
+```
+
+The change stream must carry the delete after the snapshot base. If tombstones are dropped or compacted before the consumer drains them, Customer 9 returns as a ghost record.
+
+I include create, update, and delete races in the handoff test. Deletes are not a secondary detail.
+
+## Snapshot chunks need resumable progress
+
+A crash on table 12 of 20 should not require an untracked restart. I store:
+
+```ts
+type SnapshotRun = {
+  runId: string;
+  basePosition: string;
+  snapshotIdentity: string;
+  table: string;
+  lastCompletedChunk: string | null;
+  rowsCopied: number;
+  phase: "snapshot" | "drain" | "live" | "failed";
+};
+```
+
+The `snapshotIdentity` matters. A database snapshot often has a bounded lifetime and cannot simply be reopened after a crash. The recovery policy must say whether the connector resumes the same supported snapshot, restarts with a new boundary, or uses an incremental-snapshot protocol.
+
+Reusing the old `P0` with a new unrelated table scan can recreate the consistency gap.
+
+## Duplicates are normal at the boundary
+
+The snapshot state and the change log can describe the same logical update. A connector can also redeliver changes after a restart.
+
+I require idempotent application by source identity or monotonic position. The handoff promise is normally “no missing committed change,” not “the sink handler runs exactly once.”
+
+The durable live checkpoint advances only after the corresponding sink writes are durable. Otherwise a restart can skip changes that existed only in memory.
+
+## A handoff test I trust
+
+While the snapshot runs, I execute a fixed schedule:
+
+```text
+insert a row before its chunk is scanned
+insert a row after its chunk is scanned
+update one snapshotted row twice
+delete a row present in the snapshot
+delete and recreate the same business identity
+crash during the final chunk
+crash while draining buffered changes
+```
+
+After recovery, I compare the sink with the source at a recorded end position and verify every applied position is monotonic per key.
+
+The snapshot and stream are not two independent imports. Together they form one history split at `P0`. Once the database-consistent base and retained change position are treated as a pair, the handoff becomes testable instead of hopeful.

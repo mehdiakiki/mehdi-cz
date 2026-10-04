@@ -1,0 +1,210 @@
+---
+title: "Compensation Is a Business Operation, Not a Database Rollback"
+date: "2026-10-13T09:00:00+01:00"
+tags: ["saga pattern", "compensating transaction", "distributed systems", "workflow", "reliability"]
+draft: false
+reviewed: true
+reviewedHash: "6f868828403b0c4c659ce864ecd316048989fd30208b7bc08a66cadc82ff9911"
+cluster: "reliable-data-integrations"
+campaign: "authority-2026"
+opportunity: "DATA-046"
+summary: "A saga cannot rewind remote history. Each compensation is a new, fallible business operation with its own identity, policy, evidence, and possible manual outcome."
+---
+
+When step four of a distributed workflow fails, we often say: “Roll back the first three steps.”
+
+There is no database rollback across independent services after their commits. There are only new operations that try to repair the business outcome.
+
+That difference changes how I design a saga.
+
+## A refund does not erase a charge
+
+Consider an order workflow:
+
+```text
+1. reserve inventory
+2. charge payment
+3. book shipment
+4. confirm order
+```
+
+If shipment booking fails after the charge succeeds, the database history cannot jump backwards. The payment provider may support a refund, but a refund is another financial record. It may take time, incur a fee, fail, or require review.
+
+The repaired history becomes:
+
+```text
+payment charged
+shipment booking failed
+refund requested
+refund accepted
+inventory released
+order cancelled
+```
+
+The customer and audit system can observe both the charge and refund. Calling this a rollback hides the real states.
+
+## Define compensation beside each forward step
+
+I design the workflow as a table:
+
+| Forward step | Durable success evidence | Compensation | Is compensation exact? |
+| --- | --- | --- | --- |
+| reserve stock | reservation ID | release reservation | usually close |
+| charge card | provider charge ID | refund charge | no; money moved twice |
+| book shipment | booking ID | cancel booking | depends on carrier state |
+| send confirmation | message ID | send correction | no; email cannot be unsent |
+
+The final column prevents fictional symmetry. Some effects can be reversed closely, some only counteracted, and some cannot be meaningfully undone.
+
+The [Azure compensating transaction pattern](https://learn.microsoft.com/en-us/azure/architecture/patterns/compensating-transaction) makes the same core point: undo work is application-specific, may not restore the original state, and can itself fail.
+
+## Keep the saga state explicit
+
+I store state outside the model or request process:
+
+```ts
+type Saga = {
+  sagaId: string;
+  orderId: string;
+  status:
+    | "running"
+    | "compensating"
+    | "compensation_failed"
+    | "completed"
+    | "cancelled";
+  nextStep: string;
+  version: number;
+};
+
+type SagaEffect = {
+  sagaId: string;
+  step: string;
+  direction: "forward" | "compensate";
+  effectKey: string;
+  status: "planned" | "requested" | "confirmed" | "failed";
+  externalReference?: string;
+  attempts: number;
+};
+```
+
+`effectKey` identifies the intended operation across process retries. The external reference is evidence returned by the service, such as a charge or reservation ID.
+
+A conversation transcript is not enough. It does not enforce unique effects or tell a restarted worker which remote outcome is already durable.
+
+## Compensation order follows dependencies, not a slogan
+
+Undoing in reverse order is a useful starting point:
+
+```text
+forward:     reserve -> charge -> ship
+compensate:  cancel ship -> refund -> release
+```
+
+But independent operations can compensate in parallel, and business constraints may require another order. For example, stock can be released immediately while a refund waits for the provider.
+
+I draw dependencies:
+
+```text
+cancel shipment confirmed
+        |
+        v
+close order
+
+refund requested -------> customer notification
+release inventory ------> inventory available
+```
+
+The saga is complete only when its required terminal conditions are true, not when one reverse loop reaches index zero.
+
+## Every compensation needs idempotency
+
+The refund request can time out after the provider accepts it. Retrying with a new identity may refund twice.
+
+I derive a stable key:
+
+```text
+compensation key = saga_id + forward_step + forward_effect_id + compensation_kind
+```
+
+All attempts for the same intended refund use this key. On an ambiguous result, the worker reconciles with the provider before deciding whether another request is safe.
+
+Forward and compensation identities must differ. “Charge order 17” and “Refund charge ch_82” are two effects, not two attempts of one effect.
+
+## A compensation can become impossible
+
+Inventory may already be consumed. A parcel may have left the carrier. A domain deadline may pass while retries run.
+
+I model the outcomes:
+
+```text
+compensated
+compensation_pending
+compensation_rejected
+manual_resolution_required
+accepted_residual_effect
+```
+
+The last two are uncomfortable but honest. A system that retries forever is not more consistent; it is hiding a business decision inside infrastructure.
+
+For an irreversible effect, I move approval or a final invariant check **before** the point of no return when possible.
+
+## Concurrent changes require preconditions
+
+Between the forward step and compensation, another workflow may legitimately change the resource.
+
+This command is too broad:
+
+```text
+set inventory.available = inventory.available + 1
+```
+
+A safer release refers to the exact reservation:
+
+```text
+release reservation res_441 if it is still active
+```
+
+Compensation should target the effect it owns, not calculate a guessed inverse from current aggregate state.
+
+## Failure handling is a state machine
+
+For each compensation I define:
+
+| Situation | Response |
+| --- | --- |
+| network timeout | reconcile by effect key, then bounded retry |
+| provider rate limit | wait according to policy and deadline |
+| validation rejection | stop retrying and classify |
+| resource already compensated | record idempotent success |
+| resource changed by another process | evaluate precondition and escalate |
+| retry budget exhausted | enter visible manual state |
+
+This is why a generic `catch { undoAll() }` is insufficient.
+
+## Test the second failure
+
+Teams test that step four fails and compensation starts. I also fail the compensation:
+
+```text
+crash after refund accepted but before local confirmation
+release succeeds twice from duplicate delivery
+carrier cancellation returns unknown
+manual operator and worker compensate concurrently
+workflow restarts halfway through reverse steps
+```
+
+I assert the final external effects and saga evidence, not only the final status string.
+
+## The user-facing outcome belongs in the design
+
+Compensation can take minutes or days. During that time the product needs an honest state such as “Cancellation in progress; refund requested.” Showing “Cancelled” before the refund is confirmed can make the system look finished when important work remains.
+
+The operational signals I keep are:
+
+- sagas in compensation by age and business value;
+- compensation retry rate by provider and error class;
+- ambiguous remote effects awaiting reconciliation;
+- manual cases and their owner;
+- time from forward failure to safe terminal outcome.
+
+A compensation is a forward-moving repair. Once I model it this way, it receives the same care as any production operation: stable identity, current preconditions, bounded retries, observability, and a named outcome when automation cannot finish.

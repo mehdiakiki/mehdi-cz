@@ -1,0 +1,124 @@
+---
+caseId: "RFA-188"
+title: "Why mpsc::try_iter Ending Does Not Mean the Channel Disconnected"
+date: "2026-09-05T17:27:00+01:00"
+lastmod: "2026-09-05T17:27:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "b5637220d5b4a8bc09cda4fd124810a0e1161deead020b16abb1f0ee3b17e38b"
+area: "concurrency-memory"
+symptom: "Receiver::try_iter returns None after draining current messages although a live sender publishes another message immediately afterward."
+summary: "try_iter is a nonblocking view of messages pending now, not a channel-lifecycle signal. Use try_recv when Empty and Disconnected require different actions, or a blocking receive loop when completion should follow sender ownership."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets with std"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust mpsc try_iter empty disconnected",
+    "Receiver try_iter stops before later messages",
+    "try_recv Empty vs Disconnected Rust",
+  ]
+evidence:
+  [
+    "Rust 1.98.1 channel state timeline",
+    "live sender after temporary emptiness",
+    "explicit TryRecvError repair",
+  ]
+sources:
+  [
+    "https://doc.rust-lang.org/std/sync/mpsc/struct.Receiver.html#method.try_iter",
+    "https://doc.rust-lang.org/std/sync/mpsc/struct.Receiver.html#method.try_recv",
+    "https://doc.rust-lang.org/std/sync/mpsc/struct.Receiver.html#method.iter",
+  ]
+---
+
+I once treated the end of `Receiver::try_iter` as the end of a channel. The code worked in small tests because every producer had already sent its messages. In the real shape of the program, one sender was still alive and published more work after the iterator returned `None`.
+
+The mistake is small but important: `try_iter` reports what can be received without waiting **now**. It does not prove what can arrive later.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-188/fail.rs) sends one message, drains it with `try_iter`, and records the state immediately afterward. `try_recv` reports `Empty`, not `Disconnected`. The same live sender can then send a second message, and the receiver gets it normally.
+
+## One iterator ending represents two states
+
+[`Receiver::try_iter`](https://doc.rust-lang.org/std/sync/mpsc/struct.Receiver.html#method.try_iter) creates an iterator that never blocks. It yields messages that are pending and returns `None` when no more pending messages are available. It also returns `None` after the channel is disconnected and drained.
+
+Those states look identical through the iterator interface:
+
+```text
+queue empty + at least one sender alive  -> None
+queue empty + every sender dropped       -> None
+```
+
+In the first state, another message remains possible. In the second state, no future send is possible. `Iterator::next` has only `Some(item)` and `None`, so it cannot carry this extra distinction.
+
+This is a general API lesson. A convenient abstraction sometimes merges states that the lower-level API keeps separate. I do not recover that missing information by guessing from timing.
+
+## `try_recv` exposes the distinction
+
+[`Receiver::try_recv`](https://doc.rust-lang.org/std/sync/mpsc/struct.Receiver.html#method.try_recv) is also nonblocking, but its error type separates `TryRecvError::Empty` from `TryRecvError::Disconnected`.
+
+- `Empty` means there is no message ready, but at least one sender capability still exists.
+- `Disconnected` means every sender is gone and no buffered message remains.
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-188/fixed.rs) observes the full sequence without sleeps or scheduler assumptions: one pending message, temporary emptiness, a later message, sender drop, and final disconnection.
+
+This makes a better regression test than spawning a producer and waiting an arbitrary number of milliseconds. The state transition is controlled by ownership and explicit operations.
+
+## Draining pending work is still useful
+
+`try_iter` is not wrong or unreliable. I use it when I deliberately want a snapshot-like drain: process everything ready at this point, then return to another responsibility such as rendering, polling a socket, or advancing an event loop.
+
+The important word is “ready.” The collected vector is not a history of the channel and is not a promise that producers finished. Even “snapshot” needs care because concurrent senders can publish while the iterator is running. The contract is about nonblocking availability, not a globally frozen queue.
+
+I name the result `currently_pending` or `ready_messages`, not `all_messages`. Names protect the semantic boundary after the original API call is far away.
+
+## Use a blocking iterator for ownership-based completion
+
+[`Receiver::iter`](https://doc.rust-lang.org/std/sync/mpsc/struct.Receiver.html#method.iter) has a different contract. It can block waiting for messages while senders remain alive. It ends after the channel disconnects and buffered messages have been received.
+
+That makes this shape appropriate for a worker or collector whose lifetime is defined by producer ownership:
+
+```rust
+for message in receiver.iter() {
+    process(message);
+}
+```
+
+There is a cost: one forgotten `Sender` clone can keep the loop waiting forever. RFA-111 covers that other side of the same ownership rule. I trace every sender stored in structs, closures, and coordinator scopes when a blocking receive loop refuses to finish.
+
+## Do not turn `try_recv` into an accidental hot loop
+
+Replacing `try_iter` with repeated `try_recv` can preserve the state distinction, but a loop that immediately retries on `Empty` may consume a CPU core while doing no work.
+
+When `Empty` means “check other sources and come back later,” I return control to the surrounding event loop. When the receiver should wait for work, I use `recv`, `recv_timeout`, or the blocking iterator according to the actual cancellation and deadline contract.
+
+A timeout is also not disconnection. It says the wait budget expired before a message arrived. The sender ownership state may still be live.
+
+## Buffered messages outlive the last sender
+
+Dropping every sender prevents future sends, but it does not erase messages already queued. A receiver may still obtain those buffered messages before it observes `Disconnected`.
+
+So “all senders dropped” and “receiving is finished” are separate moments:
+
+```text
+last Sender dropped
+-> queued messages remain receivable
+-> queue becomes empty
+-> receiver observes Disconnected
+```
+
+This detail matters in shutdown code. If I stop reading as soon as a separate shutdown flag changes, I may abandon accepted work. If I instead define graceful completion as “senders gone and channel drained,” the receive API can express it directly.
+
+## My channel-state checklist
+
+When a nonblocking receive loop stops too early, I ask:
+
+1. Did the API report temporary absence or permanent disconnection?
+2. Does its return type preserve that distinction?
+3. Can any original or cloned sender still publish?
+4. Are messages already buffered after the last sender drops?
+5. Should the consumer drain what is ready, block for completion, or respect a deadline?
+6. Does retrying on `Empty` create busy polling?
+7. Can the regression fixture control ownership instead of depending on sleeps?
+
+The core principle goes beyond Rust channels: no observation is not the same as a terminal state. `try_iter` answers “what can I receive without blocking now?” Channel completion is a stronger fact, established by sender ownership and an empty queue.

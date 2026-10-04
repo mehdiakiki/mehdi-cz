@@ -1,0 +1,124 @@
+---
+caseId: "RFA-721"
+title: "Why NonZeroU32::from_str_radix Rejects Zero with IntErrorKind::Zero"
+date: "2026-09-07T12:00:00+01:00"
+lastmod: "2026-09-07T12:00:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "eaee09f6e3a7a2531c2666df0a3397ded94e095afa20cfc6f7a090009ebf14ca"
+area: "upgrades-compatibility"
+symptom: "NonZeroU32::from_str_radix(\"0\", 10).unwrap() panics even though zero is valid decimal syntax and fits inside u32."
+summary: "Rust 1.98 parses directly into the non-zero destination type. Zero passes the radix grammar but fails the destination invariant, producing ParseIntError with IntErrorKind::Zero."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets"]
+profiles: ["dev", "release"]
+searchTerms: ["Rust NonZeroU32 from_str_radix zero ParseIntError", "IntErrorKind Zero nonzero integer parsing", "NonZero from_str_radix valid digits but error"]
+evidence: ["Rust 1.98.1 runtime panic after unwrapping zero", "ParseIntError reports IntErrorKind::Zero", "repaired parser preserves a domain-specific zero message and accepts twelve"]
+sources: ["https://doc.rust-lang.org/releases.html#version-1980-2026-08-20", "https://doc.rust-lang.org/std/num/type.NonZeroU32.html#method.from_str_radix", "https://doc.rust-lang.org/std/num/enum.IntErrorKind.html#variant.Zero"]
+---
+
+Zero is valid decimal text. It is also a valid `u32`. But it is not a valid `NonZeroU32`, and Rust 1.98 lets the parser express this difference directly.
+
+This program panics:
+
+```rust
+use std::num::NonZeroU32;
+
+fn main() {
+    let workers = NonZeroU32::from_str_radix("0", 10).unwrap();
+    println!("worker count: {workers}");
+}
+```
+
+The important part of the panic is:
+
+```text
+ParseIntError { kind: Zero }
+```
+
+The characters were understood. The parsed value simply cannot inhabit the requested destination type.
+
+The [failing fixture](/rust-failure-atlas/evidence/RFA-721/fail.rs) captures the unwrap panic on Rust 1.98.1. The [repaired fixture](/rust-failure-atlas/evidence/RFA-721/fixed.rs) checks `IntErrorKind::Zero`, returns a useful configuration message, and separately proves that `"12"` becomes a non-zero value.
+
+## Parsing has a grammar boundary and a type boundary
+
+I find this API easier to understand when I separate two questions.
+
+First: does the input follow the integer grammar for the selected radix? For base ten, `"0"` contains a valid digit. It has no whitespace, underscore, or invalid character.
+
+Second: is the resulting mathematical value representable by the destination type? `NonZeroU32` represents the values from one through `u32::MAX`. Its entire purpose is that zero is not present.
+
+`from_str_radix` answers both questions in one operation. It does not parse a `u32` and promise success before a later constructor checks the invariant. It returns `Result<NonZeroU32, ParseIntError>`, so a well-formed zero can still be an error.
+
+This is useful because successful parsing gives the rest of the program a stronger value. A function accepting `NonZeroU32` does not need to check zero again. Division, chunk sizing, concurrency limits, and retry intervals can carry their domain constraint in the type.
+
+## IntErrorKind::Zero is not InvalidDigit
+
+If the input is `"twelve"`, parsing fails because the characters are not decimal digits. If the input is empty, the error kind represents an empty input. If the number is too large, the error reports positive overflow. Zero has its own `IntErrorKind::Zero` variant.
+
+That distinction helps at an application boundary. A user who entered zero did not make a spelling mistake. They supplied a number which the application does not allow.
+
+In a configuration parser, I can translate the error like this:
+
+```rust
+use std::num::{IntErrorKind, NonZeroU32};
+
+fn parse_worker_count(raw: &str) -> Result<NonZeroU32, String> {
+    NonZeroU32::from_str_radix(raw, 10).map_err(|error| match error.kind() {
+        IntErrorKind::Zero => "worker count must be greater than zero".to_owned(),
+        _ => format!("invalid worker count: {error}"),
+    })
+}
+```
+
+This preserves the low-level category while presenting a domain-specific explanation. I normally avoid showing only “invalid digit” or “parse failed” for every case, because such a message sends a person to inspect syntax that was already correct.
+
+I keep a fallback arm because `IntErrorKind` is marked non-exhaustive. My code should not assume that today's variants are the complete future set.
+
+## Why unwrap is the actual failure in the reduction
+
+`from_str_radix("0", 10)` does not panic. It returns `Err`. The panic comes from `unwrap`, which claims that failure is impossible.
+
+This matters during debugging. Replacing the parser would be unnecessary if the input is allowed to be invalid. The correct repair is to preserve and handle the `Result` at the boundary where a useful policy can be chosen.
+
+An unwrap can be appropriate in a test or for a literal whose correctness is reviewed with the source. It is poor configuration handling when a file, environment variable, CLI argument, or network request can contain zero.
+
+I therefore trace where the text came from before editing the parser. If the input is external, I return a validation error. If zero means “automatic,” then `NonZeroU32` alone does not model the complete domain; I may need an enum such as `Automatic | Fixed(NonZeroU32)`. I do not quietly convert zero to one unless the product contract explicitly says so.
+
+## This differs from an invalid radix
+
+There is another `from_str_radix` boundary which looks similar but has a different cause. The radix argument itself must be within the supported range. An unsupported base such as one is a violated method precondition and may panic before ordinary text parsing can return `ParseIntError`.
+
+RFA-721 uses radix ten, so the base is valid. The failure is the destination type's zero invariant. This difference changes the first check:
+
+- for an unsupported radix, validate the dynamic base before parsing;
+- for `IntErrorKind::Zero`, decide what zero means in the application domain.
+
+Keeping these cases separate makes search results more useful. “Why did radix one panic?” and “Why did decimal zero return an error?” should not lead to the same repair.
+
+## Parse directly or validate in two steps?
+
+Before Rust 1.98 stabilized this constructor, code could parse and then construct:
+
+```rust
+let value = raw.parse::<u32>()?;
+let value = NonZeroU32::new(value).ok_or("must not be zero")?;
+```
+
+That remains clear and can be useful when syntax errors and domain errors have different application error types. The direct method is more compact and returns the standard `ParseIntError` taxonomy for both stages.
+
+I choose based on the surrounding error design, not only line count. If I already translate every parse error, the direct method avoids an intermediate unrestricted integer. If my API distinguishes lexical parsing from business validation, two explicit steps may communicate the boundary better.
+
+Both approaches should end with `NonZeroU32` once validation succeeds. Keeping a plain `u32` and remembering “zero was checked earlier” spreads an invariant across control flow instead of storing it in the value.
+
+## My checklist for non-zero configuration
+
+When a count, size, port-like identifier, or interval must not be zero, I check:
+
+1. Is zero invalid, or does it have a separate meaning such as disabled or automatic?
+2. Is the radix fixed by the protocol, or supplied dynamically?
+3. Which `IntErrorKind` values deserve a clearer user message?
+4. Does the validated value cross the boundary as `NonZeroU32`, or get weakened back to `u32`?
+5. Are zero, one, the maximum value, invalid digits, and overflow covered by tests?
+
+The core principle is that valid text is not necessarily a valid domain value. Rust 1.98's `NonZeroU32::from_str_radix` makes the destination invariant part of parsing, and `IntErrorKind::Zero` lets me explain the exact boundary instead of treating a correct digit as malformed input.

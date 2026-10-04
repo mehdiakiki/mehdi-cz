@@ -1,0 +1,137 @@
+---
+title: "When Match Reporting Costs More Than Match Searching"
+date: "2026-10-15T10:40:00+01:00"
+lastmod: "2026-09-05T12:00:00+01:00"
+tags: ["rust", "aho-corasick", "algorithms", "performance", "backpressure"]
+draft: false
+reviewed: true
+reviewedHash: "57b6d7900afbe6cdce29d8727fb3adf931e04b5cb19ded8b28a0557332ffcbd4"
+cluster: "rust-under-the-hood"
+campaign: "editorial"
+summary: "A scanner can inspect bytes efficiently and still drown in valid results. I explain output-sensitive cost, overlapping matches, allocations, callbacks, and bounded consumers in Rust."
+---
+
+We spend much time making a search loop cheaper per byte. Then a small input produces thousands of valid matches and the result path becomes the actual system.
+
+This is not an implementation accident. Algorithms that enumerate results must pay for the results they expose. Aho–Corasick avoids comparing every pattern at every position, but it cannot make a requested match disappear for free.
+
+I call this the output boundary: the point where recognizing a match becomes application work.
+
+## A small haystack can have many answers
+
+Search `aaaa` with `a`, `aa`, and `aaa` and request overlapping matches:
+
+```rust
+use aho_corasick::AhoCorasick;
+
+fn main() {
+    let matcher = AhoCorasick::new(["a", "aa", "aaa"]).unwrap();
+    let matches: Vec<_> = matcher
+        .find_overlapping_iter("aaaa")
+        .map(|m| (m.pattern().as_usize(), m.start(), m.end()))
+        .collect();
+
+    assert_eq!(9, matches.len());
+}
+```
+
+There are four occurrences of `a`, three of `aa`, and two of `aaa`. Increase both the haystack and the prefix family and output grows quickly.
+
+The crate's [`find_overlapping_iter` documentation](https://docs.rs/aho-corasick/latest/aho_corasick/struct.AhoCorasick.html#method.find_overlapping_iter) describes this operation as returning every possible match at every position. That promise is valuable, and it has a cost proportional to the answers.
+
+## “Search time” often includes application work
+
+An iterator yielding a compact match value is only the beginning. Production code may:
+
+- allocate an owned object;
+- copy matched text;
+- resolve a pattern ID into metadata;
+- update counters or a database;
+- serialize JSON;
+- send an event through a bounded channel;
+- acquire a lock around shared output;
+- redact or rewrite the input.
+
+When matches are rare, these costs disappear into the average. When matches are dense, they can dominate.
+
+This is why I never benchmark a no-match haystack and claim end-to-end throughput for a result-producing service.
+
+## Count before collecting
+
+To isolate recognition, I consume match metadata into a scalar rather than allocate a vector for every iteration:
+
+```rust
+let checksum = matcher
+    .find_overlapping_iter(haystack)
+    .fold(0usize, |value, found| {
+        value ^ found.start() ^ found.end() ^ found.pattern().as_usize()
+    });
+std::hint::black_box(checksum);
+```
+
+This does not represent the full product. It answers a narrower question: how expensive are scanning and iterator production when result storage is removed?
+
+I then add the real consumer in a second benchmark. The difference is not noise; it is the cost of the application contract.
+
+I also keep the match count with every result. If a supposedly faster configuration returns fewer matches because it changed from overlapping to non-overlapping semantics, the comparison is invalid.
+
+## Match semantics control output volume
+
+`find_iter` returns non-overlapping matches according to the configured match kind. `find_overlapping_iter` returns all overlapping matches and requires standard semantics.
+
+Choosing a lower-output semantic purely to improve performance is safe only if it matches the product rule. For a security scanner, suppressing an overlapping signature may be unacceptable. For a highlighter, selecting the leftmost-longest term may be precisely the desired behavior.
+
+I write expected examples first. [Aho–Corasick Match Kinds in Rust](/blog/aho-corasick-match-kinds-standard-leftmost-rust) shows the differences.
+
+## Copying matched bytes can amplify memory traffic
+
+A match value contains identifiers and byte offsets. That is often enough. If downstream code immediately creates `haystack[start..end].to_vec()` for every match, overlapping results copy the same source bytes repeatedly.
+
+Owned copies may be necessary when the input chunk will be released before processing completes. But I do not pay that cost automatically. Alternatives include:
+
+- process results synchronously while the borrowed input lives;
+- store owned offsets and retain the backing buffer once;
+- batch matches per input block;
+- copy only the fields that cross an ownership boundary;
+- cap or summarize results when the product permits it.
+
+Rust lifetimes make the trade visible. A borrowed match view cannot be sent to a task that outlives its input without retaining ownership somewhere.
+
+## Backpressure belongs in the design
+
+If scanning produces results faster than a database or network consumer accepts them, an unbounded channel converts throughput imbalance into memory growth.
+
+I choose one explicit behavior:
+
+1. block or await when the bounded queue is full;
+2. batch results up to a memory limit;
+3. stop after a configured maximum;
+4. aggregate counts instead of individual events;
+5. spill to durable storage;
+6. reject an input whose result volume exceeds the contract.
+
+The correct choice depends on whether every match is mandatory. Dropping silently is almost never a neutral performance optimization.
+
+For a synchronous scanner, a callback can naturally slow the producer. For parallel workers, I include queue wait time in the end-to-end profile. Otherwise the scanner benchmark can look excellent while the service accumulates a large backlog.
+
+## Adversarial output is also a capacity problem
+
+When users control input or patterns, they may create extreme overlap accidentally or deliberately. Linear input scanning does not guarantee bounded output size.
+
+I set limits on pattern count, combined pattern bytes, maximum pattern length, input size, and emitted matches where the domain allows. If all matches must be preserved, I capacity-plan the output path and use bounded flow control.
+
+This is important for rule engines and inspection services. The cost is not only CPU. A flood of valid results can increase allocations, logs, network traffic, and storage.
+
+## The benchmark matrix needs match density
+
+I keep three named inputs:
+
+- **negative:** no complete match;
+- **representative:** the expected production density;
+- **output stress:** many overlapping or adjacent matches.
+
+For each, I report bytes scanned, matches emitted, bytes of result data, and time spent in the consumer. Throughput in input bytes per second without match count is incomplete.
+
+The lesson is simple: finding a result and delivering a result are separate costs. Once recognition becomes fast, the most important optimization may be a better output contract rather than a faster transition table.
+
+For building the complete measurement, continue with [How to Benchmark a Streaming Scanner in Rust](/blog/benchmark-streaming-scanner-rust). The cluster starts at [Zero-Copy Does Not Mean Zero Memory Access](/blog/zero-copy-does-not-mean-zero-memory-access-aho-corasick-rust).

@@ -1,0 +1,73 @@
+---
+caseId: "RFA-612"
+title: "A Rust Drop Implementation Keeps Exclusive Access Until Destruction"
+date: "2026-09-06T07:31:00+01:00"
+lastmod: "2026-09-06T07:31:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "f6819ea09f8f658aa4ab9489d64c258bacf8daa3e1ae1c368218dddacdf43f57"
+area: "concurrency-memory"
+symptom: "Returning a mutable borrow from a consumed Guard fails with E0713 because Guard::drop still needs exclusive access to that same data."
+summary: "Consuming a Drop type does not let a field borrow escape across its destructor. Borrow the guard for the full relation or redesign ownership and cleanup."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust E0713 borrow may still be in use destructor", "return mutable reference from Drop type", "Drop needs exclusive access borrowed field"]
+evidence: ["Rust 1.98.1 E0713 compile failure", "consumed Guard returns borrow to data", "borrowed Guard signature repair"]
+sources: ["https://doc.rust-lang.org/error_codes/E0713.html", "https://doc.rust-lang.org/std/ops/trait.Drop.html", "https://doc.rust-lang.org/reference/destructors.html"]
+---
+
+When a value implements `Drop`, its destructor receives `&mut self` at the end of the value's lifetime. A mutable borrow of one field cannot escape across that destructor if drop may access the same field. The [failing fixture](/rust-failure-atlas/evidence/RFA-612/fail.rs) attempts exactly this and receives E0713.
+
+## Consuming the wrapper still runs cleanup
+
+The function takes `Guard<'a>` by value and tries to return its inner `&'a mut String`. Before the function can finish, `guard` must be dropped. Its `Drop` implementation appends text through the same mutable reference.
+
+Allowing the returned borrow to become active while drop also receives exclusive access would violate the uniqueness guarantee of `&mut`. The [official E0713 explanation](https://doc.rust-lang.org/error_codes/E0713.html) describes this overlap.
+
+Ownership of the wrapper does not imply permission to skip its destructor or move arbitrary fields out of a Drop type.
+
+## The repaired signature borrows the guard
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-612/fixed.rs) follows the documented form: it borrows `Guard` mutably for the required lifetime and returns a borrow tied to that access. The fixture verifies compilation rather than trying to manufacture a call whose borrow ends while the same guard immediately drops.
+
+This signature is restrictive because it must prevent the destructor from running during the returned borrow. In many application APIs, a closure-based method is easier: the guard lends the field to a callback, and the borrow is known to end before the method returns and later destruction occurs.
+
+Another design exposes operations on the guard itself rather than returning its inner mutable reference. This keeps cleanup and invariant management together.
+
+## Drop makes field extraction special
+
+Rust normally lets code destructure owned structs and move fields out. For a type implementing Drop, partial moves would leave the destructor with a partly moved value. Safe Rust prevents this.
+
+`ManuallyDrop`, raw reads, and related unsafe tools can control destruction, but they transfer detailed responsibilities: every field must be dropped exactly as required, no invalid partly moved value may reach Drop, and panic paths must remain correct. I do not use them to bypass E0713 without a small audited abstraction.
+
+The standard [`Drop` trait](https://doc.rust-lang.org/std/ops/trait.Drop.html) and Reference [destructor rules](https://doc.rust-lang.org/reference/destructors.html) are the basis for the proof.
+
+## Cleanup behaviour shapes the public API
+
+RAII guards commonly unlock mutexes, return connections, close transactions, restore state, or emit metrics. Letting internal access escape can outlive the resource policy the guard represents.
+
+A transaction guard should not return a mutable database object that remains usable after rollback or commit runs. A lock guard's protected reference must not outlive the lock. E0713 often reveals that the requested return type contradicts the guard abstraction.
+
+I prefer methods that operate while the guard is alive, explicit commit methods consuming the guard and returning an owned outcome, or APIs from established guard types.
+
+## Destructor side effects deserve careful design
+
+Drop cannot be async, and errors cannot be returned normally. Critical fallible cleanup should have an explicit method whose result callers handle; Drop becomes a best-effort fallback or invariant-preserving cleanup.
+
+Panicking in Drop can abort the process if another panic is already unwinding. I keep destructors simple, non-panicking, and independent of complex external services.
+
+Tests cover normal scope exit, early return, panic where applicable, explicit completion, and forgotten values when that is possible. The compiler protects aliasing, not successful business cleanup.
+
+## My E0713 checklist
+
+- Does the consumed wrapper implement Drop directly or through generated code?
+- Which fields can its destructor read or mutate?
+- Is a borrow of the same state being returned past destruction?
+- Can the caller operate through the guard rather than extracting the reference?
+- Would a scoped callback ensure the loan ends before Drop?
+- Should an explicit commit consume the guard and return owned data?
+- Is unsafe manual destruction genuinely necessary and fully audited?
+- Are fallible cleanup and panic paths tested outside the destructor?
+
+The core principle is that Drop is a final exclusive operation on the whole value. A field borrow cannot pretend that operation will not happen. I redesign access so the loan ends first or transfer a truly owned outcome under an explicit cleanup protocol.

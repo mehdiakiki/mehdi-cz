@@ -1,0 +1,75 @@
+---
+caseId: "RFA-639"
+title: "Why println! Cannot Format a Packed Field Directly"
+date: "2026-09-06T07:59:00+01:00"
+lastmod: "2026-09-06T07:59:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "7d554d20022bcfe73829441a2d607cf55e71920ebea496f73df806cf2c2f92f0"
+area: "ffi-targets"
+symptom: "Formatting a u32 field from a packed header fails with E0793 even though the source contains no visible ampersand."
+summary: "Formatting macros borrow their arguments, so println! can create an invalid reference to a packed field implicitly. Force a by-value copy into an aligned temporary before formatting."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["format_args implicitly borrows packed field E0793", "println packed struct field unaligned Rust", "copy packed field before formatting"]
+evidence: ["Rust 1.98.1 E0793 compile failure", "formatting creates an implicit packed-field borrow", "by-value formatting expression repair"]
+sources: ["https://doc.rust-lang.org/error_codes/E0793.html", "https://doc.rust-lang.org/reference/type-layout.html#the-alignment-modifiers", "https://doc.rust-lang.org/std/ptr/fn.read_unaligned.html"]
+---
+
+`#[repr(packed)]` reduces alignment between fields. A `u32` field may then begin at an address not divisible by four, while every `&u32` must still be properly aligned. The [failing fixture](/rust-failure-atlas/evidence/RFA-639/fail.rs) only writes `println!("{}", header.length)`, but formatting borrows the argument and receives E0793.
+
+## The borrow can be hidden by formatting
+
+Formatting looks like a by-value operation at the call site, but the machinery receives references to its arguments so it can format without taking ownership. The macro expansion therefore tries to borrow `header.length`. The source has no `&`, yet the same alignment rule applies.
+
+Creating an unaligned reference is undefined behaviour even if code never dereferences it. An unsafe block would only assert that I uphold the reference rules; it cannot change them. This is why rustc rejects the implicit operation in both safe and unsafe contexts.
+
+The [official E0793 explanation](https://doc.rust-lang.org/error_codes/E0793.html) distinguishes direct by-value access from reference creation. The Reference documents [alignment modifiers](https://doc.rust-lang.org/reference/type-layout.html#the-alignment-modifiers) and restrictions around packed fields.
+
+This differs from the basic explicit-reference case in the Atlas: here the diagnostic teaches me to inspect macro expansion and receiver types. Method calls taking `&self`, comparisons through borrowed APIs, and debug derivations may create the same hidden reference.
+
+## Copy small fields into aligned locals
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-639/fixed.rs) places the field inside a block expression, forcing a by-value copy before formatting. The compiler performs the packed load correctly, then formatting borrows a normal aligned temporary.
+
+Braces inside a formatting argument can force a value copy, but I prefer a named local when it makes the alignment boundary obvious. This repair applies to `Copy` fields. Moving a non-Copy field out of packed storage has additional restrictions and ownership concerns.
+
+If I only need a numeric header value, the copy is simple and safe. Repeated hot-loop access may deserve a parser that decodes once into an aligned domain struct rather than repeatedly touching packed memory.
+
+## Raw pointers need explicit unaligned operations
+
+For generic or manual access, I create a raw pointer without first forming a reference, using `addr_of!` or a raw-borrow expression. I then call an operation such as [`read_unaligned`](https://doc.rust-lang.org/std/ptr/fn.read_unaligned.html).
+
+Dereferencing the raw pointer with `*ptr` still expects alignment. Converting it to a reference is also wrong. The operation name must preserve the unaligned contract all the way to the load or store.
+
+Raw access still needs valid allocation bounds, initialized bytes, correct type validity, and aliasing permission. Alignment is only one safety condition. For untrusted input, byte-wise decoding is often safer than viewing bytes as a packed Rust type.
+
+## Packed is not a complete wire format
+
+Packing removes or limits padding, but it does not define byte order, semantic validity, versioning, or every target ABI detail. Mapping network bytes directly onto a packed struct can also involve lifetime, alignment, and initialization problems.
+
+I normally parse protocols from byte slices with explicit endian conversions. I use packed structs when an actual external in-memory layout requires them and the supported targets are tested.
+
+For C interop, I compare Rust layout with the real C compiler using size, alignment, and offset assertions plus cross-language reads. `repr(C, packed(N))` should match an authoritative declaration, not an assumption that “C structs are packed.” Most are not.
+
+## Keep packed storage behind an aligned API
+
+A safe wrapper returns fields by value or converts into normal Rust domain types. It does not expose references whose validity depends on offsets. Mutation methods use unaligned writes where required and validate values before storing.
+
+Deriving traits on packed types deserves inspection because generated implementations may attempt to borrow fields or change across toolchain versions. Manual implementations through local copies are sometimes clearer.
+
+Concurrent access to unaligned fields has separate atomicity issues. Ordinary integer loads are not automatically atomic, and Rust atomic types have alignment requirements. I do not use packing for shared concurrent state.
+
+## My E0793 checklist
+
+- Which packed field’s natural alignment exceeds its possible address alignment?
+- Is an explicit or implicit reference being formed?
+- Can a Copy field be read by value into a normal aligned local?
+- If raw access is required, is the pointer created without an intermediate reference?
+- Does the final operation explicitly use unaligned read or write semantics?
+- Are bounds, initialization, validity, ownership, and aliasing also proven?
+- Is packed layout required by an authoritative ABI rather than assumed wire convenience?
+- Can the boundary decode once into an aligned safe domain representation?
+
+The core principle is that packing changes storage layout but never weakens the validity requirements of `&T`. E0793 prevents an invalid reference from existing. I copy or use explicit unaligned pointer operations and keep the packed representation confined to a reviewed boundary.

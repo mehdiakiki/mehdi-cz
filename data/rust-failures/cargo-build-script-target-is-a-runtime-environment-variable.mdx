@@ -1,0 +1,85 @@
+---
+caseId: "RFA-693"
+title: "Cargo Gives TARGET to build.rs at Run Time, Not Compile Time"
+date: "2026-09-07T09:27:00+01:00"
+lastmod: "2026-09-07T09:27:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "66fee3bb52ce9f6079f560852c181b1fea132e8b1be99b4cb3abf28885f325bd"
+area: "cargo-dependencies"
+symptom: "Using env!(TARGET) in build.rs fails while Cargo says TARGET will be available to the build script."
+summary: "Cargo first compiles build.rs and later runs its executable with TARGET, HOST, and other build inputs. Read those values with std::env::var inside main instead of env!, which runs during compilation."
+rustVersions: ["Rust 1.98.1", "Cargo 1.98.1", "edition 2024"]
+targets: ["all Cargo targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["build.rs TARGET not defined at compile time", "Cargo build script env TARGET std env var", "env macro build script environment variables"]
+evidence: ["Cargo 1.98.1 build-script compile failure", "TARGET absent during build.rs compilation", "runtime environment lookup repair"]
+sources: ["https://doc.rust-lang.org/cargo/reference/environment-variables.html#environment-variables-cargo-sets-for-build-scripts", "https://doc.rust-lang.org/cargo/reference/build-scripts.html#life-cycle-of-a-build-script", "https://doc.rust-lang.org/std/macro.env.html"]
+---
+
+Cargo documentation says that a build script receives `TARGET`. Yet `env!("TARGET")` at the top of `build.rs` can fail with “environment variable TARGET not defined at compile time.” Both statements are correct because a build script has two different lives.
+
+Cargo compiles `build.rs` into a host executable. Only after that compilation succeeds does Cargo run the executable with build-specific environment variables. The [failing fixture](/rust-failure-atlas/evidence/RFA-693/fail/Cargo.toml) asks for `TARGET` during the first phase, before Cargo has supplied the second phase's environment.
+
+## build.rs is first a Rust crate
+
+The [Cargo build-script lifecycle](https://doc.rust-lang.org/cargo/reference/build-scripts.html#life-cycle-of-a-build-script) begins by compiling the script and its build dependencies. This compilation produces a program that runs on the build host.
+
+The `env!` macro expands while rustc compiles that program. It reads the environment of the rustc process and embeds a string literal. The [standard macro documentation](https://doc.rust-lang.org/std/macro.env.html) is precise about this compile-time behaviour.
+
+Later, Cargo starts the compiled program and supplies variables such as `HOST`, `TARGET`, `OUT_DIR`, and `CARGO_CFG_*`. The [Cargo environment reference](https://doc.rust-lang.org/cargo/reference/environment-variables.html#environment-variables-cargo-sets-for-build-scripts) even notes that these variables are not set when the script is compiled.
+
+So there are two environments:
+
+```text
+rustc compiling build.rs  -> env! can see this process environment
+compiled build.rs running -> std::env::var can see Cargo's build inputs
+```
+
+Using the same word “environment” for both is the source of the confusion.
+
+## Read Cargo inputs inside main
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-693/fixed/Cargo.toml) calls `std::env::var("TARGET")` inside `main`. That code executes when Cargo runs the build-script program, so the value exists.
+
+I also keep the error rather than using an unexplained default:
+
+```rust
+let target = std::env::var("TARGET")
+    .expect("Cargo supplies TARGET while running build.rs");
+```
+
+If someone invokes the compiled build-script executable by hand, the missing value now produces a message that describes the violated contract. Silently falling back to the host would be dangerous because it can generate or compile an apparently valid artifact for the wrong architecture.
+
+## HOST and TARGET answer different questions
+
+`HOST` identifies the platform where the compiler and build script run. `TARGET` identifies the platform for which the package artifact is being built. In a native build they are commonly equal, which lets incorrect scripts survive for years.
+
+During cross-compilation they differ. A code generator executable must run on `HOST`, while generated layouts, C compiler flags, bindings, and conditional Rust code usually describe `TARGET`.
+
+I log both in a controlled diagnostic mode, not in every normal build. Then I test one cross-target lane. Merely printing `cfg!(target_arch)` inside `build.rs` reports the build-script executable's architecture, so it is about the host. Cargo's `CARGO_CFG_TARGET_ARCH` or the `TARGET` triple carries the target fact.
+
+## Do not pass every process variable into the artifact
+
+Reading variables at run time does not mean every ambient value should affect the build. Each input needs a declared contract.
+
+If a global environment variable such as a native SDK path changes the build result, I emit `cargo::rerun-if-env-changed=NAME`. Cargo-provided variables are already part of its build model and are not used with that instruction in the same way.
+
+If the value must reach Rust source, I choose deliberately between generated code, `cargo::rustc-env`, and a custom cfg. I avoid making application behaviour depend on variables that happen to exist only when launched through `cargo run`.
+
+Secrets never belong in generated source, cfg values, warning output, or embedded environment strings. Build artifacts and logs travel much farther than the shell that created them.
+
+## The failure points at the wrong phase only if I ignore the message
+
+The Rust 1.98.1 diagnostic is unusually helpful: it says Cargo sets build-script variables at run time and recommends `std::env::var`. I still preserve this case because the general principle appears in many tools.
+
+A code generator, procedural macro, build script, and final target program may all execute at different phases and on different machines. “Available during the build” is not enough. I ask:
+
+1. Which process reads the value?
+2. When is that process compiled?
+3. When and where does it execute?
+4. Is the value about the host, the target, or the final runtime?
+5. What tells Cargo to rebuild when an external input changes?
+6. Could the value contain a secret or machine-local path?
+
+The core principle is phase ownership. `env!` is for the compiler's environment. `std::env::var` in `build.rs` is for the build-script process environment. Once I draw that boundary, `TARGET` is no longer mysteriously missing and cross-compilation choices become much easier to audit.

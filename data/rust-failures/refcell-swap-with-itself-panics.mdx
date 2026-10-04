@@ -1,0 +1,78 @@
+---
+caseId: "RFA-294"
+title: "RefCell::swap Panics When Both Arguments Are the Same Cell"
+date: "2026-09-06T01:14:00+01:00"
+lastmod: "2026-09-06T01:14:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "c2944286f483a91b186a5598374aab2592f74e29a3a663769088cf96d6d6ebaf"
+area: "concurrency-memory"
+symptom: "Calling cell.swap(&cell) panics even though exchanging a value with itself appears to be a harmless no-op."
+summary: "RefCell::swap performs runtime-checked mutable access to two cells and explicitly rejects identical cells as well as active borrows. Detect identity before swapping or make aliasing impossible in the API."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets with core"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust RefCell swap same cell panic", "RefCell swap with itself", "avoid RefCell self swap ptr eq"]
+evidence: ["Rust 1.98.1 single RefCell", "caught documented panic", "identity guard repair"]
+sources: ["https://doc.rust-lang.org/std/cell/struct.RefCell.html#method.swap", "https://doc.rust-lang.org/std/ptr/fn.eq.html", "https://doc.rust-lang.org/std/cell/struct.RefCell.html#method.try_borrow_mut"]
+---
+
+I wrote a generic operation that could choose the same slot twice and then called `RefCell::swap`. I expected self-swap to do nothing, like swapping two equal integer variables might appear to do. The method panicked.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-294/fail.rs) catches `value.swap(&value)` and shows that the panic is a documented precondition, not an accidental debug assertion.
+
+## RefCell enforces borrowing at runtime
+
+`RefCell<T>` allows interior mutation behind a shared reference. To keep Rust's aliasing rules, it tracks active shared and exclusive borrows dynamically.
+
+[`RefCell::swap`](https://doc.rust-lang.org/std/cell/struct.RefCell.html#method.swap) needs to exchange the two contained values. The documentation says it panics if either value is currently borrowed or if `self` and `other` point to the same `RefCell`.
+
+The same-cell condition matters because the operation conceptually needs mutable access to both sides. They are not two independent places when their allocation identity is equal.
+
+## Equal contents are not identical cells
+
+Two different `RefCell<String>` values can both contain `"ready"`. Swapping them is allowed when neither is borrowed, even though the visible result is unchanged.
+
+One cell passed twice has the opposite shape: one identity, regardless of its content. I separate value equality from place identity in tests.
+
+[`std::ptr::eq`](https://doc.rust-lang.org/std/ptr/fn.eq.html) compares whether two references point to the same value. A small wrapper can use it to turn same-cell swap into an explicit no-op, as the repaired fixture does.
+
+## An identity guard must happen before borrowing
+
+I check `ptr::eq(left, right)` before attempting any mutable borrow. If the references are equal, there is no useful exchange to perform.
+
+For distinct cells, `swap` can still panic if an earlier `borrow()` or `borrow_mut()` guard remains live. Nested expressions can extend a guard farther than expected, so I put observation and mutation in separate statements or scopes.
+
+When active borrowing is an expected contention state rather than a programmer error, [`try_borrow_mut`](https://doc.rust-lang.org/std/cell/struct.RefCell.html#method.try_borrow_mut) exposes a `Result`. Implementing a two-cell non-panicking swap then needs a careful acquisition and rollback policy; obtaining the first guard and failing the second should simply drop the first guard.
+
+## Catching the panic is not the normal repair
+
+The fixture uses `catch_unwind` only to make the failure executable without aborting the test process. Production code should detect possible identity or use an interface where two selections are guaranteed distinct.
+
+Panic catching makes a local precondition look like ordinary flow and also invokes the panic hook. It gives worse diagnostics than rejecting duplicate indexes or IDs at the point they are chosen.
+
+If same identity indicates a caller bug, I return a named error or keep the panic as an invariant assertion in an internal API. If self-swap is naturally a no-op, I encode that policy before calling `swap`.
+
+## Data structures can make distinctness explicit
+
+This problem often appears when two indexes select elements from a collection of cells. Validating `left_index != right_index` is clearer than discovering identity after lookup.
+
+For ordinary mutable slices, APIs such as `split_at_mut` or disjoint-access helpers can prove that two references do not overlap. `RefCell` moves checking to runtime, but it does not turn overlapping exclusive access into a valid operation.
+
+Sometimes a single `RefCell<Collection>` is a better model than a collection of many `RefCell<Item>` values. One mutable borrow can then perform an internal swap with the collection's checked indexing rules. The right shape depends on which group of values forms one mutation transaction.
+
+## Single-threaded does not mean unchecked
+
+`RefCell` is commonly used in single-threaded code. Its panics are unrelated to thread races; they protect aliasing inside one thread.
+
+Moving to a `Mutex` would add cross-thread synchronization but would not solve confused identity in the domain. I first fix the selection and ownership rule, then choose synchronization based on actual concurrency.
+
+This distinction helps in UI trees, graph algorithms, and test doubles where `Rc<RefCell<T>>` is common. Two graph paths can resolve to the same node even if their path descriptions differ.
+
+## What I test
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-294/fixed.rs) treats identical references as a no-op and proves that two distinct cells still exchange their contents.
+
+My table includes identical cells, distinct cells with equal values, distinct cells with different values, one active shared borrow, one active mutable borrow, and two graph references resolving to the same allocation.
+
+The core principle is that mutation operates on places, not only values. `RefCell::swap` requires two unborrowed, distinct cells. When aliasing is possible, I make identity part of validation instead of assuming a mathematically neutral self-swap bypasses Rust's runtime borrow contract.

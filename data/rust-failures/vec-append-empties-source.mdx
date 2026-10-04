@@ -1,0 +1,90 @@
+---
+caseId: "RFA-269"
+title: "Why Vec::append Leaves the Source Empty"
+date: "2026-09-06T00:49:00+01:00"
+lastmod: "2026-09-06T00:49:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "41c59675e93ca925ec043c16ee0ed8e465744e89110e74794dc501b4cf6464a7"
+area: "concurrency-memory"
+symptom: "After Vec::append, all source elements appear in the destination and the source vector has length zero."
+summary: "append moves every element out of the source vector through a mutable borrow. It does not clone or share them; callers needing both logical sequences must choose cloning or another ownership model."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets with alloc"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust Vec append source becomes empty", "does Vec append move or clone elements", "keep second vector after append Rust"]
+evidence: ["Rust 1.98.1 two small vectors", "destination concatenation", "empty source state"]
+sources: ["https://doc.rust-lang.org/std/vec/struct.Vec.html#method.append", "https://doc.rust-lang.org/std/vec/struct.Vec.html#method.extend_from_slice", "https://doc.rust-lang.org/std/vec/struct.Vec.html#method.drain"]
+---
+
+`Vec::append` joins two sequences by moving, not copying.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-269/fail.rs) appends `[3, 4]` into `[1, 2]` and expects the source to remain. [`Vec::append`](https://doc.rust-lang.org/std/vec/struct.Vec.html#method.append) produces `[1, 2, 3, 4]` and leaves the source empty.
+
+## The mutable source borrow enables ownership transfer
+
+The method receives `&mut Vec<T>` for the source. It can move each `T` out while leaving that vector in a valid empty state.
+
+No `T: Clone` bound is needed. This is a strong clue that the elements are transferred rather than duplicated.
+
+After the call, the source variable still exists and can be reused, but it no longer owns those elements. The destination owns them and will eventually drop them.
+
+## Empty length does not specify allocator state
+
+The important documented postcondition is that the source is empty. Code should not require one particular retained capacity or allocation pointer unless another contract provides it.
+
+Implementations can optimize movement, and allocation behavior can evolve. I test element ownership and order, not a guessed capacity side effect.
+
+If releasing memory is a system requirement, I choose an explicit replacement or shrinking policy and measure with the allocator context in mind.
+
+## Keep both sequences by choosing duplication
+
+When callers need source elements afterward, they need another ownership model. For `Copy` or `Clone` items, [`extend_from_slice`](https://doc.rust-lang.org/std/vec/struct.Vec.html#method.extend_from_slice) clones elements from a borrowed slice and leaves the source intact.
+
+Cloning can be expensive and can duplicate reference-counted handles rather than deep resources. I do not change `append` to cloning merely to satisfy an old assertion without checking product intent.
+
+Shared ownership through `Arc`, borrowed views, or immutable persistent structures may fit when duplication is undesirable.
+
+## Order is destination then source
+
+Existing destination items keep their order, followed by source items in their order. The operation is concatenation, not merging or sorting.
+
+If both vectors are sorted, simple append usually breaks global sortedness unless every destination value is less than or equal to every source value. A merge algorithm is required when ordering is an invariant.
+
+I assert boundary values when an ordered pipeline uses append so one upstream change cannot silently invalidate binary search later.
+
+## Append is all elements, not a selected range
+
+When only part of the source should move, [`drain`](https://doc.rust-lang.org/std/vec/struct.Vec.html#method.drain) or `split_off` can express a range. Their iterator and drop behavior deserves its own care.
+
+Repeatedly removing from the front can shift elements and become expensive. Selecting the intended range in one structural operation is clearer.
+
+For filtering transfer, I may drain and partition with an explicit policy for elements that stay.
+
+## Failure and panic safety are ownership concerns
+
+Appending may need destination capacity. Allocation failure handling depends on allocator and API behavior, and destructors can matter later. Safe Rust maintains memory safety, but external side effects in `Drop` or custom allocators can still be operationally relevant.
+
+I avoid assuming the operation is a business transaction. Moving elements between in-memory owners does not commit related database or file state.
+
+## Reusing the source can be intentional
+
+An empty source vector remains a usable collection. A batching loop can fill it again and append into an accumulator, potentially benefiting from retained internal state depending on implementation.
+
+I use `is_empty()` to express its logical readiness rather than reconstructing it without need. If a maximum-memory policy requires releasing buffers, I make that separate and observable.
+
+## What I test
+
+My matrix includes empty destination, empty source, both non-empty, non-Clone element types, and values with visible drop events. It asserts destination order and exactly one eventual destruction per element.
+
+For alternatives, I test whether the source must remain unchanged and whether cloning shares inner state. These are semantic requirements, not only performance choices.
+
+## Aliases to elements cannot survive the mutation
+
+Safe Rust will not let me keep references into either vector while mutably appending. The destination may reallocate, and the source elements change owners, so old element addresses cannot be assumed stable.
+
+Unsafe FFI code holding raw pointers needs a stronger protocol: finish mutation before exporting pointers, or prove capacity and element location invariants for every operation. The fact that append moves values efficiently does not promise address preservation.
+
+This borrow-checker friction is evidence of the real lifecycle change, not an obstacle to work around casually.
+
+The core principle is that collection combination chooses an ownership policy. `Vec::append` moves every element to the destination and leaves a valid empty source. If both sequences must remain populated, the design needs cloning, borrowing, or sharing—and should say which one instead of expecting append to do all three.

@@ -1,0 +1,101 @@
+---
+caseId: "RFA-165"
+title: "Why CStr::from_bytes_with_nul Rejects Trailing Data"
+date: "2026-09-05T16:55:00+01:00"
+lastmod: "2026-09-05T16:55:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "86b77e76a2bbbbafdd82df0fb15ef8d2ac68345de1151635ff747c5b4b7ce443"
+area: "ffi-targets"
+symptom: "CStr::from_bytes_with_nul rejects a buffer containing worker followed by NUL and trailing bytes, reporting an interior NUL at the otherwise valid terminator."
+summary: "from_bytes_with_nul validates that the complete slice is exactly one NUL-terminated C string. Use from_bytes_until_nul when parsing the first terminated string from a larger bounded buffer."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets with core::ffi"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust CStr from_bytes_with_nul trailing bytes", "FromBytesWithNulError InteriorNul after terminator", "from_bytes_until_nul versus with_nul"]
+evidence: ["Rust 1.98.1 InteriorNul error", "trailing buffer bytes", "from_bytes_until_nul repair"]
+sources: ["https://doc.rust-lang.org/std/ffi/c_str/struct.CStr.html#method.from_bytes_with_nul", "https://doc.rust-lang.org/std/ffi/c_str/struct.CStr.html#method.from_bytes_until_nul", "https://doc.rust-lang.org/std/ffi/struct.CString.html#method.new"]
+---
+
+A NUL byte can be a valid terminator or an invalid interior byte. The answer depends on the boundary passed to the constructor.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-165/fail.rs) supplies `b"worker\0trailing"` to `CStr::from_bytes_with_nul`. Rust 1.98.1 returns `InteriorNul { position: 6 }`, and `expect` panics.
+
+Position 6 is exactly where the intended C string ends. It is considered interior because the supplied slice continues afterward.
+
+## The complete slice must describe exactly one C string
+
+[`CStr::from_bytes_with_nul`](https://doc.rust-lang.org/std/ffi/c_str/struct.CStr.html#method.from_bytes_with_nul) validates two rules:
+
+1. the slice ends with one NUL byte;
+2. there is no other NUL before that final byte.
+
+The function interprets the entire slice as one C string representation. In the failing buffer, the last byte is `g`, not NUL. The NUL at position 6 is therefore inside the slice rather than at its end.
+
+This strict constructor is useful when I expect framing to have happened already. It catches a caller that accidentally includes another field, uninitialized capacity, or bytes belonging to a following record.
+
+## Parsing a bounded larger buffer is a different operation
+
+[`CStr::from_bytes_until_nul`](https://doc.rust-lang.org/std/ffi/c_str/struct.CStr.html#method.from_bytes_until_nul) searches for the first NUL and returns the prefix through that terminator. Bytes after it are outside the returned `CStr`.
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-165/fixed.rs) uses this method and receives the C string `worker` from the larger buffer.
+
+I use the two constructors for different evidence:
+
+```text
+with_nul  -> prove this whole slice is exactly one C string
+until_nul -> find one C string inside this bounded slice
+```
+
+Changing methods without knowing the buffer format can hide an upstream length bug. I first decide whether trailing bytes are legitimate data or an error.
+
+## Bounded scanning is valuable at FFI boundaries
+
+Raw C APIs often return a pointer plus a fixed buffer length, a struct containing a character array, or a pointer assumed to reach a terminator. A bounded slice lets Rust search without reading beyond known memory.
+
+If I have a fixed `[c_char; N]` field copied from a C struct, converting its initialized bytes and using `from_bytes_until_nul` can express “the first terminated string inside this field.” If no NUL exists, the function returns an error instead of scanning outside the field.
+
+This is safer to reason about than starting with an unbounded raw pointer. Creating the slice still requires proving the pointer, length, initialization, and lifetime when they originate in unsafe code.
+
+## `CString::new` solves the opposite direction
+
+When Rust owns ordinary bytes and needs to pass an owned C-compatible string outward, [`CString::new`](https://doc.rust-lang.org/std/ffi/struct.CString.html#method.new) adds the final NUL and rejects any interior NUL already present.
+
+The operations form a useful direction map:
+
+```text
+Rust bytes -> owned outbound C string: CString::new
+exact borrowed terminated bytes:       CStr::from_bytes_with_nul
+first string in bounded buffer:         CStr::from_bytes_until_nul
+```
+
+I do not append a NUL manually and then skip validation unless an unsafe invariant is already proven. The checked APIs make the boundary visible.
+
+## A C string is bytes, not guaranteed UTF-8
+
+`CStr` validates NUL termination, not text encoding. `to_str` can fail if the bytes before the terminator are not UTF-8. `to_string_lossy` chooses replacement characters and changes information.
+
+The correct conversion depends on the C API. Some interfaces define UTF-8, some use a platform encoding, and some carry arbitrary bytes despite using `char*`.
+
+I keep the value as `&CStr` or bytes until the external contract justifies decoding. NUL correctness and Unicode correctness are independent checks.
+
+## Trailing bytes may be another protocol field
+
+A larger buffer can contain several consecutive NUL-terminated strings. `from_bytes_until_nul` returns the first, but it does not return the remaining slice for me. I calculate the consumed length as `cstr.to_bytes_with_nul().len()` and continue only if the surrounding format specifies another string.
+
+For lists such as environment blocks, empty strings and double terminators can have special meaning. A loop that merely skips every NUL may misread the format. I model the outer framing separately from each `CStr` validation.
+
+## My FFI debugging sequence
+
+When a constructor reports `InteriorNul`, I inspect the complete boundary:
+
+1. Print or hex-dump the bounded bytes, including every NUL position.
+2. Record whether the length includes capacity, padding, or the next field.
+3. Decide whether the slice should be exact or searched until its first terminator.
+4. Validate encoding separately from termination.
+5. Keep raw-pointer conversion in one small reviewed unsafe boundary.
+6. Test missing NUL, early NUL, final NUL, empty C string, and trailing data.
+
+The failing fixture is useful because the bytes look obviously like a valid C string when displayed only up to the NUL. The error becomes obvious only after I include the slice length in the model.
+
+The core principle is that terminators and bounds work together. `from_bytes_with_nul` validates an exact representation, so an early terminator is interior by definition. `from_bytes_until_nul` parses within a larger known bound. Choosing between them states whether trailing bytes are a protocol feature or evidence that the wrong memory region was supplied.

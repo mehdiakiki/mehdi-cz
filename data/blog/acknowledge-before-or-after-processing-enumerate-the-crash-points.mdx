@@ -1,0 +1,204 @@
+---
+title: "Acknowledge Before or After Processing? Enumerate the Crash Points"
+date: "2026-10-28T09:00:00+01:00"
+tags: ["message acknowledgement", "at least once", "at most once", "message queue", "distributed systems"]
+draft: false
+reviewed: true
+reviewedHash: "5fee86286644cbb8cbf3fe7a52e398300b53e8e5e559ca1bb8518dc2ac9ff67e"
+cluster: "reliable-data-integrations"
+campaign: "authority-2026"
+opportunity: "DATA-053"
+summary: "Acknowledging early risks lost work; acknowledging late permits redelivery. Choose the durable handoff point, then test crashes, lease expiry, partial batches, and ambiguous effects."
+---
+
+Every message consumer eventually tells its source: “You no longer need to deliver this to me.” The mechanism may be an acknowledgement, committed offset, deleted queue message, or successful HTTP response.
+
+The difficult question is when that signal becomes safe.
+
+I answer it by placing crashes between operations.
+
+## Early acknowledgement chooses possible loss
+
+```text
+receive message
+acknowledge source
+process business work
+```
+
+If the process dies after acknowledgement and before durable business work, the source believes delivery is complete. Normal redelivery cannot repair it.
+
+This is commonly called at-most-once processing:
+
+```text
+effect count may be 0 or 1
+```
+
+It can be acceptable for disposable telemetry or work that a newer event fully replaces. It is usually a poor default for payments, identity changes, or a data synchronization record.
+
+## Late acknowledgement chooses possible duplicates
+
+```text
+receive message
+process and commit business work
+acknowledge source
+```
+
+If the business commit succeeds and the process dies before acknowledgement, the source delivers again.
+
+This is at-least-once delivery around the handler:
+
+```text
+delivery count may be 1 or more
+```
+
+It protects against silent loss only when the repeated processing is safe. I add inbox identity, idempotent updates, or stable external effect keys.
+
+## “After processing” is too vague
+
+A real handler has several boundaries:
+
+```text
+1. deserialize
+2. validate
+3. write database
+4. call external API
+5. publish output event
+6. update local status
+7. acknowledge input
+```
+
+Each write can succeed independently. I mark which system makes it durable and whether the next attempt can observe that result.
+
+For the full database/broker transaction analysis, see [Where a Transaction Ends in a Message Consumer](/blog/where-a-transaction-ends-in-a-message-consumer). This page focuses on selecting the acknowledgement point.
+
+## A durable handoff can be the acknowledgement point
+
+The request-facing process does not always need to finish the whole workflow. It can acknowledge after it transfers responsibility to durable internal work:
+
+```text
+receive webhook
+verify and commit inbox + job
+return 2xx
+
+worker later applies the job with retry and idempotency
+```
+
+The acknowledgement now means:
+
+```text
+“This system durably owns recovery,”
+not
+“Every downstream effect is already complete.”
+```
+
+That contract is useful only if the durable job cannot be orphaned and its failure remains observable.
+
+## Compare the three useful placements
+
+| Placement | Loss after ack? | Duplicate work? | Typical fit |
+| --- | --- | --- | --- |
+| before durable work | yes | less likely | explicitly disposable events |
+| after durable handoff | internal recovery owns it | handoff can be re-observed | webhooks and queued workflows |
+| after final local commit | no normal loss from source | yes around ack gap | direct database consumers |
+
+An external provider effect complicates every row. If the provider accepts a call and its response is lost, acknowledgement timing cannot tell whether the effect happened. Provider idempotency or reconciliation is still required.
+
+## Visibility timeout is a temporary lease
+
+Some queues hide a received message for a visibility period. The message is not permanently acknowledged yet.
+
+```text
+receive at 10:00
+invisible until 10:05
+worker still running at 10:06
+another worker receives it
+```
+
+Extending visibility can prevent premature duplicate work, but the extension can fail and the worker can pause or lose the network. I treat it as renewable ownership, not as a lock.
+
+Long handlers need:
+
+- a bounded expected duration;
+- lease renewal with failure handling;
+- idempotent effects;
+- cancellation or fencing for stale workers;
+- a maximum receive count and visible terminal failure workflow.
+
+## Batch acknowledgement needs a contiguous rule
+
+Suppose offsets 20–24 are processed concurrently:
+
+```text
+20 done
+21 done
+22 running
+23 done
+24 failed
+```
+
+Committing the next position as 24 because offset 23 completed would skip 22 after restart. The safe contiguous prefix ends before 22.
+
+For an offset-based log:
+
+```text
+safe committed next offset = 22
+```
+
+For a queue with individual receipt handles, each message may be acknowledged independently. The source model determines the implementation; the business effects still need identities.
+
+## Rejection and acknowledgement are different
+
+A malformed message will not become valid through infinite redelivery. But acknowledging and discarding it can hide data loss.
+
+I use a terminal handoff:
+
+```text
+write dead-letter evidence durably
+verify the handoff or couple it transactionally
+acknowledge source
+```
+
+The dead-letter workflow now owns resolution. [A Dead-Letter Queue Is Evidence, Not a Disposal Bin](/blog/a-dead-letter-queue-is-evidence-not-a-disposal-bin) defines what that ownership requires.
+
+## Acknowledgement failure is not business rollback
+
+The source can reject or time out an acknowledgement. If the database already committed, I do not undo it merely because the ack failed. I expect redelivery and let the inbox recognise completed work.
+
+Useful log fields are:
+
+```text
+message identity
+source position or receipt identity
+assignment/lease owner
+business commit identity
+ack attempt and result
+next expected redelivery time
+```
+
+This makes “ack timeout” distinguishable from “handler failed.”
+
+## My crash matrix
+
+I inject termination:
+
+```text
+after receive
+after validation
+after durable claim
+after business mutation but before commit
+after commit but before acknowledgement
+during external API ambiguity
+after acknowledgement request reaches source
+after a partial batch completes
+after lease or partition ownership is revoked
+```
+
+For each crash I restart another consumer and assert:
+
+- required business work is not lost;
+- repeated delivery does not repeat the effect;
+- a terminal failure remains discoverable;
+- offsets do not skip an incomplete gap;
+- old workers cannot commit state after ownership changes where fencing is required.
+
+The correct acknowledgement point is the earliest boundary after which this system can finish or repair the work without depending on another source delivery. Finding that boundary requires a crash table, not a preference for “early” or “late.”

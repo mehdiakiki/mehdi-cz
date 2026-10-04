@@ -1,0 +1,85 @@
+---
+caseId: "RFA-241"
+title: "Why slice::copy_from_slice Panics When Lengths Differ"
+date: "2026-09-06T00:21:00+01:00"
+lastmod: "2026-09-06T00:21:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "1f8d97f82b167623001af270e83d116f70ed02feac4aba23c696dd34bc826f6d"
+area: "concurrency-memory"
+symptom: "copy_from_slice panics when copying a two-byte source into a three-byte destination instead of copying the available prefix."
+summary: "copy_from_slice is an exact whole-slice replacement and requires equal lengths. Select an explicit destination window for prefix copying, or use an I/O abstraction when partial progress is part of the contract."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust copy_from_slice source destination length mismatch", "copy shorter slice into larger slice Rust", "slice copy_from_slice panics"]
+evidence: ["Rust 1.98.1 fixed arrays", "captured unequal-length panic", "explicit destination-window repair"]
+sources: ["https://doc.rust-lang.org/std/primitive.slice.html#method.copy_from_slice", "https://doc.rust-lang.org/std/primitive.slice.html#method.clone_from_slice", "https://doc.rust-lang.org/std/io/trait.Write.html#tymethod.write"]
+---
+
+I once read `copy_from_slice` like a low-level `write`: copy as much as fits and tell me, or at least leave the remaining destination unchanged. Its contract is stricter. It replaces one complete slice with another complete slice of exactly the same length.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-241/fail.rs) copies `[7, 8]` into `[0, 0, 0]`. [`copy_from_slice`](https://doc.rust-lang.org/std/primitive.slice.html#method.copy_from_slice) panics because two is not three.
+
+## Exact shape is part of the operation
+
+`copy_from_slice` does not return a byte count. Its return type is `()`. Success therefore means the whole destination slice was replaced from a same-sized source.
+
+That is a useful invariant. Code that expects a 32-byte key should not quietly accept 31 bytes and retain one old byte. An exact-copy primitive makes the size mismatch visible rather than inventing padding or truncation.
+
+The type system can prove equality for two arrays with matching compile-time lengths, but slices carry their length at runtime. The method checks it there and panics when the shapes differ.
+
+## Select the window explicitly
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-241/fixed.rs) intends to copy a prefix and preserve the final destination byte. It expresses this policy in the destination range:
+
+```rust
+destination[..source.len()].copy_from_slice(&source);
+```
+
+Now the two slices presented to the method both have length two. The remaining byte is visibly outside the operation.
+
+This repair still requires `source.len() <= destination.len()`. At an untrusted boundary I check that condition or use `get_mut(..source.len())` to return a recoverable error. Replacing one panic with an out-of-bounds slicing panic is not a real repair.
+
+## Partial copying needs another contract
+
+Sometimes the intended rule is “copy the minimum of both lengths.” I calculate that length deliberately:
+
+```rust
+let count = source.len().min(destination.len());
+destination[..count].copy_from_slice(&source[..count]);
+```
+
+But this discards information when the source is longer. A parser, cryptographic input, or fixed-format record usually should reject that case instead.
+
+For streams, [`Write::write`](https://doc.rust-lang.org/std/io/trait.Write.html#tymethod.write) has a different model: it may make partial progress and returns the number of bytes accepted. `write_all` loops until all bytes are written or an error occurs. A slice copy and an I/O write share familiar words, but their progress and failure contracts are not interchangeable.
+
+## Copy and clone have the same shape rule
+
+[`clone_from_slice`](https://doc.rust-lang.org/std/primitive.slice.html#method.clone_from_slice) also requires equal lengths. It works for `Clone` values and calls `clone_from` element by element, while `copy_from_slice` is for `Copy` values and may use an efficient bulk move.
+
+Changing from copy to clone does not make an unequal-length request partial. The choice is about element semantics, not shape semantics.
+
+## Overlap is another independent question
+
+Safe borrowing normally prevents using overlapping regions from one slice as the source and mutable destination in the same call. When I need an overlapping move inside one allocation, `copy_within` is the operation designed for it.
+
+This is similar to C's `memcpy` versus `memmove` distinction, but Rust exposes the aliasing boundary through different APIs and borrows. Reaching for unsafe pointers to defeat the borrow error usually means I selected the wrong safe operation.
+
+## Panics are appropriate only behind a proven invariant
+
+Inside a codec with a fixed frame width already validated by construction, a panic on an impossible mismatch can expose an internal bug. At a network or file boundary, user-controlled length should become an ordinary error before calling the method.
+
+I include expected and actual lengths in that error. “Copy failed” is weak operational evidence; “expected 32 bytes, received 31” points directly to the broken boundary.
+
+## What I test
+
+The regression covers equal empty slices, exact non-empty copies, shorter sources, longer sources, and any deliberate prefix or truncation policy. For element types with meaningful `Clone`, I separately test clone side effects.
+
+I also assert what happens to bytes outside an explicitly selected destination window. Preserving them may be intended for a header update, while zeroing them may be required to avoid stale-data disclosure.
+
+For large buffers, I benchmark only after the shape contract is correct. `copy_from_slice` can be lowered to efficient bulk copying, while a hand-written element loop may prevent optimizations or duplicate bounds logic. Performance does not justify silently choosing `min(source.len(), destination.len())`; that is a semantic truncation decision. First I expose the required sizes, then I measure equivalent implementations.
+
+When the source length is fixed by a protocol, converting a slice to an array reference can move the validation to one explicit boundary. Downstream code then carries the width in its type and no longer repeats runtime equality checks. Failed conversion remains a recoverable parse error rather than a copy panic.
+
+The core principle is that a copying API also defines a shape contract. `copy_from_slice` means exact replacement, not best-effort progress. Once I decide whether mismatch means rejection, prefix preservation, truncation, or streaming progress, the correct Rust operation becomes much clearer.

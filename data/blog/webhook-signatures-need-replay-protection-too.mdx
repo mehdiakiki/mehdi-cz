@@ -1,0 +1,291 @@
+---
+title: "Webhook Signatures Need Replay Protection Too"
+date: "2026-09-15T14:00:00+01:00"
+tags: ["webhooks", "HMAC", "replay protection", "application security", "Node.js"]
+draft: false
+reviewed: true
+reviewedHash: "0daf8299ca2d056ce5e415cf7a0a0cf3f599b519b390e3a91fe829b64d8ee525"
+cluster: "reliable-data-integrations"
+campaign: "authority-2026"
+opportunity: "DATA-015"
+summary: "Webhook verification middleware and tests that authenticate the exact request bytes, reject stale signed deliveries, support key rotation, and deduplicate effects durably."
+---
+
+A valid webhook signature proves that somebody with the signing secret authenticated a message. It does not always prove that the message is fresh.
+
+An attacker who records a valid request can send the same body and signature again. If the signed data has no timestamp, nonce, or delivery identity, the receiver may have no cryptographic reason to reject it.
+
+Even normal provider retries create repeated deliveries. Security replay and reliable redelivery are different situations, but both require the receiver to control repeated effects.
+
+I design webhook verification as four layers:
+
+```text
+authentic bytes
+fresh signed time
+known delivery identity
+idempotent business effect
+```
+
+Skipping any layer leaves a different gap.
+
+## Verify the raw bytes first
+
+HMAC signatures are calculated over bytes, not parsed JSON objects. Parsing and re-serializing can change whitespace, key order, Unicode escapes, or number formatting.
+
+The safe order is:
+
+```text
+read bounded raw body
+parse signature header
+calculate MAC over provider's exact signed message
+compare in constant time
+check signed timestamp
+claim delivery ID durably
+only then parse and process the event
+```
+
+Framework JSON middleware can consume or transform the body before the handler sees it. I configure the webhook route to retain the original byte buffer.
+
+I also enforce a request-size limit before buffering. Signature verification should not become an unlimited-memory endpoint.
+
+GitHub's troubleshooting guide explicitly warns that payload or header modification can break verification and recommends its HMAC-SHA256 signature header. See [GitHub webhook troubleshooting](https://docs.github.com/en/webhooks/testing-and-troubleshooting-webhooks/troubleshooting-webhooks).
+
+## A small verification boundary
+
+Here is simplified TypeScript-like code. Real header parsing must follow the provider's format exactly:
+
+```ts
+type VerifiedWebhook = {
+  eventId: string
+  signedAt: Date
+  rawBody: Buffer
+}
+
+function verifyWebhook(
+  rawBody: Buffer,
+  headers: Headers,
+  now: Date,
+  secrets: Buffer[]
+): VerifiedWebhook {
+  const timestamp = parseStrictTimestamp(headers.get("x-hook-time"))
+  const supplied = parseHexMac(headers.get("x-hook-signature"))
+  const eventId = parseEventId(headers.get("x-hook-id"))
+
+  const signed = Buffer.concat([
+    Buffer.from(String(timestamp.getTime())),
+    Buffer.from("."),
+    rawBody,
+  ])
+
+  const authentic = secrets.some((secret) => {
+    const expected = hmacSha256(secret, signed)
+    return expected.length === supplied.length &&
+      timingSafeEqual(expected, supplied)
+  })
+
+  if (!authentic) throw new Unauthorized("invalid signature")
+  if (!insideTolerance(timestamp, now)) {
+    throw new Unauthorized("stale delivery")
+  }
+
+  return { eventId, signedAt: timestamp, rawBody }
+}
+```
+
+The code is intentionally provider-neutral. I normally use the provider's maintained SDK when it performs these checks correctly. I still test the boundary because the wrong framework body configuration can invalidate a correct library.
+
+I compare fixed-length MAC bytes with a constant-time primitive. Ordinary string equality can leak information through timing. I reject malformed encodings before comparison without printing the supplied signature.
+
+## The timestamp must be part of the signature
+
+Checking an unsigned `X-Timestamp` header does not stop an attacker from replacing it with the current time.
+
+The timestamp must be included in the signed message. The receiver then checks:
+
+```text
+absolute(now - signed_time) <= tolerance
+```
+
+The tolerance covers network delay and small clock differences. It also defines the maximum window in which a captured signed request can be replayed before freshness rejection.
+
+Stripe includes a timestamp in its signature header and documents a default five-minute tolerance in its libraries. Stripe also generates a new signature and timestamp for an official retry. Its [webhook signature documentation](https://docs.stripe.com/webhooks?lang=node#preventing-replay-attacks) is a useful concrete reference.
+
+I keep system clocks synchronized and alert on unusual webhook clock skew. Setting tolerance to zero is not stricter in some libraries; Stripe specifically warns that it disables recency checking.
+
+## Freshness does not stop immediate replay
+
+An attacker can replay the request inside the accepted time window. This is why I also need a provider-scoped delivery ID or event ID.
+
+I claim it in durable storage with a unique key:
+
+```text
+provider + endpoint/connected account + delivery ID
+```
+
+The insert happens before returning success:
+
+```sql
+insert into webhook_inbox (
+  provider, provider_account, delivery_id, signed_at, payload
+)
+values ($1, $2, $3, $4, $5)
+on conflict (provider, provider_account, delivery_id)
+do nothing;
+```
+
+If no row is inserted, the delivery is already known. The handler returns the provider's expected success without creating another effect.
+
+The namespace matters. Two connected accounts can legally use the same event ID format. Test and live endpoints may use separate signing secrets and overlapping IDs.
+
+## Signature replay and event duplication are not identical
+
+Consider two deliveries of the same logical event:
+
+1. An attacker resends the exact captured request with its old signature.
+2. The provider retries the event with a new timestamp and signature.
+
+Timestamp checking rejects case 1 after the tolerance. It may accept case 1 inside the window and accepts case 2 because the provider legitimately re-signed it.
+
+The durable event/delivery key prevents duplicate processing in both cases. The business operation also needs idempotency because a worker can crash after the effect but before marking the inbox item complete.
+
+I therefore distinguish:
+
+- request authentication and freshness;
+- inbox deduplication;
+- effect idempotency.
+
+One database flag cannot safely replace all three.
+
+## Secret rotation needs an overlap window
+
+Webhook secrets must rotate without dropping valid in-flight deliveries.
+
+I keep an active key ID and, for a short controlled period, a previous secret:
+
+```text
+try current secret
+try previous secret while its retirement time has not passed
+record which key verified
+never log either secret
+```
+
+If the provider includes a signed key ID, I use it to select the key. Otherwise I try the small bounded set. I do not accept an unlimited history of secrets.
+
+The overlap must cover provider retry behaviour. After it ends, a delivery signed only with the retired secret will fail and should be recoverable through provider redelivery tools or API reconciliation.
+
+Different endpoints and environments receive different secrets. A test secret should never validate a production event.
+
+## Decide what the signature authenticates
+
+Some schemes sign only the body. Others sign timestamp, method, path, host, or selected headers too.
+
+Signing method and path can prevent a valid message for one endpoint from being moved to another. Signing an endpoint identifier or secret-per-endpoint can provide the same separation.
+
+I implement the provider's canonicalization exactly. I do not invent sorting, trimming, or case conversion. Canonicalization disagreement is a common source of both false rejection and accidental weakness.
+
+If I design the sending side too, I specify the signed envelope precisely:
+
+```text
+version
+key ID
+timestamp
+delivery ID
+HTTP method
+canonical path
+raw body hash or raw body
+```
+
+Versioning lets the scheme evolve without guessing how an old signature was made.
+
+## Parse and authorize after authentication
+
+A valid provider signature does not mean every payload is acceptable to every tenant.
+
+After verification, I still:
+
+- validate the JSON schema and event type;
+- bind provider account identity to the expected tenant;
+- reject object IDs outside the connection scope;
+- enforce payload limits and supported API versions;
+- fetch current state when the event is only a hint;
+- apply source versions and field-ownership rules.
+
+A compromised or misconfigured provider account should not be able to name another tenant in the JSON body and cross the local boundary.
+
+## The middleware tests I require
+
+I test byte-level behaviour, not only a helper with already parsed input.
+
+### Known provider fixture
+
+Use the provider's documented payload, secret, timestamp, and expected signature. Assert acceptance.
+
+### One-byte body change
+
+Change whitespace or one Unicode byte. Assert rejection. This also catches accidental JSON re-serialization.
+
+### Old but correctly signed request
+
+Generate a valid signature outside the tolerance. Assert freshness rejection.
+
+### Unsigned timestamp change
+
+Change only the timestamp header. Assert the signature no longer matches.
+
+### Immediate duplicate
+
+Send the same valid request twice inside the tolerance. Assert one inbox row and one business effect.
+
+### Provider retry with new signature
+
+Send the same event ID with a later valid signed timestamp. Assert authentication succeeds but deduplication prevents a second effect.
+
+### Secret rotation
+
+Accept current and previous secrets during overlap, then advance the fake clock and reject the previous one.
+
+### Wrong endpoint or account
+
+Replay a valid request against another endpoint namespace. Assert rejection or deduplication isolation according to the signing scheme.
+
+### Malformed and oversized inputs
+
+Fuzz signature parsing and reject a body over the limit before expensive work.
+
+### Crash after effect
+
+Apply the effect, stop before marking completion, then retry. Assert the operation's idempotency key prevents duplication.
+
+These cases cover authenticity, freshness, uniqueness, and processing recovery separately.
+
+## What I retain
+
+The inbox needs enough information for retry and investigation, but webhook payloads can contain personal or confidential data.
+
+I store:
+
+- provider and account namespace;
+- delivery/event ID;
+- signature key ID, never the secret;
+- signed and received times;
+- safe payload hash;
+- processing state and attempts;
+- encrypted or access-controlled payload only as long as required;
+- resulting logical operation ID.
+
+I define retention for completed payloads and keep smaller audit metadata longer.
+
+## My practical rule
+
+For webhook security, HMAC is the beginning:
+
+```text
+HMAC over exact bytes → authentic
+signed timestamp      → recent
+durable delivery ID   → recognized replay/duplicate
+idempotent effect     → safe processing retry
+```
+
+I need all four because they answer different questions.
+
+The surrounding delivery design is explained in [Webhooks, Polling, or Both?](/blog/webhooks-polling-or-both-a-recovery-first-integration-design). Signature verification keeps forged or stale messages outside; polling and reconciliation repair legitimate notifications that never arrived.

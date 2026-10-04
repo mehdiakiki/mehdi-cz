@@ -1,0 +1,106 @@
+---
+caseId: "RFA-129"
+title: "When derive(Clone) Adds an Unneeded Bound Around Arc<T>"
+date: "2026-09-05T12:29:00+01:00"
+lastmod: "2026-09-05T12:29:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "94fa3b16d6cd7e19fd1d51113d9a259e348ea5f7f0975a59f101e3258a0716a2"
+area: "diagnostics-macros"
+symptom: "Calling clone on Shared<NoClone> fails after deriving Clone even though the wrapper only contains Arc<T> and cloning Arc<T> does not clone T."
+summary: "A derived Clone implementation may expose T: Clone for a generic wrapper although Arc<T> is cloneable without that bound. A manual implementation can clone the handle and preserve the intended weak contract."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["targets with std::sync::Arc"]
+profiles: ["check", "dev", "release", "test"]
+searchTerms: ["Rust derive Clone Arc T unnecessary Clone bound", "derived Clone generic wrapper overconstrained", "Arc clone without T Clone manual impl"]
+evidence: ["Rust 1.98.1 E0599 compile failure", "derive-generated T Clone bound", "manual Arc handle clone repair"]
+sources: ["https://doc.rust-lang.org/reference/attributes/derive.html", "https://doc.rust-lang.org/std/sync/struct.Arc.html"]
+---
+
+The [failing program](/rust-failure-atlas/evidence/RFA-129/fail.rs) derives `Clone` for a generic `Shared<T>` containing one `Arc<T>`. Calling `clone()` on `Shared<NoClone>` then fails because the generated implementation expects `NoClone: Clone`.
+
+This is surprising because cloning an `Arc<T>` increments a reference count. It does not clone the `T` stored in the allocation.
+
+## Cloning a handle is not cloning its value
+
+The [`Arc` documentation](https://doc.rust-lang.org/std/sync/struct.Arc.html) describes atomically reference-counted shared ownership. `Arc::clone(&value)` creates another owning handle to the same allocation. Both handles observe the same `T`.
+
+This operation is available without `T: Clone`. The value can be expensive, non-cloneable, or intentionally unique at the object level while still having several ownership handles.
+
+I keep this distinction visible:
+
+```text
+Arc<T>::clone       -> duplicate an ownership handle
+T::clone            -> create another T value
+```
+
+They express different semantics and usually have very different costs.
+
+## Derive can expose a stronger generic contract
+
+The [derive reference](https://doc.rust-lang.org/reference/attributes/derive.html) explains that the attribute generates a trait implementation. For generic types, that generated code may include conservative parameter bounds.
+
+In this case, the effective bound prevents `Shared<T>` from being cloned unless `T` itself implements `Clone`. The implementation is valid, but it is more restrictive than cloning the only field requires.
+
+Adding `#[derive(Clone)]` to `NoClone` would satisfy the compiler. It would also suggest that the domain value has meaningful duplication semantics, which may be false. I do not modify the inner type only to accommodate an accidental wrapper bound.
+
+## The manual implementation clones exactly one field
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-129/fixed.rs) makes the desired operation explicit:
+
+```rust
+impl<T> Clone for Shared<T> {
+    fn clone(&self) -> Self {
+        Self { value: self.value.clone() }
+    }
+}
+```
+
+The body only clones `Arc<T>`, so the implementation needs no `T: Clone`. `Shared<NoClone>` now gains another handle to the same `NoClone` allocation.
+
+I sometimes spell the field operation as `Arc::clone(&self.value)`. This makes shared-handle cloning stand out during review and avoids implying that the inner domain object is duplicated.
+
+## This changes the API, not only compilation
+
+Generic bounds determine which downstream types can use an abstraction. A hidden unnecessary bound may only appear when a user stores a file handle, mutex, callback, parser state, or another non-`Clone` value in the wrapper.
+
+For library code, I add a small compile test with a deliberately non-cloneable type. It documents the promise that cloning the wrapper duplicates ownership rather than data:
+
+```rust
+struct NoClone;
+let shared = Shared { value: Arc::new(NoClone) };
+let another = shared.clone();
+```
+
+This prevents a later refactor back to derive from silently narrowing the public contract.
+
+I also name methods carefully in documentation. `clone_shared_handle` communicates aliasing more clearly than a domain verb such as `duplicate_job`. If callers need an independent value later, that should be another operation with its own `T: Clone` bound. Keeping both operations separate prevents a cheap handle clone from being mistaken for a deep copy during a performance or concurrency review.
+
+## A shallow clone can still surprise callers
+
+Removing the `T: Clone` bound is correct only if shared ownership is the intended meaning of `Shared<T>::clone`. Both wrapper values point to the same allocation. If `T` contains interior mutability, changes through one handle can be observed through the other.
+
+Some APIs use `Clone` to mean an independent snapshot. An `Arc` field does not provide that. In such a design, requiring `T: Clone` and cloning the underlying value might be the honest implementation:
+
+```rust
+impl<T: Clone> Clone for Snapshot<T> {
+    fn clone(&self) -> Self {
+        Self { value: Arc::new((*self.value).clone()) }
+    }
+}
+```
+
+The correct bound follows semantic intent, not the shortest compiler fix.
+
+## My debugging sequence
+
+When `clone()` is unavailable on a generic wrapper, I do this:
+
+1. Read which type parameter the diagnostic says lacks `Clone`.
+2. Identify whether the failure comes from a derived implementation.
+3. Check each field's actual `Clone` contract in its documentation.
+4. Decide whether clone should share, duplicate, or snapshot the underlying value.
+5. Write the narrow manual implementation when handle sharing is intended.
+6. Test with a non-`Clone` inner type and, separately, test aliasing behaviour.
+
+The core lesson is not that derive is bad. Derive is excellent when its generated contract matches the abstraction. For ownership wrappers, I still inspect that contract, because cloning a pointer-like handle and cloning the pointee are not the same promise.

@@ -1,0 +1,100 @@
+---
+caseId: "RFA-401"
+title: "A Packed Type Cannot Transitively Contain repr(align)"
+date: "2026-09-06T03:41:00+01:00"
+lastmod: "2026-09-06T03:41:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "2f9ab752c7136bfb1cb4f6e4f217d47dca358e80d75ec178b3efe4244b5aa27f"
+area: "ffi-targets"
+symptom: "A repr(packed) packet fails with E0588 because a nested field type has repr(align(8))."
+summary: "Rust rejects a packed type that directly or transitively contains an explicitly aligned type. Packing and over-alignment impose contradictory field-placement contracts, so byte formats should be parsed separately from aligned in-memory values."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets; exact external layouts remain target-specific"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust E0588 packed type transitively repr align", "packed struct contains aligned type", "repr packed nested repr align Rust"]
+evidence: ["Rust 1.98.1 E0588 compile failure", "nested align-eight field", "repr C aligned repair"]
+sources: ["https://doc.rust-lang.org/error_codes/E0588.html", "https://doc.rust-lang.org/reference/type-layout.html#the-alignment-modifiers", "https://doc.rust-lang.org/reference/type-layout.html#the-packed-representation"]
+---
+
+I expected Rust to complain only when `packed` and `align` appeared on the same struct. E0588 goes further: a packed type cannot contain an aligned type transitively.
+
+The [failing fixture](/rust-failure-atlas/evidence/RFA-401/fail.rs) puts `#[repr(align(8))]` on `Aligned`, then stores `Aligned` inside `#[repr(packed)] Packet`. The attributes are on different declarations, but their requirements still collide.
+
+## Layout requirements compose through fields
+
+The [E0588 documentation](https://doc.rust-lang.org/error_codes/E0588.html) calls out this transitive restriction. A nested type does not lose its alignment just because an outer type wants dense packing.
+
+An aligned value promises that every valid instance begins at an address satisfying its specified alignment. A packed parent may place a field at a smaller boundary to remove padding. Rust cannot guarantee both when the field requiring strong alignment is embedded in the packed storage.
+
+The conflict is structural, not about whether this particular test instance happens to land at a friendly address.
+
+## packed is more than “use fewer bytes”
+
+The Rust Reference defines [`packed` representation](https://doc.rust-lang.org/reference/type-layout.html#the-packed-representation) as an alignment and field-placement policy. It can reduce padding by lowering effective field alignment.
+
+That can create field addresses unsuitable for normal typed references. The Atlas already has cases about E0793, where borrowing a packed field would create an unaligned reference. E0588 acts earlier: an explicitly over-aligned field cannot be admitted into the packed type at all.
+
+I never add `packed` only to reduce heap or cache use without measuring and reviewing access safety. Layout attributes are compatibility promises with consequences for every field access.
+
+## align is also a real promise
+
+[`repr(align(N))`](https://doc.rust-lang.org/reference/type-layout.html#the-alignment-modifiers) raises a type's alignment. This can be needed for hardware interfaces, SIMD-oriented storage, cache-line isolation, or a foreign ABI.
+
+The promise applies wherever the type appears: directly allocated, stored in an array, or nested in another structure. An outer container must insert appropriate padding and itself have enough alignment for its field.
+
+Removing the attribute merely to silence E0588 may violate the reason it existed. I trace the requirement back to its consumer first.
+
+## The repaired fixture chooses aligned memory
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-401/fixed.rs) replaces the packed outer representation with `repr(C)`. The resulting `Packet` has alignment eight, allowing its child to be placed correctly.
+
+That repair is right for an in-memory structure whose aligned field is real. It is not automatically right for a wire protocol that requires exact packed bytes.
+
+The key decision is which contract is authoritative: aligned in-memory access or external byte layout. One Rust struct should not be forced to pretend it can satisfy two incompatible contracts.
+
+## For wire data, I parse bytes
+
+Network and file formats usually define byte offsets, byte order, allowed bit patterns, and version rules. A Rust struct adds target-dependent questions about padding, enum validity, booleans, and field alignment.
+
+I prefer a parser from `&[u8]` into a normal aligned domain type:
+
+```text
+external bytes -> validate lengths and tags -> decode fields -> aligned Rust value
+```
+
+Encoding performs the reverse transformation deliberately. This makes endianness and malformed input visible and avoids taking references into possibly unaligned external storage.
+
+For a hardware or foreign memory mapping where copying is impossible, raw-pointer reads may be necessary. That becomes a small unsafe boundary with documented alignment, volatility, aliasing, and lifetime assumptions. `packed` alone does not prove them.
+
+## Transitive means wrappers do not hide the issue
+
+Adding another ordinary wrapper around `Aligned` does not make its requirement disappear. The compiler follows field containment. This is useful because otherwise a harmless-looking refactor could smuggle an over-aligned value into packed storage.
+
+Generic containers deserve the same thought. Their concrete layout depends on the chosen type argument. I inspect fully instantiated field types rather than only attributes visible on the outer declaration.
+
+## Size and alignment are separate
+
+A type may occupy one byte and still require alignment eight. In the fixture, `Aligned(u8)` is a good reminder: payload size does not determine placement alignment.
+
+Conversely, a large byte array can have alignment one. I record both `size_of::<T>()` and `align_of::<T>()` when diagnosing representation, and I do not infer either from the other.
+
+Arrays also add trailing padding through their stride. A layout change can affect every element of a large allocation, so compactness should be measured with the real container.
+
+## repr(C) does not mean packed
+
+`repr(C)` gives C-oriented field ordering and layout rules for the target ABI. It still inserts padding needed for alignment. If an external C definition itself is packed through compiler-specific attributes, matching it requires a carefully documented boundary and compatible toolchain assumptions.
+
+I verify layouts on every supported target and preferably against headers or bindgen-generated declarations. A passing size assertion on one architecture is not a portable protocol proof.
+
+## My first checks for E0588
+
+I walk the type tree and ask:
+
+- which nested type introduces `repr(align)`;
+- why the parent was packed;
+- whether the data is owned memory or external bytes;
+- whether copying into an aligned representation is acceptable;
+- which targets and foreign declarations define the real ABI.
+
+The core principle is that layout promises compose. A packed parent cannot erase a child's explicit alignment. Rust rejects the contradiction, leaving me to separate representations or select the one layout contract the type can honestly uphold.

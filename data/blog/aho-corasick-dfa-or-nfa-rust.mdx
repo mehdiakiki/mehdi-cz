@@ -1,0 +1,111 @@
+---
+title: "Aho–Corasick DFA or NFA: Which One Should I Use in Rust?"
+date: "2026-09-17T15:40:00+01:00"
+lastmod: "2026-09-05T12:00:00+01:00"
+tags: ["rust", "aho-corasick", "dfa", "nfa", "performance engineering"]
+draft: false
+reviewed: true
+reviewedHash: "c53f0cd376aff9e01970a0e06db41206d05e7f833e0f165ed60b6baca49ee157"
+cluster: "rust-under-the-hood"
+campaign: "editorial"
+summary: "Rust's Aho–Corasick crate can build three different automata. I compare their construction cost, memory layout, search behavior, and the evidence needed before forcing one."
+---
+
+“Aho–Corasick uses a DFA” is a convenient explanation, but it is not a reliable description of the Rust crate.
+
+The `aho-corasick` crate can use a noncontiguous NFA, a contiguous NFA, or a DFA. By default it chooses an implementation for me. This matters because the three options can have very different construction costs, memory sizes, and search behavior.
+
+My short recommendation is: start with automatic selection, record what it selected, and force a kind only after measuring the complete workload.
+
+## The three representations
+
+The noncontiguous NFA represents states and their transitions in separate allocations. It is generally the fastest to build, has moderate memory use, and is commonly the slowest of the three for searching. Its main strength is handling very large pattern sets when more compact representations reach their limits.
+
+The contiguous NFA stores transitions in one contiguous allocation and applies several compression techniques. It normally gives good locality and low memory usage. The crate documentation says this is the default choice in most cases and describes it as a strong balance.
+
+The DFA represents all states densely. It has a simple search transition because failure transitions are already compiled into the table. The trade is potentially enormous memory usage and higher construction time.
+
+The crate's [resource-usage documentation](https://docs.rs/aho-corasick/latest/aho_corasick/struct.AhoCorasick.html#resource-usage) gives one illustrative 100,000-pattern experiment: the contiguous NFA used much less heap memory than both the noncontiguous NFA and DFA, while the DFA was especially large. Those numbers belong to that corpus, but the shape of the trade-off is the useful part.
+
+## Inspect instead of guessing
+
+The top-level API exposes both the selected kind and estimated heap usage:
+
+```rust
+use aho_corasick::{AhoCorasick, AhoCorasickKind};
+
+fn main() {
+    let patterns = ["error", "failure", "timeout", "cancelled"];
+    let automatic = AhoCorasick::new(patterns).unwrap();
+
+    println!("kind: {:?}", automatic.kind());
+    println!("heap bytes: {}", automatic.memory_usage());
+
+    let dfa = AhoCorasick::builder()
+        .kind(Some(AhoCorasickKind::DFA))
+        .build(patterns)
+        .unwrap();
+
+    assert_eq!(AhoCorasickKind::DFA, dfa.kind());
+    println!("DFA heap bytes: {}", dfa.memory_usage());
+}
+```
+
+I keep these values beside benchmark output. If a dependency upgrade changes automatic selection, I want the result to explain itself.
+
+`memory_usage()` is the memory retained by the completed automaton, not necessarily peak construction memory. For example, producing a contiguous NFA first requires building another representation. Capacity planning should measure process peak memory too when the pattern set is large.
+
+## Search time alone can choose the wrong winner
+
+Imagine a command-line process that builds its patterns, scans a 20 KB file, and exits. A DFA that saves a few microseconds during scanning can still lose badly if it takes longer to construct and consumes much more memory.
+
+Now imagine a service that builds one trusted matcher at startup and scans terabytes over its lifetime. Construction is amortized. Search throughput and stable latency matter more.
+
+I therefore separate at least four measurements:
+
+1. build time;
+2. retained automaton memory;
+3. peak build memory;
+4. search time over representative inputs.
+
+I also measure the combined operation when the real application rebuilds matchers frequently. A microbenchmark that excludes construction is answering a different question.
+
+## Cache behavior changes the simple story
+
+A dense transition table avoids some control flow, but every transition still needs memory. When the table no longer fits in a useful cache level, the processor waits more often for state data. A smaller contiguous NFA can sometimes compete because more of its working set stays near the CPU.
+
+This is why “DFA has one table lookup per byte” does not finish the performance analysis. The location and size of that table matter.
+
+Pattern count alone is not enough either. Total pattern bytes, shared prefixes, alphabet distribution, match kind, byte classes, and prefilters influence the generated automaton. I use the actual production pattern corpus when possible, with a safe sanitized equivalent when the patterns are confidential.
+
+## Build failure is part of the API
+
+The builder returns a `Result`. The official documentation warns that construction can fail when patterns or their combined representation become too large. For trusted static patterns, an `expect` during startup may be acceptable. For user-controlled dictionaries, treating build failure as impossible creates a denial-of-service path.
+
+I put limits before construction:
+
+- maximum number of patterns;
+- maximum individual pattern length;
+- maximum total pattern bytes;
+- maximum acceptable constructed memory;
+- maximum rebuild frequency.
+
+If I force a contiguous representation and it cannot represent the pattern set, fallback behavior must be deliberate. Automatic selection can fall back in cases where a forced kind returns an error.
+
+## A practical selection rule
+
+I use this decision order:
+
+1. Begin with the default builder.
+2. Record `kind()` and `memory_usage()`.
+3. Verify matching semantics before performance.
+4. Benchmark realistic pattern and haystack distributions.
+5. Include construction if rebuilding happens on the request path.
+6. Try forced kinds as experiments, not assumptions.
+7. Reject any improvement that violates the memory budget or worsens tail latency.
+
+The crate's detailed [design document](https://github.com/BurntSushi/aho-corasick/blob/master/DESIGN.md) explains how dense and sparse transitions, byte classes, premultiplication, and special states shape these representations. It is worth reading, but production selection still needs measurement on the application workload.
+
+The larger lesson is common in systems work: asymptotically equivalent representations can behave very differently once construction, memory layout, and cache locality enter the picture.
+
+The publication-aware [Aho–Corasick article collection](/blog/tags/aho-corasick/page/1) continues this cache argument as each supporting article becomes available. The cluster begins with [Zero-Copy Does Not Mean Zero Memory Access](/blog/zero-copy-does-not-mean-zero-memory-access-aho-corasick-rust).

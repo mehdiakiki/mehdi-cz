@@ -1,0 +1,192 @@
+---
+title: "Reading rustc Self-Profile Data to Find a Slow Crate"
+date: "2026-10-15T09:00:00+01:00"
+tags: ["rust", "rustc", "compile time", "self profile", "performance"]
+draft: false
+reviewed: true
+reviewedHash: "c72e7e0cbe0f31ef898ce0b4533a9d6308ff41e240230a33b7023d3f1f1c9ed4"
+cluster: "rust-under-the-hood"
+campaign: "authority-2026"
+opportunity: "RUST-022"
+summary: "A rustc self-profile records compiler activities and query events. First isolate the slow crate, then compare self time, invocation count, cache behaviour, and code generation under controlled builds."
+---
+
+When a Rust build becomes slow, it is tempting to blame generics, macros, the linker, or one large source file. All can be responsible. Guessing from the code shape is not a measurement.
+
+I use two levels of evidence: Cargo timings to locate the slow target, then rustc self-profile data to understand work inside that compilation.
+
+## Find the crate before profiling queries
+
+For a workspace, I begin with:
+
+```bash
+cargo build --timings
+```
+
+Cargo produces a timing report showing which crate targets ran, when they waited, and where parallelism was available. This answers questions such as:
+
+- Is one crate slow or are 80 dependencies rebuilding?
+- Is the build waiting for a build script?
+- Are several long crates compiling in parallel?
+- Is the final link the expensive step?
+
+The [Cargo timings documentation](https://doc.rust-lang.org/cargo/reference/timings.html) describes the report and its concurrency view.
+
+I do not open a rustc query profile until I can name the crate and build scenario.
+
+## Self-profile is a nightly diagnostic
+
+Rustc's self-profiler records timestamped compiler activities. On my installed nightly 1.95 toolchain, `rustc -Z help` exposes:
+
+```text
+-Z self-profile=val
+-Z self-profile-counter=val
+-Z self-profile-events=val
+```
+
+A direct example is:
+
+```bash
+rustc +nightly src/main.rs \
+  -Z self-profile=./profiles/demo
+```
+
+Compiling a one-line program this way produced a file named like:
+
+```text
+profile_demo-2705611.mm_profdata
+```
+
+The filename and format are tool output, not a stable application API. `-Z` options can change, so I check `rustc +nightly -Z help` for the toolchain used in the investigation.
+
+The [rustc development guide on profiling](https://rustc-dev-guide.rust-lang.org/profiling.html) is the primary guide for the current profiling workflow.
+
+## Record a controlled comparison
+
+A profile has meaning only with its build context. I save:
+
+```text
+rustc and Cargo version
+target triple
+profile and optimisation level
+enabled features
+incremental setting and cache state
+number of codegen units
+command and relevant environment
+machine and available cores
+commit being built
+```
+
+I decide whether the question concerns a clean build or an edit build. Then I reproduce that state deliberately.
+
+```text
+clean-build investigation: empty or isolated target directory
+edit-build investigation: warm build, apply one recorded edit, rebuild
+```
+
+Mixing one clean measurement with one warm measurement produces a dramatic but useless “improvement.”
+
+## Read totals and self time differently
+
+Profile summarisation tools from the [measureme repository](https://github.com/rust-lang/measureme) aggregate recorded events. The exact columns depend on tool version, but two concepts matter:
+
+```text
+inclusive time: activity plus nested work attributed below it
+self time:      time in the activity excluding nested children
+```
+
+If a high-level query has large inclusive time and low self time, its children contain the cost. Optimising the wrapper will not recover the inclusive total.
+
+I follow the expensive children until I reach an activity that has material self time or an unexpectedly high invocation count.
+
+## Count can matter more than one slow call
+
+A query taking 200 milliseconds once is visible. A query taking 80 microseconds 100,000 times can cost much more.
+
+I read at least:
+
+| Signal | Question |
+| --- | --- |
+| total time | where did the measured build spend time? |
+| self time | which activity itself did work? |
+| invocation count | is cheap work repeated too often? |
+| cache hits | was a query requested again with reusable inputs? |
+| blocked time | was work waiting on another compiler task? |
+| incremental load/hash time | is reuse bookkeeping material? |
+
+No single row proves a source-level fix. It narrows the next experiment.
+
+## Ask for query keys only when needed
+
+My toolchain lists event sets such as:
+
+```text
+query-provider
+query-cache-hit
+query-blocked
+incr-cache-load
+incr-result-hashing
+query-keys
+llvm
+artifact-sizes
+```
+
+Adding detailed query keys can make profiles larger and collection more expensive. I begin with default events. If one query family dominates, I collect the keys in a second, targeted run to learn which functions or items are involved.
+
+Profiling overhead is part of the experiment. I compare profiled runs with each other, not a heavily instrumented run against an uninstrumented headline number.
+
+## Translate compiler names into source hypotheses
+
+Some examples of useful directions are:
+
+```text
+macro expansion high
+  -> inspect repeated expansion volume and generated tokens
+
+trait solving or type checking high
+  -> locate query keys, complex obligations, or repeated inference
+
+monomorphization collection high
+  -> inspect generic instantiations and cross-crate duplication
+
+LLVM/codegen high
+  -> compare optimisation, codegen units, and generated code size
+
+link high in Cargo timing but absent from query focus
+  -> investigate linker and native dependencies
+```
+
+These are hypotheses. I make one source or configuration change and profile the same scenario again.
+
+## A slow edit needs an invalidation question
+
+For an edit build, I also ask what the edit made observable. Changing a widely used type or macro can invalidate much more work than changing a private body.
+
+The article [What Invalidates Rust's Incremental Compilation Cache?](/blog/what-invalidates-rusts-incremental-compilation-cache) explains the red-green dependency model. Self-profile data can show incremental loading and result hashing, but the build scenario must still reproduce the edit users experience.
+
+I keep a tiny edit script or patch description:
+
+```text
+baseline: warm workspace
+edit: change one literal in crate X function Y
+command: cargo check -p X
+runs: five, alternating before and after
+```
+
+Alternating reduces the chance that background load or thermal state becomes the entire result.
+
+## Optimise the developer path, not only one benchmark
+
+A fix that makes clean release builds 5% faster may not improve `cargo check` after an edit. A setting that speeds the laptop can increase CI artifact size or reduce parallelism.
+
+I report the result with the workflow:
+
+```text
+Before: median 8.4 s for warm body edit, 5 runs
+After:  median 5.9 s for the same edit, 5 runs
+Trade-off: clean release build unchanged; target cache +6%
+```
+
+This is more credible than “reduced compile time” without a defined build.
+
+Self-profile data is not a list of bad compiler queries. It is a trace of one rustc invocation. I first isolate the slow crate, then read time, count, dependency reuse, and code generation in that scenario. The best next step is usually a smaller experiment, not a bigger theory.

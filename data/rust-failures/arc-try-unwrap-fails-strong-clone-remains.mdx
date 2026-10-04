@@ -1,0 +1,91 @@
+---
+caseId: "RFA-115"
+title: "Why Arc::try_unwrap Fails While a Strong Clone Remains"
+date: "2026-09-05T10:15:00+01:00"
+lastmod: "2026-09-05T10:15:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "b49e5311f38c993939ff59e2711155d907891d1e19f19501f2b9d09cdef6bea4"
+area: "concurrency-memory"
+symptom: "Arc::try_unwrap returns Err even after work appears complete because another strong Arc owner is still alive."
+summary: "Arc::try_unwrap converts shared ownership back to T only for the final strong owner. Track clone lifetime rather than guessing from work completion, and handle the returned Arc without check-then-unwrap races."
+rustVersions: ["Rust 1.98.1"]
+targets: ["targets with atomic pointer operations"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Arc try_unwrap failed strong reference remains", "Rust cannot unwrap Arc multiple owners", "Arc strong_count try_unwrap race"]
+evidence: ["Rust 1.98.1 deterministic runtime failure", "live strong clone reproduction", "final-owner unwrap repair"]
+sources: ["https://doc.rust-lang.org/std/sync/struct.Arc.html#method.try_unwrap", "https://doc.rust-lang.org/std/sync/struct.Arc.html#method.strong_count"]
+---
+
+`Arc<T>` can return its inner `T`, but only when shared ownership is no longer shared. The [failing program](/rust-failure-atlas/evidence/RFA-115/fail.rs) creates an `Arc<String>`, keeps one clone named `observer`, and calls `Arc::try_unwrap` on the original. It receives `Err(Arc<String>)`; the fixture turns that result into a deliberate panic.
+
+The string is not borrowed at that line. No thread is using it. Still, two strong owners exist.
+
+## Ownership count, not activity, controls unwrapping
+
+The [`Arc::try_unwrap` documentation](https://doc.rust-lang.org/std/sync/struct.Arc.html#method.try_unwrap) states that the operation succeeds when the strong reference count is exactly one. Weak references do not prevent it.
+
+I distinguish three facts:
+
+```text
+worker finished         a behavioral event
+no borrow is active     a reference-lifetime fact
+one strong Arc remains  an ownership-count fact
+```
+
+Only the third proves `try_unwrap` can return `T`. A clone sitting unused in a struct, channel message, closure, or variable still owns the allocation.
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-115/fixed.rs) uses the observer, drops it, and then unwraps the final owner.
+
+## Err returns the Arc; it does not destroy it
+
+`try_unwrap` consumes one `Arc<T>` and returns either `Ok(T)` or `Err(Arc<T>)`. On failure, the caller receives ownership back. This makes retry, logging, or continued sharing possible without losing the allocation.
+
+I match the result rather than assuming success unless uniqueness is a proven invariant. An `expect` can be appropriate at a lifecycle boundary, but its message should name the missing invariant, such as “all worker handles must be dropped before collecting state.”
+
+For some cleanup flows I do not need the owned `T` at all. Letting the final `Arc` drop naturally is simpler.
+
+## strong_count is diagnostic, not a reservation
+
+[`Arc::strong_count`](https://doc.rust-lang.org/std/sync/struct.Arc.html#method.strong_count) helps inspect ownership. It does not reserve uniqueness. Another thread can clone or drop an owner after the count is read.
+
+This check is therefore racy:
+
+```rust
+if Arc::strong_count(&value) == 1 {
+    // another owner relationship may change before the next decision
+}
+```
+
+I call `try_unwrap` directly and handle its atomic outcome. The operation itself decides whether this owner is final at the relevant moment.
+
+The count can still be useful in logs or assertions when no other thread can access a clone. I do not use it as proof in concurrent control flow.
+
+## Hidden clones often live in infrastructure
+
+Application code may drop the obvious local clone while a task registry, channel, cache, tracing callback, or error context retains another. Derived `Clone` implementations can duplicate an Arc as part of a larger struct.
+
+I search for `Arc::clone` and `.clone()`, then follow container lifetimes. Joining a thread proves its closure has been dropped, but a result returned from the thread may itself contain an Arc. Draining a channel may release queued owners. Dropping a sender does not necessarily drop values already buffered in the receiver.
+
+This is why ownership diagrams are more useful than adding delays.
+
+## Unwrap can expose an architecture mismatch
+
+If a service expects to recover mutable owned state after sharing it widely, every owner must converge at one lifecycle point. That can be a valid phase design: construct, share read-only, stop workers, join, recover.
+
+If clones intentionally outlive that point, unwrapping is the wrong operation. Continue using shared immutable data, clone the inner value when `T: Clone`, or put explicitly mutable state behind synchronization. `Arc` does not promise ownership will later become unique.
+
+I also avoid `Arc<Mutex<T>>` followed by `try_unwrap` as a default cleanup ritual. Often reading or consuming through the protected state is enough, and forced extraction complicates shutdown.
+
+## My debugging sequence
+
+When `try_unwrap` returns `Err`, I do this:
+
+1. Preserve the returned Arc instead of discarding it in an unhelpful unwrap.
+2. Enumerate every strong clone and the container that owns it.
+3. Separate completion, borrowing, and ownership facts.
+4. Drop or consume worker handles, queues, callbacks, and registries in lifecycle order.
+5. Call `try_unwrap` directly; do not rely on a prior `strong_count` check.
+6. Decide whether recovering owned `T` is actually required by the design.
+
+The failure is not about data still being busy. It is about another valid owner still existing. Once the shutdown path makes ownership converge, unwrapping is deterministic; if ownership never converges, the API is honestly telling me to keep the value shared.

@@ -1,0 +1,99 @@
+---
+caseId: "RFA-547"
+title: "Rust Match Guards Cannot Mutate the Value Being Classified"
+date: "2026-09-06T06:26:00+01:00"
+lastmod: "2026-09-06T06:26:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "94b5fe8498ae1f839212dffb9cee890164ff8f007a9b679ada11433a56a44a34"
+area: "diagnostics-macros"
+symptom: "Assigning state = None inside a guard while matching state fails with E0510 because the guard would change the value whose arm selection is still in progress."
+summary: "A guard refines whether a pattern arm applies; it cannot rewrite the matched place mid-classification. Mutate after the arm has been selected."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust E0510 cannot assign in match guard", "mutate matched value inside guard Rust", "match guard side effects exhaustiveness"]
+evidence: ["Rust 1.98.1 E0510 compile failure", "Option state assigned during its match guard", "mutation moved into selected arm repair"]
+sources: ["https://doc.rust-lang.org/error_codes/E0510.html", "https://doc.rust-lang.org/reference/expressions/match-expr.html#match-guards", "https://doc.rust-lang.org/reference/patterns.html"]
+---
+
+A match guard runs after a pattern appears to match but before that arm is finally selected. Mutating the matched place during this decision could invalidate the classification already under way, so Rust reports E0510.
+
+The [failing fixture](/rust-failure-atlas/evidence/RFA-547/fail.rs) matches `state`, reaches the `Some` pattern, assigns `state = None` inside its guard, and returns false. The matcher would then continue as if it were still considering the original value.
+
+## Guards refine patterns; they do not restart matching
+
+An arm such as `Some(value) if value > 3 => ...` first checks the `Some` pattern and then evaluates the boolean condition. If the guard is false, matching continues with later arms.
+
+There is no language rule saying that the match restarts from the first arm after a guard mutates its subject. Allowing that mutation could make earlier arms newly applicable and break exhaustiveness reasoning.
+
+The [official E0510 page](https://doc.rust-lang.org/error_codes/E0510.html) describes this as needing to go “back in time” to reconsider an arm. The compiler prevents the inconsistent state instead.
+
+## The repaired code mutates after selection
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-547/fixed.rs) handles `Some(value)` and sets `state = None` in the arm body. At that point pattern selection is complete.
+
+This produces a clean sequence:
+
+1. classify the current state;
+2. choose exactly one arm;
+3. perform that arm's state transition.
+
+This sequence resembles a small state machine and is easier to test than classification with hidden mutation.
+
+## Read-only guards can still have effects
+
+Rust guards are general boolean expressions, and some side effects that do not assign the matched place may compile. I still keep guards observational when possible. Logging, counters, or external mutation inside a guard can run for candidate arms that are later rejected, surprising readers.
+
+The Reference's [match guard section](https://doc.rust-lang.org/reference/expressions/match-expr.html#match-guards) explains guard evaluation and notes how bindings are shared-borrowed for the guard.
+
+A helper such as `is_eligible(&value)` communicates a predicate better than a block that changes unrelated state while returning a boolean.
+
+## Compute a decision before the match when needed
+
+If arm choice depends on fallible or stateful work, I can compute that work first:
+
+```rust
+let eligibility = check(&state)?;
+match (state, eligibility) {
+    // complete patterns
+}
+```
+
+This gives the effect its own error boundary and makes the match operate on a stable snapshot. Another option is to match first and perform the fallible operation inside the selected arm.
+
+I choose based on whether the work is meaningful for every state or only one variant.
+
+## Taking a value should happen outside its own match guard
+
+Ownership code often wants to `take()` an `Option` while matching it. Calling `state.take()` changes the option to `None`, so doing it in a guard has the same conceptual problem.
+
+I can match `state.take()` directly when consuming the option is the intended first action:
+
+```rust
+match state.take() {
+    Some(value) => use_value(value),
+    None => {}
+}
+```
+
+Now the value being matched is the result of `take`, not the original place that was simultaneously under classification. The transition is explicit before matching begins.
+
+## Patterns and bindings already encode much filtering
+
+Before adding a guard, I check whether a more precise pattern can express the condition. Enum variants, literal patterns, ranges, and destructuring can make exhaustiveness visible to the compiler.
+
+Guards are necessary for arbitrary predicates, but the compiler does not generally use them to prove exhaustive coverage. The [patterns reference](https://doc.rust-lang.org/reference/patterns.html) shows the structural choices available.
+
+## My E0510 checklist
+
+- What exact place is the match classifying?
+- Does the guard assign to or take from that place?
+- Can mutation move into the selected arm body?
+- Should a transition happen before matching, with its result then matched?
+- Is the guard a read-only predicate or a hidden action?
+- Can a structural pattern replace the guard?
+- Could a false guard make an earlier pattern applicable after mutation?
+- Are state transition and arm selection tested separately?
+
+The core principle is that matching needs a stable subject while it decides. I use guards to ask questions about that subject and perform state changes only before matching or after an arm has been chosen.

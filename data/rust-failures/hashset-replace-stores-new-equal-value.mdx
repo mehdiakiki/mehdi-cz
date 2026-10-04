@@ -1,0 +1,109 @@
+---
+caseId: "RFA-156"
+title: "Rust HashSet::replace Stores the New Equal Value"
+date: "2026-09-05T16:46:00+01:00"
+lastmod: "2026-09-05T16:46:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "da0ff47a3bc601e1dde4c99629dd12d39a646de5e54c3437907d00d6f1180370"
+area: "concurrency-memory"
+symptom: "HashSet::replace changes the stored representative of an equality class, while code expected the set to retain its original canonical value."
+summary: "HashSet membership is based on Eq and Hash, but equal values can still contain different non-identity data. replace stores the new representative and returns the old one; insert retains an existing representative."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets with std::collections"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust HashSet replace equal value keeps which", "HashSet insert versus replace canonical value", "HashSet replace stores new equal element"]
+evidence: ["Rust 1.98.1 runtime assertion", "identity-only equality", "HashSet::insert repair"]
+sources: ["https://doc.rust-lang.org/std/collections/struct.HashSet.html#method.replace", "https://doc.rust-lang.org/std/collections/struct.HashSet.html#method.insert", "https://doc.rust-lang.org/std/collections/struct.HashSet.html#method.get"]
+---
+
+Two values can be equal without being identical in every field. That is where the difference between `HashSet::insert` and `HashSet::replace` becomes visible.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-156/fail.rs) stores a service with ID `7` and label `"old"`. Equality and hashing use only the ID. It then calls `replace` with another service carrying the same ID and label `"new"`. Membership has not changed, but the value returned by `get` now has the new label.
+
+The assertion expected the original canonical value to remain. It chose the operation whose purpose is to do the opposite.
+
+## Sets store representatives, not only booleans
+
+It is easy to think of a set as answering only “present or absent.” A `HashSet<T>` stores a real `T`. When several distinct values compare equal, the set must hold one representative of that equality class.
+
+The fixture defines this identity rule:
+
+```text
+Service { id: 7, label: "old" }
+    ==
+Service { id: 7, label: "new" }
+```
+
+The label is still observable through [`HashSet::get`](https://doc.rust-lang.org/std/collections/struct.HashSet.html#method.get). So the choice of representative matters even though `contains` returns the same answer for both.
+
+This is a data-modelling decision before it is a collection decision. If a field does not participate in equality, I ask whether it belongs in the key-like set value at all.
+
+## Insert preserves; replace refreshes
+
+[`HashSet::insert`](https://doc.rust-lang.org/std/collections/struct.HashSet.html#method.insert) adds the value only if an equal value is not already present. For an occupied equality class, it returns `false` and leaves the existing stored value untouched.
+
+[`HashSet::replace`](https://doc.rust-lang.org/std/collections/struct.HashSet.html#method.replace) deliberately puts the new value into the set. If an equal value existed, it returns that old value.
+
+I remember the pair like this:
+
+```text
+insert(new equal value)  -> keep old representative
+replace(new equal value) -> store new representative, return old
+```
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-156/fixed.rs) uses `insert`, because its requirement is first-writer canonicalization. The label remains `"old"`.
+
+If the requirement were “latest metadata wins,” then the original `replace` call would be correct and the assertion should change. The repair is about matching policy, not declaring one method universally safer.
+
+## This contrasts with `HashMap::insert`
+
+The neighbouring Atlas case, [HashMap::insert keeps the original equal key](/rust/failures/hashmap-insert-equal-key-keeps-original-key), documents what looks like the reverse behaviour. A map insertion with an equal key retains the stored key and replaces only its value.
+
+That difference makes sense when I write the conceptual operations:
+
+```text
+HashMap::insert: update the value associated with this key identity
+HashSet::replace: update the stored representative itself
+```
+
+A `HashSet` is implemented using map-like machinery, but its public operation is specifically designed to replace the set value. I avoid transferring expectations based only on similar collection names.
+
+## Separate stable identity from changing attributes
+
+For many domain models, a clearer structure is:
+
+```rust
+HashMap<ServiceId, ServiceRecord>
+```
+
+The key contains stable identity. The record contains display name, status, endpoints, and other evolving attributes. Then updating metadata is an ordinary value update, and there is no question about which equal service object the set should retain.
+
+A set of richer objects can still be appropriate when I want interning or canonicalization. In that case I document the rule:
+
+- first representation wins: use `insert`;
+- latest representation wins: use `replace`;
+- conflict is an error: check `get` and compare the ignored fields;
+- merge attributes: remove or take the old value, combine, then store one result.
+
+The return value from `replace` is useful for merge and audit logic because it gives ownership of the previous representative.
+
+## Equality and hashing must still agree
+
+The set documentation requires equal values to produce equal hashes. In the fixture, both implementations use only `id`. If `Eq` ignored the label but `Hash` included it, lookup could behave unpredictably inside the collection.
+
+I also do not mutate identity fields while a value is stored. Interior mutability can technically make this possible, but changing equality or hash in place is a logic error. Replacement is the controlled way to change an observable representative.
+
+## My test for representative policy
+
+One value cannot show this contract. I always construct two values that:
+
+1. are distinct in an observable field;
+2. compare equal;
+3. hash according to the same identity;
+4. are passed through the exact operation under review;
+5. are inspected with `get`, not only `contains`.
+
+I also assert the operation's return value. For `replace`, receiving the old object may be part of the ownership workflow. For `insert`, the boolean tells me whether the supplied value became stored.
+
+The general principle is that equality defines one slot, but the collection API decides which representative occupies it. `insert` and `replace` encode different canonicalization policies. Once I choose that policy explicitly, stale or unexpectedly refreshed metadata is no longer a mysterious HashSet behaviour.

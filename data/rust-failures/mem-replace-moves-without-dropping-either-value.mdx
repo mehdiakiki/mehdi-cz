@@ -1,0 +1,82 @@
+---
+caseId: "RFA-394"
+title: "mem::replace Moves Values Without Dropping Either One"
+date: "2026-09-06T03:34:00+01:00"
+lastmod: "2026-09-06T03:34:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "6ebde9d79e30cc3341a23767761ed8b98c3c18b8ea645821803a277b991dd44e"
+area: "concurrency-memory"
+symptom: "Drop counters remain zero immediately after mem::replace even though one value was removed and another installed."
+summary: "mem::replace moves the old value out and the replacement into the destination without dropping either. The caller owns the returned old value, while the new value is dropped only when its destination is later destroyed or replaced."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust mem replace does not drop values", "mem replace Drop timing", "replace old value destructor Rust"]
+evidence: ["Rust 1.98.1 custom Drop counter", "zero drops during replacement", "separate old and destination destruction"]
+sources: ["https://doc.rust-lang.org/std/mem/fn.replace.html", "https://doc.rust-lang.org/std/mem/fn.take.html", "https://doc.rust-lang.org/std/ops/trait.Drop.html"]
+---
+
+I once expected replacing a field to close the old resource immediately. With `mem::replace`, the old value is not destroyed by the call. It is returned to me as a new owner.
+
+The [failing fixture](/rust-failure-atlas/evidence/RFA-394/fail.rs) gives both values visible destructors. The drop count immediately after replacement is zero, not two.
+
+## Replacement is two moves
+
+[`mem::replace`](https://doc.rust-lang.org/std/mem/fn.replace.html) takes a mutable destination and a new value. It moves the old destination value out, moves the new value in, and returns the old value.
+
+No uninitialized gap becomes visible to safe code. No cloning is required. Most importantly, neither value is dropped during the operation.
+
+The returned value has ordinary ownership. It will be dropped when its new owner leaves scope, is explicitly passed to `drop`, or moves somewhere else. The installed value follows the destination's future lifetime.
+
+## Ignoring the return still drops it
+
+Writing `let _ = mem::replace(...)` can be misunderstood. The returned owned value is discarded and generally dropped at the end of that statement's temporary lifetime. Calling the function and not binding its result also drops the returned value as an unused temporary.
+
+That drop is caused by what the caller does with the return, not by `replace` internally. The distinction matters when control flow, panic boundaries, or explicit cleanup order is involved.
+
+I bind the old value when the transition protocol needs to inspect, flush, close, or transfer it.
+
+## The new value is now part of the destination
+
+After replacement, dropping the original variable drops the new value. The old value is independent.
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-394/fixed.rs) observes zero drops after replacement, one after explicitly dropping the returned owner, and two after dropping the destination. This three-point timeline proves the ownership transition.
+
+For a struct field, the containing struct owns the installed value. A later replacement returns it again instead of dropping it inside the call.
+
+## This enables moving from behind a mutable reference
+
+Rust normally prevents moving a non-Copy field directly out through `&mut` because the referenced place must remain valid. `replace` solves this by installing another valid `T` during the same operation.
+
+This is useful for state machines: replace `State::Running` with `State::Transitioning`, then match the owned old state without cloning it. The temporary replacement must itself be a valid state under any reentrant or panic behavior the program permits.
+
+For domain state, I choose a named replacement rather than assuming `Default` means empty.
+
+## take is replace with Default
+
+[`mem::take`](https://doc.rust-lang.org/std/mem/fn.take.html) replaces with `T::default()`. It has the same ownership shape but chooses the installed value through the `Default` trait.
+
+I use `take` when default is exactly the intended postcondition. I use `replace` when a protocol requires a specific sentinel, fresh allocation, or state variant.
+
+Neither operation destroys the returned old value by itself.
+
+## Resource cleanup timing is application behavior
+
+For files, locks, transactions, permits, and network objects, `Drop` can release an external resource. Holding the returned old value longer extends that resource lifetime even though the field already contains a replacement.
+
+Sometimes this is desired: I install a new writer, then flush and close the old writer outside the borrow of the container. Sometimes immediate cleanup is required, so I explicitly drop or finalize the old owner before proceeding.
+
+I do not depend on end-of-scope destruction when ordering affects correctness. I name the old owner and make the transition sequence visible.
+
+## Panic can split domain work around the safe move
+
+The memory operation itself preserves Rust validity. Application work after replacement can panic while both old and new resources exist. Their destructors run according to unwinding and ownership scopes, but external side effects may be partially completed.
+
+For critical transitions I separate preparation, the in-memory commit point, and fallible cleanup. If cleanup can fail, a Drop implementation cannot report that failure normally; an explicit close method may be necessary.
+
+The core principle is that mutation and destruction are different events. `mem::replace` changes which value a place owns and transfers the previous owner to the caller. Drop timing follows those resulting owners, giving the program control but requiring it to state resource lifecycle deliberately.
+
+## What I verify during review
+
+I look for the owner of both values immediately after the call. The destination owns the replacement; the binding or temporary receiving the return owns the old value. Then I check whether either destructor controls something scarce or externally visible. If it does, an underscore binding is too easy to misread, so I give the old value a meaningful name and drop or finalize it at an explicit point. This ownership inventory is more reliable than guessing cleanup timing from the word “replace.”

@@ -1,0 +1,170 @@
+---
+title: "Atomic Fences in Rust Without Hand-Waving"
+date: "2026-10-30T09:00:00+01:00"
+tags: ["rust", "atomic fence", "memory ordering", "concurrency", "unsafe Rust"]
+draft: false
+reviewed: true
+reviewedHash: "d4f129d462e46e4e449ff0e8dcfc6b2041f58db85abb1a4238dafb6c0493ac2d"
+cluster: "rust-under-the-hood"
+campaign: "authority-2026"
+opportunity: "RUST-039"
+summary: "A fence orders surrounding operations only through an atomic carrier and a reads-from relation. Trace release-fence/acquire-fence synchronization and the final-reference-count pattern."
+---
+
+An atomic fence is often described as “stop reordering here.” That picture is incomplete. A fence does not broadcast memory to every thread, and two fences do not synchronize merely because one is Release and one is Acquire.
+
+There must be an atomic communication path between them.
+
+## The carrier atomic makes the connection
+
+Consider a one-time publication protocol. The data is non-atomic and protected by a `ready` atomic:
+
+```text
+Producer                         Consumer
+
+write data = 42                  load ready, Relaxed
+fence Release                    if value came from producer store:
+store ready = true, Relaxed          fence Acquire
+                                     read data
+```
+
+The release fence is sequenced before the atomic store. The consumer's atomic load reads the value from that store and is sequenced before the acquire fence.
+
+That reads-from connection through `ready` lets the fences establish the synchronizes-with edge required to make the earlier data write happen before the later data read.
+
+Without the atomic store/load pair, the fences are two local operations with no cross-thread message.
+
+The [Rust `fence` documentation](https://doc.rust-lang.org/std/sync/atomic/fn.fence.html) defines fence synchronization in terms of operations on an atomic object, sequencing around the fences, and the value observed.
+
+## The equivalent simpler protocol is often better
+
+For one flag, I normally write:
+
+```rust
+// Producer, after initializing protected data.
+ready.store(true, Ordering::Release);
+
+// Consumer, before reading protected data.
+if ready.load(Ordering::Acquire) {
+    // Read protected data.
+}
+```
+
+The ordering is attached to the communication operations and easier to review.
+
+Fences become useful when one synchronization operation covers several relaxed atomics, when a fast path performs relaxed reads before deciding it needs Acquire, or in proven patterns such as reference-count destruction.
+
+“Fewer Acquire loads” is not automatically faster on every target. I use a fence when it expresses the protocol and measurement supports the complexity.
+
+## The consumer fence must follow the successful observation
+
+This is wrong in shape:
+
+```text
+fence Acquire
+load ready, Relaxed
+read data
+```
+
+The load that observes publication is after the fence, so it cannot serve as the operation sequenced before that acquire fence in the fence-fence relation.
+
+The conditional pattern is:
+
+```rust
+if ready.load(Ordering::Relaxed) {
+    std::sync::atomic::fence(Ordering::Acquire);
+    // The protected read comes after the fence.
+}
+```
+
+The branch must correspond to the value from the releasing publication or its valid release sequence. Seeing any arbitrary nonzero value is not enough unless the protocol proves where it came from.
+
+## One fence can follow several relaxed observations
+
+Suppose a consumer scans several slots with Relaxed loads, records which ones are ready, then performs one Acquire fence before reading data from those observed slots.
+
+```text
+relaxed load slot 0
+relaxed load slot 1
+relaxed load slot 2
+acquire fence
+read data for observed published slots
+```
+
+Each used slot still needs a matching release path and a load that read from it. The one fence can order later reads after the set of earlier observations, but it does not validate their values.
+
+The proof is larger than using an Acquire load per slot, so I keep the mapping explicit.
+
+## The final reference-count pattern
+
+A well-known pattern uses a Release decrement and an Acquire fence only on the last reference:
+
+```rust
+use std::sync::atomic::{fence, Ordering};
+
+if count.fetch_sub(1, Ordering::Release) != 1 {
+    return;
+}
+
+fence(Ordering::Acquire);
+// Destroy the allocation.
+```
+
+Non-final decrements do not need to acquire the allocation's other owners' writes because they will not destroy it. The thread that observes it removed the last reference performs the Acquire fence before destruction.
+
+Release decrements and their release sequence carry the required history to the final read-modify-write. The fence prevents destruction from moving before that acquired history.
+
+The [Rustonomicon reference-count drop discussion](https://doc.rust-lang.org/nomicon/arc-mutex/arc-drop.html) presents this pattern. Real implementations additionally handle weak counts, overflow, layout, aliasing, and deallocation.
+
+## `compiler_fence` is a different tool
+
+`std::sync::atomic::compiler_fence` restricts compiler reordering without necessarily emitting a hardware memory barrier. It is useful in specialised interactions such as signal handlers running on the same thread of execution.
+
+It does not by itself provide the multi-core synchronization of `atomic::fence`. Replacing a fence with a compiler fence because generated assembly looked expensive can introduce a race on another CPU.
+
+The public API distinction is intentional:
+
+```text
+compiler_fence: constrain compiler transformations
+fence:          participate in inter-thread atomic ordering
+```
+
+## SeqCst adds an order but not a carrier
+
+A `SeqCst` fence participates in the single total order of sequentially consistent operations and fences. This can simplify some algorithms that need agreement about global ordering.
+
+It still does not make arbitrary non-atomic data safe without the required atomic relationships. Stronger enum names cannot replace the communication graph.
+
+I avoid changing every operation to SeqCst as a substitute for identifying ownership and reads-from edges. SeqCst may make a correct proof simpler, but it cannot repair unrelated unsynchronized accesses.
+
+## Fences do not flush variables by name
+
+Descriptions such as “the release fence flushes data to memory” create wrong expectations. Caches are coherent through hardware protocols, and Rust's guarantee is defined by the language memory model rather than a literal flush of one variable.
+
+The useful relations are:
+
+```text
+sequenced-before within a thread
+modification order for one atomic
+reads-from between an atomic write and read
+synchronizes-with across threads
+happens-before for protected accesses
+```
+
+If I can draw them, I do not need a story about all memory becoming globally fresh at one instant.
+
+## A review checklist
+
+For every fence I ask:
+
+1. Which ordinary operations must it order?
+2. Which atomic object carries the cross-thread observation?
+3. Which write or release sequence can the load read from?
+4. Are the atomic operations on the correct sides of the fences?
+5. Which later non-atomic access relies on the happens-before result?
+6. Can a different value or ABA cycle satisfy the branch without the intended publication?
+7. Would attaching Acquire/Release directly to the atomic operations be clearer?
+
+I also model small protocols with Loom and inspect assembly for cost, but the correctness argument remains at the memory-model level.
+
+A fence is not an invisible lock. It is one node in a synchronization proof. The proof becomes concrete when the fence has a named carrier atomic, a specific observed modification, and protected operations sequenced on the correct sides.

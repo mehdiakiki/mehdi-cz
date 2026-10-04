@@ -1,0 +1,73 @@
+---
+caseId: "RFA-667"
+title: "Vec::append Moves Elements and Empties the Source Vector"
+date: "2026-09-06T08:27:00+01:00"
+lastmod: "2026-09-06T08:27:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "627bf922a5559df013a6675ac9312b4d71e46e3c4dce9316bfc4066f6782fa4f"
+area: "concurrency-memory"
+symptom: "After appending one vector into another through a mutable reference, the source vector unexpectedly has length zero."
+summary: "append transfers ownership of every element into the destination and leaves the source empty. Clone or extend from borrowed data when both collections must retain values."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust Vec append empties source", "append versus extend_from_slice Rust", "move all elements between vectors"]
+evidence: ["Rust 1.98.1 runtime assertion", "source vector becomes empty after append", "extend_from_slice retains source values"]
+sources: ["https://doc.rust-lang.org/std/vec/struct.Vec.html#method.append", "https://doc.rust-lang.org/std/vec/struct.Vec.html#method.extend_from_slice", "https://doc.rust-lang.org/std/iter/trait.Extend.html"]
+---
+
+`destination.append(&mut source)` moves all elements from `source` to the end of `destination`. The source remains a valid vector, but it is empty. The [failing fixture](/rust-failure-atlas/evidence/RFA-667/fail.rs) expects incoming values to remain in both collections and catches the ownership mismatch.
+
+## append is an ownership transfer
+
+The [`Vec::append` documentation](https://doc.rust-lang.org/std/vec/struct.Vec.html#method.append) states that all elements move from `other` into `self`, leaving `other` empty. No element clone is required.
+
+This makes the method suitable for merging work queues, consolidating parser output, or returning a temporary batch to an owner. Unique resources such as strings, sockets, and buffers can transfer without inventing duplicates.
+
+The `&mut Vec<T>` parameter can look weaker than a by-value parameter, but it permits the method to take elements while leaving the vector object reusable. Capacity may remain with one side according to implementation behaviour and future operations, but the documented semantic fact is that source length becomes zero.
+
+## Empty does not mean moved-away vector
+
+After append, the source variable can still be used. It can receive new elements, be inspected, or be returned to a pool. Only its previous elements changed owners.
+
+This pattern is common in Rust APIs. `mem::take`, `drain`, and methods accepting mutable containers can extract contents while preserving a valid outer value. It avoids a partially initialised object that safe Rust could not represent.
+
+I distinguish “the collection was consumed” from “the collection's elements were transferred.” With append, the collection survives and the elements move.
+
+## Retaining both sides requires duplication
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-667/fixed.rs) uses [`extend_from_slice`](https://doc.rust-lang.org/std/vec/struct.Vec.html#method.extend_from_slice), which clones source elements into the destination and leaves the source unchanged. This requires `T: Clone`.
+
+For `Copy` bytes and integers, duplication is usually straightforward. For `Arc`, cloning produces shared ownership. For large strings, copying may be expensive. For file handles or transactional guards, duplication may be unavailable or semantically wrong.
+
+I ask why both collections need the values. Sometimes the source is only retained for logging and a lightweight ID is enough. Sometimes two owners truly need shared access and `Arc` is the right model. Sometimes append is correct and a later read of the source is the actual bug.
+
+## extend has several ownership forms
+
+The [`Extend` trait](https://doc.rust-lang.org/std/iter/trait.Extend.html) adds items from an iterator. Passing `source` by value consumes the vector and moves its elements. Passing an iterator of references needs a suitable element conversion or cloning step. `extend_from_slice` makes clone-from-borrowed-slice intent concise.
+
+These forms can produce the same destination values while leaving very different source states. I include ownership in API reviews, not only the rendered contents.
+
+For very large merges, destination reservation can reduce allocation. `append` can often exploit collection internals efficiently, but I benchmark realistic patterns before depending on capacity folklore. The semantic choice comes first.
+
+## Failure and cleanup need consideration
+
+Ordinary allocation failure aborts or follows allocator behaviour; append does not return `Result`. In systems with explicit memory limits, `try_reserve` before a large merge can surface capacity failure earlier.
+
+If code panics after transferring a batch but before recording completion, retry logic may see an empty source and duplicate or lose domain work. Ownership transfer is not a transaction. I record state transitions in an order that makes retries idempotent, particularly around external acknowledgements.
+
+Tests assert destination order, source emptiness or retention, repeated use of the emptied vector, and behaviour for empty inputs. A content-only assertion on the destination misses half of the contract.
+
+## My append checklist
+
+- Should elements move, clone, or become jointly owned?
+- Is an empty source the intended postcondition?
+- Does later code mistakenly treat the source as an audit copy?
+- What does `Clone` mean for this element type?
+- Should the emptied allocation be reused or released?
+- Is reservation needed before a large merge?
+- Can a panic between transfer and acknowledgement break retries?
+- Do tests assert both source and destination states?
+
+The core principle is that merging values also chooses their next owner. `Vec::append` performs a clean transfer and leaves a reusable empty source. I use a cloning extension only when the domain genuinely requires the old and new collections to retain access.

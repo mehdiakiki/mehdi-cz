@@ -1,0 +1,83 @@
+---
+caseId: "RFA-300"
+title: "Vec of a Zero-Sized Type Reports usize::MAX Capacity"
+date: "2026-09-06T01:20:00+01:00"
+lastmod: "2026-09-06T01:20:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "9f0d450835b19455127f7cfbc4629284ac55b310d3d843bc7d2810b64d47ae13"
+area: "concurrency-memory"
+symptom: "Vec::with_capacity for a zero-sized element reports usize::MAX rather than the requested capacity, even though no enormous allocation happened."
+summary: "A Vec of zero-sized values tracks its length but needs no element storage. Rust uses usize::MAX as its effective capacity, so capacity is not reliable evidence of allocated bytes or of the constructor request."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust Vec zero sized type capacity usize MAX", "Vec unit capacity huge no allocation", "with_capacity ZST ignores requested capacity"]
+evidence: ["Rust 1.98.1 Vec<()> fixture", "requested capacity eight", "length growth without element allocation"]
+sources: ["https://doc.rust-lang.org/std/vec/struct.Vec.html#capacity-and-reallocation", "https://doc.rust-lang.org/nomicon/exotic-sizes.html#zero-sized-types-zsts", "https://doc.rust-lang.org/std/mem/fn.size_of.html"]
+---
+
+I once used `Vec::capacity()` in a memory report. The code looked harmless: request room for eight values, print the capacity, and estimate bytes as capacity multiplied by element size. Then a `Vec<()>` reported `usize::MAX`. It looked like a broken allocator or an impossible reservation, but neither was true.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-300/fail.rs) creates `Vec::<()>::with_capacity(8)` and expects a capacity of eight. Rust reports the maximum `usize` value instead.
+
+## A zero-sized value needs no element bytes
+
+The unit type `()` has size zero. The same can be true for empty structs and some marker types. A vector still owns a logical sequence of these values: its length changes, iteration produces the right number of items, and indexing follows the normal bounds rules. It does not need to reserve one storage slot per item because every item occupies zero bytes.
+
+The [`Vec` capacity documentation](https://doc.rust-lang.org/std/vec/struct.Vec.html#capacity-and-reallocation) states this case directly. When the element type has zero size, `Vec` does not allocate for elements and its capacity is always `usize::MAX`.
+
+I read this value as “storage cannot be exhausted by elements,” not “this many elements were allocated.” It is a sentinel-like representation of an effectively unbounded byte-free capacity.
+
+## Capacity is a count, not a byte measurement
+
+For ordinary `T`, capacity says how many elements fit before reallocation. It still does not directly say how many bytes the allocator obtained. Allocator layout, alignment, and implementation details stand between those ideas.
+
+For a zero-sized `T`, the distinction becomes impossible to ignore:
+
+```text
+element size       = 0 bytes
+reported capacity  = usize::MAX elements
+element allocation = 0 bytes
+```
+
+Multiplying capacity by `size_of::<T>()` happens to produce zero here, but I do not use unchecked multiplication as a general memory-accounting method. For non-zero types it can overflow, and a collection may own allocations reachable through each element that are not included in inline element size.
+
+## Length still has a real limit
+
+No element buffer does not mean an infinite vector. Length is stored as `usize`, and operations remain constrained by representable indices and other API preconditions. Trying to push until `usize::MAX` would fail for practical reasons long before becoming a useful experiment.
+
+The important separation is between logical state and physical storage. A ZST vector can advance its length without advancing a data pointer through allocated element bytes. Iterator implementations still have to produce exactly `len` values, which is one reason zero-sized types reveal subtle unsafe-code mistakes.
+
+The [Rustonomicon discussion of zero-sized types](https://doc.rust-lang.org/nomicon/exotic-sizes.html#zero-sized-types-zsts) explains why collection implementations need special handling. Pointer arithmetic by a zero-sized step does not naturally move a pointer, yet an iterator must make progress.
+
+## Requested capacity is not retained as history
+
+`with_capacity(8)` is a request about the collection's ability to accept elements efficiently. It is not a promise that a later call returns the literal argument. Even with non-zero types, an allocator may provide at least the requested capacity rather than exactly that number.
+
+For ZSTs there is no reason to remember eight as a storage boundary. Returning `usize::MAX` gives operations one consistent answer: another zero-byte element does not require growing an element allocation.
+
+I therefore never test `Vec::with_capacity(n).capacity() == n`. I test `capacity() >= n` where capacity semantics matter, and I avoid even that assertion when the real requirement is only that construction and pushes succeed.
+
+## This matters in generic and unsafe code
+
+Most application code can ignore the special representation. Generic collection utilities, allocation telemetry, serialization limits, and unsafe buffers cannot.
+
+In generic code I ask separately:
+
+- What is the logical element count?
+- What is the inline size of one element?
+- Did this operation actually allocate?
+- What upper bound does the application permit, even when storage is free?
+
+An attacker-controlled request for billions of zero-sized items can still create a very long loop or a huge encoded output even though it does not consume a vector element buffer. A byte budget alone is not a work budget.
+
+Unsafe code must also avoid treating the capacity value as permission to form an arbitrary allocation-sized memory region. The vector's documented guarantees, element layout, initialized length, and provenance matter together.
+
+## What I test
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-300/fixed.rs) verifies that `()` has size zero, that the initial and later capacities are both `usize::MAX`, and that extending the vector to one thousand values changes its length correctly.
+
+For a generic container helper I test a normal sized type, an aligned type, and a ZST. I also test empty and non-empty states, iteration counts, application limits, and any memory metric presented to operators. If I expose “reserved bytes,” I document whether it is a lower bound, an estimate, or allocator-observed data.
+
+The core principle is that logical capacity and allocated memory are related but not identical. Zero-sized types make that visible: `Vec<()>` can hold a growing sequence without element storage, so Rust reports `usize::MAX` capacity rather than preserving a capacity request that no longer represents a physical boundary.

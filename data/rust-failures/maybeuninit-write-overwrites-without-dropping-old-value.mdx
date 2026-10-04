@@ -1,0 +1,83 @@
+---
+caseId: "RFA-295"
+title: "MaybeUninit::write Does Not Drop an Old Initialized Value"
+date: "2026-09-06T01:15:00+01:00"
+lastmod: "2026-09-06T01:15:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "0b454d6209c4a37742f3cdc7b2b0ecef8910f8558bbf1b3c3510a69c69ba920a"
+area: "concurrency-memory"
+symptom: "Writing a second resource-owning value into an already initialized MaybeUninit slot drops only the second value later; the overwritten first value is leaked."
+summary: "MaybeUninit::write performs raw initialization without reading or dropping prior bytes. Use it for genuinely uninitialized storage; once a T is live, replace or drop that T under an explicit initialization-state invariant."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust MaybeUninit write does not drop old value", "overwrite initialized MaybeUninit leak", "MaybeUninit reinitialize resource safely"]
+evidence: ["Rust 1.98.1 drop-counted values", "second write into initialized slot", "one missing destructor call"]
+sources: ["https://doc.rust-lang.org/std/mem/union.MaybeUninit.html#method.write", "https://doc.rust-lang.org/std/mem/union.MaybeUninit.html#method.assume_init_drop", "https://doc.rust-lang.org/std/mem/fn.replace.html"]
+---
+
+I used `MaybeUninit` as a reusable slot and called `write` a second time after the slot already contained a live value. The later value was dropped normally. The resource owned by the first value was never released.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-295/fail.rs) gives both values a drop counter. After overwriting and cleaning the slot, the counter is one instead of two.
+
+## `write` assumes the destination needs initialization
+
+[`MaybeUninit::write`](https://doc.rust-lang.org/std/mem/union.MaybeUninit.html#method.write) places a value into the union and returns a mutable reference to it. It does not read or drop the old contents.
+
+This is correct for its main purpose: initializing memory whose previous bytes do not form a live `T`. Trying to drop uninitialized bytes would itself be invalid.
+
+The method cannot dynamically know whether my program already initialized this slot. `MaybeUninit` deliberately removes that automatic lifecycle tracking. I must carry the state invariant around it.
+
+## Leaking is not the same as memory unsafety
+
+Overwriting a live value without dropping it can leak heap memory, file handles, reference counts, locks, or application cleanup. Rust permits leaks in safe programs; destructors are not guaranteed to run in every situation.
+
+That does not make the behavior harmless. A server can exhaust resources while remaining free of immediate undefined behavior. A forgotten transaction guard can also skip important logical cleanup.
+
+The fixture stays within defined behavior and measures the missing `Drop`. It does not read the overwritten value or assume its bytes remain accessible.
+
+## Once initialized, operate on the `T`
+
+If the slot definitely contains a live `T`, I can obtain a mutable reference under the initialization invariant and use [`mem::replace`](https://doc.rust-lang.org/std/mem/fn.replace.html). Replace returns the old value, making its ownership visible:
+
+```rust
+let old = mem::replace(slot.assume_init_mut(), new_value);
+drop(old);
+```
+
+The unsafe part is proving that `assume_init_mut` is called only while the slot is initialized. The replacement itself follows ordinary Rust ownership.
+
+Alternatively, I can call [`assume_init_drop`](https://doc.rust-lang.org/std/mem/union.MaybeUninit.html#method.assume_init_drop) before writing the new value. Between those two operations the slot is uninitialized again, so the state flag must change even if constructing the replacement can panic.
+
+## A boolean flag is part of the unsafe contract
+
+Low-level containers often keep storage plus a length, bitmap, or enum describing which slots are initialized. That metadata is not optional bookkeeping. It decides where reads and drops are valid.
+
+For an array being built element by element, the initialized prefix length increases only after each successful write. If construction panics, cleanup drops exactly that prefix. For a reusable single slot, an enum such as `Empty | Full` can make transitions clearer than a loosely maintained boolean.
+
+I document these invariants beside every unsafe block and test panic paths. Correct happy-path initialization is only half of a `MaybeUninit` design.
+
+## `MaybeUninit<T>` does not run `T::drop` automatically
+
+Dropping the wrapper itself does not assume the inner bytes contain a `T`, so it cannot automatically run `T`'s destructor. Cleanup must explicitly call `assume_init_drop` for live slots or convert them with `assume_init` and let the resulting value drop normally.
+
+Calling `assume_init_drop` twice is invalid because the first call ends the value's lifetime. Never calling it leaks. Calling it before initialization is also invalid. All three errors come from the same missing state proof.
+
+I prefer higher-level containers unless layout, FFI, or partial initialization genuinely requires this manual lifecycle.
+
+## Out-pointers explain why overwrite is allowed
+
+The standard documentation uses `MaybeUninit` for out-pointers: a caller allocates uninitialized storage and a function writes the result there. In that protocol there is no previous value to destroy.
+
+If an FFI function may overwrite an already initialized output object, its contract needs a separate destroy or replace rule. Rust's `write` cannot infer a foreign ownership convention from a pointer.
+
+I represent “old value is intentionally abandoned” only when a documented external protocol requires it. Otherwise I recover and drop ownership explicitly.
+
+## What I test
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-295/fixed.rs) replaces the initialized value, drops the returned old value, then drops the current value. The counter reaches two.
+
+My larger tests cover never initialized, initialized once, replaced, extracted, construction panic after a partial prefix, and cleanup panic where the domain permits destructors to panic. I use Miri for unsafe container implementations in addition to ordinary drop counters.
+
+The core principle is that initialization and destruction are one lifecycle. `MaybeUninit::write` handles only the initialization write and intentionally ignores old bytes. Once a live value exists, I must move, replace, or drop it before treating that storage as uninitialized again.

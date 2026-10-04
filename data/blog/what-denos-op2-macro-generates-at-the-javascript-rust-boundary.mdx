@@ -1,0 +1,195 @@
+---
+title: "What Deno's op2 Macro Generates at the JavaScript–Rust Boundary"
+date: "2026-10-22T09:00:00+01:00"
+tags: ["Deno", "Rust", "op2", "V8", "procedural macros"]
+draft: false
+reviewed: true
+reviewedHash: "c2d728daf85eb054d4f9d89919dd6bebf61d05dd8b00dd7420bf302d90bfcd93"
+cluster: "rust-under-the-hood"
+campaign: "authority-2026"
+opportunity: "RUST-024"
+summary: "Deno's #[op2] turns a Rust function signature into V8 dispatch code and OpDecl metadata. Trace slow, fast, async, conversion, error, and registration boundaries."
+---
+
+Deno extensions expose privileged runtime work to JavaScript through Rust operations. A small operation can look like:
+
+```rust
+use deno_core::op2;
+
+#[op2(fast)]
+fn op_add(left: i32, right: i32) -> i32 {
+    left + right
+}
+```
+
+The Rust body is the easy part. V8 does not call an arbitrary Rust signature directly. `#[op2]` analyses that signature and generates the dispatch glue and declaration metadata expected by `deno_core`.
+
+## The macro creates a boundary adapter
+
+At a high level:
+
+```text
+JavaScript call
+    -> V8 callback arguments
+    -> generated op2 dispatch
+    -> validate and convert values
+    -> call Rust function body
+    -> convert result or throw exception
+    -> JavaScript value or Promise
+```
+
+The exact generated tokens change with `deno_core`. I use this conceptual expansion to find the ownership of a bug, not as a stable copied API.
+
+The current [`op2` generator source](https://github.com/denoland/deno_core/blob/main/ops/op2/mod.rs) parses the annotated item and macro configuration, maps the Rust signature to V8 representations, and selects generated slow, fast, or asynchronous dispatch paths.
+
+## Signature parsing happens at compile time
+
+Because `op2` is a procedural macro, unsupported combinations can fail while compiling the extension rather than becoming an arbitrary runtime cast.
+
+The generator needs to know:
+
+```text
+which parameters come from JavaScript
+which are virtual runtime values such as state or scope
+how each JavaScript value becomes a Rust value
+how the return value goes back to V8
+whether errors become JavaScript exceptions
+whether the operation is synchronous or asynchronous
+whether a V8 fast-call signature is possible
+```
+
+Attributes on arguments and return values refine conversions for strings, buffers, serde values, and V8 handles. The [current op2 argument documentation](https://github.com/denoland/deno_core/blob/main/ops/op2/valid_args.md) is a better source than an old blog post because accepted signatures evolve.
+
+## The original Rust body remains a callable inner function
+
+In the current generator, the annotated function is cloned and its internal callable form is named `call`. Around it, generated code extracts arguments and handles the V8 boundary.
+
+Conceptually, our operation becomes something like:
+
+```rust
+fn call(left: i32, right: i32) -> i32 {
+    left + right
+}
+
+fn generated_v8_callback(info: /* V8 callback info */) {
+    let left = /* convert JS argument 0 to i32 */;
+    let right = /* convert JS argument 1 to i32 */;
+    let result = call(left, right);
+    /* convert result to a V8 integer */
+}
+```
+
+This is deliberately pseudocode. Real generated code manages V8 scopes, callback data, exception paths, metrics, optional runtime state, and selected conversions.
+
+The separation is useful: business logic remains a normal Rust function body while the macro owns repetitive boundary mechanics.
+
+## Slow calls are the general path
+
+The slow V8 callback path receives generic JavaScript callback information and can perform rich conversions. It may need a V8 handle scope, argument list, operation state, or stack trace depending on the signature and configuration.
+
+The current [`dispatch_slow` source](https://github.com/denoland/deno_core/blob/main/ops/op2/dispatch_slow.rs) builds argument extraction, deferred virtual arguments, the Rust call, and return conversion. It generates only some setup pieces when the parsed signature needs them.
+
+This conditional generation matters for cost: an integer-only operation does not need every possible conversion helper merely because `op2` supports them.
+
+## Fast calls are an opt-in contract
+
+V8 fast API calls avoid parts of the generic callback path for compatible signatures. With `#[op2(fast)]`, the macro verifies whether the Rust operation can map to a supported fast signature and generates corresponding metadata and callback code.
+
+Fast is not “make every op fast.” Strings, buffers, optional values, state access, and return handling have representation and lifetime constraints. The current [`op2` README](https://github.com/denoland/deno_core/blob/main/ops/op2/README.md#fastcalls) says fast-compatible operations must be marked and also supports selecting an alternate fast implementation for a more general slow operation.
+
+I benchmark a hot boundary before changing signatures for fast-call compatibility. A fast trampoline cannot make slow filesystem or network work fast.
+
+## Async operations add promise scheduling
+
+The current `op2` documentation says asynchronous behaviour is inferred from an `async fn` or a function returning a future.
+
+```rust
+#[op2]
+async fn op_lookup(/* arguments */) -> Result<String, MyError> {
+    // asynchronous Rust work
+}
+```
+
+The generated path associates the future with Deno's pending-op machinery and a JavaScript Promise. By default, the runtime can poll eagerly so an immediately ready future returns with less scheduling delay; lazy and deferred variants change this behaviour for specialised cases.
+
+This machinery does not make blocking code asynchronous. A blocking database driver or CPU-heavy loop inside the future can still stall the isolate thread. The implementation must move truly blocking work to an appropriate worker mechanism.
+
+## Errors cross a language boundary too
+
+A fallible op can return `Result`. The error type needs the error classification expected by `deno_core`, and generated dispatch converts the error into a JavaScript exception.
+
+This boundary should preserve a safe public error while retaining internal diagnostics separately:
+
+```text
+Rust internal error with source chain
+    -> classify for JavaScript
+    -> throw bounded message and class
+    -> record internal trace without secrets
+```
+
+Returning a Rust backtrace, filesystem path, or credential-bearing provider error directly to JavaScript can leak runtime internals.
+
+## String and buffer conversions are not all zero-copy
+
+JavaScript strings in V8 may use one-byte or two-byte representations, while Rust `String` is UTF-8. The current `op2` README explains that producing a Rust `String` requires conversion and at least a copy to ensure correct encoding.
+
+Buffers have different ownership choices: borrowed views can avoid a copy only while their backing memory and V8 lifetime remain valid. An async operation cannot casually retain a borrowed slice across suspension.
+
+When boundary performance matters, I measure:
+
+```text
+number of JS-to-Rust calls
+argument and return bytes
+allocations and copies
+fast versus slow dispatch eligibility
+time in conversion versus Rust work
+whether batching reduces crossings
+```
+
+One batched operation is often better than thousands of clever tiny crossings.
+
+## OpDecl connects generated code to registration
+
+The macro also exposes declaration information used when an extension registers its operations. That declaration connects the operation name with generated dispatch functions and properties such as async or fast-call behaviour.
+
+The wider route is:
+
+```text
+#[op2] Rust item
+    -> generated OpDecl and callbacks
+    -> deno_core::extension! registration
+    -> JsRuntime installs operation bindings
+    -> JavaScript bootstrap code calls the op
+```
+
+The macro alone does not make the function globally callable by arbitrary JavaScript. The extension and runtime must register and expose it.
+
+## What op2 does not provide
+
+Generated conversion code is not application policy. The Rust operation still owns:
+
+- resource and permission checks;
+- tenant or user authorization;
+- path validation;
+- cancellation and deadlines;
+- rate and size limits;
+- blocking-work placement;
+- idempotency for external effects;
+- safe error disclosure.
+
+A correctly converted path string can still point somewhere the caller must not access.
+
+## How I inspect an op boundary
+
+Working with Deno and Rust taught me to split failures into four layers:
+
+```text
+macro layer:       signature or attribute rejected at compile time
+conversion layer:  JavaScript value cannot become expected Rust value
+operation layer:   Rust body returns a domain or runtime error
+runtime layer:     registration, promise polling, resources, or event loop
+```
+
+For a minimal extension, I inspect macro expansion with an appropriate nightly or expansion tool, but I compare it with the `deno_core` source at the exact dependency revision. Generated identifiers are not a public interface to depend upon.
+
+`#[op2]` makes a difficult boundary look small by generating the repetitive part. Understanding the slow callback, optional fast path, async scheduling, conversions, errors, and `OpDecl` registration lets me keep the handwritten Rust body simple without pretending the bridge is magic.

@@ -1,0 +1,98 @@
+---
+caseId: "RFA-149"
+title: "Why Pin::get_mut Requires Unpin for PhantomPinned Types"
+date: "2026-09-05T15:49:00+01:00"
+lastmod: "2026-09-05T15:49:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "38fa76f2c2a76cc64c8764f55a19d38f7ab8bf7dac3481b8dded77084896aedf"
+area: "concurrency-memory"
+symptom: "Pin::get_mut fails with E0277 for a value containing PhantomPinned, even when the desired mutation appears unrelated to its address."
+summary: "An unrestricted mutable reference could move the entire value, so safe Pin::get_mut exists only for Unpin pointees. Define operations on Pin receivers and expose only mutations that preserve the pinning invariant."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets"]
+profiles: ["check", "dev", "release", "test"]
+searchTerms: ["Rust Pin get_mut PhantomPinned E0277", "cannot get mutable reference pinned Unpin", "safe field update Pin PhantomPinned"]
+evidence: ["Rust 1.98.1 E0277", "PhantomPinned negative auto trait", "Pin receiver repair"]
+sources: ["https://doc.rust-lang.org/std/pin/struct.Pin.html#method.get_mut", "https://doc.rust-lang.org/std/marker/struct.PhantomPinned.html", "https://doc.rust-lang.org/std/pin/index.html"]
+---
+
+Pinning became clearer for me when I stopped reading `Pin<&mut T>` as “a stronger mutable reference.” It is a restricted interface carrying a promise: the pointee will not be moved in ways that violate its address-sensitive invariant.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-149/fail.rs) creates a `RequestState` containing `PhantomPinned`, puts it in `Box::pin`, and asks `Pin::get_mut` for `&mut RequestState`. Rust reports E0277 because `PhantomPinned` cannot be unpinned.
+
+The compiler is rejecting the unrestricted reference, not all mutation.
+
+## What would &mut T allow?
+
+With `&mut T`, safe functions such as `mem::replace`, `mem::swap`, and assignment can move a value out and put another one in. The reference does not remember which operations would break a self-reference or another address-dependent relationship.
+
+For a type implementing `Unpin`, moving after pinning is harmless. Most ordinary Rust types are `Unpin`, so [`Pin::get_mut`](https://doc.rust-lang.org/std/pin/struct.Pin.html#method.get_mut) can safely return `&mut T` for them.
+
+For a `!Unpin` type, returning that same reference would throw away the restriction that makes pinning useful. Rust therefore requires the bound:
+
+```text
+Pin<&mut T>::get_mut is safe when T: Unpin
+```
+
+The error appears at `get_mut`, but the cause is the API request. I asked for more authority than my intended field update needed.
+
+## PhantomPinned opts out of automatic Unpin
+
+[`PhantomPinned`](https://doc.rust-lang.org/std/marker/struct.PhantomPinned.html) is a zero-sized marker that does not implement `Unpin`. Including it normally makes the containing type `!Unpin` through auto-trait rules.
+
+It does not create a self-reference by itself. It tells Rust that the type's author wants moves after pinning to be controlled. The author still has to construct the type correctly and maintain the invariant.
+
+This is why adding `PhantomPinned` as decoration is not useful. It changes which safe interfaces are available and creates design work around initialization, projection, and destruction.
+
+## Ask for the operation, not unrestricted access
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-149/fixed.rs) stores the counter in `Cell<u32>` and defines:
+
+```rust
+fn record_attempt(self: Pin<&Self>) {
+    self.attempts.set(self.attempts.get() + 1);
+}
+```
+
+The method can update the counter through interior mutability without moving the `RequestState`. Callers receive one meaningful operation instead of `&mut RequestState`.
+
+This is not a universal recommendation to put every field in `Cell`. It is a minimal safe repair matching the fixture's goal. In larger code I may use a projection library, generate projections with a macro, or write a small reviewed unsafe projection when the invariant requires it.
+
+The design question is always the same: which fields are structurally pinned? A field independent of the parent's address can often be projected as ordinary mutable data. A field whose address participates in the invariant must remain pinned.
+
+## Pin protects through an API boundary
+
+The [standard pinning module](https://doc.rust-lang.org/std/pin/index.html) describes `Pin<Ptr>` as a contract involving the pointer and pointee. It does not freeze bytes. Interior-mutability types can change, and methods can expose carefully selected mutations.
+
+Pin also does not magically pin every pointer. Creating `Pin<&mut T>` unsafely and later moving `T` through another alias violates the contract. Owning containers such as `Box::pin` make the common construction easier because the allocation has a stable location and safe access does not expose a moving path for `!Unpin` values.
+
+I keep two moments distinct:
+
+1. Before pinning, initialization may still move the value.
+2. After the pinning promise begins, every access path must preserve it.
+
+Self-references must be established only when the final address is stable, often through a constructor designed for that lifecycle.
+
+## Why get_unchecked_mut is not the quick fix
+
+`Pin::get_unchecked_mut` can return `&mut T` without `Unpin`, but it is unsafe because the caller must promise not to move pinned fields. Calling it and then handing the reference to arbitrary code defeats the point.
+
+If I use it inside an implementation, I keep the unsafe block very small, project only the intended field, document why that field is not structurally pinned, and test operations such as replacement and drop. A mature projection crate is usually less error-prone.
+
+The fixture intentionally shows a safe alternative so readers do not learn that E0277 should be silenced with unsafe.
+
+## My debugging questions
+
+When `get_mut` fails on a pinned type, I ask:
+
+- Which member makes the type `!Unpin`?
+- Does the type really have an address-sensitive invariant, or was `PhantomPinned` added prematurely?
+- Does the caller need the whole `&mut T`, or only one operation?
+- Which fields may move independently?
+- Does an existing projection abstraction encode this safely?
+- Can interior mutability express the small update without widening authority?
+
+I do not solve the diagnostic by implementing `Unpin` until I can prove moving the value is harmless. For an address-sensitive type, that implementation can invalidate assumptions used by unsafe code.
+
+The core principle is capability design. `&mut T` grants the ability to move `T`; `Pin<&mut T>` intentionally withholds part of that ability. E0277 is telling me to expose a narrower operation that preserves the promise, not to fight the type system for unrestricted access.

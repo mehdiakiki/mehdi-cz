@@ -1,8 +1,8 @@
 const blurPlaceholders: Record<string, string> = {
   "/static/images/mehdi_image_enhanced_square.webp":
-    "data:image/webp;base64,UklGRoYAAABXRUJQVlA4IHoAAACwBACdASoUABQAPxFysVAsJqSisBgMAYAiCWUAxkGLfG3TWJK2OGKQ0z+FO4tAAP7qe7X1UpgwLQjOytJ01vm6+hZgVWgaqqLpydkNOzFSJHOR1UvqWEKkQJKzGBG5ZRTX3c8+7JdM+bR8Cv2o/zSAPaBc6osbGZNQAA==",
+    "data:image/webp;base64,UklGRpoAAABXRUJQVlA4II4AAAAwBQCdASoUABQAPwFmq0+rJSOiMBgMAWAgCWUAx+WMOmrpd8MY+H1Bh/sAPAFQkz7zAAD+w+HId9FyfC7R6rkxpw6jpqpaa1y9iq6XSdGHwG7gZHC0D+JJmHFdjv9rRCQs3ONAtBpdKRo4lA6A2EAtB2meRYubYT6o2H2mYdvqaDH02NVMH1nss08QAAAA",
   "/static/images/mehdi_image_enhanced_square.png":
-    "data:image/webp;base64,UklGRoYAAABXRUJQVlA4IHoAAACwBACdASoUABQAPxFysVAsJqSisBgMAYAiCWUAxkGLfG3TWJK2OGKQ0z+FO4tAAP7qe7X1UpgwLQjOytJ01vm6+hZgVWgaqqLpydkNOzFSJHOR1UvqWEKkQJKzGBG5ZRTX3c8+7JdM+bR8Cv2o/zSAPaBc6osbGZNQAA==",
+    "data:image/webp;base64,UklGRpoAAABXRUJQVlA4II4AAAAwBQCdASoUABQAPwFmq0+rJSOiMBgMAWAgCWUAx+WMOmrpd8MY+H1Bh/sAPAFQkz7zAAD+w+HId9FyfC7R6rkxpw6jpqpaa1y9iq6XSdGHwG7gZHC0D+JJmHFdjv9rRCQs3ONAtBpdKRo4lA6A2EAtB2meRYubYT6o2H2mYdvqaDH02NVMH1nss08QAAAA",
 
   "/static/images/system-design-db-control-plane.webp":
     "data:image/webp;base64,UklGRkYAAABXRUJQVlA4IDoAAACQAQCdASoJAAoABUB8JZwAApdBo4AA/q22o08xigAckuRMPTBuCCrDbPbOxrt0n4cAnMOObamkAAAA",

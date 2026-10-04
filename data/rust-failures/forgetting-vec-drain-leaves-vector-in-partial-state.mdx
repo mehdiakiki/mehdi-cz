@@ -1,0 +1,98 @@
+---
+caseId: "RFA-146"
+title: "Why Forgetting Vec::Drain Can Lose the Undrained Tail"
+date: "2026-09-05T15:46:00+01:00"
+lastmod: "2026-09-05T15:46:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "998502edf1a18f37b3805fd8e6ee8186e16db2b87f9d4f0df1b564aac0dd0a91"
+area: "concurrency-memory"
+symptom: "After mem::forget is called on a Vec::Drain iterator, the source vector contains only its prefix and the elements after the requested range are no longer visible."
+summary: "Vec::drain uses an iterator whose destructor finishes cleanup and restores the undrained tail. Preventing that destructor from running is memory-safe but leaves the vector in a documented unspecified state and may leak more elements than the selected range."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets with alloc"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust mem forget Vec Drain loses tail", "forgetting Drain leaks vector elements", "Vec drain destructor not called result"]
+evidence: ["Rust 1.98.1 runtime assertion", "forgotten Drain iterator", "explicit-drop repair"]
+sources: ["https://doc.rust-lang.org/std/vec/struct.Vec.html#method.drain", "https://doc.rust-lang.org/std/mem/fn.forget.html", "https://doc.rust-lang.org/std/vec/struct.Drain.html"]
+---
+
+I met this class of bug while thinking about iterators as only a way to receive values. Some iterators do more: they own unfinished work. `Vec::Drain` is one of them.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-146/fail.rs) drains indexes `1..3` from `[0, 1, 2, 3]`, but it never consumes the iterator. It calls `mem::forget` instead. On Rust 1.98.1, the remaining vector is `[0]`, not `[0, 3]`, and the assertion fails.
+
+The exact `[0]` result is evidence from this toolchain, not a portable promise. The stable lesson is stronger: once I forget the drain, I cannot rely on the vector retaining any particular combination of the selected and unselected elements.
+
+## Drain starts mutation before iteration finishes
+
+[`Vec::drain`](https://doc.rust-lang.org/std/vec/struct.Vec.html#method.drain) returns removed items while keeping the vector allocation. It has to protect the vector from exposing uninitialized or duplicated elements during that process. Part of the work is completed when the `Drain` value is dropped.
+
+This means the following expression is not just a lazy read:
+
+```rust
+let removed = values.drain(1..3);
+```
+
+The vector has already entered a temporary structural state. Rust prevents normal access to `values` while `removed` borrows it, but the borrow checker cannot force destructors to run. Safe Rust allows values to be leaked.
+
+The official `drain` documentation warns that if the returned iterator is leaked, for example through `mem::forget`, the vector may have lost and leaked elements arbitrarily, including elements outside the range. This is unusual wording and important wording. It tells me not to reverse-engineer the current implementation and build a recovery rule around it.
+
+## Memory-safe does not mean cleanup-complete
+
+[`mem::forget`](https://doc.rust-lang.org/std/mem/fn.forget.html) consumes a value without running its destructor. The function is safe because Rust has never guaranteed that every destructor runs. A process can exit, an `Rc` cycle can remain, or a value can intentionally be forgotten.
+
+Safety here means the remaining program does not gain permission to read invalid memory. It does not mean every logical resource is restored. File descriptors can leak. Guards can fail to perform their final action. A `Drain` can leave its collection with fewer accessible elements than I expected.
+
+This distinction is useful beyond vectors:
+
+```text
+memory safety: no invalid memory access becomes legal
+logical completion: the operation reaches its promised final state
+```
+
+Rust gives strong tools for the first. I still have to design the second.
+
+## Let the iterator finish or drop it explicitly
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-146/fixed.rs) calls:
+
+```rust
+drop(values.drain(1..3));
+```
+
+Dropping the iterator without consuming it removes the selected range and lets cleanup move the tail into its correct place. The vector becomes `[0, 3]`.
+
+I could also consume the iterator with `for`, `collect`, `count`, or another terminal operation. Explicit `drop` is clearer when I do not need the removed values. If I need only part of them, normal early exit is also fine because the iterator still drops at the end of its scope.
+
+The dangerous operation is not early exit. It is preventing destruction entirely.
+
+## Do not use forget as a borrow-checker escape hatch
+
+Sometimes code reaches for `forget` because a guard or iterator seems to live too long. That only hides the ownership problem. It converts a visible lifetime into unfinished cleanup.
+
+I prefer a smaller scope:
+
+```rust
+{
+    let mut removed = values.drain(1..3);
+    inspect(removed.next());
+} // Drain cleanup completes here
+
+use_vector(values);
+```
+
+The braces document the lifecycle. If the intended operation must be cancel-safe or panic-safe, I also test those exits. A destructor-based protocol works during unwinding, but it does not survive process abort or deliberate leaking.
+
+## What I inspect in a real failure
+
+When a collection looks truncated after a transformation, I check more than the range math:
+
+1. Is there an iterator or guard that owns completion work?
+2. Was it consumed, normally dropped, stored somewhere, placed in `ManuallyDrop`, or forgotten?
+3. Can a reference-count cycle retain it forever?
+4. Does the API documentation describe behaviour when the value is leaked?
+5. Is my test asserting a documented result or only today's implementation detail?
+
+I also keep the smallest failing input. Four integers are enough to show that an element outside the requested drain range disappears from view on the pinned toolchain. A large application trace would make this harder to see.
+
+The principle I keep is simple: an iterator can be a transaction in progress. If its destructor closes that transaction, `mem::forget` is not a neutral optimization. It abandons the protocol. Rust keeps that abandonment memory-safe, but only the program can decide whether the resulting leak and partial logical state are acceptable.

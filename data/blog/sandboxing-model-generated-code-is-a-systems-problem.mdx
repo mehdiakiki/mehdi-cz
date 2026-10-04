@@ -1,0 +1,207 @@
+---
+title: "Sandboxing Model-Generated Code Is a Systems Problem"
+date: "2026-10-11T09:00:00+01:00"
+tags: ["AI code execution", "sandboxing", "security", "AI agents", "systems engineering"]
+draft: false
+reviewed: true
+reviewedHash: "e92ac3aa1ada0cad9b6a2b6252585b3565fff37b755999bc6fde24618f31f9af"
+cluster: "reliable-ai-systems"
+campaign: "authority-2026"
+opportunity: "AI-020"
+summary: "Running generated code safely requires isolation, denied egress, external secret handling, resource limits, authenticated output, and lifecycle cleanup—not only a container."
+---
+
+When a model writes code and the product executes it, I treat the code as untrusted. A friendly prompt does not change this boundary.
+
+The generated program may contain an accidental infinite loop, download a malicious package, read a token from the environment, scan another user's files, or send data to the internet. Prompt filtering cannot cover the operating-system behaviours available after execution starts.
+
+Sandboxing is therefore a systems design, not one process flag.
+
+## Start with the attacker's possible goals
+
+My threat model asks whether untrusted code can:
+
+```text
+read host or another tenant's files
+read credentials or platform metadata
+reach internal control planes
+send input data to an external host
+consume unlimited CPU, memory, disk, processes, or time
+survive after the job should finish
+publish an unauthenticated preview or artifact
+influence a later job through reused state
+escape the isolation boundary
+```
+
+Not every workload has the same consequence. Executing arithmetic with no inputs is different from analysing a customer's repository. The second job makes source code and build credentials part of the assets.
+
+## A container is one control, not the policy
+
+I want a boundary with explicit properties:
+
+| Area | Required decision |
+| --- | --- |
+| compute isolation | VM, microVM, container, user namespace, or another supported boundary |
+| tenancy | separate environment per user, session, or task |
+| filesystem | initial files, writable paths, persistence, cleanup |
+| network | deny by default, allowed destinations, internal ranges |
+| secrets | where credentials live and how requests receive them |
+| resources | CPU, memory, disk, process, output, and wall-time limits |
+| lifecycle | create, idle, stop, destroy, and orphan cleanup |
+| output | size, content type, active content, authentication |
+| observability | command, policy, exit reason, usage, and network decisions |
+
+If one row is “whatever the runtime default does,” I have an unknown security boundary.
+
+## Separate tenants before running code
+
+Code inside one sandbox normally shares the sandbox's filesystem, process space, and network permissions. Running two users in different working directories inside that same environment is not strong tenant isolation.
+
+A current concrete example is Cloudflare's Sandbox SDK. Its [security model](https://developers.cloudflare.com/sandbox/concepts/security/) states that each sandbox runs in a separate virtual machine, but also that code executions inside the same sandbox share filesystem, processes, network, and resource limits. The documentation recommends a separate sandbox for each user, session, or task according to the isolation need.
+
+The general lesson is independent of provider: choose the isolation unit before choosing the sandbox identifier.
+
+## A sandbox ID is not authorization
+
+An unpredictable ID helps routing. It does not prove that the caller owns the environment.
+
+I keep an application-side record:
+
+```ts
+type SandboxLease = {
+  sandboxId: string;
+  tenantId: string;
+  actorId: string;
+  purpose: "code-evaluation" | "repository-analysis";
+  policyVersion: string;
+  createdAt: string;
+  expiresAt: string;
+  status: "starting" | "active" | "destroying" | "destroyed";
+};
+```
+
+Every command, file operation, preview, and destroy request checks the authenticated actor against this record. Guessing or receiving a sandbox ID must not grant access.
+
+This is easy to miss because infrastructure APIs often assume the application supplies its own end-user authorization.
+
+## Deny network egress by default
+
+Generated code that cannot escape the filesystem may still exfiltrate data over HTTPS, DNS, a package registry, or an internal service.
+
+My default policy is:
+
+```text
+internet: denied
+private and metadata networks: denied
+DNS: denied unless required by an allowed path
+allowed hosts: exact, minimal, and logged
+redirects: revalidated against the policy
+```
+
+When package installation is needed, I prefer a controlled dependency proxy or a prepared image over unrestricted internet. Domain allowlists alone need careful handling of redirects, alternate ports, DNS changes, and endpoints that can store arbitrary uploads.
+
+Cloudflare's [outbound traffic guide](https://developers.cloudflare.com/sandbox/guides/outbound-traffic/) provides a useful current example: internet access can be disabled, destinations can be allowed, and an outbound handler can mediate requests outside the sandbox.
+
+## Do not place secrets where arbitrary code can read them
+
+If a credential is an environment variable inside the sandbox, generated code can print it. If it is a file, generated code can open it. Obscure variable names are not protection.
+
+For an allowed external API, I use a trusted proxy:
+
+```text
+untrusted code
+    -> request without provider credential
+trusted outbound handler
+    -> validate destination, method, path, tenant, and quota
+    -> inject a scoped credential
+provider
+```
+
+The credential stays outside the execution environment. The proxy grants one narrow capability rather than general network authority.
+
+The proxy must also prevent the untrusted code from choosing arbitrary headers, paths, or redirect targets that widen that capability.
+
+## Resource limits need more than a timeout
+
+A wall-clock timeout does not stop every form of exhaustion. I bound:
+
+```text
+CPU time
+wall time
+memory
+disk bytes and inode count
+number of processes and threads
+stdout and stderr bytes
+uploaded and downloaded bytes
+open files and sockets
+artifact count and size
+```
+
+When time expires, I terminate the whole process tree, not only the parent shell. I record whether the job exited normally, exceeded a resource, violated policy, or was cancelled.
+
+Output limits matter because a one-line loop that prints forever can exhaust memory in the service collecting logs before compute time becomes the problem.
+
+## Filesystem state needs a lifecycle contract
+
+I decide whether a new run starts from:
+
+- a read-only base image;
+- explicitly copied input files;
+- a previous session snapshot;
+- or a completely empty writable layer.
+
+Reusing a sandbox improves speed but creates a contamination path. A later task can read files, processes, caches, or modified tools left by an earlier task.
+
+Cloudflare's [sandbox lifecycle documentation](https://developers.cloudflare.com/sandbox/concepts/sandboxes/) describes ephemeral environments that stop after inactivity and lose state, with explicit destruction available. Whatever platform I use, I keep my own expiry and cleanup job because application records and infrastructure lifetimes can disagree after crashes.
+
+## Preview output is another untrusted interface
+
+A generated HTML preview can run JavaScript in the viewer's browser. A public preview URL can leak customer input to anyone who receives the link.
+
+I decide:
+
+```text
+Is authentication required to open the artifact?
+Can generated HTML execute scripts?
+Which origin serves it?
+Can it access application cookies?
+How long does the URL live?
+Are content type and download disposition forced?
+```
+
+Active previews should live on an isolated origin without application credentials. Less trusted artifacts are downloaded as inert files rather than rendered inline.
+
+## A minimum execution flow
+
+My baseline looks like:
+
+```text
+1. authenticate actor and authorize input
+2. create a tenant-bound sandbox lease
+3. apply a versioned network and resource policy
+4. copy only required files
+5. execute as an unprivileged user
+6. capture bounded output and exit reason
+7. scan or isolate produced artifacts
+8. destroy the environment or record controlled reuse
+9. verify orphan cleanup asynchronously
+```
+
+The control plane that creates and destroys sandboxes should not be reachable from code running inside them.
+
+## Test the boundary adversarially
+
+I run small escape-oriented checks in a non-production environment:
+
+- read `/proc`, environment variables, parent directories, and platform metadata;
+- connect to public, private, loopback, and link-local addresses;
+- follow redirects from an allowed host to a denied host;
+- fork processes and leave children running;
+- fill disk with small files and with one large file;
+- print output after cancellation;
+- access another tenant's sandbox ID and preview URL;
+- recover files after expiry or claimed destruction.
+
+Passing these tests does not prove the runtime can never be escaped. It proves the application controls around the chosen sandbox match the written policy.
+
+The model is not the security boundary. The prompt is not the security boundary. The boundary is the complete path from authenticated request, through isolated compute and mediated capabilities, to cleaned-up output.

@@ -1,0 +1,102 @@
+---
+caseId: "RFA-075"
+title: "E0512: Why Generic `transmute<T, U>` Cannot Prove Equal Sizes"
+date: "2026-09-05T08:40:00+01:00"
+lastmod: "2026-09-05T08:40:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "c2ce6284d7b0a4355a7e123372d76489c997b23db7335212f64933783d1fdb2f"
+area: "concurrency-memory"
+symptom: "A generic helper using transmute T U fails with E0512 even though callers intend to choose equal-sized types."
+summary: "A generic function is checked for all permitted type substitutions, and ordinary bounds do not prove size equality or bit validity. Prefer a concrete representation conversion with an explicit semantic contract."
+rustVersions: ["Rust 1.98.1"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust E0512 generic transmute dependently sized types",
+    "cannot transmute T to U same size caller",
+    "generic transmute size equality Rust",
+  ]
+evidence: ["Rust 1.98.1 compile failure", "validity-contract audit", "typed byte conversion repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/error_codes/E0512.html",
+    "https://doc.rust-lang.org/std/mem/fn.transmute.html",
+  ]
+---
+
+A runtime assertion about size cannot make this generic function valid:
+
+```rust
+unsafe fn convert<T, U>(value: T) -> U {
+    std::mem::transmute(value)
+}
+```
+
+Rust 1.98.1 reports E0512: it cannot transmute between types of different sizes or dependently sized types. The [failing fixture](/rust-failure-atlas/evidence/RFA-075/fail.rs) needs no call. Rust rejects the generic definition itself.
+
+The phrase “dependently sized” means the concrete size depends on type parameters not fixed at this definition boundary. Some future caller could choose `T = u8` and `U = u128`.
+
+## Generic functions are checked once for their declared domain
+
+Rust does not wait for monomorphization and accept only lucky call sites. The function body must be type-correct for every substitution permitted by its bounds. No bound in the signature relates `size_of::<T>()` to `size_of::<U>()`.
+
+Adding `T: Sized, U: Sized` does not help. `Sized` says each type has a compile-time-known size, not that the two sizes are equal. A `debug_assert_eq!` executes too late and does not become a type-system proof.
+
+The official [`transmute` documentation](https://doc.rust-lang.org/std/mem/fn.transmute.html) requires source and destination to have the same size and warns that both values must be valid at their types.
+
+## Equal size would still be insufficient
+
+Bit patterns have type-specific validity rules. `u8` accepts every eight-bit pattern; `bool` accepts only the representations for false and true. References must be non-null, aligned, point to valid data, and follow aliasing rules. Enums can reserve invalid discriminants. Padding bytes may be uninitialized and are not automatically meaningful output data.
+
+Even if a future language feature proved equal sizes, `convert::<u8, bool>(2)` would remain invalid. The generic name “convert” hides too much of the safety contract.
+
+## Use a conversion that states the representation
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-075/fixed.rs) replaces the generic helper with one concrete operation:
+
+```rust
+fn convert(value: u32) -> [u8; 4] {
+    value.to_ne_bytes()
+}
+```
+
+`u32::to_ne_bytes` defines the output length and native-endian meaning. `from_ne_bytes` provides the inverse, which the fixture verifies on Rust 1.98.1.
+
+For file formats and network protocols, native endian is normally the wrong contract. I use `to_le_bytes` or `to_be_bytes` according to the format. Naming endianness is part of making the conversion portable.
+
+## Concrete transmute still needs an audit
+
+A concrete same-size transmute may compile:
+
+```rust
+let bits: u32 = unsafe { std::mem::transmute(1.0_f32) };
+```
+
+But `f32::to_bits()` expresses the supported operation without unsafe code. Standard APIs exist for many common representation conversions and preserve the intent through compiler and platform changes.
+
+When no safe API exists, I document:
+
+1. Proven size and alignment relationships.
+2. Valid bit patterns in both directions.
+3. Ownership and drop consequences.
+4. Padding and initialization.
+5. Endianness and target assumptions.
+6. Provenance when pointers are involved.
+
+Passing E0512 would address only the first item.
+
+## `transmute_copy` is not a generic escape hatch
+
+`transmute_copy` can copy bytes from a referenced source into a destination type, but using it with an oversized output can read beyond the source and cause undefined behavior. It also leaves ownership questions about the original value and duplicated resources. Replacing one rejected generic transmute with it can turn a compile error into memory unsafety.
+
+Likewise, pointer casts have different rules and should not be used to bypass value validity. A raw address with the right size is not automatically a valid value of the destination type.
+
+Copying through `MaybeUninit<U>` also cannot create the missing proof. `MaybeUninit` permits temporarily uninitialized storage; calling `assume_init` still requires every byte pattern and invariant needed by `U` to be satisfied. It moves the safety obligation instead of solving it.
+
+## Model closed sets explicitly
+
+If a library supports several known conversions, a trait owned by the library can give each source/destination pair a reviewed implementation. An enum can represent a closed family of layouts. Serialization traits can define a byte protocol. These approaches attach invariants to specific implementations instead of claiming every `T` can become every `U`.
+
+The official [E0512 explanation](https://doc.rust-lang.org/error_codes/E0512.html) focuses on the equal-size requirement. My first check goes further: list all validity obligations and find the narrowest semantic conversion. The compiler is warning that the generic signature promises an operation far broader than the implementation can justify.

@@ -1,0 +1,157 @@
+---
+title: "What Your Product Does While a Critical Provider Is Down"
+date: "2026-12-22T09:00:00+01:00"
+tags: ["graceful degradation", "API outage", "distributed systems", "integration reliability", "system design"]
+draft: false
+reviewed: true
+reviewedHash: "8e6761a8f57b147b1b8ad4df73909fffc366308cacb42b96e3a8eaca3b98fe50"
+cluster: "reliable-data-integrations"
+campaign: "authority-2026"
+opportunity: "DATA-086"
+summary: "A provider outage needs a product decision for every capability: serve bounded stale data, accept durable intent, queue safely, switch authority, or stop honestly. I design this before the incident."
+---
+
+When a critical provider goes down, the first technical question is usually “how many times should we retry?” I have learned to ask another question first: what can the user still do without us lying about the result?
+
+Retries are one mechanism. The outage behaviour is a product contract.
+
+## I split the integration into capabilities
+
+“Payments are down” or “the CRM is down” is too broad to design around. One provider may support several different actions:
+
+```text
+read current state
+search historical records
+create a new operation
+cancel an operation
+receive webhooks
+download an export
+verify an earlier ambiguous result
+```
+
+Each capability can fail differently. Reads may use a local synchronized copy. New writes may be queued. Cancellation may need to stop because a late cancellation is worse than no promise. Webhooks may continue arriving even when the provider's command API is unavailable.
+
+I build a table before production:
+
+| Capability | During outage | Freshness/status shown | Recovery action |
+| --- | --- | --- | --- |
+| read profile | serve local copy | “updated 18 minutes ago” | reconcile later |
+| create request | accept durable intent | pending, not completed | execute before expiry |
+| irreversible charge | stop or require explicit queue policy | unavailable | never blind retry |
+| cancel booking | accept only within useful deadline | pending cancellation | escalate near deadline |
+| support lookup | local indexed history | bounded stale | refresh on recovery |
+
+This table exposes where a generic “degraded mode” would hide important differences.
+
+## Stale data must carry its age
+
+A cache can keep reads working. It can also make an outage invisible while users act on old truth.
+
+I return or display:
+
+```text
+observed_at
+source version or cursor
+normal freshness objective
+current degraded status
+actions disabled because data may be stale
+```
+
+The acceptable age depends on the field. A company logo may tolerate a day. Available inventory may tolerate seconds. Permission revocation may not tolerate a stale read at all.
+
+If current authorization depends on the provider and cannot be checked locally, serving cached private data can be unsafe. Availability does not override access control.
+
+## Accepting intent is different from claiming success
+
+For some writes, the product can durably accept what the user wants:
+
+```json
+{
+  "operation_id": "op_7d2",
+  "status": "pending_provider",
+  "requested_at": "2026-12-22T08:30:00Z",
+  "expires_at": "2026-12-22T09:00:00Z"
+}
+```
+
+The UI says pending. The receipt carries a stable operation identity. The queue has an expiry, cancellation semantics, and a maximum retry budget.
+
+I do not return the same response as a completed provider write. A local `202 Accepted` can truthfully mean “we accepted responsibility for processing”, but only if the durable system and product support that responsibility.
+
+## Ambiguous outcomes need reconciliation
+
+The difficult case is a timeout after a request was sent. The provider may have completed it.
+
+```text
+not sent       -> safe to attempt later
+rejected       -> return known failure
+accepted       -> record provider identity
+timed out      -> outcome unknown; query before retry
+```
+
+If the provider supports idempotency keys, I use a stable key for the logical operation. If it exposes status by operation ID, I query it. Without either, some operations should enter manual review rather than risk a duplicate effect.
+
+My [reconciliation loop](/blog/reconciliation-is-the-repair-loop-of-a-distributed-system) is not only for old data drift. It is also how I close these uncertain live outcomes.
+
+## The circuit breaker protects both sides
+
+Once failures cross a threshold, letting every user request wait for the same timeout wastes worker capacity and delays the fallback.
+
+I use a circuit state:
+
+```text
+CLOSED     normal calls
+OPEN       fail fast into the capability-specific policy
+HALF_OPEN  a bounded number of probes
+```
+
+The breaker is scoped carefully. One endpoint, tenant credential, or region may fail while another remains healthy. A single global breaker can turn a partial incident into a complete outage.
+
+Recovery is rate-limited. When the provider returns, live traffic and queued work compete for capacity. I reserve room for live checks and drain backlog gradually with downstream quotas.
+
+## Local authority must be named
+
+Sometimes our system is authoritative for a field and the provider receives a projection. During the outage, internal changes can continue. Sometimes the provider is authoritative and local state is only an observation.
+
+I record this per field or operation. Otherwise a well-meaning degraded mode can overwrite provider truth during recovery.
+
+For bidirectional data, I keep versions and conflict rules. “Last write wins” is not automatically correct when clocks differ or a queued write represents an older intention.
+
+## The user needs a useful status
+
+I avoid messages such as “something went wrong”. The product knows more:
+
+```text
+saved locally, waiting for provider
+showing data last confirmed at 08:12
+action unavailable because current state cannot be verified
+request expired before it could be applied
+provider outcome uncertain; support case opened
+```
+
+These messages should not expose provider internals or security details. They should explain what the system promises next.
+
+## My outage test does not mock only HTTP 500
+
+I inject:
+
+1. Connection refusal before sending.
+2. Timeout after request bytes leave.
+3. Repeated 429 with `Retry-After`.
+4. Successful write followed by failed status read.
+5. Stale local cache beyond its allowed age.
+6. Webhooks continuing while command calls fail.
+7. Provider recovery with a large expired backlog.
+8. Credential failure for one tenant only.
+
+For each case I verify user status, durable operation state, side effects, authorization, queue bounds, and eventual reconciliation.
+
+The [data-freshness SLO](/blog/an-slo-for-data-freshness-is-not-an-http-availability-slo) stays visible during the outage. A green local API is not evidence that provider-backed truth is current.
+
+## The design review question
+
+I ask each product owner: if this provider is unreachable for four hours, which user promises survive, which become pending, and which must stop?
+
+Once that answer exists, engineering can build stale-read limits, durable intent, circuit breakers, idempotency, expiry, and recovery capacity around it.
+
+The goal is not to pretend the provider does not matter. It is to fail along boundaries we chose in advance, keep the parts that remain truthful, and bring the two systems back together without turning recovery into another incident.

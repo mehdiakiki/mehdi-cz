@@ -1,0 +1,139 @@
+---
+caseId: "RFA-031"
+title: "Printing a repr(packed) Field Creates an Unaligned Reference"
+date: "2026-09-04T21:00:00+01:00"
+lastmod: "2026-09-07T10:20:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "c135a2080f63811efd5e2d49c97d09f9d4009515411587d4d1890df77bee75f0"
+area: "ffi-targets"
+symptom: "Reading a repr(packed) field by value compiles, but printing it or borrowing it fails with E0793 because an implicit unaligned reference is created."
+summary: "A packed field can be read by value while borrowing the same field is invalid. See why formatting adds a hidden reference and when to copy or use read_unaligned."
+rustVersions: ["stable Rust"]
+targets: ["all targets; alignment impact is target-dependent"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust E0793 println packed field",
+    "reference to packed field is unaligned",
+    "repr packed read_unaligned",
+  ]
+evidence: ["compile-fail example", "layout and alignment check", "copy and raw-pointer repairs"]
+sources:
+  [
+    "https://doc.rust-lang.org/stable/error_codes/E0793.html",
+    "https://doc.rust-lang.org/stable/reference/type-layout.html#the-alignment-modifiers",
+  ]
+---
+
+This Rust error can look inconsistent:
+
+```rust
+#[repr(packed)]
+struct Header {
+    tag: u8,
+    length: u32,
+}
+
+let header = Header { tag: 1, length: 64 };
+let length = header.length;      // accepted
+println!("{}", header.length);   // E0793
+```
+
+Both lines seem to read `length`. The real difference is that the first copies a value, while formatting normally borrows its argument. That hidden reference must satisfy the normal alignment rule for `&u32`. A packed field may not.
+
+The Atlas keeps this distinction executable. The [failing program](/rust-failure-atlas/evidence/RFA-031/fail.rs) first proves that both fields can be copied, then receives E0793 only when it creates `&header.length`. The [repaired program](/rust-failure-atlas/evidence/RFA-031/fixed.rs) verifies both the safe-copy path and an explicit raw-pointer `read_unaligned` path on Rust 1.98.1.
+
+## What packing changes
+
+Rust normally inserts padding so each field starts at a suitable address. `#[repr(packed)]` lowers alignment and removes some or all padding. This is useful only for specific layout contracts, but it creates addresses that may be valid for bytes and invalid for an ordinary typed reference.
+
+A reference is not only an address. `&u32` promises, among other things, that its address is aligned for `u32`. Creating the reference breaks that promise immediately. It is undefined behavior even if code never dereferences the reference, and an `unsafe` block does not make the reference valid.
+
+This is why rustc rejects the expression with E0793.
+
+## The smallest discriminating check
+
+I force an explicit by-value copy before any trait call:
+
+```rust
+let length = header.length;
+println!("{}", length);
+```
+
+Or, for a compact expression:
+
+```rust
+println!("{}", { header.length });
+```
+
+The braces make the field access produce a temporary value. Formatting borrows that aligned temporary instead of borrowing through the packed field.
+
+If this compiles, the failure is about reference creation, not about the numeric value or `Display` implementation.
+
+## Why `unsafe { &header.length }` is still wrong
+
+Unsafe code means the programmer must prove the required rules. It does not switch them off:
+
+```rust
+let reference = unsafe { &header.length }; // still invalid
+```
+
+On a machine where unaligned loads happen to work, a test may appear successful. That does not repair the invalid reference, and optimized code may rely on its alignment promise.
+
+This distinction is important in reviews. “The CPU supports it” answers a hardware-load question. Rust is rejecting a language-level reference whose contract is stronger.
+
+## Use a raw pointer for true unaligned access
+
+When the value cannot simply be copied through a safe field expression, create a raw pointer without first making a reference, then use an unaligned operation:
+
+```rust
+let pointer = std::ptr::addr_of!(header.length);
+let length = unsafe { pointer.read_unaligned() };
+```
+
+The order matters. This is wrong:
+
+```rust
+let pointer = &header.length as *const u32;
+```
+
+It creates the forbidden reference before casting it. `addr_of!` or the raw-reference syntax `&raw const header.length` avoids that intermediate reference.
+
+For a write, use a raw mutable pointer and `write_unaligned` when all other ownership and validity requirements are satisfied.
+
+## Packed is not a serialization strategy
+
+I avoid using a packed struct merely to parse a network packet or file format. Matching a byte length is not enough. A format also defines byte order, valid bit patterns, versioning, and often checksums or reserved fields.
+
+A safer parser reads bytes and converts each field explicitly:
+
+```rust
+fn parse_length(bytes: &[u8; 4]) -> u32 {
+    u32::from_le_bytes(*bytes)
+}
+```
+
+This makes endianness visible and never lends a typed reference to possibly unaligned external storage.
+
+Packed layout may still be required for a documented hardware or foreign interface. Then I keep the packed type at the boundary and copy fields into an aligned Rust representation before doing normal work.
+
+## Check the actual field alignment
+
+The offset alone is not the complete question. I compare the field address with `align_of::<T>()` in a controlled test, without forming a reference:
+
+```rust
+let base = std::ptr::addr_of!(header) as usize;
+let field = std::ptr::addr_of!(header.length) as usize;
+
+assert_eq!(field - base, 1);
+assert_ne!(field % std::mem::align_of::<u32>(), 0);
+```
+
+The final assertion depends on where the value itself is placed, so a robust fixture may allocate several values or verify the known ABI context. The compiler error is stronger than one address which happens to be aligned by luck.
+
+## The repair and regression check
+
+For ordinary reading or formatting, I copy the field to a local. For raw storage that truly permits unaligned values, I use raw pointers with `read_unaligned` or `write_unaligned`. For protocol data, I parse from bytes. I never repair E0793 by manufacturing a reference in unsafe code.
+
+The regression fixture should compile the valid forms and intentionally fail the borrowed form. If the layout crosses FFI, I also assert sizes and offsets on every supported target. This keeps the reason for the unusual representation visible instead of leaving `packed` as a mysterious attribute.

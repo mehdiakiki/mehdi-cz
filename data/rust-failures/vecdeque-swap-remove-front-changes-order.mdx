@@ -1,0 +1,93 @@
+---
+caseId: "RFA-225"
+title: "VecDeque::swap_remove_front Changes the Remaining Queue Order"
+date: "2026-09-06T00:05:00+01:00"
+lastmod: "2026-09-06T00:05:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "b9d6825117abe7b3ba5568597ea51707d503f55112d63a14083f6690ee5fb6ed"
+area: "concurrency-memory"
+symptom: "Removing the item at index two with swap_remove_front changes the order of the first two remaining queue items."
+summary: "VecDeque::swap_remove_front achieves constant-time removal by moving the front item into the removed slot. Use remove when logical order is an invariant, and test the entire remaining sequence."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets with alloc"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust VecDeque swap_remove_front order changed",
+    "remove VecDeque item preserve order Rust",
+    "swap_remove_front result order",
+  ]
+evidence: ["Rust 1.98.1 four-item deque", "constant-time replacement from front", "stable remove repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/std/collections/struct.VecDeque.html#method.swap_remove_front",
+    "https://doc.rust-lang.org/std/collections/struct.VecDeque.html#method.remove",
+    "https://doc.rust-lang.org/std/collections/struct.VecDeque.html#method.swap_remove_back",
+  ]
+---
+
+I needed to cancel one queued item by index and saw a method whose name contained both “remove” and “front.” The target item was removed, so the narrow assertion passed. Later, the queue processed two surviving jobs in the wrong order.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-225/fail.rs) starts with `10, 20, 30, 40` and calls `swap_remove_front(2)`. It removes `30`, but the survivors become `20, 10, 40`.
+
+## Constant time is purchased with permutation
+
+[`VecDeque::swap_remove_front`](https://doc.rust-lang.org/std/collections/struct.VecDeque.html#method.swap_remove_front) removes the indexed element and replaces its position using the first element. This avoids shifting all elements between the front and the hole, giving constant-time removal.
+
+Conceptually the operation does this:
+
+```text
+[10, 20, 30, 40]
+ swap front with index 2
+[30, 20, 10, 40]
+ remove front
+[20, 10, 40]
+```
+
+The exact logical outcome is part of the method contract. The deque's ring-buffer storage may be split internally, but this order can be understood without inspecting its physical layout.
+
+## Queue order is often business state
+
+In a work queue, order can encode fairness, causality, retry sequence, or user expectation. Removing a canceled item must not silently promote another item ahead of an older one.
+
+Rust protects memory invariants, not my scheduling policy. Every value remains valid and owned exactly once. The program is safe while the product behaviour is wrong.
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-225/fixed.rs) uses [`VecDeque::remove`](https://doc.rust-lang.org/std/collections/struct.VecDeque.html#method.remove), which shifts the nearer side and preserves the relative order of remaining elements. Its cost is proportional to the smaller distance to an end.
+
+## Sometimes the unordered method is correct
+
+If the deque represents a bag of available workers or an unordered pool, preserving order has no value. Constant-time removal can then be the stronger design. I document that the collection's order is intentionally meaningless so later code does not start depending on an accident.
+
+There is also [`swap_remove_back`](https://doc.rust-lang.org/std/collections/struct.VecDeque.html#method.swap_remove_back), which fills the hole from the back. If some partial order matters, choosing which end supplies the replacement may reduce disruption, but it still does not preserve full order.
+
+The choice belongs to the data structure's invariant, not to a generic preference for the faster asymptotic operation.
+
+## An index can become stale before removal
+
+Even with `remove`, an index obtained earlier may identify another item after pushes, pops, rotations, or concurrent coordination around the deque. Rust's borrow rules prevent an ordinary live reference from surviving a conflicting mutation, but a copied numeric index carries no such relationship.
+
+For long-lived cancellation I prefer a stable job identifier and locate it under the same lock or ownership step that performs removal. If repeated indexed deletion is common and the queue is large, I may need a different structure combining stable identities with ordering.
+
+Caching numeric positions is an optimization that needs invalidation rules.
+
+## Ring storage is not the reason for the visible reorder
+
+`VecDeque` can expose two physical slices because the ring wraps around. Calling `make_contiguous` rearranges storage without changing logical order. Conversely, `swap_remove_front` changes logical order even when the storage already happens to be one contiguous slice.
+
+I keep these two concepts separate:
+
+- physical contiguity affects slice access and some performance;
+- logical order affects iteration and queue semantics.
+
+Debugging the allocator or wrap point will not explain an operation whose contract explicitly permutes values.
+
+## My regression asserts survivors, not only the removed value
+
+The return value `Some(30)` proves the selected item left the deque. It says nothing about the survivors. The regression collects or directly compares the entire remaining sequence.
+
+I test removing the front, back, a middle item, an out-of-range index, and repeated equal values. With real jobs, I compare stable IDs rather than payload equality. A queue test also verifies the order produced by later `pop_front` calls, because that is the observable scheduling behaviour.
+
+For unordered structures I do the reverse: I compare membership and explicitly avoid asserting an order the API does not promise.
+
+The core principle is that complexity guarantees have semantic costs. `swap_remove_front` earns constant time by spending order. Before choosing it, I decide whether order is representation detail or product state, and I make the survivor sequence part of the test whenever it matters.

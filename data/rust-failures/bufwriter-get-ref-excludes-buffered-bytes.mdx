@@ -1,0 +1,98 @@
+---
+caseId: "RFA-212"
+title: "Why BufWriter::get_ref Cannot See Buffered Bytes"
+date: "2026-09-05T17:51:00+01:00"
+lastmod: "2026-09-05T17:51:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "012c869711356c4581727696efcdfbb11d907ee646a122822120fd31ceb913b5"
+area: "ffi-targets"
+symptom: "BufWriter::get_ref returns an empty underlying Vec immediately after write_all accepted three bytes into the writer."
+summary: "BufWriter has an internal buffer and an underlying writer. get_ref exposes only the latter, so accepted bytes may remain visible only through buffer() until flush succeeds."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust BufWriter get_ref missing bytes",
+    "BufWriter underlying Vec empty before flush",
+    "BufWriter buffer versus get_ref",
+  ]
+evidence: ["Rust 1.98.1 in-memory writer", "three internally buffered bytes", "explicit flush repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/std/io/struct.BufWriter.html#method.get_ref",
+    "https://doc.rust-lang.org/std/io/struct.BufWriter.html#method.buffer",
+    "https://doc.rust-lang.org/std/io/trait.Write.html#method.flush",
+  ]
+---
+
+I wrote three bytes through a `BufWriter<Vec<u8>>` and inspected the vector with `get_ref`. The vector was empty even though `write_all` had returned success.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-212/fail.rs) fixes the capacity at eight bytes so the small write remains buffered. `get_ref()` sees no bytes; `buffer()` sees `abc`.
+
+The wrapper and its underlying writer are two storage layers.
+
+## Accepted is not yet forwarded
+
+`BufWriter` groups small writes in memory before sending larger writes to its wrapped `Write`. [`get_ref`](https://doc.rust-lang.org/std/io/struct.BufWriter.html#method.get_ref) returns a reference to that wrapped writer only.
+
+It does not flush, and it does not present a combined view of underlying plus pending bytes.
+
+The state in the fixture is:
+
+```text
+underlying Vec:        []
+BufWriter::buffer():   [a, b, c]
+logical accepted data: [a, b, c]
+```
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-212/fixed.rs) checks both layers and calls `flush` before expecting the underlying vector to contain the data.
+
+## `write_all` reports acceptance by the writer abstraction
+
+`write_all` ensures the complete input was accepted through the `Write` implementation or returns an error. For `BufWriter`, acceptance may mean copying into its internal buffer.
+
+It does not mean the operating system, network peer, disk platter, or wrapped vector has already observed those bytes. Every boundary has its own completion meaning.
+
+This is similar to an application queue accepting a message. The enqueue can succeed before downstream delivery. I avoid naming that state `persisted` or `sent` unless the actual durability or visibility contract supports it.
+
+## Large writes may bypass the buffer
+
+An implementation can send a large write directly to the underlying writer when buffering it would not help. A weak test using data larger than the buffer may see bytes in `get_ref` immediately and conclude that `get_ref` always shows accepted output.
+
+The evidence fixture deliberately writes fewer bytes than its known capacity. I test small, exact-capacity, and larger writes if application behaviour depends on batching, while avoiding assertions about undocumented internal thresholds.
+
+The public contract is that bytes can be buffered. Code must not depend on one observed forwarding decision.
+
+## `buffer()` shows only pending bytes
+
+[`BufWriter::buffer`](https://doc.rust-lang.org/std/io/struct.BufWriter.html#method.buffer) returns the currently buffered, unwritten bytes. It does not include data already sent to the underlying writer.
+
+Neither `buffer()` nor `get_ref()` alone is the complete logical stream after a mixture of flushes and new writes. Reconstructing output by concatenating them is safe only for special underlying writers whose existing contents represent exactly the earlier prefix.
+
+For files and sockets, reading the underlying object through another route introduces cursor, visibility, and synchronization questions. I do not use introspection as a substitute for a flush protocol.
+
+## Flush errors are part of the operation
+
+[`Write::flush`](https://doc.rust-lang.org/std/io/trait.Write.html#method.flush) asks the writer to ensure intermediately buffered contents reach their destination. The precise guarantee depends on the wrapped writer; it is not automatically a durable disk sync.
+
+Flush can fail. I propagate that result at a point where the caller can still react. Relying on `Drop` is unsafe for correctness because `BufWriter` ignores errors encountered while flushing during destruction, as another Atlas case demonstrates.
+
+When I need to recover the wrapped writer, `into_inner` attempts to flush and returns an error containing the writer on failure. `into_parts` separates the underlying writer and pending buffer without flushing. These APIs express different recovery policies.
+
+## `get_mut` can break stream order
+
+The mutable counterpart exposes the underlying writer directly, and its documentation warns that direct writes are inadvisable. If I write through it while earlier bytes remain buffered, the direct bytes can appear before the pending prefix.
+
+I flush before any necessary direct access and keep that access inside a narrow abstraction. Better, I avoid bypassing the buffering layer entirely.
+
+Rust prevents memory aliasing mistakes here, but it cannot infer my intended byte order across two valid write paths.
+
+## Network and file completion remain separate
+
+Flushing a buffered network writer can hand bytes to the operating system without proving the remote application processed them. Flushing a file writer is not the same as `sync_data` or `sync_all` durability.
+
+I describe each acknowledgment precisely: accepted by buffer, written to OS handle, synchronized to storage, acknowledged by peer, or committed by application. One `Ok(())` cannot stand for all of them.
+
+The core principle is that wrappers create state boundaries. `BufWriter::get_ref` shows the underlying writer, while pending bytes live in the wrapper. I flush and handle its error before claiming downstream visibility, and I test each layer separately.

@@ -1,0 +1,81 @@
+---
+caseId: "RFA-388"
+title: "overflowing_shr Masks the Shift Count and Reports It"
+date: "2026-09-06T03:28:00+01:00"
+lastmod: "2026-09-06T03:28:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "539878abcbe2d155027854092c26ebb87ad0b5ffa207ddcfc12aefe9408d960b"
+area: "upgrades-compatibility"
+symptom: "overflowing_shr with count 32 returns the original i32 value and an overflow flag rather than shifting every bit out."
+summary: "overflowing_shr computes its value with a masked count, like wrapping_shr, and separately returns true when the original count exceeds the width. Checked and unbounded shifts implement different policies."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust overflowing_shr count 32 original value", "overflowing shift masks count and true", "checked wrapping unbounded overflowing shr"]
+evidence: ["Rust 1.98.1 i32 operations", "negative value shifted by width", "four shift policy comparison"]
+sources: ["https://doc.rust-lang.org/std/primitive.i32.html#method.overflowing_shr", "https://doc.rust-lang.org/std/primitive.i32.html#method.wrapping_shr", "https://doc.rust-lang.org/std/primitive.i32.html#method.unbounded_shr"]
+---
+
+I first read `overflowing_shr` as “perform an unbounded shift and tell me if bits left the value.” That is not its contract. For `(-13_i32).overflowing_shr(32)`, Rust returns `(-13, true)`.
+
+The [failing fixture](/rust-failure-atlas/evidence/RFA-388/fail.rs) expects the value to stay `-13` but wrongly expects the boolean to be false. The count is masked for the value and reported separately as overflowing.
+
+## The result component follows wrapping count semantics
+
+An `i32` has 32 bits. [`overflowing_shr`](https://doc.rust-lang.org/std/primitive.i32.html#method.overflowing_shr) masks the shift count to the type width when computing its first tuple component. A count of 32 therefore behaves like count zero, leaving `-13` unchanged.
+
+The second component is true because the original count was at least the width. It does not report whether nonzero data bits were discarded by the effective shift. It reports overflow of the requested shift count under this API's definition.
+
+For count 33, the effective count is one and the boolean remains true. Reading the tuple as `(shifted_without-policy, data_loss)` would be incorrect.
+
+## Compare all four policies
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-388/fixed.rs) places four methods together:
+
+- `overflowing_shr(32)` returns the wrapped-count value plus `true`;
+- `wrapping_shr(32)` returns the same value without a flag;
+- `checked_shr(32)` returns `None`;
+- `unbounded_shr(32)` shifts every original bit out and returns `-1` for a negative signed value.
+
+These APIs do not differ only in error packaging. Their value semantics can differ too.
+
+## Overflow is about the count here
+
+Ordinary right shift discards low bits for many valid counts. `13 >> 1` loses information, but `overflowing_shr(1)` reports false because one is a valid count.
+
+If my application needs lossless reversibility, the overflow flag does not prove it. I would check discarded bits, use a method designed for exact shifts where available, or validate a domain invariant separately.
+
+This distinction matters in codecs. A field extraction intentionally discards other bits and should not call that arithmetic overflow. A dynamic count outside the word width may be malformed input even when masking produces a convenient value.
+
+## Ignoring the boolean chooses wrapping
+
+Writing `.overflowing_shr(count).0` is effectively choosing wrapping shift behavior while calculating a flag that is discarded. [`wrapping_shr`](https://doc.rust-lang.org/std/primitive.i32.html#method.wrapping_shr) expresses that intent directly.
+
+If the flag matters, I branch on it before treating the value as valid. Returning both fields from a lower layer can be useful when hardware emulation or a numeric algorithm specifies wrapped results plus status flags.
+
+For external counts I generally prefer `checked_shr` and turn `None` into a domain error. This avoids accepting count 32 as “do nothing” unless the protocol really says to mask.
+
+## Signedness remains part of the operation
+
+For effective nonzero counts, `i32` right shift is arithmetic and sign-extending. If the value is a bit pattern, I use `u32` before shifting. Count policy and fill policy are independent dimensions.
+
+`unbounded_shr` makes this particularly visible: shifting a positive signed number by 32 returns zero, while a negative one returns minus one. Overflowing shift at 32 returns the original value because its effective count is zero.
+
+I test positive and negative operands so a count-policy test does not accidentally hide signed-fill behavior.
+
+## Profiles do not change the named method contract
+
+Ordinary arithmetic operators can have overflow-check differences between build configurations. Named checked, wrapping, overflowing, strict, and unbounded methods state their policy consistently.
+
+I use these methods in boundary-heavy code instead of relying on release-mode behavior. Tests run in dev and release, but the expected tuple is the same.
+
+## My boundary table is small and complete
+
+For `i32` I test counts 0, 1, 31, 32, and 33. I assert the complete overflowing tuple and compare one positive and one negative operand. This reveals masking and flag meaning with little code.
+
+When a shift feeds an array index, allocation size, or protocol offset, I do not pass the wrapped result onward before validating the flag. A value that looks ordinary after masking can conceal a hostile or corrupted count. In contrast, an emulator reproducing a machine instruction may need the wrapped result exactly and store the status bit in a virtual flag register. The same Rust method supports both only if the caller gives both tuple fields their intended meaning.
+
+Names such as `overflowed` in local code help. Calling the flag `lost_bits` would encode the wrong concept and invite misuse even when the implementation is technically correct.
+
+The core principle is that an overflowing method returns a value under a defined fallback arithmetic policy plus a status bit. The status does not retroactively change how the value was computed. For `overflowing_shr`, that computation masks the count, while the boolean remembers that the original request exceeded the width.

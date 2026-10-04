@@ -1,0 +1,76 @@
+---
+caseId: "RFA-310"
+title: "Iterator::scan Can Yield Some Again After None"
+date: "2026-09-06T01:30:00+01:00"
+lastmod: "2026-09-06T01:30:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "664f46755c5b2ee1fcf0a988c5d9a7df21e27d301ee988eb2b8c0b1742e255ed"
+area: "upgrades-compatibility"
+symptom: "A scan adapter returns None for one input, but a later direct call to next produces another value instead of remaining exhausted."
+summary: "scan forwards each closure result without storing permanent exhaustion when the closure returns None. Ordinary consumers stop there, but manual next calls may resume unless the adapter is fused."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust Iterator scan Some after None", "scan iterator not fused", "Iterator scan closure None resume"]
+evidence: ["Rust 1.98.1 three-item range", "scan closure rejects middle item", "fuse makes exhaustion permanent"]
+sources: ["https://doc.rust-lang.org/std/iter/trait.Iterator.html#method.scan", "https://doc.rust-lang.org/std/iter/trait.Iterator.html#method.fuse", "https://doc.rust-lang.org/std/iter/trait.FusedIterator.html"]
+---
+
+I used `scan` as a small state machine and returned `None` when one input should stop output. A collector stopped exactly there, so I assumed the adapter was permanently exhausted. A manual caller invoked `next()` once more and received another value.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-310/fail.rs) scans `1..=3`. Its closure returns `Some(1)`, `None` for two, and would return `Some(3)`. Three consecutive calls observe `Some(1)`, `None`, then `Some(3)`.
+
+## Scan forwards one closure decision at a time
+
+[`Iterator::scan`](https://doc.rust-lang.org/std/iter/trait.Iterator.html#method.scan) combines transformation with mutable state. For each input, its closure can update the state and return an optional output.
+
+When the closure returns `None`, that call to `next` returns `None`. The adapter does not necessarily store a separate “finished forever” flag. If asked again, it may pull another input and call the closure again.
+
+This follows the base `Iterator` contract. An iterator may technically produce values after a `None`; permanent exhaustion is the stronger [`FusedIterator`](https://doc.rust-lang.org/std/iter/trait.FusedIterator.html) promise.
+
+## Most consumers make the first None final anyway
+
+`for`, `collect`, `fold`, and normal iterator consumers stop after the first `None`. They do not repeatedly poll in case a value returns. Therefore a resumable `scan` can appear permanently terminating in one code path and revive in another manual path.
+
+This does not make `None` a good pause signal. Generic consumers conventionally treat it as end of sequence. If temporary absence is part of the protocol, I represent it as an item such as `Event::Pending` or use an asynchronous stream whose polling model has a distinct pending state.
+
+The important bug is inconsistent callers: one consumes through a loop while another manually owns the adapter and assumes the same terminal state.
+
+## Fuse records the first exhaustion boundary
+
+[`Iterator::fuse`](https://doc.rust-lang.org/std/iter/trait.Iterator.html#method.fuse) wraps an iterator so every call after its first `None` also returns `None`. The repaired fixture applies it after `scan`.
+
+Ordering matters. Fusing the input range does not change a `None` created by the scan closure. I need to fuse the adapter whose output boundary can revive:
+
+```rust
+let output = input.scan(state, step).fuse();
+```
+
+If the type already implements `FusedIterator`, calling `fuse` is harmless. I usually add it at an API boundary when downstream manual polling requires the stronger guarantee rather than testing for the marker trait in generic code.
+
+## `None` can also mean filter-like omission by mistake
+
+Sometimes the closure author intended to skip one input and continue. `scan` does not treat `None` like `filter_map` does. A collector sees it as end and will never ask for later values.
+
+For stateless omission I use `filter_map`. For a stateful transform that may omit values, I may scan into a stateful intermediate and then flatten explicit optional items, or write a small named iterator whose contract is tested. The code should make “skip this item” and “end the output” different decisions.
+
+Returning `Some(None)` is one way to preserve an optional event as an item: the outer `Some` keeps the iterator alive, while the inner `None` belongs to the domain.
+
+## This resembles map_while but deserves its own model
+
+RFA-147 demonstrates that `map_while` is also not fused. Both adapters can expose a closure-produced `None` without promising every later direct call is `None`.
+
+`scan` adds persistent mutable state. The closure may have updated that state before returning `None`, and a later call sees the updated state. Fusing prevents later output, but it does not roll the state change back.
+
+I treat closure execution as a state transition even when it produces no item. If rollback is required, the closure needs transactional logic rather than an iterator wrapper.
+
+## What I test
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-310/fixed.rs) applies `fuse` and verifies that a call after the first `None` remains `None`.
+
+For a real scanner I test the full trace of inputs, state changes, and outputs. I call `next` beyond the first `None`, test empty input, and verify whether a rejected input changes state. I also compare manual iteration with `collect` so an accidental revival cannot hide behind a consumer that stops early.
+
+If the public contract says the first stop is permanent, I return a fused adapter or own an explicit `done` Boolean inside the implementation. If a pause is meaningful, I do not encode it as outer `None`.
+
+The core principle is that `None` ends a consumer but does not automatically fuse an iterator implementation. `scan` can process another input on a later call. Permanent exhaustion, skipped output, and temporary absence are three states; reliable APIs do not ask one `Option` layer to mean all three.

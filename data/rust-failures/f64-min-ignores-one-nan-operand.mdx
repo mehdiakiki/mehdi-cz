@@ -1,0 +1,82 @@
+---
+caseId: "RFA-320"
+title: "f64::min Ignores One NaN Operand"
+date: "2026-09-06T01:40:00+01:00"
+lastmod: "2026-09-06T01:40:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "268b05d8ae1c2687f3f0e35d44bd667a945a4f3af5cafb45bd11f9ad62645e13"
+area: "upgrades-compatibility"
+symptom: "Taking the minimum of a number and NaN returns the number, even though code expected an invalid measurement to propagate through the result."
+summary: "Rust's f64::min follows a missing-data-friendly NaN rule: one numeric operand wins over one NaN operand. Validate NaN explicitly when it means invalid input, and use total_cmp when you need a complete ordering."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["targets with IEEE 754 f64"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust f64 min NaN returns number", "does f64 min propagate NaN", "Rust minimum ignore NaN"]
+evidence: ["Rust 1.98.1 numeric and NaN pair", "both operand orders", "explicit NaN propagation repair"]
+sources: ["https://doc.rust-lang.org/std/primitive.f64.html#method.min", "https://doc.rust-lang.org/std/primitive.f64.html#method.is_nan", "https://doc.rust-lang.org/std/primitive.f64.html#method.total_cmp"]
+---
+
+I once treated `f64::min` as if it meant “apply the mathematical minimum operation and carry every invalid value forward.” This sounds reasonable, but it is not the contract Rust gives to this method.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-320/fail.rs) evaluates `5.0_f64.min(f64::NAN)`. It expects NaN. Rust 1.98.1 returns `5.0` instead.
+
+## One NaN is ignored by min
+
+The [`f64::min` documentation](https://doc.rust-lang.org/std/primitive.f64.html#method.min) says that if one argument is NaN, the other argument is returned. Only a pair where both values are NaN necessarily produces NaN.
+
+This can be useful for an aggregation where NaN means “no observation.” A numeric value can survive beside a missing one without additional branching. It is dangerous when NaN means “the computation is invalid and must stop.” The bit pattern is the same, but the domain meaning is different.
+
+That is the real failure here. I asked a convenient selection method to decide my data policy without stating that policy.
+
+## Validate before selecting when NaN is an error
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-320/fixed.rs) uses a small `propagating_min` function. It calls [`is_nan`](https://doc.rust-lang.org/std/primitive.f64.html#method.is_nan) on both operands and returns NaN if either test succeeds. Otherwise it delegates to `min`.
+
+In production I often prefer an even clearer boundary: reject the input and return a domain error. An `Option<f64>` can represent an absent sample. A `Result<ValidatedMeasurement, InvalidMeasurement>` can represent a rejected sample. Leaving several meanings encoded as NaN makes later aggregation harder to audit.
+
+The important point is not that one policy is universally correct. It is that the policy should appear in the type or in an explicit branch.
+
+## This is not a complete ordering operation
+
+Floating-point values do not implement ordinary `Ord` because NaN is unordered under the usual comparisons. Signed zero adds another detail: `-0.0` and `+0.0` compare equal, although their bit patterns and some later computations differ.
+
+If I need a deterministic complete order for sorting, keys, snapshots, or test output, I use [`total_cmp`](https://doc.rust-lang.org/std/primitive.f64.html#method.total_cmp). It defines an order that includes NaNs and distinguishes floating-point representations according to its documented rules.
+
+That does not make `total_cmp` a replacement for validation. It makes ordering possible. A data pipeline may still need to reject NaN before it ever sorts values.
+
+## Operand order is not the repair
+
+Swapping `value.min(NaN)` to `NaN.min(value)` does not create propagation. The documented one-NaN rule selects the numeric operand in either direction.
+
+I test both operand orders because this catches an accidental repair based on observation rather than contract. It also helps reviewers see that the behaviour is intentional and symmetric for this case.
+
+I do not infer the same rule for every floating-point operation. Arithmetic such as addition and selection helpers such as `min` answer different questions. Each API deserves its own contract check.
+
+## Aggregation needs a written missing-value policy
+
+Before computing a minimum over telemetry, prices, probabilities, or scientific measurements, I decide what these states mean:
+
+- a measurement is absent;
+- a measurement exists and is NaN;
+- positive or negative infinity is allowed;
+- positive and negative zero are distinct for the domain;
+- every value is finite and validated.
+
+Then I encode that decision once near ingestion. If I delay it, different reducers may silently apply different rules. `min`, ordinary comparisons, sorting with `total_cmp`, database ordering, and a JavaScript client can disagree in ways that look like random data loss.
+
+For a collection, I test all-invalid input, one valid item among invalid ones, NaN in the first and last positions, infinities, and both zeros. A happy-path list of finite positive numbers does not exercise the policy.
+
+## Do not use a sentinel when absence is the truth
+
+NaN is sometimes introduced only because a primitive float has no empty state. Rust gives me better modelling choices. I can keep `Option<f64>` until the aggregation boundary and then decide whether to skip `None`, return `None`, or report an error.
+
+A validated newtype can reject non-finite values in its constructor. After that, every `min` inside the trusted part of the system has a simpler meaning. This reduces repeated defensive checks and makes invalid construction visible during review.
+
+## What the fixture proves
+
+RFA-320 runs on pinned Rust 1.98.1. The failing side proves that one NaN does not propagate through `f64::min`. The repaired side proves an explicit propagation policy in both operand orders and retains normal numeric selection.
+
+It does not claim that every platform gives identical NaN payload bits. The evidence checks semantic NaN with `is_nan`, not one representation.
+
+The core principle goes beyond Rust: a low-level value and its business meaning are separate contracts. `f64::min` provides a documented floating-point selection rule. I must still decide whether NaN means missing, sortable, invalid, or impossible in my system.

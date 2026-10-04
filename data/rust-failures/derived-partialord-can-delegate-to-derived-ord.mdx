@@ -1,0 +1,107 @@
+---
+caseId: "RFA-711"
+title: "Rust 1.98 Can Derive PartialOrd Through Ord"
+date: "2026-09-07T10:40:00+01:00"
+lastmod: "2026-09-07T10:40:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "ce1305d39b25cd91b09534e122b9f89b839b114b33d5b88801b9203e092510f5"
+area: "upgrades-compatibility"
+symptom: "A wrapper deriving both PartialOrd and Ord changes comparison results on Rust 1.98 when its field implements those two traits inconsistently."
+summary: "Rust 1.98 may derive a type's PartialOrd as Some(Ord::cmp(self, other)). Code that observes a change had an invalid field contract: PartialOrd and Ord were disagreeing already."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust 1.98 derive PartialOrd uses Ord cmp changed result", "derived PartialOrd Ord inconsistent field implementation", "partial_cmp differs from cmp wrapper after Rust upgrade"]
+evidence: ["Rust 1.98.1 runtime assertion", "derived wrapper returns Ord result through PartialOrd", "consistent field implementation restores one ordering"]
+sources: ["https://doc.rust-lang.org/releases.html#version-1980-2026-08-20", "https://doc.rust-lang.org/std/cmp/trait.PartialOrd.html", "https://doc.rust-lang.org/std/cmp/trait.Ord.html", "https://doc.rust-lang.org/reference/attributes/derive.html"]
+---
+
+A comparison can change after Rust 1.98 even when the wrapper source still says the same thing:
+
+```rust
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+struct Wrapper(Inconsistent);
+```
+
+The important detail is hidden inside `Inconsistent`. Imagine its manual `Ord` implementation sorts integers normally while its manual `PartialOrd` sorts them in reverse. Before looking at the wrapper, the field type already tells two incompatible stories.
+
+Rust 1.98 introduced a faster derived `PartialOrd` path for a type which also derives `Ord`. The generated partial comparison can effectively be:
+
+```rust
+Some(Ord::cmp(self, other))
+```
+
+The [failing program](/rust-failure-atlas/evidence/RFA-711/fail.rs) expects the reverse answer inherited from the field's `PartialOrd`. On Rust 1.98.1 the derived wrapper follows `Ord` and returns `Some(Less)`, so the assertion fails. The [repaired program](/rust-failure-atlas/evidence/RFA-711/fixed.rs) makes the two field implementations agree.
+
+## This is not two independent sort preferences
+
+`PartialOrd` supports partial orders. Its `partial_cmp` returns `Option<Ordering>` because two values may be incomparable. Floating-point NaN is the familiar example.
+
+`Ord` describes a total order: every pair has one ordering and the implementation must be consistent with equality. A type implementing both traits does not get one order for `<` and another for `cmp`. The official trait contracts require their answers to correspond.
+
+For a type which implements `Ord`, the normal `PartialOrd` implementation is:
+
+```rust
+impl PartialOrd for Value {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+```
+
+I use this form rather than duplicating comparison logic. One implementation owns the policy, and the other delegates.
+
+## Why the old behavior was never safe to depend on
+
+Derive expansion is compiler-generated implementation detail within the public trait guarantees. Code which observed the field's inconsistent `PartialOrd` through an older expansion was relying on behavior outside those guarantees.
+
+This still feels like a regression when a test changes after upgrading. The useful diagnosis is not “Rust reversed my order.” It is “the upgrade selected the other side of a contract my field type was already violating.”
+
+That diagnosis changes the repair. Pinning an older compiler, reordering derive names, or manually copying an older expansion preserves the inconsistency. Repairing the field's traits removes the unstable assumption.
+
+## The bug often starts in a domain shortcut
+
+I see this when one trait is derived and another is written by hand. For example, equality may use every field, `Ord` may sort only by priority, and `PartialOrd` may derive lexicographically over the whole record. Equal-priority values can then compare equal under `cmp` while remaining unequal under `eq`.
+
+Another version uses reverse ordering for a priority queue in only one trait. The queue appears correct through one API and wrong through another. `BTreeMap`, sorting, `min`, relational operators, and custom comparisons may exercise different methods.
+
+A wrapper can amplify the problem because its derived implementations call the traits of fields or, now, delegate from one derived trait to another. The wrapper is where the changed result becomes visible, but the inconsistent field remains the owner.
+
+## A small contract table catches it
+
+For every type implementing both traits manually, I test representative pairs `a` and `b`:
+
+```rust
+assert_eq!(a.partial_cmp(&b), Some(a.cmp(&b)));
+assert_eq!(a == b, a.cmp(&b) == std::cmp::Ordering::Equal);
+assert_eq!(a.cmp(&b), b.cmp(&a).reverse());
+```
+
+I include less, equal, and greater cases, plus records that differ only in fields intentionally ignored by the order. Property tests are useful when the value space is large.
+
+The second assertion deserves attention. If `cmp` returns `Equal` for two values that `Eq` says are different, ordered collections can treat distinct keys as the same position. This is not memory unsafety, but it can lose, hide, or unpredictably retrieve domain values.
+
+## Choose one order owner
+
+When field order is correct for the domain, I derive `PartialEq`, `Eq`, `PartialOrd`, and `Ord` together. The generated implementations share the same structural policy.
+
+When the domain order is custom, I usually implement `Ord` and write `PartialOrd` as `Some(self.cmp(other))`. I make equality consistent with that same key. A tuple comparison can keep the code compact:
+
+```rust
+self.priority
+    .cmp(&other.priority)
+    .then_with(|| self.sequence.cmp(&other.sequence))
+```
+
+If values can truly be incomparable, I do not implement `Ord`. Inventing a total order only to satisfy a container can erase important meaning. I can use another data structure or define an explicit sortable key for the particular operation.
+
+Reverse order belongs in `std::cmp::Reverse` or a clearly named wrapper, not in a `PartialOrd` implementation which disagrees with `Ord` on the same type.
+
+## What I check during the upgrade
+
+I search for types deriving both comparison traits, then inspect custom comparison implementations in their fields. The risky mix is generated outer behavior over manually written inner behavior.
+
+I run comparison contract tests before and after the compiler update. When output changes, I reduce it to one field and one pair as the Atlas fixture does. Macro expansion can explain which method is called, but the final decision comes from the trait contracts.
+
+The core principle is wider than this optimization: do not depend on how derive happens to assemble a result when the input trait implementations contradict each other. Make the domain order coherent once, and compiler improvements become performance changes rather than behavior changes.

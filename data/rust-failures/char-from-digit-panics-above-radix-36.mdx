@@ -1,0 +1,92 @@
+---
+caseId: "RFA-271"
+title: "Why char::from_digit Panics Above Radix 36"
+date: "2026-09-06T00:51:00+01:00"
+lastmod: "2026-09-06T00:51:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "9a4358088d465c6ad71485ab400d39ca73ab2cbdde21c2c155bf9fabca4ed772"
+area: "ffi-targets"
+symptom: "char::from_digit returns Option for an invalid digit value but panics when the caller supplies a radix greater than 36."
+summary: "char::from_digit uses None for a digit outside a valid radix, but a radix above 36 violates the API domain and panics. Validate user-controlled bases before calling it."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust char from_digit radix 37 panic", "char from_digit None versus panic", "maximum radix char from_digit Rust"]
+evidence: ["Rust 1.98.1 caught radix-37 panic", "out-of-range digit returns None", "explicit radix validation repair"]
+sources: ["https://doc.rust-lang.org/std/primitive.char.html#method.from_digit", "https://doc.rust-lang.org/std/primitive.char.html#method.to_digit", "https://doc.rust-lang.org/std/primitive.char.html#method.is_digit"]
+---
+
+The return type of `char::from_digit` is `Option<char>`, so I first expected every invalid input to become `None`. That expectation is only half correct. An invalid digit value is optional failure; an unsupported radix is a panic.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-271/fail.rs) catches a call to [`char::from_digit(1, 37)`](https://doc.rust-lang.org/std/primitive.char.html#method.from_digit). The call panics before it can return an option.
+
+## There are two separate input domains
+
+The method receives a numeric digit and a radix. It asks two questions in order:
+
+```text
+Is the radix supported by this API?
+Is num a digit inside that valid radix?
+```
+
+For a supported radix no greater than 36, a value outside the digit set produces `None`. For example, digit 16 is not representable as one hexadecimal digit, so `char::from_digit(16, 16)` returns `None`.
+
+A radix greater than 36 is outside the method contract and panics. The distinction matters when both values come from configuration or a network request.
+
+## Why the ceiling is 36
+
+The textual digit alphabet is the familiar `0-9` followed by lowercase `a-z`. That gives 36 single-character digits. Value 10 maps to `a`, value 15 to `f`, and value 35 to `z`.
+
+The method is not a general encoder for arbitrary bases. Base 64, for example, needs another alphabet and often different grouping rules. Passing 64 does not select such an alphabet.
+
+This is an important design signal: a radix and an encoding are not the same thing. If a product accepts bases above 36, it needs an explicit digit alphabet and probably a parser that can handle more than one Rust `char` per logical digit.
+
+## Option does not promise panic-free use
+
+Rust return types describe represented outcomes, but documented preconditions can still panic. `Option` here represents whether `num` has a character inside a supported radix. It does not represent whether the radix itself is supported.
+
+I check the `Panics` section even for APIs returning `Option` or `Result`. This habit is especially important at input boundaries, where a value that “should always be valid” may become user controlled after a refactor.
+
+Wrapping the call in `unwrap_or` does not help because the panic happens before an `Option` exists. The validation must happen before the call.
+
+## Validate the base at the boundary
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-271/fixed.rs) accepts an external radix through a small wrapper. It returns a normal error when the radix exceeds 36, then delegates valid bases to `from_digit`.
+
+I preserve the inner `Option` because it communicates a different fact: the base is supported, but this numeric value is not one digit in it.
+
+In an application I may use a richer error enum:
+
+```text
+UnsupportedRadix { supplied: u32 }
+DigitOutsideRadix { digit: u32, radix: u32 }
+```
+
+That keeps metrics and client messages accurate. Combining both into “invalid digit” makes debugging configuration harder.
+
+## Radix zero and one need careful reading
+
+`from_digit` documents a panic only when the radix is larger than 36. Its behavior for very small radices should not be generalized from [`char::is_digit`](https://doc.rust-lang.org/std/primitive.char.html#method.is_digit) or [`char::to_digit`](https://doc.rust-lang.org/std/primitive.char.html#method.to_digit), whose documented supported interval is different.
+
+Similar names do not guarantee identical preconditions. I consult the exact method used and test the edges relevant to my wrapper. If my application defines conventional positional bases only, I can deliberately restrict to `2..=36` even when the lower-level constructor accepts another case.
+
+Application validation may be stricter than library validity. That is healthy when the extra rule is named.
+
+## Unicode numeric characters are another concept
+
+`from_digit` produces characters from its fixed ASCII-like alphabet. It does not choose every Unicode character with a numeric meaning.
+
+Likewise, `is_digit` and `to_digit` operate on the documented radix alphabet, while other Unicode classification methods answer different questions. A character that looks numeric to a human reader may not be accepted by a protocol grammar.
+
+I therefore separate display, Unicode classification, and machine-number syntax. This prevents a friendly input layer from silently widening a strict wire format.
+
+## What I test
+
+My table includes digit zero, the largest digit in a base, the first value outside it, radix 10, radix 16, radix 36, and one unsupported radix. I also test any stricter lower bound imposed by the application.
+
+The assertions distinguish a returned `None` from a panic or wrapper error. A single `is_err()` style check would hide the exact branch that future code depends on.
+
+For request handlers I add a no-unwind test over the complete accepted radix range. Panics should describe programmer-contract violations, not ordinary hostile input.
+
+The core principle is that a fallible return type can cover only part of an input domain. `char::from_digit` uses `None` for a digit outside a supported base, but it panics above base 36. Validate external radix values first, and keep unsupported-base errors separate from invalid-digit results.

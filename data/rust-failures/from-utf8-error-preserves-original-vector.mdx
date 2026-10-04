@@ -1,0 +1,92 @@
+---
+caseId: "RFA-367"
+title: "String::from_utf8 Returns the Original Vec Inside Its Error"
+date: "2026-09-06T02:24:00+01:00"
+lastmod: "2026-09-06T02:24:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "ddd6f0adc055fe40f0712ee93c644f51f4b853bb5f87110c8b285047bb09c03e"
+area: "ffi-targets"
+symptom: "After String::from_utf8 rejects one invalid byte, FromUtf8Error still exposes and can return the complete owned input vector."
+summary: "from_utf8 validates an owned Vec without copying it on success and preserves that allocation in FromUtf8Error on failure. Inspect Utf8Error, recover bytes, then choose strict, lossy, or alternate decoding explicitly."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust String from_utf8 recover original Vec", "FromUtf8Error into_bytes", "invalid UTF-8 ownership Rust"]
+evidence: ["Rust 1.98.1 owned byte vector", "invalid FF at byte two", "Utf8Error inspection and exact Vec recovery"]
+sources: ["https://doc.rust-lang.org/std/string/struct.String.html#method.from_utf8", "https://doc.rust-lang.org/std/string/struct.FromUtf8Error.html#method.into_bytes", "https://doc.rust-lang.org/std/string/struct.FromUtf8Error.html#method.utf8_error"]
+---
+
+I passed an owned byte vector to [`String::from_utf8`](https://doc.rust-lang.org/std/string/struct.String.html#method.from_utf8) and assumed a failed conversion had consumed the useful input. Rust returned a `FromUtf8Error` that still owned every original byte.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-367/fail.rs) submits `ok FF !`, then incorrectly expects the error's byte view to be empty. It contains the complete four-byte vector.
+
+## Validation does not require throwing ownership away
+
+`String` and `Vec<u8>` use compatible owned byte storage, but `String` adds the invariant that all contents are valid UTF-8. `from_utf8` takes ownership of a vector, validates it, and returns a `String` without copying the vector on success.
+
+On failure, Rust cannot create a safe `String`, but it can return ownership in [`FromUtf8Error`](https://doc.rust-lang.org/std/string/struct.FromUtf8Error.html). This preserves the allocation and the evidence needed to choose another decoding policy.
+
+An error is therefore not only a message. It is a recovery object.
+
+## The error carries two kinds of evidence
+
+`utf8_error()` borrows a `Utf8Error` describing where validation failed. `as_bytes()` borrows the complete original input. `into_bytes()` consumes the error and returns the owned `Vec<u8>`.
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-367/fixed.rs) checks that the valid prefix ends at byte two and that the proven invalid sequence length is one. It then recovers exactly `[o, k, FF, !]` with `into_bytes`.
+
+I inspect metadata before consuming the error if I need both. After `into_bytes`, the error value has moved, as ordinary Rust ownership requires.
+
+## Strict failure and lossy display are separate decisions
+
+For a protocol that requires UTF-8, the correct result may be rejection with the byte position. For an operator-facing preview, `String::from_utf8_lossy(&bytes)` may be useful because it substitutes replacement characters.
+
+Lossy conversion changes information. I never silently use it for identifiers, signatures, source offsets, or round trips. I retain raw bytes when exact recovery matters and label the display as repaired.
+
+Some inputs use a real non-UTF-8 character encoding. Replacing invalid bytes is not decoding that encoding. I use a decoder matching the declared format.
+
+## Borrowed and owned validation serve different ownership needs
+
+`str::from_utf8(&bytes)` validates a borrowed slice and returns `&str` on success. The original vector stays with the caller in both branches.
+
+`String::from_utf8(bytes)` is useful when successful validation should transfer the allocation into an owned `String`. It avoids a copy while still returning the vector on error.
+
+I choose based on what the successful caller needs. Converting a borrowed slice to a new `String` unnecessarily allocates when ownership was already available.
+
+## valid_up_to uses byte coordinates
+
+The reported position is a byte offset, not a Unicode scalar count. Bytes before it are valid UTF-8. The suffix beginning there contains the invalid sequence or an incomplete sequence.
+
+An `error_len` of `Some(n)` means a sequence is known invalid with that length. `None` can mean input ended in the middle of a sequence that might become valid with more bytes. That distinction matters in streaming decoders.
+
+This fixture uses an isolated `FF`, so the length is deterministically `Some(1)`. I do not generalize that value to every malformed sequence.
+
+## Preserving input supports retries without rereading
+
+At file and network boundaries, acquisition may be expensive or non-repeatable. Recovering the vector lets me log a safe digest, apply a configured alternate decoder, quarantine the payload, or return it to a caller without reading the source again.
+
+I still set resource limits before collecting arbitrary input into a vector. Ownership recovery does not protect against an oversized payload. Validation and size policy solve different risks.
+
+For sensitive bytes I avoid placing complete input in ordinary errors or logs. The error owns data; observability policy decides what may be exposed.
+
+## Allocation details have a documented boundary
+
+The standard documentation says successful `from_utf8` takes care not to copy the vector. This makes the operation appropriate for zero-copy ownership conversion after validation.
+
+I avoid turning pointer equality or exact capacity into a broader permanent assumption unless the API documents it. The important contract is that the owned data is reused on success and included on error, not a particular allocator address in every surrounding transformation.
+
+If I need the inverse, `String::into_bytes` consumes the string and returns its byte vector without copying contents.
+
+## Tests should assert the original suffix too
+
+Checking only `is_err()` proves rejection but not recoverability. My test includes valid bytes before and after the invalid byte, then asserts the complete recovered vector. This catches code that accidentally keeps only the valid prefix.
+
+I also test a fully valid multibyte string, an incomplete terminal sequence, multiple invalid regions for a lossy policy, empty input, and maximum accepted payload size.
+
+The repaired fixture ends with a valid `ready` conversion so both ownership branches remain visible.
+
+## The core principle is to design errors for continuation
+
+Good boundary errors preserve enough context for the caller to make the next safe decision. `FromUtf8Error` keeps validation details and the original owned bytes instead of reducing failure to text.
+
+I no longer unwrap this conversion at system boundaries. I match the error, inspect its byte position, recover ownership if needed, and select strict rejection or explicit decoding policy without losing the input.

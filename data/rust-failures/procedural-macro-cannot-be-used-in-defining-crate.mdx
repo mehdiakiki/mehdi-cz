@@ -1,0 +1,95 @@
+---
+caseId: "RFA-108"
+title: "Why a Procedural Macro Cannot Be Used Inside Its Defining Crate"
+date: "2026-09-05T10:08:00+01:00"
+lastmod: "2026-09-05T10:08:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "38ca36927e224cd186ff6ee767fc2f2bdce5f60818b47306005006666e43c0bf"
+area: "diagnostics-macros"
+symptom: "Applying an attribute macro inside the proc-macro crate that defines it fails because the macro is not available to that same crate's compilation."
+summary: "A procedural macro must already be compiled and loaded before it can expand another crate. Test and use it from a separate consumer crate; keep shared transformation logic callable without invoking the macro entry point."
+rustVersions: ["Rust 1.98.1", "Cargo 1.98.1"]
+targets: ["host compiler target", "consumer target"]
+profiles: ["check", "dev", "release", "test"]
+searchTerms: ["can't use procedural macro from same crate", "Rust proc macro same crate defines it", "test proc macro separate crate"]
+evidence: ["Cargo 1.98.1 self-use failure", "attribute macro inside defining crate", "two-crate workspace repair"]
+sources: ["https://doc.rust-lang.org/reference/procedural-macros.html", "https://doc.rust-lang.org/book/ch20-05-macros.html#how-to-write-a-custom-derive-macro"]
+---
+
+The [failing crate](/rust-failure-atlas/evidence/RFA-108/fail/Cargo.toml) defines an attribute macro named `traced` and immediately places `#[traced]` on an internal function. Rust reports:
+
+```text
+can't use a procedural macro from the same crate that defines it
+```
+
+The attribute is in scope. Its signature is valid. The failure is about compilation staging.
+
+## Expansion needs an already built plugin
+
+The [procedural macro reference](https://doc.rust-lang.org/reference/procedural-macros.html) describes macro functions as token-stream transformations. rustc compiles the proc-macro crate for the host, loads its artifact, and then invokes exported macros while compiling a consumer.
+
+If the defining crate tried to use its own macro during its own compilation, rustc would need the macro artifact before it had finished producing that artifact. Source order cannot solve this. Moving the macro function above the annotated item does not create a completed dynamic library.
+
+This resembles a build-stage cycle, not ordinary name resolution.
+
+## A consumer crate is the correct boundary
+
+The [repaired workspace](/rust-failure-atlas/evidence/RFA-108/fixed/Cargo.toml) contains `macros` and `app`. Cargo compiles the macro crate first, then loads it while compiling the application. The attribute expands successfully.
+
+The Rust Book's [custom derive walkthrough](https://doc.rust-lang.org/book/ch20-05-macros.html#how-to-write-a-custom-derive-macro) uses this separate-crate shape. Attribute and function-like procedural macros follow the same artifact boundary even though their token interfaces differ.
+
+For a published project, the consumer may be the ordinary facade library rather than an application. Integration tests also compile as separate crates, which makes them useful for end-to-end macro tests.
+
+## Separate transformation logic from the entry point
+
+I still want unit tests close to parsing and generation code. I do not need to invoke the exported procedural macro to get them.
+
+I structure the crate so the macro entry point converts the compiler token stream and delegates:
+
+```text
+public macro entry
+  -> parser
+  -> semantic validation
+  -> internal representation
+  -> token generation
+```
+
+Parser and validation functions can receive ordinary internal values and be unit-tested inside the defining crate. Snapshot or string tests for generated tokens can also live there, provided they do not pretend to test name resolution in a consumer.
+
+Then integration fixtures test what only rustc can prove: expansion, hygiene, trait bounds, diagnostics, and interaction with the consumer's modules.
+
+## Testing inside a module is still the same crate
+
+Putting `#[cfg(test)] mod tests` in the proc-macro crate does not create a different package artifact for macro self-use. Unit tests are compiled with the library as part of the crate's test build, and the self-use restriction still matters.
+
+Tests under `tests/` are separate integration-test crates. For a proc-macro-only package, a tiny workspace consumer or compile-test harness often makes the boundary clearer and permits both pass and fail fixtures.
+
+I keep negative fixtures because many macro bugs are diagnostic bugs: wrong span, confusing generated trait error, or accepted invalid input. A test that only calls an internal parser cannot reproduce those compiler interactions.
+
+## Host and target can differ
+
+During cross-compilation, the proc macro runs on the build host, while the expanded application is compiled for the target. This is another reason the macro is its own compiled artifact.
+
+Macro implementation code should not assume it runs on the final target. Generated code, meanwhile, must be valid for that target and should gate target-specific items in the consumer context.
+
+A self-use mental model hides this distinction. A two-crate fixture exposes it.
+
+## Avoid creating a reverse dependency
+
+When splitting the crates, it is easy to let the macro crate depend on the facade for shared types while the facade depends on the macro for re-exports. Cargo then reports a package cycle.
+
+I keep compile-time parsing models private to the macro crate or move genuinely neutral contracts to a third small crate. Runtime traits normally live in the facade, and generated tokens refer to them without the macro crate importing the facade as a Rust dependency when that would cycle.
+
+## My debugging sequence
+
+When macro self-use fails, I check:
+
+1. Whether the annotated item is compiled in the defining proc-macro package.
+2. Which logic needs a unit test and which behavior needs real expansion.
+3. A separate consumer crate or integration fixture for expansion.
+4. The dependency direction between macro, facade, and shared contracts.
+5. Renamed-dependency and cross-target behavior.
+6. Both compile-pass and compile-fail diagnostics.
+
+The macro cannot transform its own crate because the transformer is not yet an artifact rustc can load. Once I test at the real consumer boundary, the project structure matches how procedural macros actually execute.

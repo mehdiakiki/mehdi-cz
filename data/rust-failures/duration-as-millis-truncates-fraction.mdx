@@ -1,0 +1,124 @@
+---
+caseId: "RFA-214"
+title: "Duration::as_millis Truncates Instead of Rounding Up"
+date: "2026-09-05T17:53:00+01:00"
+lastmod: "2026-09-05T17:53:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "f93b256632fe22e3becae8cc493cba0d8181c0bf1e5a0a17ccd7440a2ad621d2"
+area: "concurrency-memory"
+symptom: "Duration::as_millis returns one for a duration of 1,999 microseconds although timeout code expected the value to round up to two."
+summary: "Duration::as_millis reports whole elapsed milliseconds and discards the fractional remainder. Choose floor, nearest, or ceiling explicitly when converting time for protocols and operating-system timeouts."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust Duration as_millis rounds down",
+    "as_millis truncates microseconds Rust",
+    "round Duration up milliseconds",
+  ]
+evidence: ["Rust 1.98.1 1999-microsecond duration", "whole-millisecond truncation", "integer ceiling repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/std/time/struct.Duration.html#method.as_millis",
+    "https://doc.rust-lang.org/std/time/struct.Duration.html#method.as_nanos",
+    "https://doc.rust-lang.org/std/time/struct.Duration.html#method.subsec_millis",
+  ]
+---
+
+I converted a timeout to milliseconds and assumed 1,999 microseconds would become two. `as_millis()` returned one. The method had not approximated the duration; it reported only complete milliseconds.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-214/fail.rs) isolates this boundary. The integer result is `1`, not `2`.
+
+Conversion needs an explicit rounding policy.
+
+## The method returns whole milliseconds
+
+[`Duration::as_millis`](https://doc.rust-lang.org/std/time/struct.Duration.html#method.as_millis) returns the total number of whole milliseconds contained in the duration. Any remaining microseconds or nanoseconds are excluded.
+
+For nearby values:
+
+```text
+999 microseconds   -> 0 milliseconds
+1,000 microseconds -> 1 millisecond
+1,999 microseconds -> 1 millisecond
+2,000 microseconds -> 2 milliseconds
+```
+
+This is integer floor conversion for a non-negative duration. It is deterministic and lossful.
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-214/fixed.rs) needs a timeout that is never shorter than requested, so it converts to nanoseconds and uses integer ceiling division.
+
+## Floor, nearest, and ceiling mean different products
+
+For elapsed metrics, flooring may be reasonable: report only time that definitely completed. For a user display, nearest may look natural. For a blocking timeout accepted only in whole milliseconds, ceiling often avoids turning a positive sub-millisecond request into zero.
+
+I name the conversion after its policy:
+
+```text
+elapsed_whole_millis
+display_millis_rounded
+timeout_millis_ceiling
+```
+
+A generic `to_millis` helper invites different callers to assume different rules.
+
+## Zero can change control flow
+
+The most dangerous boundary is below one millisecond. A positive duration becomes integer zero. An API may interpret zero as poll-only, disabled, no delay, or immediate expiry.
+
+This can create a busy loop: compute a small remaining deadline, truncate to zero, call a non-blocking wait, and repeat without sleeping.
+
+I test the smallest positive input and values one unit on either side of each important boundary. Normal values such as five seconds do not reveal the policy.
+
+## `subsec_millis` is not the total
+
+[`Duration::subsec_millis`](https://doc.rust-lang.org/std/time/struct.Duration.html#method.subsec_millis) returns only the millisecond part within the fractional second, always less than one thousand. It is not an alternative total conversion.
+
+For 5,432 milliseconds:
+
+```text
+as_millis()      -> 5432
+subsec_millis()  -> 432
+as_secs()        -> 5
+```
+
+Mixing total and component methods is another common source of wrong protocol values. I write unit names into variables and types where possible.
+
+## Integer arithmetic avoids floating-point surprises
+
+Using floating-point seconds and multiplying by 1,000 introduces representational rounding, large-value precision loss, and cast semantics. For an exact ceiling in this case, integer nanoseconds are clearer.
+
+The repair uses `duration.as_nanos().div_ceil(1_000_000)`. This avoids the overflow risk of the older `(n + divisor - 1) / divisor` formula when `n` is near the integer maximum.
+
+The result is `u128`. A destination API may accept `u32`, `u64`, or a platform integer, so I perform a checked conversion and define what an out-of-range timeout means.
+
+## Operating systems can round again
+
+The `Duration` documentation notes that APIs binding to system timeouts may round according to platform precision. My integer conversion is not proof that a scheduler wakes at an exact nanosecond or millisecond.
+
+There are at least two boundaries:
+
+```text
+application Duration -> protocol integer
+protocol integer     -> operating-system timing behaviour
+```
+
+I make the first one correct and test platform timing with tolerances rather than exact wake instants. A timeout is normally a lower or upper policy bound, not a real-time guarantee.
+
+## Deadlines are safer than repeated duration subtraction
+
+For multi-step operations, I keep an absolute deadline and recompute the remaining duration before each wait. Reusing the original timeout at every step can exceed the total budget.
+
+When the deadline has passed, I handle that state before converting. Saturation to zero and a true zero-duration request may need different metrics even if the next API receives the same integer.
+
+## The conversion does not round-trip
+
+After converting 1,999 microseconds to one millisecond, rebuilding with `Duration::from_millis(1)` produces a shorter duration. The missing 999 microseconds cannot be recovered from the integer.
+
+I therefore keep `Duration` as the internal value and reduce precision only at the boundary that requires it. If a database or message stores milliseconds, I document that its value is quantized and choose the same rounding rule in every producer. Otherwise two services can turn one deadline into different wire values while both use valid arithmetic.
+
+For telemetry I retain a higher-resolution source field when useful and derive display buckets later. Repeated conversion between units should not silently remove a fraction at every hop.
+
+The core principle is that reducing precision is a policy decision. `as_millis` gives whole milliseconds by truncation. I use it when floor is correct and encode ceiling or nearest conversion explicitly when the system's timing promise requires it.

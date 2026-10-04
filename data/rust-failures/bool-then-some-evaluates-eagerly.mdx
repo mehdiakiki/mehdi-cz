@@ -1,0 +1,104 @@
+---
+caseId: "RFA-228"
+title: "bool::then_some Evaluates Its Argument Even When False"
+date: "2026-09-06T00:08:00+01:00"
+lastmod: "2026-09-06T00:08:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "5d182754e5ad01f1ec4e8d90d29afb7b4bc6f89241930544cc2dac138ec1c057"
+area: "concurrency-memory"
+symptom: "A constructor with side effects runs even though false.then_some returns None."
+summary: "Method arguments are evaluated before then_some is called, so its value is eager. Use bool::then with a closure for conditional construction, especially around allocation, I/O, locks, and side effects."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust then_some evaluates when false",
+    "bool then_some eager versus then lazy",
+    "conditional Option construction Rust side effect",
+  ]
+evidence: ["Rust 1.98.1 Cell counter", "false condition with eager argument", "lazy closure repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/std/primitive.bool.html#method.then_some",
+    "https://doc.rust-lang.org/std/primitive.bool.html#method.then",
+    "https://doc.rust-lang.org/reference/expressions/call-expr.html",
+  ]
+---
+
+I used `enabled.then_some(build_value())` because it reads almost like a compact `if`. With `enabled == false`, the result was `None`, but `build_value` still ran.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-228/fail.rs) replaces the constructor with a `Cell` counter. The counter becomes one even though the condition is false.
+
+## A method argument is evaluated before the call
+
+[`bool::then_some`](https://doc.rust-lang.org/std/primitive.bool.html#method.then_some) receives a value of type `T`, not a closure. Rust must evaluate the argument expression to produce that value before the method can decide whether to wrap it in `Some` or return `None`.
+
+The behaviour follows ordinary [call-expression evaluation](https://doc.rust-lang.org/reference/expressions/call-expr.html). It is not a special boolean optimisation. The documentation also explicitly describes `then_some` as eager.
+
+This is cheap and clear for an already available value:
+
+```rust
+enabled.then_some(existing_id)
+```
+
+It is different when the argument performs work:
+
+```rust
+enabled.then_some(load_configuration())
+```
+
+The configuration load happens for both boolean values.
+
+## `then` carries computation instead of a computed value
+
+[`bool::then`](https://doc.rust-lang.org/std/primitive.bool.html#method.then) accepts an `FnOnce` closure and calls it only when the boolean is true. The [repaired program](/rust-failure-atlas/evidence/RFA-228/fixed.rs) proves that a false condition leaves the counter untouched and a true condition increments it once.
+
+The difference is visible in one pair of parentheses:
+
+```rust
+condition.then_some(make_value())
+condition.then(|| make_value())
+```
+
+I do not rely on code review noticing that punctuation. If the construction is expensive or effectful, I prefer a normal `if` when it communicates the branch more clearly.
+
+## Eagerness can change correctness, not only performance
+
+Unneeded allocation is a performance cost. Other arguments are more serious:
+
+- acquiring a lock can block or deadlock;
+- incrementing a counter changes visible state;
+- reading a file can fail even when the feature is disabled;
+- removing a value can consume ownership;
+- logging or tracing can claim an operation happened;
+- calling an external service can create an irreversible effect.
+
+The returned `None` does not roll any of these actions back. Conditional shape around a completed expression is not conditional execution.
+
+This principle also appears in eager and lazy pairs such as `Option::unwrap_or` versus `unwrap_or_else`, or `Result::or` versus closure-taking alternatives. I read the parameter type: a plain value is normally eager; a closure gives the callee control over execution.
+
+## Moves can be surprising even without side effects
+
+Because the argument is constructed before the call, ownership can move into `then_some` even when the condition is false. The resulting `None` then drops the moved value.
+
+That can be perfectly correct, but it prevents later use and may run a meaningful destructor. With `then`, captured values are still moved into the closure when it is created if the closure is `move`; if the false branch drops that closure, its captures are dropped without executing the body.
+
+So laziness does not automatically preserve every captured resource. I design ownership separately from whether the body runs.
+
+## The optimizer cannot remove observable work
+
+It is tempting to assume a compiler sees `false` and skips construction. Rust's observable semantics require effects and panics from argument evaluation to remain. Optimisation may eliminate only work proven to have no observable consequence under the language rules.
+
+A production flag that is usually false does not make eager I/O safe. The program must express laziness.
+
+## My regression observes construction directly
+
+Testing only the returned `Option` misses the bug because both methods correctly return `None` for false. I count constructor calls. For resource code I may use a fake dependency recording requests, or a `Drop` probe recording lifecycle.
+
+The test covers false and true so an implementation that never calls the constructor cannot pass. I also test error propagation if the lazy operation returns `Result`, because `Option<Result<T, E>>` and `Result<Option<T>, E>` make different promises about disabled work and failure.
+
+This tiny fixture is also useful in reviews: replacing the counter with the real expensive call makes the execution boundary immediately visible.
+
+The core principle is that conditional values and conditional computation are not the same abstraction. `then_some` conditionally keeps a value that Rust already evaluated. `then` conditionally runs a closure. I choose based on when the work must happen, not on which expression is shorter.

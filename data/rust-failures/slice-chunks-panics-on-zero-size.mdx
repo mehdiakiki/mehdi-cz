@@ -1,0 +1,78 @@
+---
+caseId: "RFA-250"
+title: "Why slice::chunks Panics When the Chunk Size Is Zero"
+date: "2026-09-06T00:30:00+01:00"
+lastmod: "2026-09-06T00:30:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "ea722d28a861504978513a9bfb89a938f98bdec58249807f573f99eb21bc6d87"
+area: "concurrency-memory"
+symptom: "Calling slice::chunks(0) panics before iteration instead of yielding no chunks or one empty chunk."
+summary: "A zero-sized chunk cannot make forward progress through a non-empty slice. Validate a dynamic size before constructing the iterator and keep empty input separate from an invalid chunk width."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust slice chunks zero panics", "chunks chunk_size must be nonzero Rust", "split slice dynamic chunk size safely"]
+evidence: ["Rust 1.98.1 three-byte slice", "captured zero-size panic", "validated-size repair"]
+sources: ["https://doc.rust-lang.org/std/primitive.slice.html#method.chunks", "https://doc.rust-lang.org/std/primitive.slice.html#method.chunks_exact", "https://doc.rust-lang.org/std/num/struct.NonZero.html"]
+---
+
+It is easy to imagine that `values.chunks(0)` should return an empty iterator. Rust rejects the request instead.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-250/fail.rs) catches the panic raised while creating or using [`slice::chunks`](https://doc.rust-lang.org/std/primitive.slice.html#method.chunks) with a zero size. The slice contains data, but the same rule also applies to an empty slice.
+
+## A chunk must advance the cursor
+
+An iterator over chunks repeatedly takes a region of `chunk_size` elements and moves to the next region. With a size of zero, the next position is the current position. The iterator could produce empty slices forever without consuming input.
+
+Returning no chunks would avoid the infinite sequence, but it would hide an invalid configuration. Returning one empty chunk would invent another convention. Rust chooses a panic and documents the nonzero precondition.
+
+This is not about division alone. It is a progress invariant: every successful iteration step must move through the source.
+
+## Empty input and invalid width are different
+
+An empty input with a valid width produces no chunks. A non-empty input with a width larger than its length produces one short final chunk. A zero width is invalid regardless of input length.
+
+I keep these states separate in validation. Treating `chunk_size == 0` as if the input were empty can silently discard real work when the size came from configuration.
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-250/fixed.rs) returns `None` for zero and constructs the iterator only after validation. In an application I normally return an error naming the setting and its source.
+
+## chunks and chunks_exact differ at the remainder
+
+Regular `chunks(n)` yields a final shorter slice when the length is not divisible by `n`. [`chunks_exact`](https://doc.rust-lang.org/std/primitive.slice.html#method.chunks_exact) yields only full chunks and retains a remainder that can be inspected separately.
+
+Both require a nonzero size. Switching to the exact variant does not repair zero; it changes what happens to the tail.
+
+For a protocol with fixed-size records, `chunks_exact` plus a required empty remainder often expresses validation well. For batching work, keeping the final partial chunk is usually correct.
+
+## Do not replace zero with one silently
+
+Using `chunk_size.max(1)` prevents the panic, but it also converts invalid configuration into a potentially huge number of tiny jobs. That can change scheduling cost, request volume, and rate limits.
+
+Clamping can be correct when the API explicitly says zero means the minimum. Otherwise I reject zero close to the boundary where it entered. A clear error is safer than a plausible but expensive fallback.
+
+If the size travels through several internal layers, a nonzero integer type can encode the invariant once. [`NonZero`](https://doc.rust-lang.org/std/num/struct.NonZero.html) or a domain wrapper prevents downstream code from receiving zero without repeating checks.
+
+## Chunk count arithmetic needs the same guard
+
+Code sometimes calculates `(len + size - 1) / size` before calling `chunks`. With size zero, division panics; with large values, `len + size - 1` can overflow.
+
+I prefer deriving counts from the iterator when performance permits, or using checked quotient/remainder arithmetic after validating the size. The allocation plan and the iterator must share the same tail policy.
+
+## Parallel batching amplifies the mistake
+
+A chunk width often controls task fan-out. Very small positive sizes can be valid Rust but invalid operational policy. I validate an upper and lower bound based on memory, latency, and worker overhead—not only nonzero.
+
+This is one place where a primitive's safety contract is weaker than the system contract. Rust prevents a non-progressing iterator. It cannot decide whether one byte per remote request is acceptable.
+
+## What I test
+
+My table includes empty and non-empty input, width zero, width one, an exact divisor, a width with a remainder, and a width larger than the input. It asserts both chunk contents and remainder handling.
+
+When size comes from configuration, I test parsing zero and missing values too. A missing setting defaulting accidentally to zero should produce the same useful configuration error.
+
+For mutable chunks, I add a test proving the produced slices do not overlap and that the partial tail is updated according to policy. The zero-size validation stays identical, but mutation makes a wrong tail assumption more damaging because some elements can remain stale.
+
+If the final partial chunk is padded before transmission, I test padding separately from chunk selection. `chunks` only partitions borrowed data; it does not promise a fixed record width.
+
+The core principle is that iterator configuration must preserve progress. A zero chunk size cannot move across a slice, so Rust makes the invalid request loud. Validate the size before constructing the iterator, then choose regular or exact chunks according to how the application treats the final remainder.

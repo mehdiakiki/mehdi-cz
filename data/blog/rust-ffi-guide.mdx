@@ -1,209 +1,351 @@
 ---
-title: "Rust FFI Guide: A Comprehensive Guide to Interfacing Rust with C"
-date: "2024-10-18"
-tags: ["rust", "ffi", "c programming", "systems programming", "interoperability"]
-draft: true
-summary: "Explore how to use Rust's Foreign Function Interface (FFI) to integrate Rust with C, including detailed type mappings, memory management, and practical examples."
+title: "A Rust FFI Boundary Is More Than repr(C)"
+date: "2026-09-14T19:00:00+01:00"
+tags: ["rust", "FFI", "C ABI", "unsafe Rust", "systems programming"]
+draft: false
+reviewed: true
+reviewedHash: "5841294ffa4df1ee5105eca0601bedb2edd8ad6a70f27a1aaf85e5663e897482"
+cluster: "rust-under-the-hood"
+campaign: "authority-2026"
+opportunity: "RUST-055"
+summary: "A tested Rust-and-C FFI boundary covering ABI layout, pointer validation, ownership, panics, error reporting, callbacks, versioning, and cross-language harnesses."
 ---
 
+`#[repr(C)]` solves one part of Rust FFI: it gives a struct a C-compatible field layout for the target ABI. It does not validate pointers, define who frees memory, stop panics, preserve lifetimes, make Rust enums universally safe, or keep two independently built libraries compatible forever.
+
+When I review an FFI boundary, I treat it as a small protocol. Every exported function needs a representation contract, an ownership contract, a failure contract, and tests compiled from both languages.
+
+This is more work than adding `extern "C"`. It is also what keeps one unsafe edge from weakening the complete Rust application.
+
+## What `extern "C"` and `repr(C)` actually do
+
+These annotations answer different questions:
+
 ```rust
-use std::ffi::CStr;
-use std::net::{IpAddr, Ipv4Addr};
-use std::ptr;
-use libc::{c_char, c_int, c_uchar, c_void};
-use std::mem::size_of;
-
-/// Link to the external C `libpcap` library for FFI.
-#[link(name = "pcap")]
-extern "C" {
-    fn pcap_open_live(
-        device: *const c_char,
-        snaplen: c_int,
-        promisc: c_int,
-        to_ms: c_int,
-        errbuf: *mut c_char,
-    ) -> *mut c_void;
-
-    fn pcap_loop(
-        handle: *mut c_void,
-        count: c_int,
-        callback: extern "C" fn(*mut c_uchar, *const pcap_pkthdr, *const c_uchar),
-        user: *mut c_uchar,
-    ) -> c_int;
-
-    fn pcap_close(handle: *mut c_void);
-
-    fn pcap_pkthdr() -> *const c_void;
-}
-
-/// Struct representing the packet header.
 #[repr(C)]
-struct pcap_pkthdr {
-    ts: libc::timeval,
-    caplen: u32,
-    len: u32,
+pub struct Point {
+    pub x: f64,
+    pub y: f64,
 }
 
-/// Capture settings for pcap.
-const SNAPLEN: c_int = 65535;
-const PROMISC: c_int = 1;
-const TO_MS: c_int = 1000;
+pub unsafe extern "C" fn consume(point: *const Point) {
+    // ...
+}
+```
 
-/// Parses Ethernet, IP, and TCP headers from packet data.
-extern "C" fn packet_handler(_user: *mut c_uchar, header: *const pcap_pkthdr, packet: *const c_uchar) {
-    let header = unsafe { &*header };
-    println!("Captured packet with length: {} bytes", header.len);
+- `extern "C"` selects the C calling convention for the function.
+- `#[repr(C)]` selects C-compatible layout rules for `Point`.
+- `unsafe` tells Rust callers that they must uphold conditions the function cannot verify completely.
 
-    // Convert packet pointer to slice for easier processing
-    let packet = unsafe { std::slice::from_raw_parts(packet, header.caplen as usize) };
+None of these prove that `point` is non-null, aligned, initialized, still alive, or safe to read. Those are validity and lifetime requirements.
 
-    // Parse the Ethernet header
-    if packet.len() < 14 {
-        println!("Packet too short for Ethernet header");
-        return;
+`repr(C)` is also not recursively magical. Every field must itself have a representation the other language understands. A `#[repr(C)]` struct containing `String`, `Vec<T>`, `&str`, a trait object, or a default-layout Rust enum does not become a stable C type.
+
+The Rust Reference documents the exact [type-layout guarantees](https://doc.rust-lang.org/reference/type-layout.html). I use that document as the contract, not one `size_of` result from my laptop.
+
+## Keep the boundary types boring
+
+I prefer a small vocabulary:
+
+- fixed-width integers such as `u32` matched with `uint32_t`;
+- `size_t` matched with `usize` on the same target ABI;
+- raw pointers plus explicit lengths;
+- opaque handles;
+- simple `#[repr(C)]` structs containing only FFI-safe fields;
+- integer status codes;
+- nullable function pointers where their layout is guaranteed.
+
+I avoid exporting Rust-specific ownership and error types directly:
+
+| Rust type | Why I do not expose it directly | Boundary representation |
+| --- | --- | --- |
+| `String` | Rust allocator, capacity and UTF-8 ownership | pointer + length, or copy function |
+| `Vec<T>` | Rust-owned allocation and layout contract | pointer + length, opaque handle |
+| `&str` | fat pointer and Rust lifetime | `const uint8_t*` + length |
+| `Result<T, E>` | no C ABI representation | status code + out parameter |
+| `bool` | C boolean conventions vary | `uint8_t` with documented 0/1 values |
+| `char` | Rust `char` is a Unicode scalar, not C `char` | `uint32_t` or encoded bytes |
+| data-carrying enum | default layout is not a C contract | tag + union, or opaque API |
+| trait object | Rust vtable ABI is not stable C ABI | explicit function table |
+
+The boundary converts boring C values into strong Rust types after validation.
+
+## A complete small API
+
+This example exposes an opaque counter. C never reads its fields, and only Rust allocates or frees it.
+
+```rust
+use std::mem::size_of;
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::ptr;
+
+pub struct Counter {
+    total: i64,
+}
+
+pub const COUNTER_OK: i32 = 0;
+pub const COUNTER_NULL: i32 = 1;
+pub const COUNTER_LENGTH: i32 = 2;
+pub const COUNTER_PANIC: i32 = 3;
+
+#[unsafe(no_mangle)]
+/// # Safety
+/// `out` must point to writable, aligned storage for one `*mut Counter`.
+pub unsafe extern "C" fn counter_new(out: *mut *mut Counter) -> i32 {
+    if out.is_null() {
+        return COUNTER_NULL;
     }
-    let eth_type = u16::from_be_bytes([packet[12], packet[13]]);
-    println!("Ethernet Type: {:#X}", eth_type);
 
-    // Only proceed if it's an IP packet (0x0800)
-    if eth_type != 0x0800 {
-        println!("Not an IP packet");
-        return;
-    }
-
-    // Parse the IP header
-    let ip_header_start = 14; // Ethernet header length
-    let ip_header = &packet[ip_header_start..ip_header_start + 20];
-
-    let version = ip_header[0] >> 4;
-    let ihl = (ip_header[0] & 0x0F) * 4;
-    let total_length = u16::from_be_bytes([ip_header[2], ip_header[3]]);
-    let protocol = ip_header[9];
-    let src_ip = Ipv4Addr::new(ip_header[12], ip_header[13], ip_header[14], ip_header[15]);
-    let dst_ip = Ipv4Addr::new(ip_header[16], ip_header[17], ip_header[18], ip_header[19]);
-
-    println!("IP Version: {}", version);
-    println!("IP Header Length: {} bytes", ihl);
-    println!("Total Length: {} bytes", total_length);
-    println!("Protocol: {}", protocol);
-    println!("Source IP: {}", src_ip);
-    println!("Destination IP: {}", dst_ip);
-
-    // Parse TCP or UDP header based on protocol
-    match protocol {
-        6 => parse_tcp_header(&packet[ip_header_start + ihl as usize..]),
-        17 => parse_udp_header(&packet[ip_header_start + ihl as usize..]),
-        _ => println!("Unsupported protocol"),
+    match catch_unwind(|| Box::new(Counter { total: 0 })) {
+        Ok(counter) => {
+            // SAFETY: `out` was checked for null. The caller's contract must
+            // still guarantee writable, aligned storage for one pointer.
+            unsafe { ptr::write(out, Box::into_raw(counter)) };
+            COUNTER_OK
+        }
+        Err(_) => COUNTER_PANIC,
     }
 }
 
-/// Parses and prints TCP header fields.
-fn parse_tcp_header(packet: &[u8]) {
-    if packet.len() < 20 {
-        println!("Packet too short for TCP header");
-        return;
+/// # Safety
+/// `counter` must be a live handle returned by `counter_new` and not freed.
+/// If `len > 0`, `values` must point to `len` initialized `i32` values.
+/// `out_total` must point to writable, aligned storage for one `i64`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn counter_add(
+    counter: *mut Counter,
+    values: *const i32,
+    len: usize,
+    out_total: *mut i64,
+) -> i32 {
+    if counter.is_null() || out_total.is_null() {
+        return COUNTER_NULL;
+    }
+    if len > 0 && values.is_null() {
+        return COUNTER_NULL;
+    }
+    if len > isize::MAX as usize / size_of::<i32>() {
+        return COUNTER_LENGTH;
     }
 
-    let src_port = u16::from_be_bytes([packet[0], packet[1]]);
-    let dst_port = u16::from_be_bytes([packet[2], packet[3]]);
-    let sequence = u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]);
-    let ack_number = u32::from_be_bytes([packet[8], packet[9], packet[10], packet[11]]);
-    let data_offset = (packet[12] >> 4) * 4;
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: the remaining pointer, initialization, aliasing and lifetime
+        // conditions are required by this function's public safety contract.
+        let counter = unsafe { &mut *counter };
+        let values: &[i32] = if len == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(values, len) }
+        };
 
-    println!("TCP Header:");
-    println!("Source Port: {}", src_port);
-    println!("Destination Port: {}", dst_port);
-    println!("Sequence Number: {}", sequence);
-    println!("Acknowledgment Number: {}", ack_number);
-    println!("Data Offset: {} bytes", data_offset);
+        for value in values {
+            counter.total = counter.total.saturating_add(i64::from(*value));
+        }
+        unsafe { ptr::write(out_total, counter.total) };
+    }));
+
+    if result.is_ok() { COUNTER_OK } else { COUNTER_PANIC }
 }
 
-/// Parses and prints UDP header fields.
-fn parse_udp_header(packet: &[u8]) {
-    if packet.len() < 8 {
-        println!("Packet too short for UDP header");
-        return;
-    }
-
-    let src_port = u16::from_be_bytes([packet[0], packet[1]]);
-    let dst_port = u16::from_be_bytes([packet[2], packet[3]]);
-    let length = u16::from_be_bytes([packet[4], packet[5]]);
-
-    println!("UDP Header:");
-    println!("Source Port: {}", src_port);
-    println!("Destination Port: {}", dst_port);
-    println!("Length: {} bytes", length);
-}
-
-fn main() {
-    // Specify the network device for packet capture (e.g., "eth0" on Linux).
-    let device = std::ffi::CString::new("eth0").expect("Failed to create CString");
-    let mut errbuf = vec![0 as c_char; 256];
-
-    // Open the capture handle with `pcap_open_live`.
-    let handle = unsafe { pcap_open_live(device.as_ptr(), SNAPLEN, PROMISC, TO_MS, errbuf.as_mut_ptr()) };
-    if handle.is_null() {
-        let err = unsafe { CStr::from_ptr(errbuf.as_ptr()) }.to_string_lossy();
-        eprintln!("Error opening device: {}", err);
-        return;
-    }
-
-    println!("Starting packet capture on device: {}", device.to_str().unwrap());
-
-    // Start capturing packets in a loop.
-    unsafe {
-        pcap_loop(handle, -1, packet_handler, ptr::null_mut());
-    }
-
-    // Clean up by closing the handle.
-    unsafe {
-        pcap_close(handle);
+/// # Safety
+/// `counter` must be null or a live handle returned by `counter_new` that has
+/// not already been passed to `counter_free`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn counter_free(counter: *mut Counter) {
+    if !counter.is_null() {
+        drop(unsafe { Box::from_raw(counter) });
     }
 }
 ```
 
-| **Rust Type**                       | **Equivalent C Type**             | **Description / Notes**                                                                                             |
-| ----------------------------------- | --------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
-| `i8`                                | `int8_t` / `char`                 | Signed 8-bit integer, often maps to `char` in C.                                                                    |
-| `u8`                                | `uint8_t` / `unsigned char`       | Unsigned 8-bit integer.                                                                                             |
-| `i16`                               | `int16_t`                         | Signed 16-bit integer, typically `short`.                                                                           |
-| `u16`                               | `uint16_t`                        | Unsigned 16-bit integer.                                                                                            |
-| `i32`                               | `int32_t` / `int`                 | Signed 32-bit integer, equivalent to C’s `int` on most platforms.                                                   |
-| `u32`                               | `uint32_t` / `unsigned int`       | Unsigned 32-bit integer, equivalent to `unsigned int`.                                                              |
-| `i64`                               | `int64_t` / `long long`           | Signed 64-bit integer; often maps to C `long long` on most systems.                                                 |
-| `u64`                               | `uint64_t` / `unsigned long long` | Unsigned 64-bit integer.                                                                                            |
-| `isize`                             | `intptr_t`                        | Signed integer with platform-dependent size (32 or 64-bit depending on architecture).                               |
-| `usize`                             | `uintptr_t`                       | Unsigned version of `isize`, typically used for sizes and indexing.                                                 |
-| `f32`                               | `float`                           | 32-bit floating-point number.                                                                                       |
-| `f64`                               | `double`                          | 64-bit floating-point number.                                                                                       |
-| `bool`                              | `_Bool` / `int`                   | Rust `bool` maps to `_Bool` in C99; can use `int` (0 for false, 1 for true) in older standards.                     |
-| `char`                              | `char`                            | Rust `char` is a Unicode scalar value, so avoid direct mapping; C `char` is 1 byte (not equivalent to Rust `char`). |
-| `c_void`                            | `void`                            | Used for FFI to represent a void pointer (`*mut c_void` / `*const c_void`).                                         |
-| `c_char`                            | `char`                            | Typically represents single-byte characters; use `CString` or `CStr` for strings.                                   |
-| `c_schar`                           | `signed char`                     | Signed 1-byte integer.                                                                                              |
-| `c_uchar`                           | `unsigned char`                   | Unsigned 1-byte integer.                                                                                            |
-| `c_short`                           | `short`                           | Signed 16-bit integer.                                                                                              |
-| `c_ushort`                          | `unsigned short`                  | Unsigned 16-bit integer.                                                                                            |
-| `c_int`                             | `int`                             | Platform-dependent, typically a 32-bit signed integer.                                                              |
-| `c_uint`                            | `unsigned int`                    | Platform-dependent, typically a 32-bit unsigned integer.                                                            |
-| `c_long`                            | `long`                            | Signed integer, size can vary by platform (32 or 64-bit depending on system).                                       |
-| `c_ulong`                           | `unsigned long`                   | Unsigned integer, size can vary by platform (32 or 64-bit depending on system).                                     |
-| `c_longlong`                        | `long long`                       | 64-bit signed integer.                                                                                              |
-| `c_ulonglong`                       | `unsigned long long`              | 64-bit unsigned integer.                                                                                            |
-| `c_float`                           | `float`                           | 32-bit floating-point number.                                                                                       |
-| `c_double`                          | `double`                          | 64-bit floating-point number.                                                                                       |
-| `*const T`                          | `const T*`                        | Immutable pointer to data of type `T`.                                                                              |
-| `*mut T`                            | `T*`                              | Mutable pointer to data of type `T`; requires `unsafe` to dereference in Rust.                                      |
-| `Option<&T>`                        | `T*`                              | Nullable pointer; use `std::ptr::null()` for `None`.                                                                |
-| `Option<&mut T>`                    | `T*`                              | Same as above, but for mutable pointers.                                                                            |
-| `&T`                                | `const T*`                        | Immutable reference, passed as const pointer in C but must follow Rust’s borrowing rules.                           |
-| `&mut T`                            | `T*`                              | Mutable reference, passed as mutable pointer in C.                                                                  |
-| `CString`                           | `const char*`                     | Rust’s C-compatible string for passing strings to C functions.                                                      |
-| `&CStr`                             | `const char*`                     | C-compatible reference to a C string (`CStr` provides safe access to `const char*`).                                |
-| `Box<T>`                            | `T*`                              | Rust heap-allocated type; requires `Box::into_raw` and `Box::from_raw` for FFI.                                     |
-| `fn()` or `extern "C" fn()`         | `void (*)(void)`                  | Function pointers; use `extern "C" fn()` for FFI compatibility.                                                     |
-| `extern "C" fn(a: T1, b: T2) -> T3` | `T3 (*)(T1, T2)`                  | Function pointers with arguments and return type; use `extern "C" fn()` for compatibility.                          |
-| `[T; N]`                            | `T[N]`                            | Fixed-size arrays; pass by pointer or reference to work with C arrays.                                              |
-| `struct Name { ... }`               | `struct Name { ... }`             | Use `#[repr(C)]` to ensure struct layout matches C; required for FFI compatibility.                                 |
-| `enum Name { ... }`                 | `enum Name { ... }`               | Use `#[repr(C)]` for Rust enums to align with C enums, especially if they’re simple integer enums.                  |
-| `Result<T, E>`                      | N/A                               | Rust’s `Result` is not FFI-compatible; replace with error codes or other C-friendly error-handling conventions.     |
+Rust 2024 requires unsafe attributes such as `no_mangle` to be written as `#[unsafe(no_mangle)]`. The exported symbol itself is part of the safety review: duplicate or unexpected symbol names can break linking assumptions.
+
+The C header makes the other half of the contract explicit:
+
+```c
+#ifndef COUNTER_H
+#define COUNTER_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+typedef struct Counter Counter;
+
+enum {
+    COUNTER_OK = 0,
+    COUNTER_NULL = 1,
+    COUNTER_LENGTH = 2,
+    COUNTER_PANIC = 3
+};
+
+int32_t counter_new(Counter **out);
+int32_t counter_add(
+    Counter *counter,
+    const int32_t *values,
+    size_t len,
+    int64_t *out_total
+);
+void counter_free(Counter *counter);
+
+#endif
+```
+
+The opaque `typedef` prevents C from depending on Rust field layout. I can change the internal `Counter` without changing the ABI.
+
+## The C harness matters
+
+I compile and run a consumer written in C:
+
+```c
+#include "counter.h"
+#include <assert.h>
+
+int main(void) {
+    Counter *counter = NULL;
+    assert(counter_new(&counter) == COUNTER_OK);
+    assert(counter != NULL);
+
+    int32_t values[] = {10, -3, 8};
+    int64_t total = 0;
+    assert(counter_add(counter, values, 3, &total) == COUNTER_OK);
+    assert(total == 15);
+
+    assert(counter_add(counter, NULL, 0, &total) == COUNTER_OK);
+    assert(counter_add(counter, NULL, 1, &total) == COUNTER_NULL);
+
+    counter_free(counter);
+    return 0;
+}
+```
+
+A typical CI flow builds the Rust crate as a `cdylib`, compiles this file with the platform C compiler, links it against the produced library, and runs it. This catches symbol, calling-convention, header, and linker mistakes that a Rust-only unit test cannot see.
+
+I run the harness on every supported architecture and operating system. C ABI details such as `long` size differ between LP64 and LLP64 targets, which is why I prefer fixed-width integers in the public header.
+
+## Pointer checks have limits
+
+Checking `is_null()` is useful, but it does not prove that a non-null pointer is valid. Rust cannot generally verify that foreign memory:
+
+- is aligned for `T`;
+- covers the requested length;
+- contains initialized valid values;
+- lives for the duration of the call;
+- is not concurrently mutated;
+- does not alias a Rust mutable reference.
+
+This is why an exported raw-pointer function can remain `unsafe` from Rust's point of view even when it returns errors for common bad inputs.
+
+I keep the unsafe block small and write a `# Safety` contract that states what the caller must guarantee. Validation then narrows the remaining assumptions before safe domain code receives the data.
+
+The 2024 edition's `unsafe_op_in_unsafe_fn` discipline helps: an unsafe function still uses explicit unsafe blocks for each operation, making the proof boundary visible.
+
+## Zero-length slices are a small trap
+
+`slice::from_raw_parts` still requires a non-null, aligned pointer even when length is zero. C APIs commonly allow `(NULL, 0)`.
+
+In the example I handle zero length separately and return `&[]`. I do not pass the null pointer to `from_raw_parts`.
+
+I also check that `len * size_of::<T>()` fits within `isize::MAX`, one of the documented slice requirements. This does not validate the allocation; it only rejects impossible slice sizes early.
+
+## Ownership must cross in one direction at a time
+
+I use naming and API shape to show ownership:
+
+```text
+borrowed input:       const pointer + length, valid only for the call
+mutable borrowed:     mutable pointer + length, exclusive for the call
+Rust-owned handle:    created by Rust, destroyed by one Rust free function
+caller-owned output:  caller provides buffer and capacity
+transferred buffer:   explicit pointer/length/capacity plus matching destructor
+```
+
+Memory allocated by Rust should normally be freed by Rust. Allocator choice and layout can differ across modules or runtimes. A `Box::into_raw` pointer is returned exactly once to `Box::from_raw`; double free or use after free remains undefined behaviour.
+
+For variable output, I often use a two-call API: first ask for required length, then fill a caller-owned buffer. It avoids transferring allocator ownership across the boundary.
+
+## Strings need encoding and length rules
+
+`const char *` is not enough specification. I declare:
+
+- UTF-8, another encoding, or uninterpreted bytes;
+- NUL-terminated or explicit length;
+- whether embedded NUL is allowed;
+- borrowed or owned memory;
+- maximum accepted length;
+- behaviour for invalid encoding.
+
+`CStr` requires a terminating NUL and no earlier assumptions about arbitrary memory. `str::from_utf8` validates explicit UTF-8 bytes. I convert only after the pointer and length contract is established.
+
+I never expose a Rust `char` as a C `char`: Rust's type represents a Unicode scalar value and has a different validity model.
+
+## Panics and foreign exceptions need a policy
+
+A panic must not accidentally unwind through a C ABI boundary that does not permit unwinding. With `extern "C"`, a Rust panic reaching the boundary aborts safely under the documented ABI behaviour. If process abort is unacceptable, I use `catch_unwind` at the exported entry and translate the result into a status code.
+
+`catch_unwind` is not a general exception mechanism. It catches unwinding Rust panics, not `panic=abort`, and foreign-exception interactions have strict limits. The Rustonomicon's [FFI and unwinding guide](https://doc.rust-lang.org/nomicon/ffi.html#ffi-and-unwinding) documents when `C-unwind` is required.
+
+I also make destructors called from FFI unable to panic through the boundary. Error messages use a separate retrieval API or caller buffer with documented lifetime, rather than a pointer to a temporary Rust string.
+
+## Callbacks add thread and lifetime contracts
+
+A C callback may be invoked:
+
+- synchronously before the registration call returns;
+- later on a foreign thread;
+- more than once;
+- during shutdown;
+- concurrently with unregister.
+
+The signature does not communicate these rules. I document them and pass an opaque user-data pointer with an explicit lifetime.
+
+If the callback can arrive from another thread, captured Rust state needs `Send`/synchronization guarantees enforced by the safe wrapper. Unregistering must define when no more callbacks can happen before user data is freed.
+
+I use `Option<extern "C" fn(...)>` for nullable callbacks only where Rust documents the nullable-function-pointer representation.
+
+## ABI versioning belongs in the first design
+
+Once other programs link to a library, field and symbol changes become compatibility decisions.
+
+I prefer opaque handles and functions, but sometimes a configuration struct is useful. Then I add size and version:
+
+```c
+typedef struct {
+    uint32_t abi_version;
+    size_t struct_size;
+    uint32_t flags;
+    void *reserved;
+} counter_config_v1;
+```
+
+The Rust side reads only fields covered by `struct_size`, validates the supported version, requires reserved fields to be zero, and copies values instead of retaining a borrowed stack pointer.
+
+I do not reorder or change the meaning of existing fields. New entry points can carry version suffixes when symbol compatibility matters.
+
+## My ABI checklist
+
+Before release, I verify:
+
+- every exported function has an explicit ABI and stable symbol name;
+- every exposed value has documented layout on every supported target;
+- no default-layout Rust type leaks into the header;
+- pointer nullability, alignment, length, aliasing, and lifetime are written down;
+- ownership transfer and the matching destructor are unambiguous;
+- integer widths, boolean values, string encoding, and enum values are fixed;
+- panics and foreign exceptions cannot cross the wrong boundary;
+- callbacks define threads, concurrency, reentrancy, and unregister completion;
+- status codes preserve useful error categories without leaking secrets;
+- header and library versions match;
+- a real C harness builds, links, and executes in CI;
+- sanitizers run on the C side and platform matrix;
+- Rust unit/property tests cover conversion code;
+- unsafe blocks explain the invariants they rely on.
+
+Miri can help test Rust unsafe code, but it cannot model an arbitrary real C library and native ABI. I combine it with C/C++ sanitizers, integration harnesses, and target-specific CI.
+
+Microsoft's pragmatic Rust guidance recommends keeping the FFI crate as a translation layer so interop concerns do not spread through the core domain; see its [FFI guidelines](https://microsoft.github.io/rust-guidelines/guidelines/ffi/index.html). The Rustonomicon also documents [alternative representations](https://doc.rust-lang.org/nomicon/other-reprs.html) and which nullable pointer cases have guarantees.
+
+## The boundary I want
+
+My safe application code should never receive an unchecked foreign pointer. The FFI module receives boring C values, validates what can be validated, documents what the caller must guarantee, converts once, and calls a normal Rust API.
+
+`repr(C)` makes selected bytes predictable. The rest of FFI safety comes from protocol design: ownership, validity, failure, unwinding, threading, versioning, and tests from both sides.

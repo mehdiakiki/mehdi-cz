@@ -1,0 +1,82 @@
+---
+caseId: "RFA-290"
+title: "BufRead::skip_until Counts the Delimiter Byte"
+date: "2026-09-06T01:10:00+01:00"
+lastmod: "2026-09-06T01:10:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "9c1ab69e11f29f84a198316d3522902489ee4b091f217b375aa9a4d42592f954"
+area: "ffi-targets"
+symptom: "Skipping abc| with skip_until('|') returns four bytes rather than the three payload bytes before the delimiter."
+summary: "BufRead::skip_until consumes and counts everything through the delimiter, including the delimiter itself. The count measures stream progress, not payload length, and EOF without a delimiter has a separate meaning."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets with std I/O"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust BufRead skip_until includes delimiter", "skip_until returned byte count Rust", "skip NUL terminated field BufRead"]
+evidence: ["Rust 1.98.1 Cursor input", "three payload bytes plus delimiter", "remaining stream assertion"]
+sources: ["https://doc.rust-lang.org/std/io/trait.BufRead.html#method.skip_until", "https://doc.rust-lang.org/std/io/trait.BufRead.html#method.read_until", "https://doc.rust-lang.org/std/io/trait.Read.html#method.take"]
+---
+
+I used `skip_until` to pass over one field in a binary stream. The field contained three payload bytes, but the method returned four. I first read that count as the field length. Rust was reporting how far the reader advanced.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-290/fail.rs) reads `abc|rest` and skips through `|`. [`BufRead::skip_until`](https://doc.rust-lang.org/std/io/trait.BufRead.html#method.skip_until) returns four because it consumes `a`, `b`, `c`, and the delimiter.
+
+## The count describes consumed bytes
+
+The method discards bytes until it sees the selected byte or reaches EOF. When it finds the delimiter, that delimiter belongs to the consumed portion. Its returned `usize` is the total number of bytes read during this call, including the delimiter.
+
+This makes the count useful for updating an absolute stream offset:
+
+```text
+new offset = old offset + returned count
+```
+
+It does not directly describe the payload before the delimiter. When the delimiter was found, that payload length is `count - 1`. When EOF was reached without the delimiter, every counted byte was payload. I need the termination reason before subtracting.
+
+## The return value does not say why reading stopped
+
+For a non-empty remaining stream, the count alone cannot always prove that the delimiter appeared. If I skip four bytes, those bytes may be `abc|`, or they may be `abcd` followed by EOF.
+
+`skip_until` is deliberately a discard operation. It does not return the skipped bytes, so the caller cannot inspect the last one afterward. If the format requires proving that a terminator was present, I use [`read_until`](https://doc.rust-lang.org/std/io/trait.BufRead.html#method.read_until) into a bounded buffer and inspect its final byte, or I write a small bounded scanner over `fill_buf` and `consume`.
+
+For a trusted format where EOF is an accepted terminator, the simpler method is enough. The API choice depends on whether discarded content still contains validation evidence.
+
+## Zero means the reader was already at EOF
+
+If the reader is at EOF before this call, `skip_until` returns zero. A delimiter appearing immediately returns one because the delimiter itself is consumed.
+
+These two cases are valuable boundary tests:
+
+```text
+input ""       -> 0
+input "|rest"  -> 1
+input "a|rest" -> 2
+```
+
+I do not interpret zero as an empty terminated field. An empty field followed by a delimiter produces one. Zero means no byte was available to read.
+
+## It is still a potentially unbounded read
+
+Discarding instead of allocating does not bound time or input consumption. If an attacker keeps sending bytes without the delimiter or EOF, the call can continue blocking and consuming indefinitely.
+
+At protocol boundaries I impose a maximum field size. One option is [`Read::take`](https://doc.rust-lang.org/std/io/trait.Read.html#method.take), though its limit is cumulative over the adapter and reaching that artificial EOF still needs to be distinguished from finding the real delimiter. Another option is a loop over buffered slices that stops with a domain error after the allowed number of bytes.
+
+The absence of allocation protects memory, but it does not by itself protect worker occupancy or byte budgets.
+
+## Interrupted errors are retried internally
+
+The standard method ignores `ErrorKind::Interrupted` and retries. Other I/O errors are returned. By then, part of the input may already have been discarded.
+
+This means retrying the entire logical skip from a higher layer can skip into the following record. Stream operations need a progress policy: either the reader and parser remain together after an error, or the whole stream is abandoned and reopened from a known checkpoint.
+
+For seekable files I may record the starting offset and seek back only when the format and error policy make this safe. Network streams usually offer no such rollback.
+
+## What I test
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-290/fixed.rs) asserts the count of four and then reads `rest`, proving that the delimiter was consumed rather than left for the next parser stage.
+
+My larger table includes a delimiter first, middle, and last; no delimiter before EOF; empty input; repeated delimiters; and a multibyte text character around the delimiter. The delimiter argument is one byte, and the count is bytes, not Unicode scalar values.
+
+For hostile input I test the size cap and verify what remains after it fires. I also make the parser report absolute offsets using the consumed count, because an off-by-one there can point every later error at the wrong byte.
+
+The core principle is that a returned count needs a unit and a boundary. `skip_until` counts bytes consumed through the delimiter. It is excellent for discarding a field efficiently, but it does not return payload length or independently prove why the scan stopped.

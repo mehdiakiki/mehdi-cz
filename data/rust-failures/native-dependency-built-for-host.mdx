@@ -1,0 +1,143 @@
+---
+caseId: "RFA-041"
+title: "A Rust Native Dependency Built for the Host Instead of the Target"
+date: "2026-09-04T21:00:00+01:00"
+lastmod: "2026-09-07T12:40:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "c845185edba06062370752f9d434759b620b2b7ee8d30c53f528218ddb945230"
+area: "ffi-targets"
+symptom: "A native dependency compiles successfully during cross-compilation but produces code for the build host instead of the Rust target."
+summary: "Cargo build scripts execute on the host while producing artifacts for TARGET. Trace compiler selection and inspect object headers before changing linker flags."
+rustVersions: ["stable Rust", "Cargo stable", "cc 1.x where used"]
+targets: ["cross-compiled native targets"]
+profiles: ["dev", "release"]
+searchTerms:
+  [
+    "Rust build script compiles C for host",
+    "cc crate wrong target cross compile",
+    "Cargo HOST TARGET native dependency",
+  ]
+evidence: ["build-script environment trace", "object-header inspection", "cross-target fixture"]
+sources:
+  [
+    "https://doc.rust-lang.org/cargo/reference/build-scripts.html#inputs-to-the-build-script",
+    "https://docs.rs/cc/latest/cc/#external-configuration-via-environment-variables",
+  ]
+---
+
+A Cargo build script is compiled for and executed on the host. The native object it creates may need to run on the target. Confusing those two machines produces a file which can be a perfectly valid object and still be unusable in the final target link.
+
+Cargo provides both values:
+
+```text
+HOST=x86_64-unknown-linux-gnu
+TARGET=aarch64-unknown-linux-gnu
+```
+
+The first discriminating check is to print them with the selected C compiler and then inspect the produced object format.
+
+The Atlas runs this check with a real target pair. It compiles the [failing build script](/rust-failure-atlas/evidence/RFA-041/fail/build.rs) using Rust 1.98.1, then gives it `HOST=x86_64-unknown-linux-gnu`, `TARGET=thumbv7em-none-eabi`, and `CC=clang`. Because the script never forwards `TARGET`, Clang succeeds but `readelf` reports an ELF64 x86-64 object. The [repaired build script](/rust-failure-atlas/evidence/RFA-041/fixed/build.rs) forwards `--target=thumbv7em-none-eabi`; the same [C source](/rust-failure-atlas/evidence/RFA-041/native/add.c) becomes an ELF32 ARM object.
+
+This focused matrix proves compiler selection and object architecture without pretending that the current host completed a Rust link or ran ARM code. A production cross-build should add the final target link and an emulator or device test when that environment is available.
+
+## Do not use build-script `cfg!` for the target
+
+This looks reasonable but asks about the build script itself:
+
+```rust
+if cfg!(target_arch = "x86_64") {
+    // This describes HOST because build.rs runs there.
+}
+```
+
+Cargo explicitly warns about this. Target configuration arrives through `TARGET` and `CARGO_CFG_*` environment variables:
+
+```rust
+fn main() {
+    let host = std::env::var("HOST").unwrap();
+    let target = std::env::var("TARGET").unwrap();
+    let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap();
+
+    println!("cargo:warning=HOST={host} TARGET={target} ARCH={arch}");
+}
+```
+
+For repeatable rebuilds, any custom environment input should also be declared with `rerun-if-env-changed`.
+
+## Let a target-aware helper select tools
+
+The `cc` crate reads `TARGET`, `HOST`, `OUT_DIR`, and profile inputs supplied by Cargo. A normal build script can stay small:
+
+```rust
+fn main() {
+    cc::Build::new()
+        .file("native/hash.c")
+        .compile("native_hash");
+}
+```
+
+The crate supports target-specific compiler variables before falling back to plain `CC`. For example, a target-prefixed `CC_aarch64_unknown_linux_gnu` can take priority over `CC`.
+
+Hard-coding `gcc` with `std::process::Command` bypasses this selection. It normally invokes the host compiler, which happily creates an x86-64 object.
+
+If another native build system is necessary, I ask the target-aware tool for its configured compiler and flags, or forward a complete toolchain file. Passing only `--target` to Cargo does not automatically teach every nested `make` or CMake invocation how to cross-compile.
+
+## Inspect the output before the final link
+
+An architecture mismatch often appears only at link time. I inspect an object or archive produced under `OUT_DIR`:
+
+```text
+expected: ELF 64-bit LSB relocatable, ARM aarch64
+actual:   ELF 64-bit LSB relocatable, x86-64
+```
+
+This evidence separates compiler selection from link order or missing libraries. An archive contains member objects, so I inspect a member rather than trusting the `.a` suffix.
+
+I also log the full compiler command. The correct executable with a wrong `--sysroot` can still select host headers or libraries.
+
+## Generated programs may belong to HOST
+
+Some build scripts compile a generator and run it during the build. That generator must target the host, while a library linked into the product must target `TARGET`.
+
+I name outputs by role:
+
+```text
+host-tools/schema_generator
+target-libs/libprotocol.a
+```
+
+One compiler setting for both roles is wrong whenever `HOST != TARGET`. Cargo handles this distinction for Rust build dependencies; custom native orchestration must preserve it too.
+
+## Header selection is part of the target
+
+A target compiler reading host system headers can produce subtler failures than a rejected object. Type widths, feature macros, calling conventions, and libc declarations may differ.
+
+I record compiler, target flag, sysroot, include search paths, archiver, and object format as one toolchain tuple. Fixing only the final linker cannot repair code compiled from the wrong declarations.
+
+## False repairs
+
+Adding `-m64` may change width but not operating system, ABI, libc, or architecture family. Renaming the archive cannot change its contents. Copying a prebuilt host library into the target directory only moves the mismatch.
+
+Setting global `CC` may repair one target and break host tools or another target. Target-scoped environment and Cargo configuration make the intended selection clear.
+
+## Binding generation has the same two-machine problem
+
+A binding generator runs on `HOST`, but the declarations it models usually belong to `TARGET`.
+Invoking host Clang with host include paths can generate Rust types whose sizes and conditional fields
+do not match the native target library.
+
+I pass the target triple, sysroot, target defines, and target header roots to the generator. Then I
+compile static assertions on the target side for important sizes, alignments, and offsets. A binding
+file being valid Rust proves only that generation produced syntax; it does not prove that the
+generator read the target's ABI.
+
+For checked-in bindings, I record the target family and native header version which produced them.
+One generic file may be correct, but that must come from an intentionally portable header contract,
+not from accidentally running generation on one developer machine.
+
+## The regression proof
+
+My first cross-build gate compiles one native function and inspects the object architecture. The complete product gate also links it into the target Rust artifact and runs under the target environment or emulator when practical. Keeping these stages separate tells me whether a failure begins at compiler selection, final linking, or execution.
+
+The build log records `HOST`, `TARGET`, compiler path, and important flags. This does not expose secrets; it exposes the toolchain contract. A successful compile becomes meaningful only when the object header proves it was compiled for the consumer.

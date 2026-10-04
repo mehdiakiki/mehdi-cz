@@ -1,0 +1,81 @@
+---
+caseId: "RFA-629"
+title: "The Program Entry Point Must Remain Synchronous"
+date: "2026-09-06T07:49:00+01:00"
+lastmod: "2026-09-06T07:49:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "9d2f1ad4218c2885dc500cb6dbd27c2755cf3daff484ab3f4e81695ddc1a3dfd"
+area: "async-runtime"
+symptom: "Declaring async fn main fails with E0752 because the operating-system entry contract does not provide a Rust task context that can poll the returned future."
+summary: "Async main syntax needs a runtime macro or an explicit synchronous main that builds an executor and drives one top-level future. Keep startup and shutdown ownership visible."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust E0752 main function async", "async fn main runtime Rust", "Rust synchronous main block_on future"]
+evidence: ["Rust 1.98.1 E0752 compile failure", "program main declared directly async", "ordinary synchronous main repair"]
+sources: ["https://doc.rust-lang.org/error_codes/E0752.html", "https://doc.rust-lang.org/reference/crates-and-source-files.html#main-functions", "https://doc.rust-lang.org/book/ch17-00-async-await.html"]
+---
+
+An async function does not execute its body when called; it creates a future that must be polled with a task context. The operating system does not enter a Rust executable by supplying that async machinery. The [failing fixture](/rust-failure-atlas/evidence/RFA-629/fail.rs) marks `main` async directly and receives E0752.
+
+## Someone must drive the first future
+
+Every awaited operation is eventually under an executor that polls futures and arranges wakeups. If `main` simply returned a future to the platform, no standard Rust contract would poll it. The [official E0752 explanation](https://doc.rust-lang.org/error_codes/E0752.html) therefore requires the language entrypoint itself not to be async.
+
+The Reference defines permitted [main function forms](https://doc.rust-lang.org/reference/crates-and-source-files.html#main-functions). The Book introduces [async and await](https://doc.rust-lang.org/book/ch17-00-async-await.html) and the role of a runtime.
+
+I see E0752 as an ownership question: which component creates the executor and controls its lifetime?
+
+## Runtime macros generate a synchronous boundary
+
+Popular runtimes offer an attribute such as `#[tokio::main]`. The source appears to contain async main, but the macro generates a synchronous entrypoint that builds or accesses a runtime and drives the async body. This is runtime functionality, not permission from the Rust language to use a bare async entrypoint.
+
+For a small application the macro can be clear. For a service with customised worker count, thread names, metrics, time, or shutdown policy, I often prefer an explicit builder in ordinary `fn main`. It makes configuration and construction failures visible.
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-629/fixed.rs) stays synchronous and has no async work. A real repaired service would build its chosen executor and call one top-level async application function.
+
+## Keep library code independent of executor creation
+
+Libraries normally return futures or expose async functions. They should not create a new runtime inside each method to make a synchronous-looking interface. A caller may already be running on an executor, and nested blocking can panic, deadlock, or occupy a worker needed for progress.
+
+If both audiences matter, I provide separately named sync and async entry APIs with documented behaviour. The sync form can own a dedicated runtime only when that is an intentional part of its contract.
+
+Runtime-specific spawning, timers, and I/O types create coupling even without a builder call. I keep these choices near application composition when portability is valuable, and accept coupling deliberately when a runtime feature is central to the design.
+
+## Startup order belongs before uncontrolled concurrency
+
+At main I load and validate configuration, initialise observability, build clients, and establish cancellation signals. I then enter the async application with owned dependencies. This keeps partially initialised global state to a minimum.
+
+Starting background tasks too early can lose their handles or let them observe incomplete configuration. I retain join handles or place tasks in a supervised set. A startup failure should cancel and await anything already launched before returning a useful exit status.
+
+Command-line parsing and simple filesystem reads may stay synchronous when their cost is bounded and happens before the runtime. CPU-heavy initialization can use dedicated threads or a blocking pool after the executor starts. “Inside async” does not automatically make blocking work cooperative.
+
+## Shutdown is part of the entrypoint contract
+
+The owner of the runtime also owns its ending. On termination I stop accepting work, signal tasks, allow bounded draining, flush durable state and telemetry where possible, then return an appropriate process status.
+
+Dropping the runtime may cancel outstanding tasks. Detached work is not guaranteed to finish just because main’s future returns. I test shutdown with in-flight requests, stuck dependencies, and repeated signals.
+
+Panics and errors need a clear policy. Returning `Result` from supported main forms can produce an exit code and debug-formatted error, while a service may want structured top-level reporting. I avoid both swallowing errors and logging the same chain in every layer.
+
+## Tests need controlled runtime ownership too
+
+Async test attributes provide a runtime per test according to their configuration. For integration scenarios, one explicit test runtime may make time control and cleanup easier. I never let background tasks leak between tests.
+
+Compile evidence proves a bare async main is invalid. Behavioural tests prove that the selected runtime configuration drives tasks, observes cancellation, and shuts down resources. These are different claims.
+
+For binaries supporting several modes, synchronous main can parse the mode and build only the necessary runtime components. This reduces startup work and makes feature-specific failures easier to locate.
+
+## My E0752 checklist
+
+- Is the actual language entrypoint declared `async` without a runtime transformation?
+- Which executor should poll the top-level future?
+- Does a runtime macro generate the intended configuration, or is an explicit builder clearer?
+- Is runtime creation kept at the application edge rather than inside libraries?
+- Are startup tasks supervised and cancelled if later initialization fails?
+- What happens to in-flight futures when the top-level future returns?
+- Are blocking startup and runtime operations placed deliberately?
+- Do integration tests cover graceful shutdown, timeouts, and process status?
+
+The core principle is that asynchronous code needs a synchronous owner which starts polling and eventually stops it. E0752 keeps that first boundary explicit. I use the entrypoint to own runtime configuration, startup order, supervision, and shutdown rather than treating an attribute as invisible plumbing.

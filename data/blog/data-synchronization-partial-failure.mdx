@@ -1,0 +1,186 @@
+---
+title: "Designing Data Synchronization for Partial Failure"
+date: "2026-09-05T14:00:00+01:00"
+tags: ["distributed systems", "data synchronization", "reliability", "api integration", "software engineering"]
+draft: false
+reviewed: true
+reviewedHash: "7da0b56ed71fe37c09f3947189bd1ef0cdb5a0049598277a50f587d97704ec87"
+cluster: "reliable-data-integrations"
+campaign: "authority-2026"
+opportunity: "DATA-002"
+summary: "A synchronization run rarely fails as one clean unit. Define progress, safe retries, checkpoints, and recovery so partial success becomes an ordinary state."
+---
+
+A synchronization job can read 9,000 records and fail on record 9,001. Is the run successful or failed?
+
+The honest answer is both. Some work became durable. Some work did not happen. The source may also have changed while the job was reading it.
+
+This is why I do not model synchronization as one large request. I model it as a process that moves the destination toward a known state, through many small recoverable steps.
+
+The core principle is:
+
+> Partial success is not an edge case. It is a normal state that needs an explicit recovery path.
+
+## The happy path hides the real contract
+
+A first implementation often looks like this:
+
+```ts
+async function synchronize() {
+  const records = await provider.listEverything();
+  await destination.replaceEverything(records);
+}
+```
+
+Real providers add more states:
+
+- results are paginated;
+- rate limits arrive halfway through a run;
+- a request times out after the provider applied it;
+- one record is malformed while the next thousand are valid;
+- credentials expire;
+- the process restarts;
+- a source record changes between page one and page ten.
+
+The important design question becomes: **what fact can the system prove after interruption?**
+
+"The job failed" is not enough. I need the job record to say what completed, what can be repeated, and what needs human attention.
+
+## Define the unit of progress
+
+Recovery becomes easier when progress has a small durable unit. Depending on the source, it can be:
+
+- one resource;
+- one page and its continuation token;
+- one immutable event offset;
+- one bounded time window;
+- one source snapshot version.
+
+A checkpoint is meaningful only if it describes completed durable work. Saving a page cursor before its records are committed can skip data after a crash. Saving it after the commit may repeat the page, so the write path must accept repetition safely.
+
+The ordering is normally:
+
+```text
+fetch page
+    ↓
+validate and map records
+    ↓
+write records durably
+    ↓
+commit checkpoint
+```
+
+If the process stops before the checkpoint, it may fetch the page again. That is okay when applying the same source observation twice has the same intended result.
+
+## Retries need a semantic reason
+
+"Retry three times" is not a reliability design. I first classify the failure.
+
+| Failure | Typical response |
+| --- | --- |
+| timeout or temporary network error | retry with a limit and backoff |
+| provider rate limit | respect its delay, then resume |
+| expired credential | refresh or pause for intervention |
+| malformed record | quarantine or stop, according to the contract |
+| invalid configuration | fail immediately |
+| destination unavailable | stop advancing the checkpoint and retry later |
+
+Retries also need jitter when many workers can fail together. Otherwise all workers wait for the same period and attack the recovering service at the same moment. AWS has a practical explanation of [timeouts, retries, backoff, and jitter](https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/).
+
+Most importantly, the operation must be safe to repeat. HTTP itself distinguishes idempotent methods because a client can retry after a connection failure without knowing whether the first request completed. [RFC 9110 explains this uncertainty](https://www.rfc-editor.org/rfc/rfc9110#section-9.2.2).
+
+For writes, a useful key often includes source identity:
+
+```text
+(source, resource_type, external_id, source_revision)
+```
+
+The exact key depends on the product. The important part is that the system can recognize the same intent again.
+
+I wrote separately about [idempotency keys](/blog/idempotency-key) and why [exactly-once delivery is usually the wrong mental model](/blog/exactly-once-delivery-myth).
+
+## Separate observation from application
+
+One strong design is to split the work into two stages:
+
+```text
+external API → source observations → mapping and validation → product state
+```
+
+The first stage records what was observed. The second decides how to apply it.
+
+This separation is useful because network access and product interpretation fail for different reasons. If a mapper has a bug, I can replay stored observations without calling the provider again. If provider access fails, previously fetched records can still finish processing.
+
+It is not free. An intermediate store adds cost, retention questions, and another operational component. For a small integration, an in-process pipeline with careful checkpoints can be enough. The architecture should match the recovery requirement.
+
+## Decide what one bad record means
+
+There are two dangerous defaults:
+
+1. Stop every run forever because one record is invalid.
+2. Ignore the record and report success.
+
+Neither is always correct.
+
+For independent records, quarantine can be useful. Store the source identity, failure reason, mapper version, and a safe representation of the input. Continue the rest of the page, but mark the run as completed with errors.
+
+For related records, continuing may produce an invalid state. If a parent record is missing, importing its children can be wrong. In this case the failure boundary may need to be a group, page, or snapshot.
+
+The product must choose this boundary. Infrastructure cannot discover the business meaning by itself.
+
+## Success needs more than a green job
+
+A run status should answer operational questions:
+
+```ts
+type SyncRun = {
+  state: "running" | "completed" | "completed_with_errors" | "paused" | "failed";
+  startedAt: string;
+  checkpoint?: string;
+  fetched: number;
+  applied: number;
+  unchanged: number;
+  quarantined: number;
+  lastSuccessfulProgressAt?: string;
+};
+```
+
+This makes a useful distinction between activity and progress. A job can be running and retrying for six hours without making one successful write.
+
+I also want metrics for freshness, retry count, oldest unresolved failure, and lag from source observation to destination application. Throughput alone can look healthy while important data is stale.
+
+## Test interruption, not only completion
+
+The best synchronization tests stop the system in uncomfortable places:
+
+- after fetching a page but before writing it;
+- after writing half a batch;
+- after writing all records but before saving the checkpoint;
+- while the provider returns the same page twice;
+- while records arrive out of order;
+- while a retry happens after an unknown outcome.
+
+Then restart the process and inspect the final state.
+
+The goal is not to prove that every line runs once. The goal is to prove that repetition and interruption still converge on an acceptable result.
+
+## What I took from building synchronization systems
+
+Building synchronization systems made partial failure impossible to treat as an afterthought. Provider limits, pagination, interruption, repeated observations, and durable representation all meet at this boundary.
+
+The examples here are intentionally generic. The lesson is that recovery is part of the data model, not only a `catch` block around the network call.
+
+## A recovery checklist
+
+For each synchronization step, ask:
+
+- What is the smallest durable unit of progress?
+- When is its checkpoint committed?
+- What happens if this exact step runs twice?
+- Which errors are retryable, and for how long?
+- Can one bad record be isolated safely?
+- Can an operator see stale progress?
+- Can stored input be replayed after mapping logic changes?
+- What does "completed with errors" mean to the product?
+
+A reliable synchronizer is not one that never fails. It is one that knows how to continue without guessing what already happened.

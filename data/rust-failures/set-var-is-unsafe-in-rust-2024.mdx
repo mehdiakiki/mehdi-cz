@@ -1,0 +1,105 @@
+---
+caseId: "RFA-084"
+title: "Rust 2024: Why std::env::set_var Became Unsafe"
+date: "2026-09-05T09:04:00+01:00"
+lastmod: "2026-09-05T09:04:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "98c5d3fb7c2315eec07cd2ea65b137bb951184d6848cf693096a8b4911f2dbb6"
+area: "upgrades-compatibility"
+symptom: "A call to std::env::set_var requires an unsafe block after moving the crate to edition 2024."
+summary: "The process environment is shared with threads and foreign libraries whose reads Rust cannot observe. The strongest repair is often explicit application configuration, not a larger unsafe block."
+rustVersions: ["Rust 1.98.1"]
+targets: ["Unix-family targets", "all targets at the API boundary"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust 2024 set_var unsafe E0133",
+    "std env set_var now unsafe",
+    "environment mutation threads Rust",
+  ]
+evidence:
+  ["Rust 1.98.1 edition-2024 failure", "thread-lifecycle invariant", "documented unsafe repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/edition-guide/rust-2024/newly-unsafe-functions.html",
+    "https://doc.rust-lang.org/std/env/fn.set_var.html",
+  ]
+---
+
+This familiar setup code changes meaning under edition 2024:
+
+```rust
+fn main() {
+    std::env::set_var("RFA_MODE", "verified");
+}
+```
+
+Rust 1.98.1 reports E0133 because `set_var` is unsafe in the 2024 edition. The [failing program](/rust-failure-atlas/evidence/RFA-084/fail.rs) pins that result.
+
+The surprising part is not that environment variables are global. It is that modifying them can interact unsafely with reads performed outside Rust's control. A process may contain foreign libraries, runtime support code, or another thread using platform environment functions. Rust cannot inspect all of those operations and prove there is no race.
+
+## Process-wide state crosses library boundaries
+
+An application often treats the environment like a map. That mental model is incomplete. It is process-global state exposed through operating-system and C-library APIs. Some platforms provide stronger behavior than others, but a portable Rust API cannot assume that every concurrent reader and writer is safely coordinated.
+
+The [Edition Guide](https://doc.rust-lang.org/edition-guide/rust-2024/newly-unsafe-functions.html) explains the edition change for `set_var` and `remove_var`. The standard-library [set_var documentation](https://doc.rust-lang.org/std/env/fn.set_var.html) gives the safety condition and platform guidance.
+
+Edition gating lets existing crates continue to compile while new-edition code must acknowledge the contract. The underlying platform risk did not suddenly appear in 2024.
+
+## A narrow unsafe block needs a lifecycle proof
+
+For a single-threaded program before any thread or foreign runtime is started, the direct repair can be honest:
+
+```rust
+fn main() {
+    // Safety: no other threads have been created and no foreign code runs here.
+    unsafe { std::env::set_var("RFA_MODE", "verified") };
+    start_application();
+}
+```
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-084/fixed.rs) uses this limited situation. The comment is not a generic permission to mutate the environment. It depends on the program being before its concurrency boundary.
+
+In a test process, that condition may already be false. Rust tests run concurrently by default, and dependencies may read environment variables. A test that changes a common variable can be logically flaky even on a platform where the operation does not corrupt memory.
+
+## Explicit configuration is usually stronger
+
+For application behavior I prefer reading the environment once, validating it, and passing a configuration value through owned Rust data:
+
+```rust
+struct Config {
+    mode: String,
+}
+
+fn load_config() -> Result<Config, std::env::VarError> {
+    Ok(Config { mode: std::env::var("RFA_MODE")? })
+}
+```
+
+Workers receive `Arc<Config>` or the fields they need. Tests construct `Config` directly. This avoids process-global mutation, makes dependencies visible, and allows two test cases to use different settings without coordination.
+
+Subprocess configuration is another good boundary. `std::process::Command::env` changes the child process environment being constructed rather than mutating the current process. That often matches the real requirement when invoking a tool.
+
+## A mutex is not a complete fix
+
+It is tempting to put `set_var` behind a global Rust mutex. That coordinates only code using the same mutex. A C library, system function, or dependency may read the environment without taking it. The safety problem is precisely that the full reader set is not visible to the type system.
+
+This is a recurring systems lesson: synchronization works only when every participant shares the protocol.
+
+## How I migrate a real repository
+
+I classify each mutation:
+
+1. Startup configuration before concurrency.
+2. Test-only mutation.
+3. Configuration for a child process.
+4. Runtime feature switching or application state.
+
+The first may justify a documented unsafe block. The second should usually become injected configuration or a subprocess-isolated test. The third belongs on `Command`. The fourth should move to application state, a flag service, or another synchronized component rather than the operating-system environment.
+
+I also search transitive helpers. A wrapper named `configure_runtime` may hide the `set_var` call far from thread startup, making the local safety comment impossible to support.
+
+Libraries should be especially conservative. A library rarely controls whether its caller already created threads or loaded native code, so it usually cannot justify process-environment mutation. I prefer accepting configuration through a constructor or function argument. This also prevents a library call from changing unrelated behavior elsewhere in the host process, which is a correctness problem even before memory safety is considered.
+
+Rust 2024 forces the design question at the call. The fastest compiling edit is an unsafe block, but the durable repair is to shrink the amount of code depending on mutable process-wide state. When mutation remains, its proof should name the exact point before other threads and foreign readers can exist.

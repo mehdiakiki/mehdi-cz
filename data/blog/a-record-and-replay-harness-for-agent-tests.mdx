@@ -1,0 +1,165 @@
+---
+title: "A Record-and-Replay Harness for Agent Tests"
+date: "2026-09-09T07:50:00+01:00"
+lastmod: "2026-09-09T07:50:00+01:00"
+tags: ["ai agents", "llm evaluation", "testing", "determinism", "software engineering"]
+draft: false
+reviewed: true
+reviewedHash: "9e89e1106ca8fcb13a29e94c6c0fbc4e1d7c7ec02933306ffcdc170a47b8611d"
+cluster: "reliable-ai-systems"
+campaign: "editorial"
+summary: "A working record-and-replay harness for agent tests: a JSON cassette of decisions and tool results, deterministic replay with zero live calls, and a readable diff when the trajectory changes."
+---
+
+An agent test that calls a real model and real tools is slow, costs money, and fails for reasons unrelated to your change. The fix is a cassette: record every model decision and every tool result once, then replay them. Replay is deterministic, makes zero live calls, and fails with a readable diff when the code asks for a different tool or different arguments. In the harness below, one live run takes 2674 ms and 200 replays take 5.1 ms.
+
+The pattern is old. HTTP libraries have done this for years, and VCR in Ruby is the reference most people know. What I could not find was a small implementation for an agent loop, where the recorded thing is an alternating sequence of decisions and tool calls. So I wrote one.
+
+```bash
+node experiments/ai-evals/agent-replay.mjs
+node --test experiments/ai-evals/*.test.mjs
+```
+
+## What has to go into the cassette
+
+An agent run is a loop. The agent asks for a decision, the decision names an intent, the agent code turns that intent into a tool call, and the tool returns.
+
+Two things must be recorded. The decisions are the non-deterministic input, and you want them frozen. The tool results are the environment, and freezing them is what makes the test hermetic.
+
+What must not be recorded is the step between: the agent code that turns an intent into a tool call. That code is under test.
+
+This distinction is the whole design. In the fixture the model asks for a refund of 19000 cents. The agent code inserts an eligibility check first, then caps the amount at the order total of 14500. The cassette stores both numbers.
+
+```json
+[
+  {
+    "kind": "decision",
+    "index": 2,
+    "decision": { "intent": "issue_refund", "amountCents": 19000 }
+  },
+  {
+    "kind": "tool",
+    "index": 2,
+    "name": "check_refund_eligibility",
+    "args": { "orderId": "ord-99120" },
+    "result": { "eligible": true, "maxRefundCents": 14500 },
+    "latencyMs": 240
+  },
+  {
+    "kind": "tool",
+    "index": 3,
+    "name": "issue_refund",
+    "args": { "orderId": "ord-99120", "amountCents": 14500 },
+    "result": { "refundId": "rf-ord-99120-1", "refundedCents": 14500 },
+    "latencyMs": 520
+  }
+]
+```
+
+That is an excerpt. The first two decisions with their tool calls, and the final decision, are not shown. The indices are the real ones from `cassettes/refund-within-order-total.json`.
+
+Reading that JSON I see the safety behaviour without running anything. A cassette is documentation of what the system actually did, which is what "The Final Answer Can Be Right While the Tool Trajectory Is Unsafe" asks you to grade.
+
+## Three modes: record, replay, hybrid
+
+`record` runs the live decision source and the live tools, and writes everything down.
+
+`replay` runs neither. Decisions and tool results both come from the cassette.
+
+`hybrid` replays the decisions but executes the tools for real. Use it when a tool contract changes and you want to know whether the recorded reasoning still works.
+
+```text
+[record] one simulated live run
+  wall clock: 2674.2 ms
+  live decisions: 4, live tool calls: 4
+  cassette steps: 8
+  trajectory: search_policy -> lookup_order -> check_refund_eligibility -> issue_refund
+
+[replay] same code, cassette only
+  wall clock: 0.2 ms
+  live decisions: 0, live tool calls: 0
+  replayed decisions: 4, replayed tool calls: 4
+  200 replays including cassette parsing: 5.1 ms total, 0.03 ms each
+
+[hybrid] decisions replayed, tools executed for real
+  wall clock: 1152.5 ms
+  live decisions: 0, live tool calls: 4
+```
+
+The live latencies are artificial sleeps, not a network. The decision costs 380 ms and the four tools between 180 ms and 520 ms. The wall clock lines move a little between runs, the counters do not. About 57% of the live run waits for decisions, 43% for tools.
+
+Replay costs 0.03 ms per run, so one live run buys tens of thousands of replays. The exact ratio moves by a factor of several under CPU load, which is why the counters matter more than the ratio. A suite of two hundred agent cases takes nine minutes live and well under a second on cassettes, so it runs on every commit.
+
+I assert `live decisions: 0` and `live tool calls: 0` in the test, not the mode flag. A harness that silently falls through to a live call is worse than no harness, because the suite then makes paid calls that nobody planned for.
+
+## Divergence detection is the feature, not the error
+
+A cassette that only replays is a fast way to run the old code. It becomes a test when it notices the new code asking for something else.
+
+First case: someone removes the eligibility check from the agent code.
+
+```text
+[divergence] the eligibility check is removed from the agent code
+  divergence at tool call 2
+    expected tool: check_refund_eligibility
+    actual tool:   issue_refund
+    recorded args: {"orderId":"ord-99120"}
+    actual args:   {"amountCents":14500,"orderId":"ord-99120"}
+```
+
+Second case: someone removes the cap that limits a refund to the order total. Same tools, different money.
+
+```text
+[divergence] the refund cap is removed, so only the arguments change
+  divergence at tool call 3 (issue_refund)
+    -amountCents: 14500
+    +amountCents: 19000
+     orderId: "ord-99120"
+```
+
+The second one matters most. The trajectory is identical, the final answer would be identical, and the refund is 4500 cents larger than the order. A test that reads only the answer sees nothing. It is the same defect class as the duplicate and over-amount effects in "Make Retried Agent Actions Idempotent Before Adding Autonomy".
+
+The diff marks unchanged fields with a leading space and changed ones with a minus and plus line. A reviewer reading a failed CI job should not have to decode which field moved, and "amountCents changed from 14500 to 19000" needs no decoding.
+
+A short run is a divergence too. If the code finishes while the cassette still holds unused tool calls, the harness fails and names the first unused call. Otherwise removing a step would silently pass.
+
+## Where cassettes fit against other agent tests
+
+A cassette is a regression test with a specific shape: it pins one full trajectory, arguments included.
+
+That makes it good at catching an unintended change in the path. It cannot measure quality, because it replays one recorded reality and cannot say whether that reality was correct. For quality you still need the graded set and the interval in [What Evidence an AI Feature Needs Before You Ship It](/blog/what-evidence-an-ai-feature-needs-before-you-ship-it).
+
+Cassettes should come from production failures with the personal data removed, following [Turn Production Traces Into an Evaluation Set Without Copying User Data](/blog/turn-production-traces-into-an-evaluation-set-without-copying-user-data). A recorded trace that still holds a real customer's order is a data problem in your repository forever.
+
+Two behaviours deserve their own cassettes. One is the approval boundary: the model asks to send or spend and the code must stop and wait, as in "Approval Boundaries for Expensive, External, and Irreversible AI Actions". The other is resumption: a cassette that ends mid-run, so the test asserts that the workflow restarts from durable state instead of replaying an effect, as in "Recovering an Agent Workflow After the Process Dies".
+
+## When a cassette must be re-recorded
+
+This is where the pattern goes wrong. A cassette that is re-recorded whenever it fails stops being a test. It only records what the code did last.
+
+I re-record when the intended behaviour changed and a human reviewed the diff: a new required tool, a changed tool contract, a deliberate policy change. The review happens on the cassette diff in the pull request, like any other change.
+
+I do not re-record because the test is red and the deadline is near, and I do not re-record because the model version changed. A changed trajectory under a new model is exactly the information the cassette exists to give me.
+
+Two rules keep this workable. Pin the recorded-at stamp instead of a wall clock value, or every rerecord produces a diff full of timestamps that nobody reads. And version the cassette format, so an old file fails loudly instead of being misread.
+
+Cassettes also age. If a tool's response shape changes and nothing re-records, the suite stays green while testing a tool contract that no longer exists. That is what `hybrid` mode is for, run on a schedule rather than on every commit.
+
+## What I check in a record-and-replay setup
+
+- Replay makes zero live calls, and the test asserts the counters.
+- The code that builds tool arguments stays outside the recording, so it can still fail.
+- Divergence names the tool, the index, and the changed argument fields.
+- A run that ends early, with recorded calls unused, fails too.
+- The cassette is deterministic on disk, so a rerecord shows only real changes.
+- Cassettes carry no personal data.
+- Re-recording requires a reviewed diff, never a red build and a deadline.
+- Something runs against the real tools on a schedule, so cassettes cannot drift.
+
+## Sources
+
+- [Google Testing Blog, Hermetic Servers](https://testing.googleblog.com/2012/10/hermetic-servers.html)
+- [Martin Fowler, Mocks Aren't Stubs](https://martinfowler.com/articles/mocksArentStubs.html)
+- [VCR, record and replay HTTP interactions](https://github.com/vcr/vcr)
+- [FoundationDB, deterministic simulation testing in the FDB paper](https://www.foundationdb.org/files/fdb-paper.pdf)
+- [Anthropic, Demystifying evals for AI agents](https://www.anthropic.com/engineering/demystifying-evals-for-ai-agents)

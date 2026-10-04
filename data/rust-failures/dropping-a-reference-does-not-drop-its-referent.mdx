@@ -1,0 +1,114 @@
+---
+caseId: "RFA-403"
+title: "Dropping a Reference Does Not Drop Its Referent"
+date: "2026-09-06T03:43:00+01:00"
+lastmod: "2026-09-06T03:43:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "72a9428bb76c02422f2b11c9add6a635b47d0216802a4af8b9d7f78320658613"
+area: "concurrency-memory"
+symptom: "drop(&guard) returns immediately but the guard's destructor counter stays at zero because only a copied reference was consumed."
+summary: "std::mem::drop destroys the value passed by ownership. Passing &T drops only a Copy reference and leaves T alive; move the owned resource into drop or end its owner scope when cleanup timing matters."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust drop reference does nothing", "dropping references lint referent not dropped", "force destructor through shared reference Rust"]
+evidence: ["Rust 1.98.1 Drop counter", "shared-reference drop call", "owned-value drop repair"]
+sources: ["https://doc.rust-lang.org/std/mem/fn.drop.html", "https://doc.rust-lang.org/std/ops/trait.Drop.html", "https://doc.rust-lang.org/rustc/lints/listing/warn-by-default.html#dropping-references"]
+---
+
+I once saw `drop(resource_ref)` and read it as “release the resource now.” The variable was a reference. The call released nothing owned by the referent.
+
+The [failing fixture](/rust-failure-atlas/evidence/RFA-403/fail.rs) gives the underlying value an observable destructor. After `drop(borrowed)`, the counter remains zero. The value is destroyed only when its owner later leaves scope.
+
+## drop consumes exactly its argument
+
+[`std::mem::drop`](https://doc.rust-lang.org/std/mem/fn.drop.html) is conceptually simple:
+
+```rust
+pub fn drop<T>(_x: T) {}
+```
+
+The function takes a value by ownership. When the function returns, that parameter reaches the end of its scope and is destroyed normally.
+
+If `T` is `File`, `MutexGuard`, or another owned resource, moving it into `drop` ends that owner and runs its destructor. If `T` is `&File` or `&MutexGuard`, only the reference value is passed.
+
+A shared reference is `Copy`. Copying and then ending one reference does not move, close, or destroy the value it points at.
+
+## Rust warns because this is usually a mistake
+
+The `dropping_references` lint is [warn-by-default](https://doc.rust-lang.org/rustc/lints/listing/warn-by-default.html#dropping-references). It catches calls to `drop` where the argument is a reference and explains that the call does nothing to the referent.
+
+The evidence fixture allows the lint so the mistaken program can run and expose the destructor counter. In production I do not silence this warning globally. It often identifies a real ownership misunderstanding.
+
+Removing the call may be correct if the intention was only to stop using the borrow. Moving the owned value is correct if immediate destruction was intended.
+
+## Ending a borrow and dropping an owner are different
+
+Modern Rust uses non-lexical lifetimes. A borrow can end after its last use even if its reference variable remains in the surrounding lexical scope. I rarely need `drop(reference)` to convince the borrow checker that I am finished with it.
+
+If a complex expression keeps a borrow alive, a smaller block often communicates the boundary:
+
+```rust
+let result = {
+    let borrowed = value.inspect();
+    calculate(borrowed)
+};
+value.mutate(result);
+```
+
+The block shows when access ends. It still does not destroy `value`.
+
+## Move the owner for immediate cleanup
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-403/fixed.rs) passes the owned `Tracked` value to `drop`. The counter becomes one immediately.
+
+```rust
+drop(value);
+assert_eq!(drops.get(), 1);
+```
+
+After this call, `value` cannot be used because it was moved. That compiler-enforced loss of access is part of the guarantee. If code can keep using the owned variable, then that owner was not destroyed.
+
+For a field behind `&mut`, moving it directly may be forbidden because the containing value must remain valid. `mem::replace` or `mem::take` can install another valid value and return the old owner, which can then be finalized or dropped.
+
+## Reference-counted pointers add another layer
+
+Dropping `&Arc<T>` drops only a reference to the Arc handle. Dropping an owned `Arc<T>` decrements the strong count. Even then, `T` is destroyed only if that was the last strong owner.
+
+The same phrase “drop it” can therefore mean several different transitions. I name the layer:
+
+- end a borrow;
+- destroy one handle;
+- destroy the final owner and payload;
+- release an external resource controlled by the payload.
+
+Tests should observe the layer that the application actually cares about.
+
+## Drop timing matters for guards
+
+[`Drop`](https://doc.rust-lang.org/std/ops/trait.Drop.html) powers RAII. A mutex guard unlocks, a read guard releases access, and a scoped permit returns capacity when its owner is destroyed.
+
+Calling `drop(&guard)` does not release any of them. This can create a deadlock when code believes it unlocked before attempting another acquisition.
+
+I pass the owned guard to `drop` or put it in a smaller block. The smaller block is often clearest because no later line in that block can accidentally need the guard again.
+
+## A mutable reference is not ownership either
+
+`&mut T` gives exclusive access for a borrow duration, but it still does not own `T`. Passing a reborrow such as `drop(&mut *value)` ends that temporary reference only.
+
+Moving out through a mutable reference requires a replacement operation or an ownership-taking API designed for the type. Exclusivity and ownership solve different problems.
+
+Unsafe pointer operations do not change this fundamental lifecycle. Manufacturing a move without preserving initialization and drop invariants can cause double destruction or use after free.
+
+## My debugging proof
+
+When cleanup seems late, I write down:
+
+1. the exact static type passed to `drop`;
+2. who still owns the resource afterward;
+3. whether shared handles remain;
+4. which destructor controls the external effect;
+5. an observable counter or state transition around the call.
+
+The core principle is literal: `drop` destroys its argument value. A reference is its own small value and does not own the referent. To control cleanup, I need the actual owner or an explicit finalization API, not one more borrowed view of it.

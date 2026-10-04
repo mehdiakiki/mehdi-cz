@@ -1,0 +1,120 @@
+---
+caseId: "RFA-166"
+title: "Why Vec::dedup_by Passes Its Arguments in Reverse Order"
+date: "2026-09-05T17:05:00+01:00"
+lastmod: "2026-09-05T17:05:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "0d0b80819aa02e7ea4370993c65800f79a8cf1321a64984ffd970a5cb8301252"
+area: "concurrency-memory"
+symptom: "A Vec::dedup_by closure observes the later adjacent element as its first argument and the earlier element as its second argument."
+summary: "dedup_by documents a later-then-earlier mutable argument order and removes the first argument when the closure returns true. Name parameters by role and avoid assuming left-to-right callback order."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets with alloc"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust Vec dedup_by arguments reversed",
+    "dedup_by closure argument order later earlier",
+    "Vec dedup_by removes which element",
+  ]
+evidence:
+  ["Rust 1.98.1 callback trace", "two distinct adjacent values", "role-named closure repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/std/vec/struct.Vec.html#method.dedup_by",
+    "https://doc.rust-lang.org/std/vec/struct.Vec.html#method.dedup",
+    "https://doc.rust-lang.org/std/vec/struct.Vec.html#method.dedup_by_key",
+  ]
+---
+
+Callback arguments often follow the order I see in the collection. `Vec::dedup_by` deliberately deserves a closer read.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-166/fail.rs) places `"first"` before `"second"`, records the first callback arguments, and expects the same order. Rust 1.98.1 records `("second", "first")` instead.
+
+This matters beyond naming because both arguments are mutable and the first one is the value removed when the closure returns true.
+
+## The documented order is later, then earlier
+
+[`Vec::dedup_by`](https://doc.rust-lang.org/std/vec/struct.Vec.html#method.dedup_by) removes consecutive elements according to a closure. Its documentation states that the elements are passed in the opposite order from their slice order.
+
+For adjacent values at indexes `i - 1` and `i`, the useful mental model is:
+
+```text
+same_bucket(&mut values[i], &mut values[i - 1])
+            later element          earlier element
+```
+
+If the closure returns true, the first argument—the later element—is removed.
+
+I therefore name parameters `later` and `earlier`, not `left` and `right`. The [repaired program](/rust-failure-atlas/evidence/RFA-166/fixed.rs) does exactly that and asserts the observed order.
+
+## Pure equality can hide the issue
+
+If the closure is symmetric, argument order does not change its answer:
+
+```rust
+values.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+```
+
+This is why many uses work without anyone noticing. The issue appears when the closure:
+
+- mutates one argument;
+- records which representation is canonical;
+- compares directionally;
+- merges data from one element into the other;
+- assigns earlier and later semantic roles.
+
+A test with identical values also hides it. The fixture uses two distinct strings and always returns false so no removal obscures the callback trace.
+
+## Decide which representative survives
+
+Suppose adjacent records share an ID but the later record has fresher metadata. `dedup_by` normally keeps the earlier element when it reports a duplicate. If I want latest metadata to survive, I can copy or merge selected fields from `later` into `earlier`, then return true to remove `later`.
+
+That looks counterintuitive unless the parameter roles are explicit:
+
+```rust
+records.dedup_by(|later, earlier| {
+    if later.id == earlier.id {
+        earlier.metadata = later.metadata.clone();
+        true
+    } else {
+        false
+    }
+});
+```
+
+Now the earlier slot survives with merged data. Whether this is a good design depends on cloning cost and failure invariants, but the ownership outcome is clear.
+
+If I instead mutate `later` and return true, that mutation disappears with the removed element.
+
+## Deduplication is only consecutive
+
+Like [`Vec::dedup`](https://doc.rust-lang.org/std/vec/struct.Vec.html#method.dedup), this method removes only consecutive matches. `[A, B, A]` retains both `A` values unless I sort or otherwise group them first.
+
+Sorting introduces another policy: which representation becomes earlier among equal keys? A stable sort preserves input order for equal keys; an unstable sort does not promise it. Canonicalization therefore needs a complete plan, not only one `dedup_by` closure.
+
+For global uniqueness without ordering, a map or set may be a better model. The Atlas cases for [HashMap key retention](/rust/failures/hashmap-insert-equal-key-keeps-original-key) and [HashSet replacement](/rust/failures/hashset-replace-stores-new-equal-value) show that those APIs also require an explicit representative policy.
+
+## Mutation and panic need an invariant
+
+The closure receives mutable references. If it changes one value and then panics, the vector remains memory-safe but may contain partially normalized records. There is no generic rollback.
+
+I keep closure work small and infallible when possible. For multi-step merging, I compute a candidate from shared references first, then apply one clear mutation. If recovery after `catch_unwind` matters, I test a panic at each mutation point.
+
+This is the same broad rule as `Option::take_if`: a predicate receiving `&mut T` is not automatically observational.
+
+## My verification sequence
+
+When `dedup_by` preserves the wrong data, I check:
+
+1. Are equal values adjacent?
+2. Which argument is later and which is earlier?
+3. Which argument is removed on true?
+4. Does the closure mutate a value that will be removed?
+5. Does preprocessing define a stable canonical order?
+6. What remains if the closure panics?
+
+I also record one callback pair in a minimal test. This is faster than reasoning from final output when several elements merge.
+
+The core principle is that callback position is part of an API contract. A closure with two mutable values cannot safely be understood as anonymous `a` and `b` when direction matters. For `dedup_by`, the first is later and removable; the second is earlier and retained. Naming those roles turns a surprising reverse order into readable code.

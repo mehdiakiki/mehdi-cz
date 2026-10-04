@@ -1,0 +1,101 @@
+---
+caseId: "RFA-698"
+title: "Cargo build.rs Generated Files Belong Under OUT_DIR"
+date: "2026-09-07T10:52:00+01:00"
+lastmod: "2026-09-07T10:52:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "4aa8f1d621f0740da00d5361bffff97a6d0a831dd4b6e866fb4c1f81783c1b35"
+area: "cargo-dependencies"
+symptom: "include! cannot find generated.rs under OUT_DIR even though build.rs successfully wrote a file with that name."
+summary: "A relative write in build.rs uses the package directory, while concat!(env!(OUT_DIR), ...) reads Cargo's isolated output directory. Build one absolute destination from OUT_DIR and share that contract with the include site."
+rustVersions: ["Rust 1.98.1", "Cargo 1.98.1", "edition 2024"]
+targets: ["all Cargo targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Cargo include OUT_DIR generated file not found", "build.rs writes generated.rs wrong directory", "couldn't read OUT_DIR generated Rust file"]
+evidence: ["Cargo 1.98.1 generated-source fixture", "successful write to package root but missing OUT_DIR file", "shared OUT_DIR path repair"]
+sources: ["https://doc.rust-lang.org/cargo/reference/environment-variables.html#environment-variables-cargo-sets-for-build-scripts", "https://doc.rust-lang.org/cargo/reference/build-scripts.html#outputs-of-the-build-script", "https://doc.rust-lang.org/std/macro.include.html"]
+---
+
+A build script writes `generated.rs` successfully. The Rust crate immediately fails because `include!` cannot read `generated.rs` under a long path inside `target`. Both operations used the same file name, but they did not use the same directory.
+
+The [failing project](/rust-failure-atlas/evidence/RFA-698/fail/Cargo.toml) calls `std::fs::write("generated.rs", ...)` in `build.rs`. Cargo starts a build script with the package directory as its working directory, so the file lands beside the manifest. The library looks under `env!("OUT_DIR")`, where nothing was written.
+
+This failure is a path-contract bug, not an ordering race.
+
+## Relative paths need an owner
+
+A relative path always receives meaning from a current directory. Build systems can change that context through workspace commands, packaging, vendoring, remote execution, or direct script invocation.
+
+Cargo documents `CARGO_MANIFEST_DIR` for package source inputs and `OUT_DIR` for build outputs. I use them for different ownership:
+
+```text
+CARGO_MANIFEST_DIR -> checked-in inputs owned by the package
+OUT_DIR            -> generated outputs owned by this package build
+```
+
+I do not generate into `src` or the repository root. That dirties the checkout, creates races between profiles and targets, surprises packaging, and lets one build reuse another build's target-specific file.
+
+## Build one destination from OUT_DIR
+
+The [repaired project](/rust-failure-atlas/evidence/RFA-698/fixed/Cargo.toml) obtains `OUT_DIR` while the script runs, converts it to a `PathBuf`, and joins `generated.rs`:
+
+```rust
+let output = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo supplies OUT_DIR"));
+fs::write(output.join("generated.rs"), generated_source)?;
+```
+
+The Rust library uses:
+
+```rust
+include!(concat!(env!("OUT_DIR"), "/generated.rs"));
+```
+
+The generator and consumer now share one location chosen by Cargo. The [Cargo environment reference](https://doc.rust-lang.org/cargo/reference/environment-variables.html#environment-variables-cargo-sets-for-build-scripts) explains that this directory is unique to the package build.
+
+I use `var_os` for paths because operating-system paths are not guaranteed to be Unicode. Converting a required build path to `String` too early can create another target-specific failure.
+
+## include! parses code in the caller's context
+
+The [`include!` macro](https://doc.rust-lang.org/std/macro.include.html) reads a file at compile time and parses its contents as Rust in the surrounding expression or item context. It is not a module boundary by itself.
+
+Generated tokens therefore need the right syntax for the include position. Inner attributes, imports, names, and macro hygiene can interact with the caller. A file that exists can still fail because the generator produced invalid or context-inappropriate Rust.
+
+For larger generated APIs I include the file inside a private module and re-export a deliberate surface. This reduces accidental name collisions and makes generated-versus-handwritten ownership clear.
+
+I format or parse generated source during tests when practical. A failure that points only into an OUT_DIR file is hard to diagnose if CI does not preserve or print the relevant safe fragment.
+
+## OUT_DIR can keep old files
+
+Cargo's output directory is isolated, but a build script must not assume it is empty on every run. Old files can remain across rebuilds. If generation stops producing a module, a stale file may continue to satisfy `include!` unless the consumer and cleanup policy change together.
+
+I normally write a complete deterministic output set, replace files atomically where interruption matters, and remove obsolete members owned by that generator. I never delete the entire Cargo directory from inside a build script; it may contain artifacts managed by Cargo or another execution.
+
+Content-addressed names or a generated manifest can help when the set is large. The included root should identify exactly which generated version belongs to this build.
+
+## Inputs and outputs need separate invalidation
+
+Correct output placement does not tell Cargo when to rerun generation. I still emit `rerun-if-changed` for source schemas and `rerun-if-env-changed` for external variables that affect the bytes.
+
+The dependency graph is:
+
+```text
+declared inputs -> build.rs -> OUT_DIR/generated.rs -> include! -> crate artifact
+```
+
+Every arrow needs a test. A clean build proves creation. A warm build after changing an input proves invalidation. A target or feature matrix proves outputs do not leak between configurations.
+
+## My generated-file check
+
+When Cargo says a generated file is missing, I check:
+
+1. the build script's actual absolute destination;
+2. the include site's actual absolute source path;
+3. whether both use the same package, profile, and target OUT_DIR;
+4. whether generation completed before returning success;
+5. whether the file contains valid Rust for its include context;
+6. whether all source inputs have rerun declarations;
+7. whether stale files can survive after the output set shrinks;
+8. whether logs expose only safe paths and content.
+
+The core principle is that generated data needs a single owner and address. Cargo gives each package build an output directory for that purpose. Once the writer and reader derive the same path from `OUT_DIR`, missing files stop being mysterious and cross-target isolation becomes part of the build structure rather than a convention.

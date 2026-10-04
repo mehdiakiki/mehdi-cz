@@ -1,0 +1,218 @@
+---
+title: "Make Retried Agent Actions Idempotent Before Adding Autonomy"
+date: "2026-10-01T09:00:00+01:00"
+tags: ["ai agents", "idempotency", "tool calling", "retries", "reliability"]
+draft: false
+reviewed: true
+reviewedHash: "8c75d99c77dc825851a8ba02668bc2a1ea0b0afdaf2ca3568039f160846a9ff1"
+cluster: "reliable-ai-systems"
+campaign: "authority-2026"
+opportunity: "AI-018"
+summary: "Agent retries must reuse one logical action identity and reconcile uncertain effects. An effect ledger makes autonomy bounded, inspectable, and recoverable."
+---
+
+An AI workflow calls `send_invoice`. The provider accepts the request, but the response is lost. The agent sees a timeout and tries again with newly generated arguments.
+
+This is not a model-quality problem. It is the old distributed-systems problem of an ambiguous write, now placed inside a loop that can decide to act again.
+
+Before I increase an agent's autonomy, I make every mutating tool answer three questions:
+
+1. What single human or system intent does this action represent?
+2. How does a retry prove it is the same action?
+3. How do we discover the result when the first outcome is unknown?
+
+The implementation I use is an effect ledger.
+
+## Attempt identity is not action identity
+
+Each model turn, HTTP request, and worker execution can have its own attempt ID. They must share one logical action ID when they represent the same intended effect.
+
+```text
+task_id: task_91
+action_id: action_send_invoice_42_v3
+attempt_id: attempt_1
+attempt_id: attempt_2
+```
+
+Generating a new action ID after a timeout defeats idempotency. The retry must carry the original ID through model orchestration, queue delivery, and provider call.
+
+I do not ask the model to invent this key. Trusted application code derives or allocates it when the action is proposed and binds it to canonical arguments.
+
+## The effect ledger
+
+A useful record is:
+
+```sql
+create table agent_effect (
+  action_id text primary key,
+  task_id text not null,
+  actor_id text not null,
+  tenant_id text not null,
+  tool_name text not null,
+  tool_version text not null,
+  canonical_arguments jsonb not null,
+  arguments_sha256 text not null,
+  approval_id text,
+  expected_resource_version text,
+  state text not null,
+  provider_idempotency_key text,
+  provider_result_id text,
+  attempt_count integer not null default 0,
+  last_error_code text,
+  created_at timestamptz not null,
+  updated_at timestamptz not null
+);
+```
+
+The ledger stores the approved intent, not hidden chain-of-thought. Canonical arguments use resolved resource IDs, bounded values, and a tool contract version.
+
+If the same `action_id` arrives with a different argument hash, execution stops. It is a new intent trying to reuse an old identity.
+
+## Use an explicit state machine
+
+I keep the states small:
+
+```text
+proposed -> awaiting_approval -> ready -> executing
+executing -> succeeded
+executing -> retryable_failure -> ready
+executing -> permanent_failure
+executing -> uncertain -> reconciling
+reconciling -> succeeded | ready | operator_review
+```
+
+There is no transition from `succeeded` back to `ready`. A later desire to repeat the effect creates a new action and, when needed, a new approval.
+
+The worker claims `ready` with a compare-and-set:
+
+```sql
+update agent_effect
+set state = 'executing',
+    attempt_count = attempt_count + 1,
+    updated_at = now()
+where action_id = :action_id
+  and state in ('ready', 'retryable_failure')
+returning *;
+```
+
+Only the worker receiving a row can call the provider.
+
+## Idempotency has to reach the provider
+
+The local ledger prevents two local workers from intentionally starting the same action. It cannot undo a crash after the provider commits but before the local success update.
+
+When the provider supports idempotency, I send a stable key derived from the action identity:
+
+```text
+provider key = hash(tenant_id, tool_name, action_id)
+```
+
+Retries reuse it. They do not hash `attempt_id`.
+
+AWS's [guidance on safe retries](https://aws.amazon.com/builders-library/making-retries-safe-with-idempotent-APIs/) emphasizes caller-provided request identity and semantic equivalence across retries. The same principle applies to agent tools: repeated transport attempts should represent one caller intent.
+
+## Unknown is a real result
+
+A timeout on a write does not mean failure. It means the client lacks evidence.
+
+I classify outcomes:
+
+```text
+definite success       -> store provider result, mark succeeded
+definite rejection     -> mark permanent or retryable failure
+no request was sent    -> safe to retry within policy
+request may have landed-> mark uncertain, reconcile
+```
+
+Reconciliation can query by provider idempotency key, external reference, or expected resource change. If the provider has no lookup and no idempotency support, the tool has weaker autonomy. It may need operator review rather than an automatic second write.
+
+Returning `false` for an unknown outcome is a dangerous simplification.
+
+## Approval binds exact intent
+
+For a consequential action, approval covers:
+
+- canonical tool name and version;
+- resolved target identity;
+- exact or bounded arguments;
+- expected resource version;
+- actor and tenant;
+- expiry time;
+- action ID.
+
+If the agent changes the amount, recipient, or target after approval, the argument hash changes and the action returns to `awaiting_approval`.
+
+A retry of identical approved intent does not ask the user again. A mutation of intent does.
+
+## Stale state stops execution
+
+Between proposal and execution, the target may change. I compare the current version with `expected_resource_version` immediately before the effect.
+
+```text
+approved invoice version: 7
+current invoice version: 8
+result: stale_action, create a new preview
+```
+
+Idempotency prevents duplicate execution. Optimistic concurrency prevents an old but unique action from applying to new state. Both are needed.
+
+## The model sees a bounded tool result
+
+The orchestrator returns status from the ledger:
+
+```json
+{
+  "action_id": "action_send_invoice_42_v3",
+  "status": "uncertain",
+  "next_step": "reconciliation_in_progress",
+  "retry_allowed": false
+}
+```
+
+The model is not allowed to work around this by choosing a second tool with the same effect. Effect classes belong to policy, not only tool names. `send_invoice_email` and `email_customer` may share the external-communication class and target.
+
+## Retry budgets limit amplification
+
+Even idempotent calls consume quota and can pressure an unhealthy provider. I set:
+
+- per-action attempt limit;
+- overall task deadline;
+- exponential backoff with jitter;
+- provider-specific retryable codes;
+- shared retry budget across workers;
+- maximum time in uncertain state before escalation.
+
+Idempotent does not mean free.
+
+## Testing the ledger
+
+I test the state machine with failure injection:
+
+| Injected event | Required result |
+| --- | --- |
+| two workers claim one action | one provider call starts |
+| provider succeeds, response is lost | action becomes uncertain, then reconciles to success |
+| retry arrives with changed arguments | identity conflict, no call |
+| approval expires before execution | action returns to approval |
+| resource version changes | stale action, no call |
+| provider returns retryable error before effect | same action ID retries within budget |
+| process crashes after success response | provider key or reconciliation prevents another effect |
+| successful action re-enters queue | ledger returns stored success |
+
+The assertion is about durable effect count, not only HTTP call count.
+
+## Autonomy follows recoverability
+
+I grant more automatic retry and execution authority when a tool is:
+
+- naturally read-only;
+- idempotent end to end;
+- reversible;
+- cheaply reconciled;
+- tightly bounded in cost and scope.
+
+I grant less when it is irreversible, externally visible, expensive, weakly observable, or supported by no provider idempotency contract.
+
+This is a more useful autonomy scale than “agent level 1 to 5.” It ties authority to engineering evidence.
+
+An agent does not become reliable because the model is less likely to repeat itself. It becomes reliable when repeated attempts converge on one recorded intent, one bounded effect, and one discoverable outcome.

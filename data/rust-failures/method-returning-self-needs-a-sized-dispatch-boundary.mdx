@@ -1,0 +1,87 @@
+---
+caseId: "RFA-371"
+title: "A Trait Method Returning Self Needs a Sized Dispatch Boundary"
+date: "2026-09-06T03:11:00+01:00"
+lastmod: "2026-09-06T03:11:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "bd0a5f035bd56e02209238d09ad8f60ff1045c35c4ecbc1391523852c6b0c5b6"
+area: "diagnostics-macros"
+symptom: "A method returning Self prevents creating a trait object although another receiver method could be dispatched safely."
+summary: "A dyn trait erases the concrete Self type, so it cannot expose a dispatchable method returning that unknown type by value. Add where Self: Sized for concrete-only construction, or return an erased representation deliberately."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust trait method return Self dyn compatible", "E0038 references Self return type", "where Self Sized object safe method"]
+evidence: ["Rust 1.98.1 E0038 compile failure", "Self return method", "Self Sized dispatch exclusion repair"]
+sources: ["https://doc.rust-lang.org/reference/items/traits.html#dyn-compatibility", "https://doc.rust-lang.org/error_codes/E0038.html", "https://doc.rust-lang.org/reference/types/trait-object.html"]
+---
+
+I once added a convenient `duplicate(&self) -> Self` method to a trait that was also used behind `dyn`. The method made sense for every concrete implementation. Still, creating `&dyn Duplicate` stopped compiling, including code that only wanted to call the unrelated `label` method.
+
+The [failing fixture](/rust-failure-atlas/evidence/RFA-371/fail.rs) reproduces this exact boundary. Rust reports E0038 because `duplicate` references `Self` in its return type.
+
+## The caller must know the size of a returned value
+
+Returning a value by value requires a concrete return type with a known layout. In generic code, monomorphization supplies it: when `T: Duplicate`, `T::duplicate` returns `T`.
+
+With `&dyn Duplicate`, the concrete implementer is intentionally erased. The dynamic caller can invoke methods represented by the vtable, but the signature `-> Self` asks it to receive the hidden concrete type directly. The call site has no single stack layout or named type that works for every implementation.
+
+This is not solved merely because all current implementations happen to be zero-sized or equally sized. Trait-object validity is based on the interface contract, including future implementations.
+
+## One incompatible method can affect the whole object
+
+The [dyn-compatibility reference](https://doc.rust-lang.org/reference/items/traits.html#dyn-compatibility) says a dispatchable method must not use `Self` except in its receiver type. A return of `Self` violates that rule.
+
+Without an explicit boundary, the trait cannot become a trait object at all. Rust rejects the object at creation rather than waiting to see whether my program calls the problematic method. This keeps the meaning of `dyn Duplicate` coherent.
+
+When I see the error underlining `let value: &dyn Duplicate`, I inspect the trait definition above the use site. E0038 often points to the object creation and then lists the specific item that prevents dyn compatibility.
+
+## Self: Sized removes a method from dynamic dispatch
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-371/fixed.rs) adds:
+
+```rust
+fn duplicate(&self) -> Self
+where
+    Self: Sized;
+```
+
+This does two things. Concrete values can still call `duplicate`, because their implementing type is sized and known. The method is explicitly non-dispatchable on a trait object, so the remaining `label(&self)` method can form the dynamic interface.
+
+The fix is not a trick that teaches the vtable how to return `Self`. It states that dynamic callers do not get this operation. Trying `value.duplicate()` on `&dyn Duplicate` still fails, as it should.
+
+I like this repair when duplication is a convenience for generic and concrete code, not a requirement of the erased abstraction.
+
+## Return an erased value when cloning through dyn is required
+
+Sometimes the real requirement is to duplicate an object in a heterogeneous collection. Then excluding the method is incomplete. I define an operation with a representable result, for example `fn clone_box(&self) -> Box<dyn Service>`.
+
+Each implementation allocates its concrete clone and returns it behind a new trait object. The caller knows the size of `Box<dyn Service>` even though the allocation inside contains a different concrete type.
+
+That design has costs and semantics worth naming: allocation, ownership, fallibility if I choose a fallible constructor, and loss of the original concrete type at the call site. I do not hide these decisions behind an automatic-looking `Self` return.
+
+Another option is an enum when the implementation set is closed. The enum has one known layout and preserves variant identity without vtable dispatch. The right repair follows whether extensibility or a closed set is the actual requirement.
+
+## Self in input positions has a related problem
+
+A method like `fn merge(&self, other: Self)` also places the hidden type outside the receiver. What could a caller pass to two erased values? Even if both are `dyn Duplicate`, their underlying concrete types may differ.
+
+I can mark such a method `Self: Sized`, accept another trait object and define cross-type semantics, or move the operation into generic code that guarantees both operands share one `T`. These choices express different domain rules.
+
+The receiver is special because the trait object already carries a concrete value and a vtable for it. Other appearances of `Self` need information the erased interface does not necessarily retain in a usable form.
+
+## This matters when public traits evolve
+
+Adding a method returning `Self` to a public dyn-compatible trait can break every downstream trait-object use. A default implementation does not remove the incompatible signature. Before extending such a trait, I test a tiny assertion that constructs `&dyn Trait` or `Box<dyn Trait>`.
+
+I also document which methods are available only for concrete implementers. Otherwise a user sees one trait definition and reasonably expects all its methods through every form of the trait.
+
+My practical review is:
+
+- use `where Self: Sized` for concrete-only helpers;
+- return `Box<dyn Trait>` when erased ownership is intended;
+- use an enum when implementations are closed;
+- keep `-> Self` when static identity is a real part of the API.
+
+The core principle is that type erasure must leave every dynamic operation with a representable signature. `Self` in a receiver works because the object supplies it. `Self` returned by value asks the caller to recover the erased concrete type. A `Self: Sized` boundary makes that difference explicit and lets the rest of the trait remain useful dynamically.

@@ -1,0 +1,205 @@
+---
+title: "Reliable File Imports Over SFTP Without Exactly-Once Delivery"
+date: "2026-09-29T17:00:00+01:00"
+tags: ["sftp", "file import", "data integration", "idempotency", "reliability"]
+draft: false
+reviewed: true
+reviewedHash: "5f7d43f8b124699f762383dabd7cc309347772ec51877f03ec3fde768d8e6037"
+cluster: "reliable-data-integrations"
+campaign: "authority-2026"
+opportunity: "DATA-030"
+summary: "An SFTP folder is not a queue. Reliable imports need a ready-file contract, stable file identity, durable claims, idempotent processing, and reconciliation."
+---
+
+SFTP file exchange looks simpler than an API integration. A producer uploads a file. A consumer downloads it. The file is moved to an archive.
+
+Then production introduces the difficult cases. The consumer reads a half-written file. Two workers pick the same name. Processing succeeds but the archive move times out. A partner uploads a corrected file under the old name. The network drops after a rename, so the client does not know which directory owns the file.
+
+I do not try to make SFTP provide exactly-once delivery. It is remote filesystem access, not a transactional queue. I build an at-least-once pickup protocol and make the import effect idempotent.
+
+## Define when a file becomes ready
+
+File size staying unchanged for a minute is a useful fallback, not a strong publishing contract. A slow producer can pause for longer. Timestamps can have weak precision or clock differences.
+
+The clean contract is:
+
+```text
+upload incoming/order-20260929.csv.part
+close and verify the upload
+rename to ready/order-20260929.csv
+```
+
+The consumer lists only `ready/`. It never reads `.part` files.
+
+Rename behaviour varies by SFTP protocol version and server. The SSH file-transfer draft describes an atomic rename flag and requires an unsupported response when the server cannot provide it. In real systems, clients and servers commonly negotiate different extensions. I test the exact server rather than assuming every `rename` call is atomic. The relevant protocol details are in the [SSH File Transfer Protocol draft](https://datatracker.ietf.org/doc/html/draft-ietf-secsh-filexfer-12#section-8.3).
+
+When atomic rename is unavailable, I require a separate manifest or completion marker uploaded after the data file:
+
+```text
+ready/order-20260929.csv
+ready/order-20260929.complete
+```
+
+The marker contains expected bytes and checksum. The consumer processes only pairs that agree.
+
+## A filename is not enough identity
+
+Partners reuse names such as `daily.csv`. They can also resend the same content under a different name.
+
+I record several identities:
+
+```ts
+type RemoteFileIdentity = {
+  partnerId: string;
+  remotePath: string;
+  observedSize: number;
+  observedModifiedAt: string | null;
+  contentSha256: string;
+  declaredBatchId: string | null;
+};
+```
+
+The useful business key is usually `partnerId + declaredBatchId`. The content hash proves what bytes were processed. If the same batch ID arrives with different bytes, I quarantine it as a conflict instead of calling it a harmless duplicate.
+
+Hashing requires downloading the file, so remote metadata is only an early filter. I do not mark a file complete from name, size, and timestamp alone.
+
+## Claim before processing
+
+With several workers, listing and choosing a file is a race. My preferred claim is a rename inside the same remote filesystem:
+
+```text
+ready/batch-42.csv
+  -> processing/worker-7/batch-42.csv
+```
+
+Only the worker whose rename succeeds owns the claim. The worker also inserts or updates a local intake record:
+
+```sql
+create table file_intake (
+  partner_id text not null,
+  batch_id text not null,
+  remote_path text not null,
+  content_sha256 text,
+  status text not null,
+  claimed_by text,
+  lease_until timestamptz,
+  attempt_count integer not null default 0,
+  last_error text,
+  primary key (partner_id, batch_id)
+);
+```
+
+The remote rename and local insert cannot share a transaction. A crash can leave one completed without the other. That is why the processing directory and intake table are both reconciled.
+
+## Download to a temporary local path
+
+The worker downloads into a path that is not visible to parsers:
+
+```text
+/spool/partner-a/batch-42.download
+```
+
+It streams a SHA-256 hash and byte count, verifies any manifest, closes the file, then renames it locally to an immutable content-addressed path. Parsing begins only after this step.
+
+I keep the original bytes for a defined retention period. Normalized rows alone are not enough when a parser bug or mapping change needs replay.
+
+Compressed archives get extra controls: maximum expanded bytes, maximum file count, allowed names, path traversal rejection, and nesting limits. A valid zip is not automatically a safe import.
+
+## Commit business effects idempotently
+
+Each source row receives a deterministic identity from the partner, batch, and row key:
+
+```text
+source_record_id = hash(partner_id, batch_id, partner_row_id)
+```
+
+The database uses this identity as a unique key. Reprocessing the complete file then repeats calculations but does not create duplicate business effects.
+
+I commit the intake result and database effects together when they use the same database:
+
+```sql
+begin;
+
+insert into imported_order (...)
+values (...)
+on conflict (partner_id, source_record_id)
+do update set ...;
+
+update file_intake
+set status = 'processed', content_sha256 = :hash
+where partner_id = :partner and batch_id = :batch;
+
+commit;
+```
+
+If the destination is another API, every row or logical operation needs its own idempotency key and result ledger.
+
+## Archive is evidence, not the commit point
+
+After the database commits, the worker tries:
+
+```text
+processing/worker-7/batch-42.csv
+  -> archive/2026/09/batch-42.csv
+```
+
+If the move times out, business processing remains complete. The reconciler checks both possible paths and retries the move. It does not process the file again merely because archival housekeeping failed.
+
+The archive path includes enough context to avoid overwriting a previous file. I never enable blind overwrite for conflicting content.
+
+## The failure matrix
+
+| Failure | State after restart | Recovery |
+| --- | --- | --- |
+| producer stops during upload | `.part` or missing marker | ignore and alert by age |
+| consumer crashes before claim | file remains ready | another worker claims |
+| claim succeeds, local row missing | file in processing | reconciler reconstructs intake row |
+| row inserted, claim did not happen | intake says claimed, file ready | verify and retry claim |
+| download interrupted | local `.download` | remove or resume only with verified ranges |
+| database commits, archive move times out | intake processed, file in processing or archive | reconcile path, never repeat effect blindly |
+| same batch ID, new hash | identity conflict | quarantine and require a correction policy |
+
+This table is the real protocol. Happy-path arrows are not enough.
+
+## Leases recover abandoned claims
+
+A worker claim needs an expiry because workers disappear. The local row carries `lease_until` and a heartbeat. Another worker can take over only after the lease expires and after it confirms the first worker is not still active.
+
+The import remains idempotent because takeover may replay work. A lease prevents permanent ownership; it does not prove the old worker stopped at the exact expiry instant.
+
+## Reconciliation closes the gaps
+
+I run a periodic job that compares:
+
+- ready files without intake rows;
+- processing files with expired or missing claims;
+- claimed rows with no remote file;
+- processed rows whose files are not archived;
+- archive files with no completed record;
+- duplicate batch IDs with different hashes;
+- `.part` files older than the producer's expected window.
+
+Every mismatch has an explicit action or alert. This turns unknown network outcomes into inspectable state.
+
+## Security is part of reliability
+
+I pin host keys, use a dedicated least-privilege account, restrict directories, rotate credentials, and log remote server identity. I also reject unexpected symlinks and canonicalize paths before local writes.
+
+The filename and file contents are untrusted partner input. CSV formula injection, encoding surprises, oversized fields, and archive traversal belong in the test set.
+
+## The contract I ask partners to accept
+
+The smallest useful agreement specifies:
+
+1. temporary naming or a completion marker;
+2. stable batch identity;
+3. checksum and byte count;
+4. character encoding and schema version;
+5. correction and resend semantics;
+6. retention in ready and archive directories;
+7. maximum file size and delivery window;
+8. who investigates quarantined files.
+
+SFTP can transport files securely. It does not decide when bytes are complete, whether a batch was already applied, or how a crash should recover.
+
+I get reliable imports by making those states explicit: ready, claimed, downloaded, verified, committed, and archived. The protocol accepts duplicate pickup and prevents duplicate business effect. That is more honest—and more robust—than calling the folder exactly once.

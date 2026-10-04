@@ -1,0 +1,84 @@
+---
+caseId: "RFA-227"
+title: "f64::total_cmp Orders Negative Zero Before Positive Zero"
+date: "2026-09-06T00:07:00+01:00"
+lastmod: "2026-09-06T00:07:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "fcb1809d67bcb6824b3555321fe52231d631e0f72b9348505da7d6f2bfe1c302"
+area: "concurrency-memory"
+symptom: "Sorting zero and negative zero with total_cmp reverses their bit-pattern order even though ordinary equality considers them equal."
+summary: "f64::total_cmp follows IEEE totalOrder, distinguishing signed zeros and ordering NaNs. Normalize domain-equivalent values before total ordering, or preserve the exact representation deliberately."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets with IEEE-compatible f64 representation"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust f64 total_cmp negative zero order",
+    "total_cmp differs PartialEq signed zero",
+    "sort floats Rust negative zero NaN",
+  ]
+evidence: ["Rust 1.98.1 signed-zero bit patterns", "IEEE total order", "domain normalization repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/std/primitive.f64.html#method.total_cmp",
+    "https://doc.rust-lang.org/std/primitive.f64.html#method.to_bits",
+    "https://doc.rust-lang.org/std/primitive.f64.html#method.partial_cmp",
+  ]
+---
+
+I sorted floating-point values with `total_cmp` because an ordinary float comparison does not define an order for NaN. The sort became deterministic, but one test still looked impossible: negative zero moved before positive zero even though Rust says the two values are equal.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-227/fail.rs) compares bit patterns after sorting. A normal `assert_eq!` on the float values would hide the reorder because `-0.0 == 0.0` is true.
+
+## Total order preserves distinctions ordinary equality ignores
+
+[`f64::total_cmp`](https://doc.rust-lang.org/std/primitive.f64.html#method.total_cmp) follows the IEEE 754 total-order predicate. Its order places negative zero below positive zero. It also places negative and positive NaNs in defined regions around infinities and finite values.
+
+Rust's `PartialEq` and `PartialOrd` for floats follow ordinary numeric comparison rules instead. Under those rules the signed zeros compare equal, while NaN is unordered and unequal even to itself.
+
+`total_cmp` does not merely fill the NaN hole in `partial_cmp`. It chooses a representation-aware total relation whose equality classes differ from ordinary float equality.
+
+## The right order depends on domain identity
+
+For some work, signed zero carries information. IEEE arithmetic can produce different infinities from reciprocal positive and negative zero. Numerical algorithms may need the sign to preserve direction near a boundary. A diagnostic or serializer may also need exact bits.
+
+For other domains, such as a displayed temperature or a ranking score, users consider both zeros the same. Letting their representation influence sorting can create unstable-looking groups or cache keys.
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-227/fixed.rs) shows both policies. One assertion accepts the exact total order. The other canonicalizes every value equal to zero into positive zero before sorting.
+
+Neither policy is universally correct. The important step is making identity explicit before selecting an ordering function.
+
+## Ordinary equality cannot verify representation order
+
+[`f64::to_bits`](https://doc.rust-lang.org/std/primitive.f64.html#method.to_bits) exposes the bit representation as `u64`. Positive zero is all zero bits. Negative zero has its sign bit set.
+
+That is why the fixture compares bits. This assertion is too weak:
+
+```rust
+assert_eq!(sorted, [-0.0, 0.0]);
+```
+
+It also passes if the elements appear in the opposite order. The equality relation used by the assertion considers corresponding signed zeros equal.
+
+When exact representation matters, my test uses bits. When domain equality intentionally normalizes values, the test first applies that normalization and then compares the canonical form.
+
+## NaN policy should come before sorting
+
+`total_cmp` gives every NaN a place, but that does not mean arbitrary NaNs are valid domain values. Different NaN payloads and signs can affect the total order, and arithmetic does not always preserve a NaN bit pattern in a portable way.
+
+I decide whether to reject NaN, put all NaNs into one domain bucket, preserve their exact representation, or treat them as missing data. Then I implement ordering consistent with that choice.
+
+Using [`partial_cmp`](https://doc.rust-lang.org/std/primitive.f64.html#method.partial_cmp) followed by `unwrap` is only sound if an earlier invariant proves there are no NaNs. I keep that validation close to construction and return an error at the boundary instead of hoping a distant sort never sees invalid data.
+
+## Ordering, equality, and hashing must agree in data structures
+
+If I wrap `f64` to use it as an ordered key, I must design `Eq`, `Ord`, and `Hash` around the same equivalence relation. Treating signed zeros as equal in one trait but distinct in another violates collection expectations. NaN makes handwritten wrappers especially easy to get wrong.
+
+I use a reviewed float wrapper or a domain newtype with tests for zeros, infinities, normal values, subnormals, and representative NaNs. A comparator added only at one sorting call does not automatically define safe key semantics elsewhere.
+
+## My regression contains values equal under one relation
+
+Most sorting tests use clearly different finite numbers. They cannot expose a relation mismatch. I include positive and negative zero and inspect their bits. If NaN is supported, I include it explicitly and assert the chosen policy rather than relying on a platform's default NaN constant sign.
+
+The core principle is that a total order is also a choice about identity. `total_cmp` provides a rigorous representation-level order, but my product may have a coarser equality. I normalize first when the domain merges representations, and I test with values that ordinary equality would conceal.

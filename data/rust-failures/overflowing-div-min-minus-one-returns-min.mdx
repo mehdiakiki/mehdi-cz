@@ -1,0 +1,105 @@
+---
+caseId: "RFA-364"
+title: "overflowing_div Returns MIN and true for MIN / -1"
+date: "2026-09-06T02:21:00+01:00"
+lastmod: "2026-09-06T02:21:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "a39558a04dd31dc9eac92b07692d29c40d0c6ca647f770107c242fd5819cdbea"
+area: "upgrades-compatibility"
+symptom: "i32::MIN.overflowing_div(-1) returns (i32::MIN, true), not a zero placeholder or a representable positive quotient."
+summary: "The mathematical quotient of signed MIN divided by -1 is one beyond MAX. overflowing_div returns the wrapped dividend plus an overflow flag, while division by zero still panics and needs separate validation."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust overflowing_div MIN minus one", "overflowing division returns MIN true", "does overflowing_div panic on zero"]
+evidence: ["Rust 1.98.1 i32 operations", "MIN divided by negative one", "checked division and zero-divisor contrast"]
+sources: ["https://doc.rust-lang.org/std/primitive.i32.html#method.overflowing_div", "https://doc.rust-lang.org/std/primitive.i32.html#method.checked_div", "https://doc.rust-lang.org/std/primitive.i32.html#method.wrapping_div"]
+---
+
+I once treated the value part of `overflowing_div` as an arbitrary placeholder whenever its flag was true. For the one signed division overflow, Rust returns the original minimum value. The pair is `(i32::MIN, true)`.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-364/fail.rs) expects `(0, true)` and fails. The flag is right, but the wrapped result has a precise contract too.
+
+## Signed division has one representable overflow pair
+
+An `i32` ranges from `-2^31` through `2^31 - 1`. The negative side contains one additional magnitude because zero occupies a non-negative bit pattern.
+
+Mathematically:
+
+```text
+-2^31 / -1 = 2^31
+```
+
+That positive value is one greater than `i32::MAX`, so it cannot be represented. Other non-zero signed division pairs have quotients inside the range.
+
+[`overflowing_div`](https://doc.rust-lang.org/std/primitive.i32.html#method.overflowing_div) reports this pair by returning `self` and setting the boolean to true. For normal division it returns the quotient and false.
+
+## The wrapped value is MIN again
+
+In two's-complement modular arithmetic, positive `2^31` has the same 32-bit pattern as `i32::MIN`. Returning MIN makes the value consistent with a wrapped representation.
+
+I still branch on the boolean. If I ignore it, the result looks negative even though dividing two negative numbers should produce a positive quotient. That can corrupt a sign-sensitive calculation while every operation remains memory-safe.
+
+The flag is not optional documentation. It carries the fact that the mathematical operation did not fit.
+
+## Overflowing does not handle division by zero
+
+The most important second rule is that `overflowing_div(0)` panics. There is no quotient or useful wrapped bit pattern for division by zero, so the method's overflow tuple does not absorb that state.
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-364/fixed.rs) uses `catch_unwind` only to prove this boundary in a controlled fixture. In application code I validate the divisor or use [`checked_div`](https://doc.rust-lang.org/std/primitive.i32.html#method.checked_div).
+
+`checked_div` returns `None` for both a zero divisor and the signed MIN/-1 overflow. If callers need to distinguish these causes, I check zero first and represent the two errors separately.
+
+## Different methods preserve different information
+
+The integer API family is a policy table:
+
+- ordinary `/` panics on division by zero and on signed MIN/-1 overflow;
+- `checked_div` converts both invalid cases to `None`;
+- `overflowing_div` reports MIN/-1 with a flag but still panics on zero;
+- [`wrapping_div`](https://doc.rust-lang.org/std/primitive.i32.html#method.wrapping_div) returns the wrapped value for MIN/-1 but still panics on zero;
+- saturating division returns `MAX` for the overflow pair but also still rejects zero.
+
+The names describe arithmetic overflow. None turns zero division into an ordinary number.
+
+## Widening before division can preserve the quotient
+
+If the application can accept a wider result, converting operands to `i64` before division represents `2^31` exactly. This is different from widening the already wrapped `i32` result, which only produces negative `-2^31` in the wider type.
+
+The order is critical:
+
+```text
+widen operands -> divide -> exact wider quotient
+divide with i32 policy -> widen -> already lost meaning
+```
+
+At a storage boundary I then use checked narrowing and decide how an out-of-range quotient should be represented.
+
+## Quotient and remainder invariants expose ignored overflow
+
+For valid non-zero division, `a == q * b + r` under the selected remainder convention, subject to representability of the reconstruction. The overflow pair cannot satisfy the ordinary signed `i32` arithmetic story without another overflow.
+
+I use boundary tests rather than relying only on small positive values. Inputs include `MIN`, `MAX`, `-1`, `0`, and `1`, with zero handled before the division call.
+
+Property tests can work in a wider integer type to verify the mathematical result and then compare it with the chosen `i32` policy.
+
+## Do not collapse overflow into a valid business value
+
+Zero is often meaningful: zero items, zero balance, or no elapsed units. Returning it for overflow without a separate state can make a severe numeric failure look like an ordinary result.
+
+`overflowing_div` avoids this ambiguity by always returning the flag. My wrapper keeps that information as a `Result`, enum, metric, or explicit tuple depending on the boundary. I do not call `.0` unless modular behavior is truly intended and documented.
+
+For user-controlled calculations, I prefer a domain error with the operands or a safe summary. For low-level bit arithmetic, the wrapped value and flag can be exactly what the algorithm needs.
+
+## The repaired fixture separates all three states
+
+It first proves an ordinary pair: `10 / 2` gives `(5, false)`. It then asserts `(MIN, true)` for the overflow pair and `None` from checked division. Finally it proves that zero remains a panic case for `overflowing_div`.
+
+This table is more useful than one assertion because it prevents “overflowing means never panics” from replacing the original misunderstanding.
+
+## The core principle is that policy methods have bounded scope
+
+An arithmetic policy solves the states named by its contract. `overflowing_div` represents quotient overflow with a wrapped value and boolean. It does not make division total over every divisor.
+
+I now ask two questions separately: can the mathematical result fit, and is the operation defined at all? MIN divided by -1 fails the first; division by zero fails the second.

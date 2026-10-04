@@ -1,0 +1,247 @@
+---
+title: "What Is a Type? A Set of Values, a Promise About Operations, or Both"
+date: "2026-09-09T06:20:00+01:00"
+lastmod: "2026-09-09T06:20:00+01:00"
+tags: ["types", "type systems", "typescript", "rust", "c", "types under the hood"]
+draft: false
+reviewed: true
+reviewedHash: "92975ddf5512ec546f55a65994295af9f6feb181f90cab8d8e5f729ffd64def2"
+cluster: "rust-under-the-hood"
+campaign: "editorial"
+summary: "I took one small type, Human = man or woman, and compiled it in TypeScript, Rust, and C to see what stays of it. A type is a set of allowed values plus a set of allowed operations, both checked once, and neither reaches the processor."
+---
+
+A type is two things at the same time. It is a set of values that are allowed, and it is a set of operations that are allowed on those values. The first part is the shape of the type. The second part is its behavior. Some types have both, like a struct with methods. Some types have only shape, like `type Human = "man" | "woman"`.
+
+And in the three languages I look at here, none of it exists once the program runs. The compiler uses the type to check the program, then it throws the type away, and the processor only ever sees bytes and instructions.
+
+That is the short answer. I did not believe it completely until I compiled the same tiny program three times and looked at what came out. This article is that experiment.
+
+## The question that started this
+
+For a long time, my mental picture of a type was a box with things inside and buttons on the outside. A `User` has a name and an email inside, and it has `send_welcome_email()` on the outside. Shape and behavior together. That picture works for most code I write.
+
+Then I wrote this line in TypeScript:
+
+```ts
+type Human = "man" | "woman";
+```
+
+There is no box here. There are no buttons. It is a list of two words.
+
+It has a shape, in the sense that only two values are allowed, but it has no behavior at all. You cannot call anything on a `Human`. So is it really a type? And if it is, what does the computer do with it?
+
+I decided to compile it and look. The source files and a script that reproduces every output below are in the `types-under-the-hood` fixture of the site repository. I used TypeScript 5.9, rustc 1.95 nightly, and GCC 15.2 on x86-64 Linux.
+
+## Experiment 1: TypeScript, the type is gone before the program runs
+
+Here is the whole program. One type, one function that uses it, one call.
+
+```ts
+type Human = "man" | "woman";
+
+function greet(h: Human): string {
+  if (h === "man") {
+    return "Hello sir";
+  }
+  return "Hello madam";
+}
+
+console.log(greet("man"));
+```
+
+I compiled it with `tsc --target es2020`. This is the complete output:
+
+```js
+function greet(h) {
+    if (h === "man") {
+        return "Hello sir";
+    }
+    return "Hello madam";
+}
+console.log(greet("man"));
+```
+
+The word `Human` does not appear. I searched for it. Zero occurrences. The parameter `h` lost its type annotation. The function lost its return type. What is left is exactly the program I would have written in plain JavaScript fifteen years ago.
+
+So where did the type go? It did its job, then the compiler removed it. The job was this: when I write `greet("child")` instead of `greet("man")`, the compiler stops me.
+
+```text
+error TS2345: Argument of type '"child"' is not assignable to parameter of type 'Human'.
+```
+
+This error exists only at compile time. If I send `"child"` to the compiled JavaScript at runtime, nothing stops it. The function returns "Hello madam" and the program continues. The type was a check, and the check happened once, before the program existed.
+
+So in TypeScript, `Human` is pure shape. It says which values are allowed. It says nothing about behavior, and it leaves no trace.
+
+## Experiment 2: Rust, the type becomes one byte
+
+Now the same program in Rust. Here the type is an enum, which is the closest thing to the TypeScript union.
+
+```rust
+pub enum Human { Man, Woman }
+
+pub fn greet(h: Human) -> &'static str {
+    match h {
+        Human::Man => "Hello sir",
+        Human::Woman => "Hello madam",
+    }
+}
+```
+
+Two small programs print the size of a `Human` in memory and the byte behind each value:
+
+```text
+size of Human: 1 byte
+Man as byte: 0, Woman as byte: 1
+```
+
+One byte. The value `Man` is the number 0, and `Woman` is the number 1. That is the whole runtime existence of the type. Not a name, not a list of variants, not a check. One byte that holds 0 or 1.
+
+The compile-time check is still there, the same as in TypeScript:
+
+```text
+error[E0599]: no variant or associated item named `Child` found for enum `Human` in the current scope
+```
+
+Then I asked for the assembly of `greet`, with optimizations on. Two words before reading it. A register is a small storage slot inside the processor that holds a few bytes and nothing else. A Rust `&str` is returned in two registers: the address of the text in `rax` and its length in `rdx`.
+
+This is the complete function, with the two label names shortened:
+
+```asm
+greet:
+    movl    %edi, %eax
+    leaq    9(,%rax,2), %rdx
+    leaq    .Lanon.1(%rip), %rcx      # -> address of "Hello madam"
+    leaq    .Lanon.0(%rip), %rax      # -> address of "Hello sir"
+    testl   %edi, %edi
+    cmovneq %rcx, %rax
+    retq
+```
+
+I want to read this slowly, because this is the moment the type disappears.
+
+The value of `h` arrives in the register `edi`. It is 0 or 1. The first line copies it into `rax` for some arithmetic, and two lines later `rax` is reused to hold the address of "Hello sir". The two `leaq` lines do not read memory. They only compute an address, relative to the current instruction, which is what `%rip` means.
+
+Then `testl %edi, %edi` asks one question: is this register zero? If yes, the answer stays "Hello sir". If not, `cmovneq` swaps the answer to "Hello madam". That is all. There is no comparison with the word "man". There is no lookup of the variants of `Human`. There is a byte and a test for zero.
+
+The strange line `leaq 9(,%rax,2), %rdx` is the compiler being clever. It builds the length half of the returned `&str`, in `rdx`. "Hello sir" is 9 characters and "Hello madam" is 11. So the compiler computes the length as 9 plus 2 times the byte. For 0 it gives 9, for 1 it gives 11. The type `Human` was used to prove that only 0 and 1 can arrive, and then that proof was turned into arithmetic.
+
+This last point matters. Notice that there is no third branch. The `match` has two arms, and the assembly has one test. If a byte with the value 7 arrived in `edi`, the function would still run, the test would say "not zero", and it would return "Hello madam" with a length of 23, which is far past the end of the string. Nobody checks, because the type was the promise that 7 never arrives. This is exactly why creating a `Human` from a raw byte in Rust is undefined behavior: it breaks a promise that the compiled code already relied on.
+
+## Experiment 3: C, a type that checks nothing
+
+The C version looks almost the same:
+
+```c
+enum human { MAN, WOMAN };
+
+const char *greet(enum human h) {
+    if (h == MAN) return "Hello sir";
+    return "Hello madam";
+}
+```
+
+Two differences appeared immediately. First, the size:
+
+```text
+size of enum human: 4 bytes
+```
+
+Four bytes, not one. C lets the compiler pick the integer type behind an enum, and GCC on x86-64 picks a 4-byte one. With `-fshort-enums` the same GCC gives 1. Second, and this is the interesting one, I called `greet(7)` on purpose:
+
+```c
+printf("%s\n", greet(7));
+```
+
+GCC compiled it with `-Wall -Wextra` and said nothing. Not a warning. The program printed "Hello madam". In C, `enum human` has a shape on paper, two named values, but the compiler does not enforce it. Any integer is accepted. So the type has a name and a size, and almost no rule.
+
+The assembly is the same idea as Rust:
+
+```asm
+greet:
+    testl   %edi, %edi
+    leaq    .LC1(%rip), %rdx
+    leaq    .LC0(%rip), %rax
+    cmovne  %rdx, %rax
+    ret
+```
+
+Test for zero, pick one of two addresses. The processor does the same work in both languages. It does not know that Rust promised two values and C promised nothing. At this level, there is no difference, because there is no type.
+
+## So what is a type
+
+After the three experiments I can say it more precisely than I could before.
+
+A type has two halves, and in these three languages both halves live in the compiler.
+
+The shape half is the set of values that are allowed. `Human` allows two. `u8` allows 256. `bool` allows two. A struct with three fields allows every combination of its fields. This is the half that decides how many bytes are needed and what those bytes may contain.
+
+The behavior half is the set of operations that are allowed. You can add two `u8`. You cannot add two `Human`. You can call `.len()` on a string and not on a number. In many languages this half is written as methods, traits, or interfaces, and this is why my old picture of a type was a box with buttons.
+
+`type Human = "man" | "woman"` has only the first half. It is a set with two members and no operations. That is why it felt strange to me. It is still a type. It is just a type made only of shape.
+
+And here is the part that changed how I read code: in these three languages, the two halves are checked in the same place, at compile time, and they disappear in the same way. The shape half sometimes leaves a small trace, the size of the value and the instructions chosen for it. The behavior half leaves nothing at all. There is no runtime object that says "this byte is a Human, so you may not add it".
+
+## What the processor actually sees
+
+The processor has registers and memory. A register holds bits. An instruction like `testl` looks at bits and sets a flag. It does not have an opinion about what the bits mean.
+
+When we say a language is "typed", we mean that a program was written next to a set of promises, and a checker verified the promises once. The promises are then used in two ways. First, to refuse programs that break them, like `greet("child")`. Second, to generate smaller code, like the one test with no third branch. After that, the promises are deleted.
+
+I find it useful to compare this with the labels on boxes in a warehouse. The person loading the truck reads the labels and decides what goes where. The truck does not read anything. It only carries weight. If a box was labeled wrong, the truck still drives, and the problem appears at the destination.
+
+This also explains something about dynamic languages that I return to later in this series. JavaScript at runtime does keep a small tag on each value, because it never had a compile-time checker to make the promises. So in the general case it checks at runtime, and modern engines spend a lot of effort guessing when they can skip the check. A static language moves most of that cost to compile time.
+
+## Where the shape half leaves a trace
+
+I said the shape half sometimes leaves a trace. Here is one more measurement to show what I mean:
+
+```text
+size of Human: 1
+size of Option<Human>: 1
+size of u8: 1
+```
+
+An `Option<Human>` can be `None`, `Some(Man)`, or `Some(Woman)`. Three values. And it still fits in one byte, the same size as `Human` alone. The compiler knows that `Human` uses only 0 and 1, so it uses 2 to mean `None`.
+
+It read the shape of the type, took a decision about bytes, and then, again, threw the type away. The byte does not know it is an `Option`. It holds 0, 1 or 2. This is what rustc does today. The language does not promise it for every enum, and I go through the exact rules in "Rust Enum Niches", another article of this series.
+
+So the trace of a type at runtime is never the type. It is a consequence of the type: a size, a chosen instruction, a spare value used for something else.
+
+## The model I take from this
+
+1. A type is a set of allowed values and a set of allowed operations. Shape and behavior. A type can have only the first half, and `Human` is one of those.
+2. Both halves are checked once, at compile time. That is where "not assignable" and "no variant named Child" come from.
+3. The compiler uses the type as a proof to generate less code. The two-arm match became one test. This is where a type collapses into instructions.
+4. After that the type is gone. The processor sees bytes and instructions and has no idea what a `Human` is. A wrong byte is not caught, because the type was the promise that the wrong byte cannot exist.
+
+In retrospect, a type is a way to constrain the writer of the program. It has no real representation at the lower levels, in the machine instructions the processor executes. Some languages keep a small tag next to each value at runtime, and I come back to that later in the series, but the instructions themselves never carry the type. The constraint is on me, when I write, not on the machine, when it runs.
+
+Languages differ in how strong the constraint is. TypeScript checks it and deletes it. Rust checks it, uses it for layout and code generation, and treats a broken promise as undefined behavior. C names it and barely checks it. But in all three the processor ends up with the same `testl` and the same `cmov`.
+
+## The rest of this series
+
+This article is the entry point. Each of the next ones takes one of the sentences above and follows it further with the same method, compile and look:
+
+- Does a type exist at runtime? Following one value from source to register.
+- A type is a set: why `Human` has two members and `Option<Human>` has three.
+- Shape without behavior: two structs with the same fields.
+- Behavior without shape: traits, interfaces, and types that own no bytes.
+- Where a type becomes a layout: fields, padding, and reordering.
+- Two ways to make a type disappear: erasure and monomorphization.
+- The processor has no types: what `add` does to bits it does not understand.
+- Runtime type tags: what dynamic languages keep that static ones throw away.
+- Types as proofs: what the checker knows that the binary forgets.
+
+New articles appear on the [types under the hood tag page](/blog/tags/types-under-the-hood/page/1) as they go live. The full index of Rust articles is on [Rust Under the Hood](/blog/topics/rust-under-the-hood).
+
+## Sources
+
+- [TypeScript handbook: literal types](https://www.typescriptlang.org/docs/handbook/2/everyday-types.html)
+- [The Rust Reference: enumerations and discriminants](https://doc.rust-lang.org/reference/items/enumerations.html)
+- [The Rust Reference: type layout](https://doc.rust-lang.org/reference/type-layout.html)
+- [The Rust Reference: behavior considered undefined](https://doc.rust-lang.org/reference/behavior-considered-undefined.html)
+- [The Rustonomicon: alternative representations](https://doc.rust-lang.org/nomicon/other-reprs.html)
+- [cppreference: C enumerations](https://en.cppreference.com/w/c/language/enum)
+- [x86 instruction reference: CMOVcc](https://www.felixcloutier.com/x86/cmovcc)

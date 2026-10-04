@@ -1,0 +1,94 @@
+---
+caseId: "RFA-131"
+title: "Why BufWriter Can Lose an Error When It Is Dropped"
+date: "2026-09-05T12:31:00+01:00"
+lastmod: "2026-09-05T12:31:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "3a5485c1b59e21c5e2a6e9b52d802cfee2bc4f70a998bf5f19e88d880bb97c98"
+area: "concurrency-memory"
+symptom: "write_all succeeds because bytes enter BufWriter's memory buffer, but a later drop cannot report the error raised while writing them to the underlying destination."
+summary: "Buffered acceptance is not durable delivery. BufWriter attempts to empty its buffer during Drop but ignores resulting errors, so important output paths need an explicit flush or ownership-recovery operation whose Result is handled."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["targets with std::io"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust BufWriter drop ignores flush error", "BufWriter write_all succeeds data not written error", "Rust buffered writer explicit flush before drop"]
+evidence: ["Rust 1.98.1 deterministic runtime failure", "drop-time write error is unreportable", "explicit flush observes error"]
+sources: ["https://doc.rust-lang.org/std/io/struct.BufWriter.html", "https://doc.rust-lang.org/std/io/trait.Write.html"]
+---
+
+The [failing program](/rust-failure-atlas/evidence/RFA-131/fail.rs) wraps a writer that always rejects bytes. A small `write_all` call still returns `Ok(())` because `BufWriter` accepts the bytes into its memory buffer. Dropping the buffer later tries to send them downstream, but the error cannot come back to the caller.
+
+The program panics deliberately after `drop` to prove that execution continued without an error value. This is not a fabricated edge: it models a full disk, closed connection, broken pipe, or failing storage layer discovered only when buffered data moves.
+
+## Accepted into a buffer is not delivered
+
+The [`BufWriter` documentation](https://doc.rust-lang.org/std/io/struct.BufWriter.html) explains that the type batches small writes to an underlying writer. This can reduce system calls when many small pieces are emitted.
+
+It also introduces two different states:
+
+```text
+write_all returned Ok -> bytes accepted by this writer abstraction
+flush returned Ok     -> pending bytes passed to the underlying writer
+```
+
+Even the second statement does not always mean durable on physical storage. Filesystems, devices, and network peers have their own acknowledgement and persistence boundaries. But without a successful buffer flush, the first boundary was not crossed at all.
+
+I therefore avoid describing every successful `write_all` as “the file was written.” The exact guarantee belongs to the full stack of writers.
+
+## Drop cannot return Result
+
+The important warning in the `BufWriter` documentation is that dropping the value attempts to flush the buffer, but errors during that attempt are ignored. Rust destructors run automatically and the [`Drop::drop` method](https://doc.rust-lang.org/std/ops/trait.Drop.html) has no result return channel.
+
+This creates a general systems rule: important fallible finalization should not exist only in a destructor.
+
+RAII remains useful. It ensures memory and handles are released on ordinary paths and during unwinding. It cannot invent a place to deliver an I/O error after the owner has decided to discard the value.
+
+Logging the error from `Drop` would not fully solve the contract either. Applications may need to retry, fail a transaction, keep a temporary file, return an HTTP error, or mark a job incomplete. Only the caller knows what failure means.
+
+## Explicit flush makes the error observable
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-131/fixed.rs) calls `output.flush()` and handles the returned error before the writer leaves scope. The [`Write` trait documentation](https://doc.rust-lang.org/std/io/trait.Write.html) defines `flush` as ensuring buffered content reaches its destination.
+
+In the fixture, flushing asks the underlying writer to accept the pending bytes. Its `write` method returns an error, and the application can inspect it. The evidence does not claim that `flush` performs disk `fsync` or remote acknowledgement; it proves the narrower buffer-boundary behaviour.
+
+For code producing an important artifact, I use a function shaped like this:
+
+```rust
+fn produce(mut output: BufWriter<File>) -> std::io::Result<()> {
+    write_payload(&mut output)?;
+    output.flush()?;
+    Ok(())
+}
+```
+
+The caller now owns the failure decision.
+
+## Consuming methods can preserve more context
+
+`BufWriter::into_inner` tries to flush before returning the underlying writer and preserves the writer inside its error type if flushing fails. This can be valuable when a caller needs recovery rather than simple propagation.
+
+I also consider whether another layer is buffered. A serializer may wrap `BufWriter`; compression or encryption may have its own `finish` operation; a file may require `sync_all` for a stronger durability goal. The correct shutdown order is normally inside-out, checking every fallible boundary.
+
+A single `flush` call at an arbitrary layer is not a universal persistence proof.
+
+## Tests should fail after buffering, not before it
+
+A useful test writer accepts or buffers enough input for the early call to succeed, then fails when the buffer is actually drained. If the fake writer fails on the first user-facing method, the test only proves ordinary `?` propagation.
+
+The fixture uses a small payload relative to the default buffer capacity so that `write_all` completes in memory. It then contrasts implicit drop with explicit flush. This makes the hidden timing of the error observable and deterministic.
+
+For production systems, I also inject short writes, interrupted operations, failures after N bytes, and errors during finalization. These cases find assumptions that happy-path in-memory writers cannot expose.
+
+## My debugging sequence
+
+When output seems to disappear without an error, I do this:
+
+1. List every buffering layer between the producer and final destination.
+2. Identify which method only accepts bytes and which method completes the layer.
+3. Find the last explicit `flush`, `finish`, or `into_inner` whose result is handled.
+4. Test a failure that happens after initial buffering succeeds.
+5. Define the required guarantee: buffered, handed to OS, synchronized, or acknowledged remotely.
+6. Return finalization errors to the component that can act on them.
+
+The principle is broader than Rust I/O: resource cleanup and successful completion are different contracts. Drop is excellent for best-effort cleanup. When data matters, I keep a fallible completion step explicit and verify its result.

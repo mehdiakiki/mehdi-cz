@@ -1,0 +1,215 @@
+---
+title: "What repr(transparent) Guarantees—and What It Leaves Unspecified"
+date: "2026-11-23T09:00:00+01:00"
+tags: ["rust", "repr transparent", "FFI", "type layout", "unsafe Rust"]
+draft: false
+reviewed: true
+reviewedHash: "676973682ace8909fe6a60cd811d11e4b6966c70400fe94bb0de38618cfc7444"
+cluster: "rust-under-the-hood"
+campaign: "authority-2026"
+opportunity: "RUST-057"
+summary: "repr(transparent) gives a wrapper the layout and ABI of its one meaningful field. It does not erase Rust validity rules, make every nested use equivalent, or document a foreign declaration for you."
+---
+
+`#[repr(transparent)]` is stronger than “this wrapper probably has no padding.” Rust guarantees that the wrapper has the same layout and ABI as its single non-zero-sized field.
+
+It is also narrower than “the wrapper and field are interchangeable everywhere.” Type validity, safety invariants, public API promises, and the foreign declaration still matter.
+
+## The core guarantee
+
+```rust
+#[repr(transparent)]
+pub struct UserId(pub u64);
+```
+
+The [Rust Reference](https://doc.rust-lang.org/reference/type-layout.html#the-transparent-representation) guarantees that `UserId` has the layout and ABI of `u64`.
+
+I can test size and alignment:
+
+```rust
+use std::mem::{align_of, size_of};
+
+assert_eq!(size_of::<UserId>(), size_of::<u64>());
+assert_eq!(align_of::<UserId>(), align_of::<u64>());
+```
+
+These assertions demonstrate two consequences on one target. The representation attribute, not the test, supplies the cross-compilation guarantee.
+
+## Only one field may affect size or alignment
+
+A transparent struct may contain at most one field that is not both size zero and alignment one. Extra marker fields can be used when they satisfy the restriction:
+
+```rust
+use std::marker::PhantomData;
+
+#[repr(transparent)]
+struct Handle<T> {
+    raw: u64,
+    marker: PhantomData<fn() -> T>,
+}
+```
+
+Not every zero-sized field is harmless. A zero-sized type can have alignment greater than one, so Rust checks the full constraint.
+
+I let the compiler enforce this instead of reasoning from `size_of == 0` alone.
+
+## `repr(C)` is a different promise
+
+```rust
+#[repr(C)]
+struct CUserId(u64);
+```
+
+This is a C struct containing a `u64`. It has the C struct ABI, not necessarily the scalar ABI of `u64`.
+
+```rust
+#[repr(transparent)]
+struct TransparentUserId(u64);
+```
+
+This has the ABI of the field itself. The [Rustonomicon representation guide](https://doc.rust-lang.org/nomicon/other-reprs.html#reprtransparent) calls out this difference for FFI.
+
+I choose `repr(C)` for a record whose fields form a C struct and `repr(transparent)` for a newtype intended to pass like one inner value.
+
+## The C side must still declare the inner ABI
+
+Rust:
+
+```rust
+#[repr(transparent)]
+pub struct Meters(pub f64);
+
+unsafe extern "C" {
+    fn report_distance(value: Meters);
+}
+```
+
+The C declaration should use the corresponding field type:
+
+```c
+void report_distance(double value);
+```
+
+Declaring a one-field C struct is a different ABI choice. The wrapper name does not cross the ABI automatically; headers, calling convention, target data model, and bindgen configuration still require review.
+
+The broader [Rust FFI guide](/blog/rust-ffi-guide) covers ownership, strings, unwinding, and callbacks that representation alone cannot solve.
+
+## Same layout does not mean same valid bit patterns
+
+A wrapper can impose an invariant:
+
+```rust
+#[repr(transparent)]
+pub struct NonZeroUserId(u64);
+
+impl NonZeroUserId {
+    pub fn new(value: u64) -> Option<Self> {
+        (value != 0).then_some(Self(value))
+    }
+}
+```
+
+At the language representation level, this struct's field accepts every `u64`. The private constructor expresses an API invariant, not a compiler-enforced invalid bit pattern.
+
+Other inner types, such as references or `NonZeroU64`, do have validity requirements. Creating them from arbitrary bytes remains undefined behaviour even through a transparent wrapper.
+
+`repr(transparent)` does not legalize invalid values.
+
+## Transmute needs all invariants, not only equal size
+
+The representation is designed to support layout equivalence with the field, but every conversion still needs a proof:
+
+```text
+source value is valid
+destination value accepts the bit pattern
+alignment is respected
+ownership is transferred exactly once
+lifetimes remain truthful
+no private semantic invariant is bypassed
+```
+
+Safe constructors or `From` implementations are clearer for ordinary newtypes:
+
+```rust
+impl From<u64> for UserId {
+    fn from(value: u64) -> Self { Self(value) }
+}
+```
+
+I reserve transmute or pointer casts for boundaries where the representation proof is actually necessary.
+
+## Nested layout can have extra rules
+
+Knowing `Wrapper<T>` is transparent over `T` does not justify guessing the layout of every type containing `Wrapper<T>`.
+
+```rust
+#[repr(transparent)]
+struct Wrapper<T>(T);
+
+type A = Option<Wrapper<&'static u8>>;
+type B = Option<&'static u8>;
+```
+
+Specific niche and `Option` guarantees may make layouts equal, but those are separate guarantees. I do not derive them only from the wrapper's size.
+
+Types such as `UnsafeCell` also affect niche use despite being transparent, which is why nested equivalence needs its own documentation.
+
+## Public ABI must be public on purpose
+
+The Rustonomicon notes that a transparent representation is considered part of a type's public ABI when the field is public or the layout is documented in prose.
+
+For a public crate I write the promise explicitly:
+
+```text
+`UserId` is ABI-compatible with `u64` on supported targets.
+Its numeric value is opaque to callers except through documented methods.
+```
+
+This separates representation stability from semantic API. Making a field private does not excuse relying privately on undocumented layout across crates.
+
+## Single-variant enums can also be transparent
+
+The attribute is not limited to structs. A single-variant enum satisfying the same field restriction may be transparent:
+
+```rust
+#[repr(transparent)]
+enum Temperature {
+    Celsius(f64),
+}
+```
+
+This does not give the enum a separate runtime discriminant; it follows the meaningful field's layout and ABI. I still prefer a struct newtype unless the enum form communicates a useful domain distinction, because the representation guarantee does not make pattern matching or future addition of variants backward compatible.
+
+## What the attribute does not provide
+
+It does not by itself guarantee:
+
+- that an inner type is FFI-safe;
+- a stable serialized or on-disk format;
+- valid construction from arbitrary bytes;
+- the layout of surrounding enums or containers;
+- safe ownership transfer across languages;
+- symbol names or Rust ABI stability;
+- thread safety, pinning, or lifetime correctness;
+- semantic interchangeability with the inner value.
+
+Serialization libraries usually look at type implementations, not memory layout. A transparent memory wrapper can serialize differently unless configured.
+
+## My ABI comparison checklist
+
+I verify:
+
+```text
+one allowed non-trivial field
+size and alignment on supported targets
+extern calling convention and foreign declaration
+inner type's FFI status
+validity of every inbound value
+ownership and lifetime rules
+panic/unwind boundary
+nested Option or enum guarantees separately
+public documentation of the ABI promise
+binding generation and cross-language call test
+```
+
+`repr(transparent)` is valuable because it makes one exact promise: the wrapper follows the layout and ABI of its meaningful field. Good unsafe and FFI design comes from using that promise without smuggling unrelated assumptions into it.

@@ -1,0 +1,98 @@
+---
+caseId: "RFA-704"
+title: "AtomicU8::from_mut_slice Exclusively Borrows the Original Slice"
+date: "2026-09-07T09:35:00+01:00"
+lastmod: "2026-09-07T09:35:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "d22a3f290d0cd4a3c5d1fc6891a818b6f3f22cc107d49e4b550d44a30ab97f5f"
+area: "concurrency-memory"
+symptom: "After AtomicU8::from_mut_slice creates an atomic view, assigning through the original byte slice fails with E0506."
+summary: "Rust 1.98 can safely lend ordinary mutable storage as an atomic slice on supported targets. Safety comes from an exclusive borrow: non-atomic access resumes only after the atomic view ends."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["targets with 8-bit atomic load/store and compatible primitive alignment"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust AtomicU8 from_mut_slice borrow error", "atomic_from_mut original slice E0506", "mix atomic and non atomic access mutable slice Rust 1.98"]
+evidence: ["Rust 1.98.1 E0506 compile failure", "ordinary assignment while atomic view remains live", "scoped atomic phase and later byte assertion"]
+sources: ["https://doc.rust-lang.org/std/sync/atomic/type.AtomicU8.html#method.from_mut_slice", "https://doc.rust-lang.org/std/sync/atomic/index.html#memory-model-for-atomic-accesses", "https://doc.rust-lang.org/releases.html#version-1980-2026-08-20"]
+---
+
+Rust 1.98 stabilized a safe way to view some ordinary mutable primitives as atomic values. `AtomicU8::from_mut_slice` is useful for a phased design: initialize or own a byte slice exclusively, lend it to concurrent atomic work, then return to ordinary access after that phase ends.
+
+The conversion does not make atomic and non-atomic access safe at the same time. Its mutable borrow is the mechanism which prevents that mixture.
+
+The [failing fixture](/rust-failure-atlas/evidence/RFA-704/fail.rs) keeps the atomic view alive and writes through the original array:
+
+```rust
+let mut bytes = [0_u8, 0];
+let atomics = AtomicU8::from_mut_slice(&mut bytes);
+
+bytes[0] = 7;
+atomics[1].store(9, Ordering::Relaxed);
+```
+
+Rust emits E0506. The later use of `atomics` proves that the exclusive borrow of `bytes` is still active when the ordinary assignment occurs.
+
+## The conversion changes the access phase
+
+The atomic module's memory-model documentation forbids conflicting atomic and non-atomic access to the same location without synchronization. A conversion API must preserve that rule.
+
+`from_mut_slice` starts from `&mut [u8]`. A mutable reference already guarantees exclusive access to its referent for the borrow. The returned `&mut [AtomicU8]` carries that exclusivity forward while offering atomic methods.
+
+Safe code cannot reach the original slice during the live atomic view. That is not an inconvenience around the feature; it is why the feature can be safe.
+
+The [working fixture](/rust-failure-atlas/evidence/RFA-704/fixed.rs) gives the phases a visible scope:
+
+```rust
+let mut bytes = [0_u8, 0];
+{
+    let atomics = AtomicU8::from_mut_slice(&mut bytes);
+    atomics[0].store(7, Ordering::Relaxed);
+    atomics[1].store(9, Ordering::Relaxed);
+}
+
+assert_eq!(bytes, [7, 9]);
+```
+
+After the last atomic-view use, ordinary access can resume. An explicit block is not always required because non-lexical lifetimes can detect the last use, but I like the block when it documents a concurrent phase.
+
+## Atomic storage is not automatic synchronization
+
+The conversion changes the available operations. It does not select the correct ordering or establish a protocol between threads.
+
+`Ordering::Relaxed` gives atomicity for each byte but no cross-location publication guarantee. If one byte is a readiness flag for data stored elsewhere, I still need a justified release/acquire relationship or a higher-level primitive.
+
+I write the invariant before choosing orderings:
+
+```text
+which thread writes each location?
+which value publishes completion?
+what earlier writes must a reader observe?
+what prevents ordinary access during the atomic phase?
+```
+
+The type solves the last question inside safe Rust. It cannot infer answers to the first three.
+
+## Target availability is part of the API
+
+Atomic types and these conversions are available only where the target supports the relevant atomic width and compatible alignment. `AtomicU8` has broad support, but portable libraries should still treat target capability as a build contract.
+
+For wider integers, primitive and atomic alignment may differ on some targets. I do not replace a checked conversion with a raw cast. The stabilized methods appear under the target conditions where the standard library can uphold their representation requirements.
+
+Cross-compilation CI should include the constrained targets a library promises, not only the developer's host.
+
+## The inverse operation has the same phase rule
+
+`AtomicU8::get_mut_slice` lends a mutable atomic slice as ordinary bytes. It is safe for the same reason: `&mut` proves no other thread can concurrently access those atomics through safe references during the borrow.
+
+This is helpful for bulk initialization before sharing or bulk inspection after workers have joined. It is not a shortcut for reading atomics non-atomically while other threads run.
+
+## A practical ownership shape
+
+I often keep the ordinary buffer under one owner, create the atomic view inside `thread::scope`, let scoped workers borrow pieces of that view, join them at the end of the scope, and only then inspect the bytes normally. Structured thread lifetimes make the phase boundary auditable.
+
+Tests cover the exact target, every ordering-sensitive invariant, and transition into and out of the atomic phase. I also use a concurrency model checker when correctness depends on interleavings rather than only final independent byte values.
+
+The core principle is broader than atomics: safe reinterpretation needs an exclusive transition between access modes. Rust 1.98 provides the transition, and the borrow error catches code which tries to keep both modes active at once.
+
+The storage owner does not change during this transition. No elements are copied and no atomic objects are separately allocated. This is precisely why the lifetime and target-alignment conditions carry so much of the safety proof.

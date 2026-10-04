@@ -1,0 +1,112 @@
+---
+caseId: "RFA-064"
+title: "E0191: Why a Rust Trait Object Must Specify Its Associated Type"
+date: "2026-09-05T08:35:00+01:00"
+lastmod: "2026-09-05T08:35:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "f69bae844d6cb710145068b19f3734e6e5eb8af054200cd4680edc0d5b9217b9"
+area: "diagnostics-macros"
+symptom: "Rust rejects dyn Source with E0191 because the trait's associated Item type was not fixed at the object boundary."
+summary: "An associated type is selected once per trait implementation, but a trait-object vtable still needs its concrete method signatures. Bind the associated type or erase the item through another deliberate boundary."
+rustVersions: ["Rust 1.98.1"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust E0191 associated type must be specified dyn Trait",
+    "value of associated type Item must be specified",
+    "trait object associated type Rust",
+  ]
+evidence:
+  ["Rust 1.98.1 compile failure", "vtable-signature comparison", "associated-type binding repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/error_codes/E0191.html",
+    "https://doc.rust-lang.org/reference/items/associated-items.html#associated-types",
+  ]
+---
+
+Associated types often make generic APIs easier to read, but they cannot disappear when a trait becomes a trait object:
+
+```rust
+trait Source {
+    type Item;
+    fn next(&mut self) -> Option<Self::Item>;
+}
+
+fn consume(_source: &mut dyn Source) {}
+```
+
+Rust 1.98.1 reports E0191:
+
+```text
+the value of the associated type `Item` in `Source` must be specified
+```
+
+The [failing fixture](/rust-failure-atlas/evidence/RFA-064/fail.rs) does not even call `next`. Creating the `dyn Source` type already needs to know the associated type selected by implementations allowed behind that object.
+
+## Each implementation chooses one associated type
+
+An implementation might choose:
+
+```rust
+impl Source for Names {
+    type Item = String;
+    // ...
+}
+```
+
+Another implementation could choose `u64`. The [Reference describes associated types](https://doc.rust-lang.org/reference/items/associated-items.html#associated-types) as type aliases associated with another item. For a given `impl Source for Names`, `Item` is fixed, but `Source` by itself does not name which implementation choice is in use.
+
+Generic code can carry the choice as a projection such as `S::Item`. A trait object erases `S`, so the remaining object type must retain enough information to make its callable interface concrete.
+
+## The vtable method signature depends on `Item`
+
+For `dyn Source<Item = String>`, the dynamic `next` call returns `Option<String>`. For `dyn Source<Item = u64>`, it returns `Option<u64>`. Those values have different layouts, drop behavior, and calling conventions. One unspecified vtable entry cannot safely mean both.
+
+The repair binds the projection:
+
+```rust
+fn consume(source: &mut dyn Source<Item = String>) {
+    if let Some(name) = source.next() {
+        println!("{name}");
+    }
+}
+```
+
+Now any concrete source placed behind the object must implement `Source<Item = String>`. The [repaired fixture](/rust-failure-atlas/evidence/RFA-064/fixed.rs) sends a memory-backed name source through this exact boundary and verifies the result on Rust 1.98.1.
+
+## This is not the same as a generic type parameter
+
+A trait could instead be declared `trait Source<T>`. One concrete type may then implement `Source<String>` and `Source<u64>` separately. With `type Item`, each `Source` implementation for one self type chooses one item type.
+
+Both designs still need a concrete dynamic interface. A `dyn Source<String>` has the type argument visible; a `dyn Source<Item = String>` has the associated binding visible. I choose between the trait designs based on implementation uniqueness and inference, not as a way to evade E0191.
+
+## When different item types must share one collection
+
+If one vector needs heterogeneous sources, binding `Item = String` means all sources must converge on strings. That may be the correct application protocol. If it is not, there are several explicit erasure strategies:
+
+- Return a local enum containing every supported item variant.
+- Return `Box<dyn Any>` and perform checked downcasts at the consumer.
+- Serialize into owned bytes at the boundary.
+- Put the consumer operation on the trait so items do not cross the object boundary.
+
+Each strategy loses different static information. `Any` is flexible but moves errors to runtime and requires `'static` values for ordinary downcasting. An enum is closed but keeps exhaustiveness. Bytes create a serialization contract. I do not hide this decision behind a vague object alias.
+
+## Associated types not used by methods can still matter
+
+Even if the current object-safe methods never mention `Item`, the trait object's identity includes its associated type bindings. Implementations with different bindings are different trait-object types. This supports coherent method lookup and lets supertraits or future generic code rely on the projection.
+
+If an associated type is genuinely irrelevant to dynamic consumers, splitting the trait can produce a smaller object-safe interface. The generic extension trait can keep the associated type while the dynamic core exposes only the operations needed across the boundary.
+
+## My diagnostic sequence
+
+When E0191 appears inside several aliases, I expand the object type and list every associated type from the trait and its supertraits. Then I ask where each should be fixed:
+
+1. At a function parameter accepting one item protocol.
+2. At a type alias shared by a subsystem.
+3. Through a generic parameter when static dispatch is enough.
+4. Through explicit item erasure when heterogeneous outputs are required.
+
+The official [E0191 explanation](https://doc.rust-lang.org/error_codes/E0191.html) gives the minimal binding syntax. The deeper reason is that dynamic dispatch erases the implementor, not the method's concrete ABI. Specifying the associated type provides the information the vtable and caller still need.

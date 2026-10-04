@@ -1,0 +1,80 @@
+---
+caseId: "RFA-291"
+title: "Iterator::chain Abandons the First Iterator After None"
+date: "2026-09-06T01:11:00+01:00"
+lastmod: "2026-09-06T01:11:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "3ffebec533658e2b3d14f806f7ec59867cdd2730f3ae3527315e1267f3a88282"
+area: "upgrades-compatibility"
+symptom: "A custom first iterator returns None once and could return Some later, but chain switches to its second iterator and the later first-side value is never observed."
+summary: "Iterator::chain treats the first None as the sequence boundary and continues with the second iterator. Iterator None is not a temporary wait signal; model pauses outside Iterator or repair the producer before chaining."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust Iterator chain first None permanent", "chain non fused iterator loses later Some", "Iterator None temporary unavailable Rust"]
+evidence: ["Rust 1.98.1 custom resumable iterator", "first call returns None", "only second iterator collected"]
+sources: ["https://doc.rust-lang.org/std/iter/trait.Iterator.html#method.chain", "https://doc.rust-lang.org/std/iter/trait.Iterator.html#tymethod.next", "https://doc.rust-lang.org/std/iter/trait.FusedIterator.html"]
+---
+
+I built a custom iterator that used `None` to mean “nothing is ready on this call.” Alone, another call could produce a value. Once I placed it before another iterator with `chain`, that later value disappeared.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-291/fail.rs) has a first iterator returning `None`, then `Some(1)`. It chains `[2]` and collects only `2`.
+
+## Chain needs one irreversible boundary
+
+[`Iterator::chain`](https://doc.rust-lang.org/std/iter/trait.Iterator.html#method.chain) promises one sequence made from the first iterator followed by the second. To cross from the first sequence to the second, it observes `None` from the first.
+
+After that transition, going back would break the promised order. If the first iterator later produced `1`, should it appear after a value already emitted from the second iterator? Chain avoids that ambiguous interleaving by abandoning the first side once its end is observed.
+
+The mental model is:
+
+```text
+state First:  Some(x) -> emit x
+state First:  None    -> switch to Second
+state Second: next()  -> only poll Second
+```
+
+The adapter stores which phase it reached. It does not alternate between sources looking for revived values.
+
+## `None` is not `Pending`
+
+The [`Iterator::next`](https://doc.rust-lang.org/std/iter/trait.Iterator.html#tymethod.next) result has values and no value. It has no wakeup registration, readiness event, or reason for absence.
+
+For asynchronous work, `Poll::Pending` is the state saying the operation may later progress and arranging a wakeup. For a nonblocking queue, a domain enum can distinguish `Item`, `TemporarilyEmpty`, and `Closed`. A plain iterator cannot carry all three meanings through `Option<Item>`.
+
+Using `None` as a pause can appear to work with a manual loop that calls `next` again. It fails as soon as a consumer treats the conventional end as final, including `collect`, `for`, and many adapters.
+
+## FusedIterator is a stronger public promise
+
+The base `Iterator` trait technically permits another `Some` after `None`. [`FusedIterator`](https://doc.rust-lang.org/std/iter/trait.FusedIterator.html) marks iterators that promise this will never happen.
+
+That distinction does not make a reviving iterator a good input for chain. Chain's own sequencing requires the first boundary to be permanent. Adding `.fuse()` to the first input would make the loss explicit by suppressing later values; it would not recover them.
+
+The repair belongs in the producer or abstraction. It should delay returning `None` until its sequence is actually finished.
+
+## This mirrors streaming I/O, with different types
+
+`Read::chain` also crosses permanently after its first reader reports EOF with `Ok(0)`. RFA-280 documents that case. Both APIs concatenate two sources and need a one-way state transition.
+
+The details differ: `Iterator` ends with `None`, while synchronous `Read` uses a zero-byte successful read under its contract. The wider rule is the same. An end marker cannot also serve as temporary backpressure when a combinator uses it to move to the next phase.
+
+I make stream lifecycle explicit before composing sources. This prevents an adapter from being blamed for faithfully interpreting a misleading producer.
+
+## Double-ended chains add another frontier
+
+When both sources support `DoubleEndedIterator`, `next_back` begins from the second iterator and later reaches the first. Forward and backward consumption can meet in the middle.
+
+I avoid depending on undocumented polling counts or side effects inside custom iterators. Iterator values should carry the important result; calls to `next` should not be a hidden protocol whose exact schedule must survive optimization.
+
+If polling behavior matters for correctness, I usually need a state machine API with named events rather than a generic iterator.
+
+## What I test
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-291/fixed.rs) uses a first iterator whose only value appears before its final `None`. Chain then produces `[1, 2]` in the documented order.
+
+For a custom iterator I test its complete trace: several values, its first `None`, and extra calls after that `None`. If it implements `FusedIterator`, I assert permanent exhaustion. If it intentionally can pause, I do not export it as the input to ordinary iterator consumers without an adapter that preserves the pause state as an item.
+
+I also test chain with either side empty, both sides empty, early consumer termination, and forward/backward calls when supported. These cases expose which source owns the current frontier.
+
+The core principle is that composition gives terminal signals architectural meaning. In `chain`, the first `None` is the boundary that activates the second iterator. A temporary absence needs its own state, because once it is compressed into `None`, chain has no reason or safe ordering rule for returning.

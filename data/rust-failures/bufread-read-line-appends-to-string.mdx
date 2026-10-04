@@ -1,0 +1,108 @@
+---
+caseId: "RFA-177"
+title: "Why BufRead::read_line Appends to the String"
+date: "2026-09-05T17:16:00+01:00"
+lastmod: "2026-09-05T17:16:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "06887dbcea118ef36f9ea05af9d479e75a4928ddbc53409a5d71f5d5b50b5c17"
+area: "ffi-targets"
+symptom: "BufRead::read_line preserves old String contents and appends the next line, producing prefix:hello instead of replacing the buffer."
+summary: "read_line reuses caller-owned storage by appending through the newline or EOF. Clear the buffer when each iteration represents a fresh line, and use the returned byte count—not string emptiness—to detect EOF."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust read_line appends to String",
+    "BufRead read_line clear buffer",
+    "Rust read_line does not replace contents",
+  ]
+evidence: ["Rust 1.98.1 Cursor fixture", "pre-populated String", "explicit clear repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/std/io/trait.BufRead.html#method.read_line",
+    "https://doc.rust-lang.org/std/io/trait.BufRead.html#method.lines",
+  ]
+---
+
+I like APIs that accept a reusable buffer because they make allocation policy visible. The price is that I must understand whether the operation replaces or extends the existing contents.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-177/fail.rs) starts with `"prefix:"` in a `String`, reads `"hello\n"`, and expects only the line. The result is `"prefix:hello\n"`.
+
+## Appending is the documented operation
+
+[`BufRead::read_line`](https://doc.rust-lang.org/std/io/trait.BufRead.html#method.read_line) reads through a newline or EOF and appends those bytes to the provided `String`. Previous content is preserved. The documentation explicitly tells callers to clear the buffer first when replacement is desired.
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-177/fixed.rs) makes that lifecycle visible:
+
+```rust
+line.clear();
+let bytes = reader.read_line(&mut line)?;
+```
+
+`clear` sets the length to zero but retains the allocation. Repeated reads can therefore reuse capacity while each loop iteration still sees one fresh line.
+
+This is the same broad pattern as `Read::read_to_string`, but line-oriented loops make the error easier to repeat: forgetting one `clear` grows a buffer with every iteration.
+
+## The returned number counts newly read bytes
+
+`read_line` returns the number of bytes appended by that call, including the newline when one was read. It does not return the final `String::len()`.
+
+This matters when the buffer was not empty intentionally. It also matters for UTF-8: a line can contain fewer Unicode scalar values than bytes. I name the result `bytes_read`, not `characters`.
+
+An `Ok(0)` result means EOF. Testing `line.is_empty()` is not equivalent if old contents were preserved or if buffer management is wrong. The byte count is the protocol signal.
+
+## The newline remains in the buffer
+
+The method includes `\n`, and a preceding `\r` from CRLF input remains too. Blindly calling `trim()` may remove meaningful leading or trailing spaces in addition to line endings.
+
+When my protocol defines line terminators, I remove only the accepted suffix:
+
+```rust
+if line.ends_with('\n') {
+    line.pop();
+    if line.ends_with('\r') {
+        line.pop();
+    }
+}
+```
+
+Whether the final line must have a terminator is a separate validation rule. EOF can arrive after bytes without a newline, and `read_line` returns those bytes successfully.
+
+## Invalid UTF-8 changes the choice of API
+
+Because the destination is a `String`, input must remain valid UTF-8. A binary or mixed-encoding protocol should use `read_until` with a `Vec<u8>` and perform decoding according to its real contract.
+
+I avoid converting arbitrary input lossily before parsing identifiers or security-sensitive fields. Replacement characters can make distinct byte sequences look similar and can hide malformed input.
+
+For ordinary trusted UTF-8 text, `read_line` gives a convenient validation boundary.
+
+## A missing newline can grow without bound
+
+Line-based code often assumes that input arrives in reasonable lines. An untrusted peer can send bytes forever without a newline, causing the destination to keep growing while `read_line` blocks.
+
+The standard documentation calls out this risk. Depending on the protocol, I apply a length-limited reader, scan a bounded buffer for the delimiter, or reject a line as soon as it exceeds the maximum.
+
+The limit belongs to the protocol, not only to memory optimisation. It defines what input the service accepts.
+
+## `lines()` trades control for convenience
+
+[`BufRead::lines`](https://doc.rust-lang.org/std/io/trait.BufRead.html#method.lines) yields a newly owned `String` per result and removes line endings. It is pleasant when allocation control and terminator distinctions are unimportant.
+
+I prefer explicit `read_line` when I need buffer reuse, exact byte accounting, maximum sizes, or a policy for CRLF versus LF. Neither API is universally better; they expose different choices.
+
+## My loop pattern
+
+In a reusable-buffer loop I keep the order deliberate:
+
+1. Clear the buffer.
+2. Read and keep the returned byte count.
+3. Stop on `Ok(0)`.
+4. Enforce the maximum line size.
+5. Remove only the permitted terminator.
+6. Parse or move the line before clearing it again.
+
+If a consumer needs to retain the value, it must clone, move, or transform it before the next iteration. A reusable buffer is mutable scratch space, not stable record storage.
+
+The core principle is that ownership of a buffer includes ownership of its lifecycle. Rust lets `read_line` reuse the allocation by appending. Clearing, bounding, and interpreting the contents remain explicit caller responsibilities.

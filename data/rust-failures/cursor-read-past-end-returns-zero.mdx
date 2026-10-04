@@ -1,0 +1,88 @@
+---
+caseId: "RFA-267"
+title: "Why Cursor Read Past the End Returns Zero Without Moving"
+date: "2026-09-06T00:47:00+01:00"
+lastmod: "2026-09-06T00:47:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "317d546037f64f5099ab8b3ccd393a002868e60e999bbb753ba93cee67c60acf"
+area: "ffi-targets"
+symptom: "Reading from a Cursor positioned beyond its buffer returns zero bytes and leaves the position beyond the end."
+summary: "Cursor permits positions beyond current length. Reads there observe EOF and return zero; unlike a write to a growable buffer, reading does not fill gaps or clamp the position."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets with std io"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust Cursor read position beyond end returns zero", "Cursor set_position past buffer EOF", "does Cursor clamp position Rust"]
+evidence: ["Rust 1.98.1 vector Cursor", "position ten over length three", "zero-byte read and unchanged position"]
+sources: ["https://doc.rust-lang.org/std/io/struct.Cursor.html#method.set_position", "https://doc.rust-lang.org/std/io/trait.Read.html#tymethod.read", "https://doc.rust-lang.org/std/io/struct.Cursor.html"]
+---
+
+`Cursor::set_position` accepts a position beyond the current buffer length. A later read does not clamp it back.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-267/fail.rs) wraps `b"abc"`, sets position ten, and requests one byte. The read returns zero, and the cursor remains at ten.
+
+## Zero bytes means EOF for this read state
+
+The [`Read` contract](https://doc.rust-lang.org/std/io/trait.Read.html#tymethod.read) permits a successful result of zero when the buffer is empty or the reader is at end of stream. A Cursor positioned beyond its in-memory content has no byte available, so it behaves as EOF.
+
+This is not an out-of-bounds memory access and not automatically an error. The position is logical state stored as `u64`; it is not restricted to `0..=len` by [`set_position`](https://doc.rust-lang.org/std/io/struct.Cursor.html#method.set_position).
+
+## Reading does not repair the position
+
+The operation cannot know whether the caller intends to wait for more data, seek back, or preserve an external offset. It returns zero without moving.
+
+Repeated reads at the same position keep returning zero. A loop that treats every `Ok(0)` as temporary and retries immediately can spin forever.
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-267/fixed.rs) asserts both the zero result and unchanged position. A real repair decides whether to seek to end, reject the offset, or stop at EOF.
+
+## Write behavior can be very different
+
+For a Cursor over a growable `Vec<u8>`, writing beyond the end can extend the vector and zero-fill the gap. Reading at that same future position does not extend anything.
+
+This asymmetry follows operation direction: a write supplies new bytes, while a read only observes existing bytes. Generalizing from the write case produces a false expectation that read will clamp or allocate.
+
+For a fixed-size backing slice, writes also cannot grow beyond capacity, so the wrapped type matters.
+
+## External offsets need validation
+
+File formats and protocols may contain offsets. Converting them directly to Cursor positions lets malformed input point far beyond available data, where an ordinary read looks like clean EOF.
+
+If early EOF is a format error, I compare the offset and required length with the backing data using checked arithmetic before seeking. The error then says “section outside input” rather than “unexpected empty field.”
+
+Checked addition is important for `offset + length`; both values can fit separately while their sum overflows.
+
+## read_exact changes the failure shape
+
+When one byte or a fixed header is required, `read_exact` turns premature EOF into an error rather than returning a short count. It still cannot distinguish every reason for EOF without surrounding context.
+
+I use `read` for streaming progress and `read_exact` for fixed-width format requirements. Calling `read` once and assuming the whole requested buffer was filled is already wrong even before considering a past-end cursor.
+
+## Empty destination also returns zero
+
+A read into an empty output slice can return zero even when input remains. This is why zero does not universally prove source exhaustion.
+
+The caller knows whether its destination was empty. In loops I ensure a positive buffer size and then apply the reader-specific EOF contract.
+
+This resembles zero-sized iterator parameters: progress depends on providing somewhere for data to go.
+
+## Cursor position and inner length need different metrics
+
+I log `position()` and the backing `len()` separately. Reporting only “offset 10” does not show whether that offset is valid for a 3-byte or 30-byte input.
+
+After mutating the inner buffer through allowed APIs, its length can change while position remains. The Cursor does not automatically preserve a relation between them.
+
+## What I test
+
+My table reads at zero, exactly at end, and beyond end; seeks back after EOF; uses empty and non-empty destination buffers; and compares fixed versus growable backing stores for writes.
+
+For parsers I assert domain errors for invalid offsets before any field decoding. This keeps structural corruption distinct from an ordinary end-of-stream condition.
+
+## Sparse-position tests should avoid huge allocation
+
+A Cursor over `Vec<u8>` may allocate when a later write fills the gap. To test read behavior, I can set a very large logical position without writing and verify immediate EOF without allocating that distance.
+
+Production code should still cap external offsets. A harmless read at a huge position can be followed by a write that attempts a huge allocation. The capability of the next operation is part of validating cursor state.
+
+I reset or reject the position before handing the same Cursor to code that can mutate its backing vector.
+
+The core principle is that a cursor position is independent logical state, not a bounded index invariant. Reading beyond current content safely reports zero bytes and preserves that state. Validate structured offsets explicitly and choose `read_exact` when premature EOF must be an error.

@@ -1,0 +1,112 @@
+---
+caseId: "RFA-171"
+title: "Why Path::join Can Replace the Base Path"
+date: "2026-09-05T17:10:00+01:00"
+lastmod: "2026-09-05T17:10:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "15bb5d76b7bf57d5231c6152822e9025130c44a419ff95dad2826e0aee01491f"
+area: "ffi-targets"
+symptom: "Path::join with an absolute candidate discards the intended base on Unix, producing /etc/passwd instead of a path beneath the application directory."
+summary: "Path::join composes paths according to platform rules; it does not prove that a result stays under a trusted directory. An absolute component replaces the base, and relative parent components require a separate containment policy."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["Unix fixture; path rules are target-specific"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust Path join absolute replaces base",
+    "PathBuf join user path escapes root",
+    "Rust safe join relative path containment",
+  ]
+evidence:
+  ["Rust 1.98.1 x86_64 Linux assertion", "absolute Unix candidate", "reject-absolute repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/std/path/struct.Path.html#method.join",
+    "https://doc.rust-lang.org/std/path/struct.Path.html#method.is_absolute",
+    "https://doc.rust-lang.org/std/path/enum.Component.html",
+  ]
+---
+
+I used to read `base.join(candidate)` as “put this candidate below the base.” That is a useful sentence for ordinary relative paths, but it is not the contract of the API.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-171/fail.rs) joins `/srv/application/files` with `/etc/passwd` on Unix. The result is `/etc/passwd`. The base is gone.
+
+This is not a filesystem escape hidden inside an unsafe API. It is normal path composition, and it becomes dangerous only when my application gives `join` a security meaning that `join` never promised.
+
+## An absolute candidate replaces what came before
+
+[`Path::join`](https://doc.rust-lang.org/std/path/struct.Path.html#method.join) returns an owned path made by joining its argument to the current path. The linked `PathBuf::push` behaviour is important: if the pushed path is absolute, it replaces the previous path.
+
+On Unix, the operation is easy to visualise:
+
+```text
+/srv/application/files + reports/today.txt  -> /srv/application/files/reports/today.txt
+/srv/application/files + /etc/passwd        -> /etc/passwd
+```
+
+The second operand is already rooted, so treating it as a child would produce a strange path with two roots. Rust follows the platform's path rules instead.
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-171/fixed.rs) checks [`Path::is_absolute`](https://doc.rust-lang.org/std/path/struct.Path.html#method.is_absolute) before joining. That closes the exact failure demonstrated by the case.
+
+## Rejecting absolute paths is only the first check
+
+A relative path can still contain parent components:
+
+```text
+../../secrets/key
+```
+
+Joining that value produces a path that is textually based under my directory, but filesystem resolution may walk outside it. This means “not absolute” and “contained” are different properties.
+
+For a deliberately small namespace, I inspect [`Component`](https://doc.rust-lang.org/std/path/enum.Component.html) values and reject `ParentDir`, `RootDir`, and platform prefixes. I may also reject `CurDir` to keep stored names canonical.
+
+This component policy is often better than searching the string for `..`. Path components understand separators and target rules; substring checks confuse a filename such as `report..txt` with a parent directory.
+
+## Normalisation is not filesystem containment
+
+Removing `.` and resolving lexical `..` components can make a path easier to compare. It still does not account for symbolic links, mount points, or a directory changed between validation and use.
+
+For example, a path that looks like `/srv/application/files/customer/avatar` may cross a symlink at `customer`. A string prefix comparison cannot see that. Even canonicalising both paths can leave a time-of-check/time-of-use gap if an attacker can change the tree after the check.
+
+When the boundary is security-sensitive, I prefer operating relative to an already opened directory with platform facilities that constrain resolution. The precise facility is operating-system specific. The general Rust principle is simpler: a `PathBuf` describes a path; it is not proof of where a later filesystem operation will land.
+
+## Prefix checks have their own trap
+
+I do not use a string check like this:
+
+```rust
+result.to_string_lossy().starts_with(base.to_string_lossy().as_ref())
+```
+
+`/srv/files-backup` starts with the text `/srv/files`, but it is not inside `/srv/files`. Path-aware `starts_with` compares complete components and is a better lexical check, after applying an explicit normalisation policy.
+
+That still remains a lexical claim. I name it accordingly in code, for example `is_lexically_below`, rather than `is_safe_path`.
+
+## Cross-platform code needs target-aware fixtures
+
+The evidence here is intentionally marked as a Unix fixture. Windows has prefixes, drive letters, rooted paths, verbatim forms, and separator rules that do not fit a Unix-only model.
+
+If a service accepts paths produced on one system and consumes them on another, I decide whose syntax is authoritative. `std::path` interprets paths using the current target's rules; it is not a universal parser for every platform's path syntax.
+
+I test the actual supported targets with candidates covering:
+
+- an ordinary child path;
+- an absolute or rooted path;
+- one and several parent components;
+- empty and current-directory components;
+- symlinks when the real filesystem boundary matters;
+- target-specific prefixes and separators.
+
+## My review sequence
+
+When I see a path built from external input, I now ask:
+
+1. Is this merely path construction, or is somebody treating it as containment?
+2. Can the candidate be absolute or rooted?
+3. Are parent components allowed?
+4. Can symbolic links or concurrent filesystem changes cross the boundary?
+5. Which operating-system path grammar applies?
+6. Can the application use an opened directory as the capability instead of validating strings?
+
+The core principle extends beyond Rust: composition is not validation. `Path::join` correctly combines path syntax. My application must separately define and enforce which filesystem locations are allowed.

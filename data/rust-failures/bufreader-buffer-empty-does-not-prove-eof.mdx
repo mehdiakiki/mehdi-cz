@@ -1,0 +1,92 @@
+---
+caseId: "RFA-355"
+title: "An Empty BufReader::buffer Does Not Prove EOF"
+date: "2026-09-06T02:15:00+01:00"
+lastmod: "2026-09-06T02:15:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "74d032b27d790117fa4babe6a13c063a2df54b22a56257ae0be1ea288bbf74da"
+area: "ffi-targets"
+symptom: "BufReader::buffer returns an empty slice immediately after construction even though the underlying reader contains bytes."
+summary: "buffer() is a non-filling observation of bytes already held inside BufReader. fill_buf() may perform I/O and is the BufRead operation that can distinguish an empty cache from EOF at that moment."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust BufReader buffer empty not EOF", "BufReader buffer does not fill", "buffer vs fill_buf Rust"]
+evidence: ["Rust 1.98.1 in-memory Cursor source", "empty buffer immediately after construction", "fill_buf exposes ready and later confirms EOF"]
+sources: ["https://doc.rust-lang.org/std/io/struct.BufReader.html#method.buffer", "https://doc.rust-lang.org/std/io/trait.BufRead.html#tymethod.fill_buf", "https://doc.rust-lang.org/std/io/trait.BufRead.html#tymethod.consume"]
+---
+
+I once used [`BufReader::buffer`](https://doc.rust-lang.org/std/io/struct.BufReader.html#method.buffer) as a cheap test for whether input remained. It returned an empty slice, so I stopped parsing. The wrapped source had not reached EOF; the buffer simply had not been filled yet.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-355/fail.rs) constructs a `BufReader` over a `Cursor` containing `ready`. Immediately afterward, `buffer()` is empty. Construction allocates or prepares buffering state, but it does not eagerly read the source.
+
+## buffer observes current cache state only
+
+The method returns a reference to data already present in the internal buffer. Its key guarantee is negative: unlike `fill_buf`, it does not try to fill an empty buffer.
+
+This makes `buffer()` useful for inspection without I/O. I can see how many unread bytes are currently cached, inspect them in debugging, or make decisions where initiating another read would be inappropriate.
+
+It also means an empty result has at least two explanations: no fill has happened, or buffered data was consumed. EOF is only one possible state behind those observations.
+
+## fill_buf is allowed to ask the source
+
+[`BufRead::fill_buf`](https://doc.rust-lang.org/std/io/trait.BufRead.html#tymethod.fill_buf) returns the current available buffer and attempts to read more from the underlying source when the buffer is empty. On success, a non-empty slice provides bytes without advancing the logical consumer position.
+
+When `fill_buf()` successfully returns an empty slice, the reader is at EOF for that operation. For a regular file or in-memory cursor, this is straightforward. For streaming abstractions, I still follow the specific `Read` contract and application lifecycle; an adapter may impose its own boundary.
+
+The method is fallible because filling can perform I/O. `buffer()` cannot report such an error because it performs no fill.
+
+## Looking and consuming are separate
+
+`fill_buf` lets me inspect bytes in place. After processing some prefix, I call [`consume(amount)`](https://doc.rust-lang.org/std/io/trait.BufRead.html#tymethod.consume) to mark those bytes as read.
+
+This separation enables parsers to search delimiters without copying every byte. But it creates a protocol: I must not consume more than the returned buffer length, and I must finish using the borrowed slice before mutably accessing the reader again.
+
+If I repeatedly call `fill_buf` without consuming, I should expect the same data. If I consume everything, `buffer()` can become empty while more source bytes still exist and wait for the next fill.
+
+## Empty is an observation, not a lifecycle event
+
+This case is part of a wider systems lesson. An empty queue can still have producers. A non-blocking iterator can return no item and later resume. A network buffer can be empty while the connection remains open.
+
+The source of truth for lifecycle is different from current availability. `BufReader::buffer()` reports current cached availability. It does not report that the source is closed, exhausted forever, or unable to produce another byte.
+
+Conflating these states leads to truncated messages that look like successful completion.
+
+## Why construction stays lazy
+
+Reading during `BufReader::new` would add surprising side effects to a constructor. It could block on a socket, return an error that the constructor's current signature cannot represent, or consume bytes before the caller is ready.
+
+Lazy filling keeps the wrapper cheap to create and places I/O in operations that already return `io::Result`. It also means a buffer capacity is not a promise about current length. Capacity describes storage available for future reads.
+
+I now treat `new`, `capacity`, `buffer`, and `fill_buf` as four different questions: create state, report possible storage, observe cached bytes, and obtain available bytes.
+
+## Avoid polling buffer in a busy loop
+
+Because `buffer()` does not fill, looping until it becomes non-empty cannot make progress by itself. No hidden worker automatically transfers bytes into an ordinary `BufReader`.
+
+I call a reading method, use `fill_buf`, or integrate the source with the appropriate blocking or asynchronous readiness model. Standard `BufReader` implements synchronous `Read`; it is not an async buffer and does not wake a task when data arrives.
+
+For async runtimes I use their buffered I/O traits and follow their readiness contracts instead of carrying this exact synchronous API pattern across unchanged.
+
+## Be careful when mixing direct inner reads
+
+`BufReader` may read ahead. Once it contains bytes, reading directly from its underlying reader can skip the cached logical data and break ordering. The standard documentation warns against direct reads through `get_ref` or `get_mut` for this reason.
+
+An empty buffer at one instant does not make arbitrary inner-reader access a generally safe design. The wrapper should usually remain the owner of sequential reading for the complete protocol.
+
+If I must hand off a seekable source, I reconcile logical and physical positions explicitly and test the transition.
+
+## The deterministic repair
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-355/fixed.rs) first asserts that `buffer()` is empty. It then calls `fill_buf()` and sees `ready`; the non-filling `buffer()` now observes the same bytes. After consuming five bytes, both the cache and a subsequent fill are empty.
+
+The second empty `fill_buf` is meaningful because an I/O attempt has established EOF on the finite cursor. The first empty `buffer` only described an unfilled cache.
+
+For production parsers I test empty input, input smaller than capacity, input spanning several fills, delimiters crossing boundaries, and errors after partial data. These reveal assumptions that a single in-memory read often hides.
+
+## The core principle is to ask whether an observer advances state
+
+Read-only-looking methods can answer very different questions. `buffer()` intentionally avoids advancing the I/O state. `fill_buf()` may advance the underlying source into internal storage while leaving the consumer's logical position unchanged.
+
+An empty observation is evidence only about the layer observed. To prove EOF, I use the operation whose contract is allowed to consult the source.

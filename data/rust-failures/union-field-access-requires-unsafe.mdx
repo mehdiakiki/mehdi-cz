@@ -1,0 +1,106 @@
+---
+caseId: "RFA-095"
+title: "E0133: Why Reading a Rust Union Field Is Unsafe"
+date: "2026-09-05T09:15:00+01:00"
+lastmod: "2026-09-05T09:15:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "fad603512cf06baec4ccb189aee15bb05aa2ae39ee8bb2d4c63af718bb4c1024"
+area: "ffi-targets"
+symptom: "Reading a Rust union field fails because the compiler cannot know which field currently contains valid data."
+summary: "A union overlays storage without tracking an active variant. Reading one field asserts that the bytes are initialized and valid for that field; keep this proof narrow or use an enum when a tag exists."
+rustVersions: ["Rust 1.98.1"]
+targets: ["all targets; representation details vary"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust E0133 access to union field unsafe",
+    "read Rust union field unsafe block",
+    "union active field validity",
+  ]
+evidence: ["Rust 1.98.1 compile failure", "active-field invariant", "narrow unsafe read repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/reference/items/unions.html",
+    "https://doc.rust-lang.org/reference/unsafety.html",
+  ]
+---
+
+Writing a union field is allowed, but reading one requires an unsafe context:
+
+```rust
+union Word {
+    integer: u32,
+    bytes: [u8; 4],
+}
+
+let word = Word { integer: 0x0102_0304 };
+let bytes = word.bytes;
+```
+
+Rust 1.98.1 reports E0133 because access to a union field is unsafe. The [failing fixture](/rust-failure-atlas/evidence/RFA-095/fail.rs) captures the compiler's reason: the field may not be properly initialized, and using invalid data is undefined behavior.
+
+Unlike an enum, a union stores no Rust-managed tag saying which interpretation is active. All fields overlap the same storage.
+
+## Reading is a claim about validity
+
+The [Reference on unions](https://doc.rust-lang.org/reference/items/unions.html) defines their storage and field restrictions. The [unsafety chapter](https://doc.rust-lang.org/reference/unsafety.html) lists reading a union field as an unsafe operation.
+
+When code reads `word.bytes`, it claims that the current storage contains a valid `[u8; 4]`. Every bit pattern is valid for u8, so this particular reinterpretation has a manageable validity argument. Reading arbitrary bytes as `bool`, a reference, or a Rust enum would be much more dangerous because many bit patterns are invalid for those types.
+
+The unsafe block does not check the bits. It marks where the human proof is consumed.
+
+## Keep the read and its reason together
+
+The verified repair is narrow:
+
+```rust
+let word = Word { integer: 0x0102_0304 };
+// Safety: every bit pattern is valid for [u8; 4].
+let bytes = unsafe { word.bytes };
+```
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-095/fixed.rs) compiles and runs this access. The result depends on native endianness. On a little-endian target the byte order differs from a big-endian target. Validity does not guarantee portable meaning.
+
+If the code wants a defined byte encoding, `u32::to_le_bytes` or `to_be_bytes` is clearer and safe. A union is not needed.
+
+## An external tag should be checked first
+
+FFI APIs often pair a union with a numeric tag. The tag states which field the producer initialized. I validate the tag, lengths, version, and any ownership flags before selecting the field. Unknown tags need an explicit policy; treating them as the nearest known variant is unsafe.
+
+When Rust owns both producer and consumer, an enum usually models this better. The enum couples the discriminant and payload so safe pattern matching cannot select the wrong field.
+
+At a foreign boundary the C representation may require a union. I translate it into an internal enum as early as possible, leaving the unsafe interpretation in one reviewed module.
+
+## Fields with drop need more work
+
+Union fields cannot automatically run arbitrary drop logic because Rust does not know which field is active. Values requiring destruction need `ManuallyDrop` and a separate invariant controlling initialization and cleanup. A case can be valid to read and still be wrong to drop twice or forget entirely.
+
+Copy fields avoid some ownership complications, but not invalid bit patterns or semantic errors.
+
+## Type punning is not always portable
+
+Using a union to reinterpret floats, integers, or SIMD types can depend on layout, target endianness, and validity. Standard conversion methods such as `from_bits`, `to_bits`, or byte conversion functions communicate intent and usually avoid unsafe code.
+
+For foreign layouts, `repr(C)` gives specific layout guarantees, while the default Rust representation is not a stable C interface. I verify field sizes and alignments on every supported target.
+
+## Assignment and access are intentionally different
+
+Assigning to a union field does not read the previous field, so the syntax is safe for allowed union field types. Reading must choose an interpretation and is unsafe. This asymmetry reflects the actual proof burden.
+
+Pattern matching a union field is also a read and therefore needs unsafe. Borrowing a field adds reference alignment and aliasing requirements on top of value validity.
+
+## My union review checklist
+
+Before a field read I require answers for:
+
+1. Which operation initialized the storage?
+2. How is the active field known?
+3. Are all current bits valid for the selected Rust type?
+4. Does the interpretation depend on endianness or target layout?
+5. Who owns and eventually destroys any resources?
+6. Can the value be converted immediately into a safe enum or struct?
+
+If the safety comment says only “field was set,” I look for the exact control flow proving it cannot have been overwritten through another field.
+
+E0133 prevents union interpretation from becoming invisible. The correct repair is not a broad unsafe block; it is a small read next to a precise active-field and validity proof, followed by conversion into a safer representation whenever possible.

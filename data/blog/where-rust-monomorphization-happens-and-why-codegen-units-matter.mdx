@@ -1,0 +1,192 @@
+---
+title: "Where Rust Monomorphization Happens and Why Codegen Units Matter"
+date: "2026-09-21T09:00:00+01:00"
+tags: ["Rust monomorphization", "codegen units", "Rust compile time", "binary size", "rustc internals"]
+draft: false
+reviewed: true
+reviewedHash: "b55e21f239cc6c6a70ba69ba51168d0f2d1859c8ff322209416b39d7db07dabb"
+cluster: "rust-under-the-hood"
+campaign: "authority-2026"
+opportunity: "RUST-011"
+summary: "A tested walkthrough of monomorphization collection, concrete generic instances, codegen-unit partitioning, compile-time parallelism, and binary-size trade-offs."
+---
+
+Rust monomorphization is often explained as “the compiler copies a generic function for every concrete type.” This is useful, but it hides two different compiler jobs:
+
+1. discover which concrete instances must exist;
+2. place and translate those instances into codegen units and backend IR.
+
+That distinction matters when I investigate compile time, duplicate work or binary size. A generic definition can come from one crate, be instantiated by another crate, be assigned to a codegen unit, and later be inlined or removed. There is no single source line where all of “monomorphization” happens.
+
+I checked the small experiment below with `rustc 1.95.0-nightly (3a70d0349 2026-02-27)` on x86-64 Linux.
+
+## The generic source
+
+```rust
+#[inline(never)]
+fn twice<T>(value: T) -> T
+where
+    T: std::ops::Add<Output = T> + Copy,
+{
+    value + value
+}
+
+fn main() {
+    println!("{} {}", twice(21_u32), twice(21_u64));
+}
+```
+
+The source has one `twice` definition and two used substitutions:
+
+```text
+twice::<u32>
+twice::<u64>
+```
+
+Rust's assembly cannot remain generic over an unknown `T`. The selected addition operation, calling convention, value size and machine instructions depend on the concrete type.
+
+## Collection discovers mono items
+
+Nightly rustc can print the result of monomorphization collection:
+
+```bash
+rustc \
+  -C opt-level=0 \
+  -C debuginfo=0 \
+  -Zprint-mono-items=yes \
+  mono.rs \
+  -o mono
+```
+
+The relevant output from this program was:
+
+```text
+MONO_ITEM fn <u32 as std::ops::Add>::add @@ ...-cgu.0[Internal]
+MONO_ITEM fn <u64 as std::ops::Add>::add @@ ...-cgu.0[Internal]
+MONO_ITEM fn twice::<u32> @@ ...-cgu.0[Internal]
+MONO_ITEM fn twice::<u64> @@ ...-cgu.0[Internal]
+```
+
+`main`, formatting helpers and runtime functions also appeared. A mono item is a unit that needs code generation, such as a concrete function instance or static. The collector starts from roots and discovers referenced items recursively.
+
+The rustc [monomorphization guide](https://rustc-dev-guide.rust-lang.org/backend/monomorph.html) places collection just before MIR lowering and code generation. The `collect_and_partition_mono_items` query first collects the needed items, then partitions them into codegen units.
+
+## The binary confirms two functions
+
+At optimization level zero, `#[inline(never)]` keeps the demonstration visible. Demangling the symbol table showed:
+
+```bash
+nm -C mono | rg 'mono::twice'
+```
+
+```text
+0000000000014010 t mono::twice::<u32>
+0000000000014030 t mono::twice::<u64>
+```
+
+This proves two symbols existed in this build. It does not prove every generic call always creates a lasting binary symbol. Optimizations can inline, merge or remove code. Unused generic combinations are not generated merely because the source definition could accept them.
+
+## Collection and code generation are not the same moment
+
+The compiler can identify `twice::<u32>` as a required mono item before backend IR exists. Later, while MIR is translated into the backend representation, type parameters are replaced with concrete types.
+
+The rustc guide on [lowering MIR](https://rustc-dev-guide.rust-lang.org/backend/lowering-mir.html) says the actual translation-time monomorphization occurs as codegen proceeds. I keep these statements together:
+
+```text
+collection: determine the concrete items that need machine code
+partition:  assign those items to codegen units
+lowering:   translate each concrete MIR instance to backend IR
+```
+
+This removes an apparent contradiction between “monomorphization collection happens before codegen” and “monomorphization happens while translating MIR.” They describe different parts of the work.
+
+## Where a dependency's generic code is generated
+
+If library crate A defines `fn parse<T>()` and binary crate B calls `parse::<MyType>()`, A cannot ship machine code for every future `T`. The generic MIR and metadata cross the crate boundary so B can generate the concrete instance it needs.
+
+This is why changing generic code in a dependency can affect downstream compilation differently from changing an ordinary non-inline function. It is also why public generic APIs can move compile-time and binary-size costs into consumers.
+
+Dynamic dispatch chooses another trade-off. A call through `dyn Trait` can share one caller path and select behaviour through a vtable at runtime, but it adds indirection and object-safety constraints. Monomorphization enables static dispatch and specialization to concrete layouts, but creates more compiler work and potentially more code.
+
+## What a codegen unit is
+
+After collection, rustc partitions mono items into codegen units, commonly shortened to CGUs. Backend IR in different CGUs can be generated in parallel. They also form important incremental-reuse and optimization boundaries.
+
+```text
+collected mono items
+├── CGU 0 → backend module → object code
+├── CGU 1 → backend module → object code
+└── CGU 2 → backend module → object code
+                         ↓
+                       linker
+```
+
+The compiler's [code generation guide](https://rustc-dev-guide.rust-lang.org/backend/codegen.html) explains that these modules can be processed concurrently and later passed to the linker. Depending on LTO settings, some optimization moves across or into the link step.
+
+## Why more units can compile faster
+
+With several CGUs, backend work can use multiple cores. A small change may require rebuilding fewer reusable units. This can improve development build time.
+
+But a function in one unit is less visible to optimization running in another. Without suitable link-time optimization, the backend has fewer opportunities for cross-unit inlining and whole-program reasoning. More partitions also add per-unit overhead.
+
+The rough trade-off is:
+
+| Choice | Likely benefit | Likely cost |
+| --- | --- | --- |
+| More CGUs | parallel codegen, often faster incremental/dev builds | weaker cross-unit optimization, overhead, sometimes larger/slower binary |
+| Fewer CGUs | broader optimization context, often stronger final code | less parallelism, slower clean or incremental codegen |
+| LTO | recovers cross-module optimization | longer link/optimization time and more memory |
+
+These are tendencies, not promises for every crate.
+
+## A timing experiment that does not pretend too much
+
+I compiled the tiny example five times with each setting after toolchain startup:
+
+```bash
+rustc -C opt-level=2 -C debuginfo=0 -C codegen-units=1 mono.rs -o mono-1
+rustc -C opt-level=2 -C debuginfo=0 -C codegen-units=8 mono.rs -o mono-8
+```
+
+Observed wall times and binary sizes were:
+
+| Setting | Five wall times | Binary size |
+| --- | --- | ---: |
+| `codegen-units=1` | 0.06, 0.07, 0.07, 0.07, 0.07 s | 4,334,976 bytes |
+| `codegen-units=8` | 0.07, 0.07, 0.07, 0.07, 0.07 s | 4,335,232 bytes |
+
+The honest conclusion is that this program is too small to measure a useful compilation-speed difference. The 256-byte size difference is specific to this toolchain and build. Publishing a dramatic “8 CGUs are faster” conclusion from these numbers would be noise.
+
+The small test is good for verifying mono items. For timing, I use a representative crate and record:
+
+```text
+exact rustc and linker versions
+target and CPU
+clean versus incremental build
+optimization, debug info, LTO and panic settings
+codegen-units value
+several warm and cold repetitions
+wall time, peak memory and final artifact size
+```
+
+I change one setting at a time. `cargo build --timings`, rustc self-profiling and symbol-size tools can then identify whether monomorphization/codegen is actually the dominant cost.
+
+## Reducing monomorphization cost deliberately
+
+When evidence points here, possible changes include:
+
+- move type-independent work out of a generic function;
+- reduce unnecessary combinations of generic parameters;
+- avoid exposing large generic implementation bodies across crate boundaries without benefit;
+- use trait objects at boundaries where runtime dispatch is acceptable;
+- box or erase types only where the measured trade-off is worthwhile;
+- choose different CGU/LTO settings for development and release profiles;
+- inspect the largest repeated concrete instances before redesigning an API.
+
+I do not remove generics as a ritual. They often provide excellent performance and type safety. The aim is to find accidental multiplication of expensive code.
+
+## My practical model
+
+Rust first collects the concrete functions and statics that require code. It partitions those mono items into codegen units. During MIR-to-backend lowering it generates code for the concrete substitutions, and later optimization or linking may inline, merge or remove them.
+
+Codegen units balance parallel and incremental compilation against optimization scope and overhead. Their effect is workload-specific, so I verify mono items with compiler output and measure timings on the real crate. This gives me evidence about where generic expressiveness costs time or bytes instead of blaming “monomorphization” as one invisible phase.

@@ -1,0 +1,101 @@
+---
+caseId: "RFA-123"
+title: "Why PhantomData of a Raw Pointer Makes a Wrapper Not Send"
+date: "2026-09-05T10:23:00+01:00"
+lastmod: "2026-09-05T10:23:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "ce91918835f713bc06ef935c39185d13471a89f5bd3dee33386aa1dd13646ab1"
+area: "concurrency-memory"
+symptom: "A wrapper containing only an integer and PhantomData<*const T> fails to cross thread::spawn because the phantom raw pointer affects automatic Send derivation."
+summary: "PhantomData has no runtime storage but tells Rust how a type logically relates to T. That relationship affects variance, drop checking, Send, and Sync; choose the marker shape from real ownership semantics."
+rustVersions: ["Rust 1.98.1"]
+targets: ["all targets with std threads"]
+profiles: ["check", "dev", "release", "test"]
+searchTerms: ["PhantomData raw pointer not Send Rust", "wrapper cannot be sent between threads PhantomData", "PhantomData affects Send Sync"]
+evidence: ["Rust 1.98.1 E0277 compile failure", "whole-wrapper thread transfer", "owned PhantomData marker repair"]
+sources: ["https://doc.rust-lang.org/std/marker/struct.PhantomData.html", "https://doc.rust-lang.org/nomicon/phantom-data.html"]
+---
+
+`PhantomData<T>` takes no ordinary storage, but it is not ignored by the type system. The [failing program](/rust-failure-atlas/evidence/RFA-123/fail.rs) has a handle containing an integer ID and `PhantomData<*const T>`. Moving the whole handle into `thread::spawn` fails with E0277 because `*const u8` is not `Send` in this context.
+
+There is no actual pointer field at runtime. The marker still says the wrapper has a logical relationship to a raw pointer.
+
+## Zero-sized does not mean semantically empty
+
+The [`PhantomData` documentation](https://doc.rust-lang.org/std/marker/struct.PhantomData.html) explains that a marker acts as though a type parameter or lifetime were present. It can communicate ownership, variance, and drop-checking relationships to the compiler.
+
+Auto traits such as `Send` and `Sync` are also derived from field types. When the field is `PhantomData<*const T>`, the wrapper receives the relevant auto-trait behavior as though that relationship mattered.
+
+I use this rule:
+
+> Phantom data occupies no bytes, but it occupies a place in the type's proof.
+
+Adding or changing it can therefore be a safety-relevant change.
+
+## The exact marker form matters
+
+These shapes do not say the same thing:
+
+```rust
+PhantomData<T>
+PhantomData<&'a T>
+PhantomData<&'a mut T>
+PhantomData<*const T>
+PhantomData<fn() -> T>
+```
+
+They can produce different variance, ownership, drop checking, and auto traits. The [Nomicon PhantomData chapter](https://doc.rust-lang.org/nomicon/phantom-data.html) provides a table of these effects and explains why unsafe abstractions need an accurate marker.
+
+I do not copy a marker from another crate because both types are “handles.” One wrapper may own a `T`, another may borrow it, and another may only use `T` as a compile-time tag.
+
+## The repaired fixture declares logical ownership
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-123/fixed.rs) uses `PhantomData<T>`. With `T = u8`, the wrapper can be sent to another thread because `u8` is `Send`.
+
+This is correct for the reduced example's intended semantics. It is not a universal repair. If the integer is a handle into thread-affine state, making the wrapper `Send` would be wrong even though no pointer is stored.
+
+For an FFI resource handle, I ask:
+
+- Does this value own the resource?
+- May the resource be used or destroyed on another thread?
+- Is access shared or exclusive?
+- What lifetime keeps the external allocation valid?
+- Does `Drop` act on a `T`-like resource?
+
+The marker and any manual unsafe trait impl must match those answers.
+
+## Closure capture can hide the issue
+
+Modern Rust closures can capture individual fields. If the thread closure only reads `handle.id`, the compiler may move that integer rather than the whole wrapper, and the failing example can unexpectedly compile.
+
+The evidence fixture calls `inspect(handle)` inside the closure to force the complete `Handle<T>` across the thread boundary. This is a useful testing detail: a compile-pass result for one field access does not prove the enclosing type is `Send`.
+
+When verifying auto traits, I use a direct generic assertion or move the whole value:
+
+```rust
+fn assert_send<T: Send>() {}
+```
+
+This avoids drawing conclusions from capture optimization.
+
+## unsafe impl is a promise about external reality
+
+It is possible to write `unsafe impl Send for Handle<T>`. This does not make the external resource thread-safe. It tells Rust that the programmer has proved transfer is safe.
+
+I require that proof to cover creation, use, destruction, callbacks, and aliasing. Native libraries often document thread affinity or require initialization on one thread. An integer handle can encode access to non-thread-safe global state.
+
+If the handle must stay on its creating thread, a deliberate not-Send marker protects users. This is valuable API design, not a limitation to remove.
+
+## My debugging sequence
+
+When a phantom wrapper fails `Send` or `Sync`, I do this:
+
+1. Force a direct auto-trait assertion on the whole wrapper.
+2. Inspect every real and phantom field named in the diagnostic chain.
+3. Write the logical ownership, borrowing, variance, and thread-affinity contract.
+4. Select the marker form matching that contract.
+5. Add an unsafe auto-trait implementation only with an external safety proof.
+6. Keep compile tests for types that should and should not cross threads.
+
+The compiler is not confused by an empty field. `PhantomData` exists precisely to make invisible relationships visible to type checking. The right fix is to describe the real relationship accurately, even when the runtime representation is only one integer.

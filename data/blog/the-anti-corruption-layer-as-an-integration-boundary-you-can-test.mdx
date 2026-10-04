@@ -1,0 +1,148 @@
+---
+title: "The Anti-Corruption Layer as an Integration Boundary You Can Test"
+date: "2026-12-03T09:00:00+01:00"
+tags: ["anti-corruption layer", "API integration", "domain-driven design", "contract testing", "system design"]
+draft: false
+reviewed: true
+reviewedHash: "36f4bfd09a0c3786156c269442768175d3e971442015696ea483100a3af12aa3"
+cluster: "reliable-data-integrations"
+campaign: "authority-2026"
+opportunity: "DATA-073"
+summary: "An anti-corruption layer protects product meaning, not only field names. I show the boundary, translation tests, unknown states, error mapping, and evidence I keep around it."
+---
+
+While building integration-heavy systems, I learned that the most expensive provider field is often the one that escapes the adapter.
+
+At first it looks harmless. An external API calls something `customer_id`, so an internal table receives a `customer_id` column. A provider says an object is `active`, so product code starts checking that string. Six months later a second provider uses `account`, defines “active” differently, and the application is full of conditions that nobody owns.
+
+An anti-corruption layer is how I stop this spread. I do not use the name because I think another system is badly designed. The two systems simply have different histories and different meanings.
+
+## My boundary translates meaning
+
+Microsoft's description of the [anti-corruption layer pattern](https://learn.microsoft.com/en-us/azure/architecture/patterns/anti-corruption-layer) focuses on a façade or adapter that prevents one subsystem's model from leaking into another. In practice, I give the layer five jobs:
+
+```text
+external identity   -> internal identity
+external fields     -> internal concepts
+external states     -> explicit internal states
+external failures   -> internal failure categories
+external behaviour  -> internal operation contract
+```
+
+Only the second line is ordinary JSON mapping. The other four are where integrations usually hurt.
+
+Imagine a provider returning:
+
+```json
+{
+  "id": "cus_421",
+  "status": "active",
+  "renew_at": null
+}
+```
+
+I do not pass this object into the billing domain. I translate it into something the product owns:
+
+```text
+AccountRef(provider = "north", external_id = "cus_421")
+SubscriptionState = Enabled
+Renewal = NotScheduled(reason = ProviderDidNotSupplyDate)
+```
+
+The last line is deliberate. A null renewal date could mean “never renews”, “not calculated yet”, or “not included at this endpoint”. Converting all three to `None` would make the code shorter and the business meaning weaker.
+
+## The story that changed how I test adapters
+
+I used to test adapters mostly with a happy provider fixture: valid JSON enters, valid internal object leaves. This proved deserialization. It did not prove the boundary.
+
+The difficult bugs appeared at the edges: a new enum value, a successful HTTP response containing a rejected operation, a timeout after the provider accepted a write, and timestamps with a different interpretation. From this I started writing a translation table before the adapter code.
+
+| Provider observation | Internal result | Evidence retained |
+| --- | --- | --- |
+| known active state | `Enabled` | provider state + mapping version |
+| unknown state | `UnknownExternalState` | raw safe value |
+| HTTP 200, operation rejected | domain rejection | provider reason code |
+| timeout after write | outcome unknown | operation identity |
+| field absent | `NotObserved` | endpoint/version |
+| explicit null | mapped semantic state | source payload version |
+
+This table becomes tests. It also becomes a conversation with the product owner, because several rows cannot be decided by an engineer alone.
+
+## I separate transport from translation
+
+My adapter normally has four small parts:
+
+```text
+ProviderClient      HTTP, authentication, rate limits
+ProviderPayload     exact external representation
+Translator          external meaning to internal command/event
+IntegrationService  retries, idempotency, persistence, observability
+```
+
+When one type does all four, tests need a fake server just to check whether `pending_review` maps correctly. By separating them, most meaning tests become pure and fast.
+
+```rust
+fn translate_status(input: ProviderStatus) -> InternalStatus {
+    match input {
+        ProviderStatus::Active => InternalStatus::Enabled,
+        ProviderStatus::Paused => InternalStatus::Suspended,
+        ProviderStatus::Unknown(value) => InternalStatus::NeedsReview(value),
+    }
+}
+```
+
+The syntax is not important. Exhaustive, named decisions are.
+
+## Unknown values must cross the boundary safely
+
+I never assume an external enum is closed because today's documentation lists four values. Providers add states. Old records return forgotten states. Feature flags expose values gradually.
+
+There are three honest policies:
+
+- preserve the unknown value and continue with restricted behaviour;
+- quarantine the record for review;
+- reject the operation with a visible compatibility failure.
+
+Silently mapping an unknown value to a normal default is not an honest policy. It creates data that looks understood.
+
+The article [How an Unknown Enum Value Breaks an Otherwise Compatible Consumer](/blog/how-an-unknown-enum-value-breaks-an-otherwise-compatible-consumer) explores this failure in more detail.
+
+## Errors need semantic translation too
+
+A provider may expose 400, 409, 429, and 500. Those codes are transport observations, not yet product decisions.
+
+I translate them into categories such as:
+
+```text
+InvalidRequest
+Conflict(current_version)
+RateLimited(retry_after)
+DependencyUnavailable
+OutcomeUnknown(operation_id)
+```
+
+The most important category is often `OutcomeUnknown`. A write timeout does not prove failure. If I convert it to a generic error and retry without stable identity, I can duplicate the effect.
+
+This is why my [provider adapter](/blog/provider-adapters-should-translate-behaviour-not-only-json) translates behaviour, not only payloads.
+
+## Contract tests I actually want
+
+I keep sanitized provider fixtures for every meaningful case, but fixture tests are only one layer:
+
+1. Pure translation tests cover every known and unknown state.
+2. Schema tests detect fields that disappeared or changed representation.
+3. A fake provider exercises timeout, duplicate, reorder, and rate-limit behaviour.
+4. A small live probe checks assumptions that a fake cannot prove.
+5. Production metrics count unknown mappings and quarantined records.
+
+I version the mapping logic in evidence records. When a historical record looks wrong, I need to know which translator produced it, not only which application release was deployed.
+
+## What the layer should not become
+
+An anti-corruption layer can turn into a second application if I place business workflows inside it. I keep product policy in the domain. The layer answers “what did the provider mean?” The domain answers “what should our product do about it?”
+
+I also avoid one universal canonical model for providers that are genuinely different. Shared concepts belong in the internal model; provider-specific capabilities can remain explicit. Hiding every difference behind the lowest common denominator makes the boundary tidy but loses useful meaning.
+
+For me, the test of this pattern is simple. I should be able to remove a provider without rewriting the core product vocabulary. I should also be able to explain every translation with a table, a test, and retained evidence.
+
+That is more work than renaming JSON keys. It is much less work than letting somebody else's model quietly become my architecture.

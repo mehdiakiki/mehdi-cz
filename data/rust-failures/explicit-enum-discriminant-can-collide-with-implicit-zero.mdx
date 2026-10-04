@@ -1,0 +1,95 @@
+---
+caseId: "RFA-372"
+title: "An Explicit Enum Discriminant Can Collide With an Implicit Zero"
+date: "2026-09-06T03:12:00+01:00"
+lastmod: "2026-09-06T03:12:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "57378d7f80671ea2e23448f1fb95a9a03b3427ffa69fabe668d0807ae9e8e227"
+area: "diagnostics-macros"
+symptom: "An explicitly numbered enum variant collides with an earlier implicit zero and rustc reports E0081."
+summary: "Rust assigns discriminants to unnumbered variants too: zero for the first, then the previous value plus one. Audit the effective table, not only visible equals signs, especially for protocol and FFI enums."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust E0081 duplicate enum discriminant implicit", "enum variant same discriminant Rust", "explicit enum value collides with implicit zero"]
+evidence: ["Rust 1.98.1 E0081 compile failure", "implicit zero and explicit zero", "unique repr u8 values repair"]
+sources: ["https://doc.rust-lang.org/error_codes/E0081.html", "https://doc.rust-lang.org/reference/items/enumerations.html#discriminants", "https://doc.rust-lang.org/reference/type-layout.html#primitive-representations"]
+---
+
+I have seen enum numbering reviewed by looking only at the variants containing `=`. That misses half of the table. Rust assigns a discriminant to every variant, including the ones whose values are not written.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-372/fail.rs) declares `Waiting` first, without a number, and then `Running = 0`. Rust reports E0081 because both variants have effective discriminant zero.
+
+## Implicit does not mean absent
+
+The [enum discriminant rules](https://doc.rust-lang.org/reference/items/enumerations.html#discriminants) give an unnumbered first variant the value zero. A later unnumbered variant receives one more than the preceding variant.
+
+For this declaration:
+
+```rust
+enum Stage {
+    Waiting,
+    Running = 0,
+}
+```
+
+the complete table is `Waiting = 0`, `Running = 0`. The visual difference between an omitted expression and an explicit expression does not create a semantic difference in the resulting value.
+
+Rust requires discriminants to be unique. The [E0081 explanation](https://doc.rust-lang.org/error_codes/E0081.html) notes that clashes can involve variants that look unrelated because automatic numbering has already occupied a value.
+
+## Mixed numbering creates hidden dependencies
+
+Suppose an enum begins `Unknown = 255, Ready, Busy`. Now `Ready` is not zero; its implicit value follows 255, and with `repr(u8)` it cannot even be represented. Or suppose a new variant is inserted before an implicit run. Every later implicit value can move.
+
+This makes mixed numbering risky for protocols, database values, telemetry codes, and FFI. A source edit that looks like reordering names can change external integers or fail because of a collision.
+
+For an internal enum whose numbers never leave the program, implicit discriminants are often the clearest choice. I do not expose their numeric casts as stable identifiers. For an external contract, I normally assign every value explicitly and test the mapping.
+
+## repr chooses representation, not uniqueness policy
+
+Adding `#[repr(u8)]` selects a primitive representation under the documented rules. It does not permit aliases. Rust enums model exactly one declared variant at a time, and duplicate values would make a numeric representation unable to distinguish two variant constructors.
+
+Other languages and schema formats sometimes allow several symbolic names for the same integer. I do not translate that mechanically into two Rust variants with one discriminant. Instead I keep one canonical Rust variant and accept aliases in the parser, or represent the raw integer separately from the normalized domain enum.
+
+This preserves an important property: after validation, one Rust value has one unambiguous variant identity.
+
+## The repair depends on whether numbers are public
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-372/fixed.rs) gives `Waiting = 0` and `Running = 1`, then asserts the casts. This is appropriate for a tiny fixed numeric contract.
+
+If the numbers have no external meaning, I remove all explicit assignments and let Rust number the enum. I also avoid testing exact casts, because that would turn an implementation detail into a contract.
+
+If multiple external numbers should map to one state, I parse them:
+
+```rust
+match raw {
+    0 | 10 => Stage::Waiting,
+    1 => Stage::Running,
+    _ => return Err(UnknownStage(raw)),
+}
+```
+
+The alias exists at the boundary, while the domain model stays canonical.
+
+## Do not transmute unchecked integers into enums
+
+A primitive representation does not make every integer a valid enum value. Creating a Rust enum with a discriminant not declared by the type violates its validity rules. Incoming bytes should remain integers until validation succeeds.
+
+I use `TryFrom<u8>` or a parsing function that returns an error containing the unknown raw value. This also gives versioning a place to live. An older reader can preserve or reject a newer code without pretending that it is a valid old variant.
+
+For C interfaces, I check the exact ABI and header rather than assuming `repr(u8)` matches a C `enum`, whose representation is controlled by the C implementation. Fixed-width integer parameters plus validation are frequently easier to evolve.
+
+## Tests should cover the complete effective table
+
+For contract-facing enums I maintain a table test with every variant and expected integer. I also test unknown input. The compiler catches duplicates in the Rust declaration, but it cannot know whether a unique number is the correct number for my protocol.
+
+When code generation owns the enum, I validate schema IDs before emitting Rust. This produces a domain-specific error instead of making the generated crate the first place a collision becomes visible.
+
+In review, I ask three questions:
+
+1. Which values are implicit after applying Rust's rules?
+2. Are the numbers observable outside this build?
+3. What happens when an unknown or aliased value arrives?
+
+The core principle is that omission is still a value assignment. E0081 is not complaining about syntax; it is showing that the completed discriminant table contains two identical entries. Writing or deliberately hiding the whole table makes enum evolution much safer.

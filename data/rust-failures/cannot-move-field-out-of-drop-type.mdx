@@ -1,0 +1,130 @@
+---
+caseId: "RFA-070"
+title: "E0509: Why Rust Cannot Move a Field Out of a Type That Implements Drop"
+date: "2026-09-05T08:35:00+01:00"
+lastmod: "2026-09-05T08:35:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "95e98c1b8c99f2e673fff56c6727ffdda3536e87ad77d55bb5c314c61cdde5ef"
+area: "diagnostics-macros"
+symptom: "Moving an owned field out of a consumed struct fails with E0509 only after the struct receives a Drop implementation."
+summary: "A destructor runs on the complete value and may depend on its fields. Replace extracted state with a valid empty state, redesign ownership, or implement carefully audited manual destruction rather than leaving a partial value."
+rustVersions: ["Rust 1.98.1"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust E0509 cannot move out type implements Drop",
+    "move field out of struct with destructor",
+    "Option take field Drop type Rust",
+  ]
+evidence: ["Rust 1.98.1 compile failure", "destructor-state model", "Option take repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/error_codes/E0509.html",
+    "https://doc.rust-lang.org/std/option/enum.Option.html#method.take",
+  ]
+---
+
+Consuming a struct normally allows its fields to be moved into new owners. Adding a destructor changes that:
+
+```rust
+struct Guard {
+    value: String,
+}
+
+impl Drop for Guard {
+    fn drop(&mut self) {}
+}
+
+fn take(guard: Guard) -> String {
+    guard.value
+}
+```
+
+Rust 1.98.1 reports E0509: it cannot move out of `Guard`, which implements `Drop`. The [failing fixture](/rust-failure-atlas/evidence/RFA-070/fail.rs) uses an empty destructor deliberately. Even when this particular body reads nothing, the language protects the general destructor contract.
+
+## Drop receives the value after the attempted move
+
+At the end of `take`, Rust must run `Guard::drop(&mut guard)`. If `guard.value` had been moved out, `drop` would receive a reference to a partially invalid `Guard`. A real destructor might log the field, use it to release another resource, or maintain an invariant connecting several fields.
+
+Safe code cannot make the destructor conditional on which field happened to move earlier. The rule keeps `Drop::drop` able to assume that `self` is a valid instance of its type.
+
+This differs from a struct without a `Drop` implementation. For an ordinary struct, the compiler can track each field and drop only the fields that remain. A custom destructor observes the value as a whole before automatic field destruction.
+
+## Leave a valid replacement state
+
+One repair represents the field as optional:
+
+```rust
+struct Guard {
+    value: Option<String>,
+}
+
+fn take(mut guard: Guard) -> String {
+    guard.value.take().unwrap()
+}
+```
+
+[`Option::take`](https://doc.rust-lang.org/std/option/enum.Option.html#method.take) replaces the field with `None` and returns the previous `Some(String)`. When `drop` later runs, `guard` is still a completely valid value. Its destructor can explicitly handle the already-taken state.
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-070/fixed.rs) compiles, runs, and verifies the extracted string on Rust 1.98.1.
+
+This design is correct only if `None` is a valid state. I often name the operation `into_value` or `disarm` and document what destruction does after extraction.
+
+## `mem::take` and `mem::replace` express other valid empty states
+
+If the field has a meaningful default:
+
+```rust
+let value = std::mem::take(&mut guard.value);
+```
+
+This writes `String::new()` before returning the original string. `mem::replace` can install any explicitly chosen replacement. Both maintain a valid full struct for the destructor.
+
+The replacement can affect destructor behavior. An empty path, zero handle, or default configuration may not mean “resource already transferred.” I prefer `Option` when the absent state carries important meaning.
+
+## Borrowing and cloning have different contracts
+
+Returning `&guard.value` cannot work from a function that consumes `guard`, because the guard is dropped at return. A method borrowing `&self` can expose `&str` while the guard remains alive:
+
+```rust
+fn value(&self) -> &str {
+    &self.value
+}
+```
+
+Cloning the string leaves the original intact for `Drop`, but it allocates and duplicates data. It may be correct for a snapshot operation, not for transferring ownership of a resource.
+
+## Unsafe manual extraction has several obligations
+
+Low-level containers sometimes use `ManuallyDrop`, `ptr::read`, or custom drop flags to extract fields and control destruction. This requires proving that:
+
+- No field is dropped twice.
+- Every still-initialized field is dropped exactly once.
+- The custom destructor never reads moved storage.
+- Panic paths preserve the drop-state invariant.
+- Safe public methods cannot expose an invalid intermediate state.
+
+An empty `Drop` body today does not make such unsafe code future-proof. A later destructor edit can turn an undocumented partial-move assumption into undefined behavior.
+
+For application code, a safe explicit state such as `Option` is normally cheaper to maintain than a manual destruction protocol.
+
+## Resource guards need a clear disarm operation
+
+This pattern appears with temporary files, transactions, locks, and rollback guards. The destructor performs cleanup unless the operation commits. A strong API models that transition:
+
+```rust
+fn commit(mut self) -> Value {
+    self.committed = true;
+    self.value.take().expect("value present before commit")
+}
+```
+
+The destructor checks `committed` or the optional resource. The state change and extraction happen together, making cleanup behavior reviewable and testable on both normal and panic paths.
+
+## My first check
+
+When E0509 appears after a type gains `Drop`, I inspect what invariant the destructor needs and choose a valid post-extraction state. Removing `Drop` merely to make the move compile is safe only when the destructor was genuinely unnecessary and automatic field destruction provides all behavior.
+
+The official [E0509 explanation](https://doc.rust-lang.org/error_codes/E0509.html) shows borrowing as one option. For ownership transfer, the deeper rule is that custom destruction receives a complete value. Replace the field before extraction or redesign the state machine so `Drop` always observes a valid, intentional state.

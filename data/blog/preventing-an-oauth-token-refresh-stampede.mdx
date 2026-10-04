@@ -1,0 +1,266 @@
+---
+title: "Preventing an OAuth Token Refresh Stampede"
+date: "2026-09-14T14:00:00+01:00"
+tags: ["OAuth", "token refresh", "concurrency", "race conditions", "data integration"]
+draft: false
+reviewed: true
+reviewedHash: "dec451cf1379e25e072f71df5e74f889bbf96c938e41d1b260eeb6c1901211d4"
+cluster: "reliable-data-integrations"
+campaign: "authority-2026"
+opportunity: "DATA-014"
+summary: "A concurrent refresh design using local single-flight work, database versions, conditional writes, and recovery rules for providers that rotate refresh tokens."
+---
+
+OAuth access tokens usually expire at an inconvenient time: while several workers are using the same connected account.
+
+They all observe the expired token. They all request a refresh. If the provider rotates refresh tokens, one response can invalidate the credential used by the other requests. A slower worker may then overwrite the newest stored token with an older result.
+
+This is an OAuth token refresh stampede. It is a concurrency problem around credentials, not only an OAuth configuration problem.
+
+I prevent it with two layers:
+
+- single-flight refresh inside one process to reduce duplicate work;
+- versioned conditional writes in shared storage to make concurrent results safe across processes.
+
+The database condition is the correctness mechanism. The in-memory optimization is not.
+
+## The race in one timeline
+
+Assume the database stores refresh token R1 at version 7.
+
+```text
+worker A reads R1, version 7
+worker B reads R1, version 7
+worker A sends R1 and receives access A2 + refresh R2
+worker B sends R1 and receives access A3 + refresh R3
+worker B stores R3, version 8
+worker A finishes later and stores R2, version 8
+```
+
+What happens depends on the provider:
+
+- it may allow both refreshes and invalidate one returned token;
+- it may accept only the first refresh and reject the second;
+- it may detect reuse and revoke the complete token family;
+- it may return the same refresh token when rotation is disabled.
+
+The client should not guess. I read the provider's rotation and reuse-detection contract, then design for the strict case.
+
+## Do not refresh only at the 401 boundary
+
+Waiting for an API request to return 401 increases contention. I refresh shortly before expiry:
+
+```text
+refresh_when = expires_at - safety_window
+```
+
+The window covers clock skew, network time, and the next request duration. I add small random jitter per account so thousands of credentials created together do not refresh in the same second.
+
+A 401 can still happen because the provider revoked the token or local clocks differ. It becomes one input to the refresh path, not the only trigger.
+
+I do not refresh on every 401 blindly. A 401 may mean wrong audience, revoked access, or invalid client credentials. Repeating refresh requests forever can destroy useful evidence and load the provider.
+
+## Local single flight reduces duplicate calls
+
+Inside one process, I keep at most one refresh future per connection ID:
+
+```text
+get_valid_token(connection):
+    token = load token
+    if token is safely valid:
+        return token
+
+    return single_flight(connection, async):
+        token = load token again
+        if token is now safely valid:
+            return token
+        return refresh_and_store(token)
+```
+
+The second read inside the single-flight section matters. Another request may have completed the refresh while this caller waited.
+
+The map entry must be removed after success and failure. Otherwise one failed future can poison the connection forever. I also bound the map and tie waiters to their own deadlines.
+
+Single flight saves provider requests, but two application instances still have two maps. Shared-state correctness remains necessary.
+
+## Store a version with the credentials
+
+My credential row contains at least:
+
+```text
+connection_id
+encrypted_access_token
+encrypted_refresh_token
+access_expires_at
+credential_version
+provider_token_family, when available
+last_refresh_status
+updated_at
+```
+
+The worker reads version 7, calls the provider, then writes only if version 7 is still current:
+
+```sql
+update oauth_credential
+set encrypted_access_token = $new_access,
+    encrypted_refresh_token = $new_refresh,
+    access_expires_at = $new_expiry,
+    credential_version = credential_version + 1,
+    last_refresh_status = 'ok'
+where connection_id = $connection
+  and credential_version = $version_read;
+```
+
+If the affected row count is zero, another worker won. The loser discards its response, reloads the current credential, and checks whether it is usable.
+
+This conditional write prevents a late result from replacing a newer stored token. It does not prevent the duplicate request from reaching a strict provider, which is why local single flight or a short cross-process claim can still be useful.
+
+## Why I avoid a long database lock around the network
+
+One tempting solution is:
+
+```text
+begin transaction
+select credential for update
+call OAuth provider
+update credential
+commit
+```
+
+Now a database row lock is held across an unpredictable network request. Provider latency consumes database connections, failover makes lock duration uncertain, and blocked workers can create a queue.
+
+If the provider strictly allows one refresh at a time, I prefer a short renewable claim:
+
+```text
+refresh_owner
+refresh_lease_until
+refresh_generation
+```
+
+The transaction only claims ownership and commits. The owner performs the network call outside the transaction, then stores the result if its generation and credential version still match. Other workers wait briefly, reload, or retry after the lease.
+
+The lease needs a fence. A worker whose lease expired cannot later overwrite the winner.
+
+For many providers, conditional writes plus single flight are enough. I add distributed coordination only when the provider's rotation semantics make concurrent refresh requests destructive.
+
+## Treat a missing refresh token carefully
+
+Some providers return a new access token but omit `refresh_token` when the old refresh token remains valid. Others rotate and always return a replacement.
+
+I never translate omission automatically into null. The adapter has an explicit rule:
+
+```text
+new refresh token present → validate and replace
+refresh token omitted and provider promises reuse → preserve current token
+response contract requires rotation but token missing → fail without erasing current credential
+```
+
+An empty or malformed response should not destroy the last recoverable token.
+
+This is one example of why provider adapters must translate behaviour, not only JSON fields.
+
+## The losing worker must not retry stale credentials forever
+
+Suppose worker B refreshes successfully while A receives `invalid_grant` for the old token. A should reload the database before marking the connection broken.
+
+My logic is:
+
+```text
+refresh fails with invalid_grant
+    ↓
+reload credential
+    ↓
+stored version advanced and token is valid?
+    yes → use winner's token
+    no  → classify provider rejection and require reconnection if permanent
+```
+
+This distinguishes a concurrency loser from a truly revoked grant.
+
+I bound this recovery to one reload. An endless invalid-grant loop only hides a broken connection.
+
+## Refresh success and API retry are different
+
+After a 401, the caller may refresh successfully and retry the original API request. That repeat is safe for a read, but a write may already have executed before the 401-like response was lost or altered by a gateway.
+
+The original operation still needs its own idempotency and retry policy. A fresh access token does not make a duplicate side effect safe.
+
+I preserve one logical operation ID and idempotency key while credentials change underneath it.
+
+## Protect tokens as credentials
+
+Concurrency correctness is not enough. I also:
+
+- encrypt access and refresh tokens at rest;
+- keep encryption keys outside the credential row;
+- avoid tokens in logs, traces, errors, and queue payloads;
+- scope database access to the credential service;
+- redact HTTP client diagnostics;
+- record versions and result categories instead of token text;
+- delete credentials when the connection is revoked;
+- make reconnect replace the credential generation deliberately.
+
+The OAuth 2.0 Security Best Current Practice recommends refresh-token protection and, for public clients, sender-constrained refresh tokens or rotation to detect replay. See [RFC 9700](https://www.rfc-editor.org/rfc/rfc9700.html). The underlying refresh grant is defined in [OAuth 2.0, section 6](https://www.rfc-editor.org/rfc/rfc6749.html#section-6).
+
+## The concurrent tests I run
+
+I test with a fake OAuth provider whose rotation behaviour I control.
+
+### Twenty callers, one process
+
+Expire one credential and release twenty callers together. Assert one refresh request and the same resulting access token for every waiter.
+
+### Two processes, reversed responses
+
+Let A and B read version 7. Return B's response first and A's later. Assert only one conditional update succeeds and the database keeps the winner.
+
+### Strict single-use refresh token
+
+Accept the first request and reject the second with `invalid_grant`. Assert the loser reloads the winner instead of disconnecting the account.
+
+### Expired refresh claim
+
+Let the claim owner crash. Advance the fake clock, allow another worker to acquire a higher generation, then resume the old worker. Assert the old generation cannot write.
+
+### Missing rotated token
+
+Return an access token without a required replacement refresh token. Assert the stored refresh token is not erased and the response becomes a visible provider-contract failure.
+
+### Revoked grant
+
+Return `invalid_grant` without any concurrent version advance. Assert the connection enters a reconnect-required state and no automatic retry loop continues.
+
+### Database write failure after provider success
+
+The provider rotates R1 to R2, but local storage fails. This is the hardest case because R1 may now be invalid and R2 may be lost. I make this state highly visible and use provider-supported recovery or reconnection. No local locking scheme can reconstruct a response that was never durably stored.
+
+That final test forces an honest operational answer.
+
+## What I measure
+
+Useful metrics include:
+
+- refresh requests per successful credential rotation;
+- number of callers joined to single flight;
+- conditional-write conflicts;
+- refresh claim wait time;
+- invalid-grant results after a concurrent version advance;
+- credentials inside the refresh safety window;
+- permanent reconnect-required connections;
+- refresh latency and provider error class.
+
+A stampede often appears first as a sudden rise in refresh requests per connection.
+
+## My practical rule
+
+I treat token refresh as a versioned state transition:
+
+```text
+(access A1, refresh R1, version 7)
+                  ↓ one accepted transition
+(access A2, refresh R2, version 8)
+```
+
+Local single flight reduces calls. A conditional database write prevents stale results from winning. A short fenced claim is added only when concurrent requests themselves are unsafe. Provider errors always trigger a reload before a connection is declared broken.
+
+The result is not “exactly one refresh request” under every crash. It is a stronger and more practical guarantee: old refresh work cannot silently replace new credentials, and every ambiguous failure has a bounded recovery path.

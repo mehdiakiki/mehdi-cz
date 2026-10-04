@@ -1,0 +1,88 @@
+---
+caseId: "RFA-362"
+title: "BTreeMap::retain Visits Entries in Ascending Key Order"
+date: "2026-09-06T02:19:00+01:00"
+lastmod: "2026-09-06T02:19:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "1075064162de09b9d5bed8201e0f4cd5214107a2662a9f1b7b6a6328ad9550f9"
+area: "concurrency-memory"
+symptom: "A BTreeMap retain predicate observes keys 1, 2, 3 even though the entries were inserted in the order 3, 1, 2."
+summary: "BTreeMap is ordered by K: Ord, and retain explicitly visits entries in ascending key order. The callback may mutate values and choose removal, but insertion history is not the traversal schedule."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust BTreeMap retain order", "BTreeMap retain ascending key order", "retain predicate insertion order Rust"]
+evidence: ["Rust 1.98.1 BTreeMap", "insertion sequence three one two", "predicate visit sequence one two three"]
+sources: ["https://doc.rust-lang.org/std/collections/struct.BTreeMap.html#method.retain", "https://doc.rust-lang.org/std/collections/struct.BTreeMap.html#method.iter", "https://doc.rust-lang.org/std/cmp/trait.Ord.html"]
+---
+
+I inserted B-tree entries in the order `3`, `1`, `2` and used a stateful `retain` predicate. The callback ran for `1`, `2`, `3`. [`BTreeMap::retain`](https://doc.rust-lang.org/std/collections/struct.BTreeMap.html#method.retain) follows ascending key order, not insertion history.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-362/fail.rs) records every key while retaining all entries. Its final assertion expects insertion order and fails with the documented sorted sequence.
+
+## BTreeMap organizes identity by Ord
+
+A `BTreeMap<K, V>` stores unique keys and exposes ordered traversal according to [`Ord`](https://doc.rust-lang.org/std/cmp/trait.Ord.html). Insertion is a structural update to that ordered map; it does not append an item to a historical sequence.
+
+The `retain` callback receives `&K` and `&mut V`, then returns true to keep the pair or false to remove it. The documentation explicitly promises ascending key visitation.
+
+This promise is stronger than the unspecified iteration order of `HashMap` and `BinaryHeap`. It can be useful, but only if I recognize which order it is.
+
+## Insertion order needs a different representation
+
+If the application needs “oldest inserted first,” a plain `BTreeMap` does not preserve enough information. I add a sequence number to the key, keep a second order index, or choose an insertion-ordered collection.
+
+Trying to reconstruct insertion order from current keys is impossible in general. Sorting by key and inserting by key can produce the same map from many different histories.
+
+I choose a map based on the query and ordering contract, not because all maps are interchangeable behind similar methods.
+
+## Stateful predicates inherit the traversal order
+
+A pure predicate such as `|key, _| key % 2 == 0` returns the same survivors regardless of visit order. Order becomes visible when the closure keeps counters, applies a quota, compares with a previous entry, logs work, or updates values from shared state.
+
+For example, “retain the first three visited entries” means the three smallest keys in a `BTreeMap`. It does not mean the earliest inserted entries. This may be exactly the desired rule for a range index, but it must be named.
+
+I avoid hidden external side effects inside `retain` when a separate explicit loop would communicate sequencing better.
+
+## Values may change; keys may not
+
+The callback gets mutable access to each value, so it can normalize or update retained values in the same pass. It only borrows the key immutably because changing a key in place could violate the tree ordering.
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-362/fixed.rs) increments every value while removing key `2`. It proves the visit order `[1, 2, 3]` and the final ordered pairs `[(1, 11), (3, 31)]`.
+
+If a transformation changes keys, I normally build new entries or remove and reinsert them. I decide how collisions between transformed keys should be handled instead of allowing an implicit winner.
+
+## Ascending means the key's implemented order
+
+Ascending is defined by `K::cmp`, not necessarily human lexical order or numeric meaning inferred from display. A key wrapped in `Reverse<T>` reverses the traversal. A tuple key sorts lexicographically by components. A custom key follows its custom `Ord` implementation.
+
+The ordering must agree with `Eq`. Violating the trait's consistency rules is a logic error that can make ordered collections behave unpredictably, though safe Rust still protects memory safety.
+
+For strings, Rust's ordinary ordering compares Unicode scalar encoding lexicographically by bytes; it is not locale-aware collation. If people expect language-specific order, I store or compute an explicit collation key.
+
+## Panic leaves a valid map but partial business work
+
+The predicate is ordinary Rust code and may panic. Some earlier ascending keys may already have been modified or removed, while later keys were not visited.
+
+The collection remains memory-safe, but `retain` is not a transaction. I validate fallible inputs before the mutation, or compute a removal plan first when all-or-nothing domain behavior matters.
+
+Likewise, the callback cannot return `Result<bool, E>` directly. For fallible processing I use a separate pass and then apply confirmed changes, accounting for keys that may disappear between phases when concurrency exists outside the map owner.
+
+## Range operations may express the intent better
+
+If the rule is purely about an ordered prefix or interval, [`BTreeMap::range`](https://doc.rust-lang.org/std/collections/struct.BTreeMap.html#method.range) communicates bounds more directly than running a predicate over the whole map. Removal APIs and split operations can fit ownership transfer cases.
+
+`retain` is strongest when every entry needs a predicate or value update. I do not hide a simple cutoff inside stateful closure logic unless measurement shows it is appropriate.
+
+## Tests must scramble insertion order
+
+Inserting already sorted keys would make insertion and traversal order identical, so the test would not distinguish the contracts. The fixture deliberately inserts `3`, `1`, `2`.
+
+For custom keys I test ties as defined by `Ord`, reverse wrappers, empty and one-entry maps, complete removal, and complete retention. I assert callback order only because `BTreeMap::retain` documents it; I never copy this assertion to a hash map.
+
+## The core principle is to identify the collection's ordering authority
+
+Different orderings can coexist: arrival time, insertion sequence, key order, priority order, and physical storage order. A collection chooses which of these it promises.
+
+For `BTreeMap::retain`, the authority is ascending `Ord` key order. Once I make that explicit, stateful retention becomes predictable, and I know when another representation is required.

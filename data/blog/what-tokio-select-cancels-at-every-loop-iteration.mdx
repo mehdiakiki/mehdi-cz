@@ -1,0 +1,190 @@
+---
+title: "What tokio::select! Cancels at Every Loop Iteration"
+date: "2026-11-08T09:00:00+01:00"
+tags: ["rust", "Tokio", "select", "cancellation safety", "async"]
+draft: false
+reviewed: true
+reviewedHash: "72716eda678f6f75ea2868827b6cbc7dfcd79df5ee992a46158676578ffa79ea"
+cluster: "rust-under-the-hood"
+campaign: "authority-2026"
+opportunity: "RUST-042"
+summary: "tokio::select! polls branch futures on one task and drops the losers when a branch completes. In a loop, recreating a cancellation-unsafe operation can lose partial progress."
+---
+
+`tokio::select!` waits for one of several asynchronous branches. When one branch completes, the other branch futures are dropped for that invocation.
+
+Inside a loop, the next iteration often creates them again from the beginning.
+
+This is correct only when losing a branch can be cancelled safely or when its future is intentionally kept alive outside the loop.
+
+## One loop makes the lifecycle visible
+
+```rust
+loop {
+    tokio::select! {
+        message = receiver.recv() => {
+            handle(message).await;
+        }
+        _ = shutdown.cancelled() => {
+            break;
+        }
+    }
+}
+```
+
+For each iteration:
+
+```text
+create/poll recv future
+create/poll shutdown future
+one becomes ready
+run its branch
+drop the other future
+begin next iteration with new futures
+```
+
+Tokio's [`select!` documentation](https://docs.rs/tokio/latest/tokio/macro.select.html) describes this lifecycle and includes a cancellation-safety section for common async methods.
+
+## Cancellation-safe means restart does not lose progress
+
+For use in this loop, an operation is cancellation safe when:
+
+```text
+If its future is dropped before returning Ready,
+calling the operation again does not lose a value or corrupt progress.
+```
+
+Tokio's `mpsc::Receiver::recv` is designed for this select-loop pattern. If another branch wins before `recv` returns, a message is not silently consumed and lost by that cancelled receive future.
+
+Not every operation has this property.
+
+## `read_line` is a classic dangerous branch
+
+```rust
+let mut line = String::new();
+
+loop {
+    tokio::select! {
+        result = reader.read_line(&mut line) => {
+            // use line
+        }
+        _ = tick.tick() => {
+            report_progress();
+        }
+    }
+}
+```
+
+`read_line` may consume bytes into internal or caller-visible progress before producing a complete line. If the timer wins and the future is dropped, recreating `read_line` can lose or confuse that partial progress according to the API's documented cancellation behaviour.
+
+Tokio documents `AsyncBufReadExt::read_line` as not cancellation safe in this use, while the `lines().next_line()` pattern has a safer contract for selected line reads.
+
+I do not infer safety from `&mut self` or the return type. I read the method documentation.
+
+## Keep a long operation alive when cancellation is not intended
+
+Sometimes periodic events should be observed without restarting the main operation:
+
+```rust
+let operation = do_long_work();
+tokio::pin!(operation);
+
+loop {
+    tokio::select! {
+        result = &mut operation => {
+            break result;
+        }
+        _ = tick.tick() => {
+            report_progress();
+        }
+    }
+}
+```
+
+The tick branch wins many times, but the pinned operation remains owned outside each `select!` invocation. It is polled again rather than recreated.
+
+This requires the future to support being polled after pending in the usual way and the code to stop polling it after completion.
+
+## Dropping a future does not undo external effects
+
+Suppose a branch sends an HTTP request. Dropping its future after a timeout may stop waiting for the response, but the server may already have accepted the request.
+
+```text
+client future dropped != remote operation rolled back
+```
+
+Retrying with a new request identity can duplicate a payment or message. The operation needs a stable idempotency key and reconciliation for ambiguous outcomes.
+
+Cancellation safety at the Rust future level and idempotency at the distributed-system level are separate proofs.
+
+## Disabled branches still deserve careful construction
+
+`select!` supports branch preconditions:
+
+```rust
+result = maybe_work(), if work_enabled => { /* ... */ }
+```
+
+The macro evaluates preconditions and branch expressions according to its documented lifecycle; a disabled branch is not polled. I avoid putting side effects into future construction or the `if` expression because readability and repeated loop evaluation become surprising.
+
+I compute simple state first and make the async branch itself responsible for cancellable work.
+
+## Fairness does not repair cancellation
+
+By default, Tokio selects a branch-check order with fairness behaviour; `biased;` uses source order. Fairness matters when several branches are continuously ready.
+
+It does not make a losing future cancellation safe. A branch can still lose once at exactly the wrong partial-progress point.
+
+With `biased;`, I place shutdown and low-volume critical branches carefully so a hot stream cannot starve them. I also bound per-message work outside the select loop.
+
+## Branch code runs after the selection
+
+The handler expression after `=>` is not polled concurrently with the other select futures. Once a branch wins, its async work in the branch body runs before the loop reaches the next `select!`, unless that work explicitly spawns or selects again.
+
+```rust
+message = receiver.recv() => {
+    handle_slowly(message).await;
+}
+```
+
+While `handle_slowly` runs, this loop is not polling shutdown. If shutdown latency matters, the handler itself needs a cancellation design or work must be transferred to an owned task set with bounded concurrency.
+
+`select!` provides concurrency within one task, not parallel execution of every branch body.
+
+## Timeouts are cancellation
+
+`tokio::time::timeout(duration, operation)` returns an elapsed error by dropping or returning ownership from a future according to the API shape. Conceptually, a timeout is another select branch winning.
+
+Before wrapping an operation, I ask:
+
+```text
+What state can be partially consumed?
+What happens when the future is dropped?
+Can I resume the same future?
+Can I retry safely with the same effect identity?
+Who cleans up child tasks or resources?
+```
+
+Adding a timeout without these answers moves a hang into possible data loss or duplicate effects.
+
+## A cancellation test
+
+I create a future with observable stages:
+
+```text
+stage 1: reserve input
+stage 2: consume partial bytes
+stage 3: commit result
+stage 4: return Ready
+```
+
+Then I make another branch win after each stage and poll again. The assertions are:
+
+- a value is not lost between stages;
+- partial buffers remain valid or are discarded by explicit policy;
+- resources and permits are released;
+- remote effects are reconciled;
+- completed futures are not polled again;
+- shutdown reaches all owned work.
+
+The key question in a `select!` loop is not only which branch wins. It is what dropping every losing future means at that exact point. When I make future ownership and restart behaviour visible, cancellation becomes a designed state rather than a surprise.

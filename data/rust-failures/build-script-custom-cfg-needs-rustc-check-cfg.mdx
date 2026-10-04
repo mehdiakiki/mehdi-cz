@@ -1,0 +1,94 @@
+---
+caseId: "RFA-692"
+title: "A Cargo Build Script Custom cfg Needs rustc-check-cfg"
+date: "2026-09-07T09:10:00+01:00"
+lastmod: "2026-09-07T09:10:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "8ddaa2c0c1192815939a0fd121a3706fd14f16e7a4b97529bc7f9d9e7947488d"
+area: "cargo-dependencies"
+symptom: "A custom cfg emitted by build.rs fails under deny(unexpected_cfgs) even though Cargo passes the cfg to rustc."
+summary: "rustc-cfg activates a custom condition, while rustc-check-cfg declares its allowed name and values. A careful build script emits both, including the check declaration on branches where the condition is inactive."
+rustVersions: ["Rust 1.98.1", "Cargo 1.98.1", "edition 2024"]
+targets: ["all Cargo targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Cargo build.rs unexpected cfg condition name", "rustc-check-cfg custom build script", "cargo rustc-cfg unexpected_cfgs deny"]
+evidence: ["Cargo 1.98.1 workspace fixture", "custom has_fast_path cfg rejected", "unconditional rustc-check-cfg repair"]
+sources: ["https://doc.rust-lang.org/cargo/reference/build-scripts.html#rustc-check-cfg", "https://doc.rust-lang.org/rustc/check-cfg/cargo-specifics.html", "https://doc.rust-lang.org/rustc/lints/listing/warn-by-default.html#unexpected-cfgs"]
+---
+
+A build script can discover a native capability and enable Rust code with a custom configuration name. The surprising part is that enabling the name and declaring it valid are two different Cargo instructions.
+
+The [failing project](/rust-failure-atlas/evidence/RFA-692/fail/Cargo.toml) prints `cargo::rustc-cfg=has_fast_path`. Rustc receives the condition, selects the fast branch, and still rejects both `#[cfg(has_fast_path)]` expressions because the crate denies `unexpected_cfgs`.
+
+That sounds contradictory at first. It is not. One instruction chooses a configuration for this build. The other defines the vocabulary that source code is allowed to use.
+
+## Selection and validation are separate
+
+I keep this small model in mind:
+
+```text
+cargo::rustc-check-cfg=cfg(has_fast_path)  -> this name is expected
+cargo::rustc-cfg=has_fast_path             -> this name is true now
+```
+
+The first line does not enable the fast path. The second line does not register the name with the checking system. The [Cargo build-script reference](https://doc.rust-lang.org/cargo/reference/build-scripts.html#rustc-check-cfg) documents the pair, and the [rustc Cargo-specific check-cfg guide](https://doc.rust-lang.org/rustc/check-cfg/cargo-specifics.html) explains why they are used together.
+
+This separation is useful. A name can be valid for the project while being false on the current machine. Without that distinction, the compiler could not tell a known inactive condition from a spelling mistake.
+
+## The declaration must be unconditional
+
+The [repaired project](/rust-failure-atlas/evidence/RFA-692/fixed/Cargo.toml) emits `rustc-check-cfg` before it emits `rustc-cfg`. More importantly, the declaration is not hidden inside the successful probe branch.
+
+Suppose a script does this:
+
+```rust
+if accelerator_found() {
+    println!("cargo::rustc-check-cfg=cfg(has_accelerator)");
+    println!("cargo::rustc-cfg=has_accelerator");
+}
+```
+
+The source still contains `#[cfg(has_accelerator)]` when no accelerator exists. On that machine the compiler sees no declaration and warns about the name. I emit every possible name and value unconditionally, then emit the active selection conditionally.
+
+For a valued configuration, I declare the complete accepted set. This catches `backend = "opnessl"` instead of silently compiling the fallback for a typo. When values come from external tools, I decide whether the set is closed, admits `none()`, or must be represented by generated constants rather than an open-ended cfg string.
+
+## A Cargo feature is not always the replacement
+
+The compiler help suggests considering a Cargo feature. Sometimes that is right: features are appropriate when the package consumer chooses a capability as part of dependency resolution.
+
+A build script cfg answers another question. It can represent something discovered from the target, native SDK, generated binding set, or toolchain environment. Turning every discovered fact into a feature can make callers promise facts they cannot know and can create invalid combinations.
+
+I choose by ownership:
+
+- a consumer-selected compile-time capability is often a feature;
+- a target or native probe result can be a build-script cfg;
+- a value needed by executable code may belong in generated Rust or `rustc-env`;
+- a runtime capability should usually remain a runtime check.
+
+The name is not the architecture. It is only one channel from the build decision into rustc.
+
+## Keep the probe and fallback testable
+
+A repaired build on one developer machine proves only the active branch. I test at least one environment where the probe succeeds and one where it fails. Both must accept the same cfg vocabulary, and each must select the intended code.
+
+I also run with `unexpected_cfgs` denied in CI. The lint described in the [rustc lint listing](https://doc.rust-lang.org/rustc/lints/listing/warn-by-default.html#unexpected-cfgs) is valuable because an unknown cfg normally removes code. A misspelling can therefore look like a valid fallback rather than an obvious unresolved name.
+
+For cross-compilation, the build script itself runs on the host while configuring code for the target. I do not use the build script's own `cfg!(target_os)` as proof about the target. I read Cargo's target environment and keep host tools separate from target capabilities.
+
+## The useful regression is negative
+
+The fixture proves a negative property: a cfg can be active and still be undeclared. Its repair proves both sides by compiling with a denied lint.
+
+For a real project I add another deliberate misspelling in a compile-fail test or a small generated fixture. If the misspelling is accepted, the checking contract is too broad. If a supported inactive value is rejected, the declaration is too narrow.
+
+My review sequence is:
+
+1. list every custom cfg name and possible value the build script can emit;
+2. emit `rustc-check-cfg` for the complete list on every execution;
+3. emit `rustc-cfg` only for conditions that are true for this target build;
+4. deny `unexpected_cfgs` in a CI lane;
+5. exercise the positive, negative, and misspelled cases;
+6. decide whether each choice belongs to Cargo resolution, build discovery, generated code, or runtime detection.
+
+The core principle goes beyond Cargo. Declaring a vocabulary and selecting one member are different operations. When both are explicit, a missing capability takes the fallback and a misspelled capability fails the build. That is exactly the distinction I want from configuration code.

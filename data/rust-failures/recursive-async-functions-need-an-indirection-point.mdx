@@ -1,0 +1,71 @@
+---
+caseId: "RFA-620"
+title: "Recursive async Functions Need an Indirection Point"
+date: "2026-09-06T07:40:00+01:00"
+lastmod: "2026-09-06T07:40:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "1bb6df279ed2ac7076f1dfeeaeab37fcdb42f1171dc413a5ad784db61df0f7ad"
+area: "async-runtime"
+symptom: "A directly recursive async function fails with E0733 because its generated future would otherwise contain itself without a finite size."
+summary: "An async function returns a concrete state machine. Put the recursive future behind Box::pin, or replace recursion with an explicit stack when allocation and depth matter."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust E0733 recursion async fn requires boxing", "recursive async function Box pin", "async recursion future size Rust"]
+evidence: ["Rust 1.98.1 E0733 compile failure", "direct await of recursive descend call", "Box pin indirection repair"]
+sources: ["https://doc.rust-lang.org/error_codes/E0733.html", "https://doc.rust-lang.org/book/ch17-05-traits-for-async.html", "https://doc.rust-lang.org/std/pin/struct.Pin.html"]
+---
+
+The source looks ordinary: an async function calls itself with a smaller depth and awaits the result. The hidden type is not ordinary. Every async function produces one concrete future type containing the state that can remain live at its suspension points. Direct recursion would require that future to contain another value of its own type, then another, forever. The [failing fixture](/rust-failure-atlas/evidence/RFA-620/fail.rs) exposes this equation and receives E0733.
+
+## The problem is size, before it is scheduling
+
+I first rewrite the function mentally as “a function returning an unnamed struct which implements `Future`.” Its locals and control position become fields. If one field must be the same whole unnamed struct, rustc cannot choose a finite layout.
+
+The [official E0733 explanation](https://doc.rust-lang.org/error_codes/E0733.html) requires indirection and shows boxing either the recursive call or the body. The pointer has a known size even while the allocation behind it holds a different future instance.
+
+This resembles recursive data types. `enum List { More(List) }` is impossible for the same reason, while `More(Box<List>)` has a finite outer shape. Async syntax can hide this familiar layout problem.
+
+## The small repair is Box::pin
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-620/fixed.rs) wraps the recursive call with `Box::pin` before awaiting it. `Box` supplies indirection and `Pin` preserves the location required by future polling rules. The standard library documents [Pin](https://doc.rust-lang.org/std/pin/struct.Pin.html) and why address-sensitive values need controlled movement.
+
+I do not translate this into “all recursive async code should be boxed.” The repair proves the type can exist. It also adds one allocation per recursive step in this form. That cost, maximum depth, cancellation behaviour, and retained state still need review.
+
+For bounded traversal with a small known depth, boxing may be a clear solution. For a large directory tree, dependency graph, or retry workflow, an explicit `Vec` stack often gives better control. It can reuse allocation, enforce a limit, record progress, and avoid overflowing a logical recursion budget.
+
+## Concurrency is a separate decision
+
+Recursion describes dependency, not concurrency. Awaiting one child before visiting the next stays sequential. Joining many child futures can increase concurrency, memory use, open file descriptors, or provider requests. I choose and bound that fan-out explicitly.
+
+This distinction catches a common mistake: fixing E0733 with boxed futures, then assuming the traversal became parallel. Nothing about pointer indirection schedules sibling work. Conversely, collecting every recursive future before awaiting may create an uncontrolled burst.
+
+I test order and maximum in-flight work when those are product properties. A semaphore or work queue is often easier to reason about than recursive join construction.
+
+## Cancellation cuts through the recursive chain
+
+Dropping the outer future drops the suspended descendants it owns. If a level performs an external side effect and then awaits its child before recording completion, cancellation can leave partial progress. The type repair cannot make that operation transactional.
+
+I place durable checkpoints around effects, make repeatable operations idempotent, and test cancellation at several depths. Owned guards are dropped as futures unwind, but remote actions may already have happened. A recursive workflow needs the same recovery design as an iterative one.
+
+Errors also need context. Adding the current node or depth while propagating an error makes a deeply nested failure diagnosable. I avoid logging the same error at every level because that creates noise without new evidence.
+
+## Lifetimes may favour a scoped design
+
+A boxed trait-object future often introduces lifetime bounds. Borrowed inputs can be valid, but the returned box must not claim `'static` unless it owns everything it captures. I let signatures express the real borrow and avoid cloning merely to satisfy an unnecessarily broad alias.
+
+If the recursion carries mutable state, only one active borrow can cross each await in the sequential design. An explicit stack can sometimes shorten loans and make the ownership clearer. The Book’s discussion of [traits for async](https://doc.rust-lang.org/book/ch17-05-traits-for-async.html) helps connect future types, pinning, and dispatch choices.
+
+## My E0733 checklist
+
+- Where does an async function directly or indirectly call itself?
+- What recursive equation would its generated future type create?
+- Is one boxed call enough, or should the whole body return a boxed future?
+- What allocation occurs per level and what depth is permitted?
+- Would an explicit work stack make limits and progress clearer?
+- Is the traversal sequential, bounded concurrent, or accidentally unbounded?
+- What happens if the outer future is cancelled halfway down?
+- Do borrowed captures have honest lifetime bounds rather than forced `'static` ownership?
+
+The core principle is that an async function still has one concrete, finite return type. E0733 reveals the recursive layout hidden by syntax. I add one deliberate indirection point, then separately design depth, concurrency, cancellation, and recovery.

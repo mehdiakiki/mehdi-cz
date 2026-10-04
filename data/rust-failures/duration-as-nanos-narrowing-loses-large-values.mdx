@@ -1,0 +1,84 @@
+---
+caseId: "RFA-334"
+title: "Narrowing Duration::as_nanos Loses Large Durations"
+date: "2026-09-06T01:54:00+01:00"
+lastmod: "2026-09-06T01:54:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "d88a7dcb0b014368c6cf64340eda1d50814b01cc7b9d98171443cca9d3c210f5"
+area: "upgrades-compatibility"
+symptom: "A Duration round-trip through total nanoseconds becomes a much smaller value because as_nanos returns u128 and an as u64 cast discards high bits."
+summary: "Duration spans can exceed what u64 nanoseconds represent. Preserve the seconds and subsecond components, keep total nanoseconds as u128, or reject values before narrowing into a protocol field."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust Duration as_nanos u64 truncation", "from_nanos as_nanos round trip large duration", "Duration nanoseconds overflow u64"]
+evidence: ["Rust 1.98.1 Duration maximum seconds", "u128 to u64 narrowing", "seconds and subsecond reconstruction"]
+sources: ["https://doc.rust-lang.org/std/time/struct.Duration.html#method.as_nanos", "https://doc.rust-lang.org/std/time/struct.Duration.html#method.from_nanos", "https://doc.rust-lang.org/std/time/struct.Duration.html#method.subsec_nanos"]
+---
+
+I converted a `Duration` into nanoseconds for a storage field and then reconstructed it with `Duration::from_nanos`. The code looked like a round-trip. The hidden `as u64` made it a truncation.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-334/fail.rs) starts with a large valid duration, calls `as_nanos() as u64`, and rebuilds it. The new duration is not equal to the original.
+
+## The two APIs use different integer widths
+
+[`Duration::as_nanos`](https://doc.rust-lang.org/std/time/struct.Duration.html#method.as_nanos) returns `u128`. It needs that width because `Duration` stores up to `u64` whole seconds plus a nanosecond fraction. Expressing all those seconds in nanoseconds can exceed `u64`.
+
+[`Duration::from_nanos`](https://doc.rust-lang.org/std/time/struct.Duration.html#method.from_nanos) accepts `u64`. It can construct every duration whose total nanoseconds fit in that narrower input, not every possible `Duration`.
+
+The signatures warn that these functions are not mathematical inverses over the complete domain.
+
+## as performs narrowing rather than validation
+
+Casting `u128` to `u64` with `as` retains the low bits and discards the high bits. It does not return an error. The resulting value can look reasonable while representing a completely different duration.
+
+This is more dangerous than a panic because the program continues with corrupted time data. A timeout, retention period, certificate field, or scheduled delay can shrink silently.
+
+I use `u64::try_from(total_nanos)` when a destination really is limited to `u64`. Failure then becomes a schema or validation error.
+
+## Preserve Duration in its natural components
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-334/fixed.rs) reconstructs the value from `as_secs()` and [`subsec_nanos`](https://doc.rust-lang.org/std/time/struct.Duration.html#method.subsec_nanos). Those components match the representation accepted by `Duration::new` without narrowing the total.
+
+If I control a schema, I can store seconds as `u64` and nanos as a bounded `u32`, or store total nanoseconds in a true 128-bit representation. The schema must define normalization and maximum values.
+
+Copying the `Duration` directly is even simpler inside one Rust process because it is a `Copy` value.
+
+## The practical u64-nanosecond range is smaller than many expect
+
+`u64::MAX` nanoseconds covers roughly 584 years. That is enormous for a request timeout but not for every timestamp difference, archival field, astronomical interval, or sentinel value.
+
+More importantly, correctness should not depend on “nobody will use such a large value” when the type explicitly permits it. I place a checked product limit at ingestion and return a clear message if the field is meant to be much smaller.
+
+Then later conversions can rely on a validated newtype rather than scattered assumptions.
+
+## Units and widths belong together
+
+A raw integer called `timeout` is incomplete. It needs a unit, width, range, and rounding rule. Milliseconds in `u64` cover a much larger duration than nanoseconds in `u64`, but lose sub-millisecond precision.
+
+When crossing FFI or a database, I document all four facts. I avoid casts hidden inside serialization helpers because reviewers cannot see whether they validate.
+
+Protocol evolution is easier when the unit appears in the field name, such as `timeout_ns`, and a versioned limit is written down.
+
+## Floating-point conversion is another contract
+
+Converting duration to floating-point seconds can represent a wide range but loses integer precision at large magnitudes. It does not repair the integer-width mismatch; it chooses a different one.
+
+I select representation from required maximum range and resolution. For accounting or exact scheduling fields, integer components are often clearer. For approximate display, floating-point seconds may be fine.
+
+The conversion boundary owns rounding, overflow, and non-finite handling.
+
+## Tests need values around the destination limit
+
+I test zero, one nanosecond, exactly `u64::MAX` nanoseconds, one nanosecond beyond that when constructible, a large seconds-only duration, and a value with both components.
+
+Round-trip properties are constrained to the representation's supported domain. Outside it, the expected result is a validation error, never truncation.
+
+I also test serialized values in other languages because a receiver may parse a 128-bit decimal into a 64-bit number or a JavaScript floating-point number.
+
+## What the evidence proves
+
+RFA-334 uses `Duration::from_secs(u64::MAX)` to make the width mismatch undeniable on Rust 1.98.1. It proves that the total exceeds `u64` and that component reconstruction remains exact.
+
+The core principle is that a unit conversion can also be a range conversion. `as_nanos` honestly returns the width its domain needs. If my next system accepts less, I validate that narrower contract instead of using `as` to remove the evidence.

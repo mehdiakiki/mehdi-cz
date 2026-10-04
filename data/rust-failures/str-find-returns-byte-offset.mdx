@@ -1,0 +1,105 @@
+---
+caseId: "RFA-172"
+title: "Why Rust str::find Returns a Byte Offset"
+date: "2026-09-05T17:11:00+01:00"
+lastmod: "2026-09-05T17:11:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "15cb076dc13898cf6d5f72f844d2bc89433109d7778f8f5ed0e4cda884dc7866"
+area: "concurrency-memory"
+symptom: "str::find returns index 2 for the visually second character in éclair because the returned position counts UTF-8 bytes rather than Unicode scalar values."
+summary: "Rust string offsets count UTF-8 bytes so a find result can be used directly at a valid slice boundary. Character ordinals and user-perceived grapheme positions are different coordinate systems and need explicit conversion."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust str find returns byte index",
+    "String find Unicode character position Rust",
+    "convert UTF-8 byte offset to char index",
+  ]
+evidence: ["Rust 1.98.1 UTF-8 assertion", "two-byte leading character", "prefix-char-count repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/std/primitive.str.html#method.find",
+    "https://doc.rust-lang.org/std/primitive.str.html#method.char_indices",
+    "https://doc.rust-lang.org/std/primitive.str.html#method.is_char_boundary",
+  ]
+---
+
+When I search for the `c` in `éclair`, I can naturally call it the second character. Rust returns `2`, not `1`. Both statements can be correct because they use different coordinates.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-172/fail.rs) assumes the result of `"éclair".find('c')` is a character ordinal. The assertion fails. UTF-8 encodes `é` in two bytes, so `c` begins at byte offset two.
+
+## Search and slicing use the same coordinate system
+
+[`str::find`](https://doc.rust-lang.org/std/primitive.str.html#method.find) returns the byte index of the first match. This choice makes the result directly useful for string slicing:
+
+```rust
+let text = "éclair";
+let at = text.find('c').unwrap();
+assert_eq!(&text[at..], "clair");
+```
+
+Rust strings are UTF-8 byte sequences with a validity invariant. A slice range is also expressed in bytes and must begin and end at UTF-8 character boundaries. Returning a byte offset lets `find` identify the exact legal boundary without walking the prefix again.
+
+If `find` returned “the second Unicode scalar value,” I would need a second conversion before I could slice. That conversion is not constant-time because UTF-8 values have variable width.
+
+## Byte offset and character ordinal answer different questions
+
+If my user interface needs the number of preceding Unicode scalar values, I count them explicitly. The [repaired program](/rust-failure-atlas/evidence/RFA-172/fixed.rs) does this:
+
+```rust
+let byte_offset = text.find('c').unwrap();
+let scalar_index = text[..byte_offset].chars().count();
+assert_eq!(scalar_index, 1);
+```
+
+The slice is valid because a successful character match begins on a boundary. For a byte pattern or a separately obtained integer, I first need to establish that the offset is a character boundary.
+
+[`str::char_indices`](https://doc.rust-lang.org/std/primitive.str.html#method.char_indices) is useful when I need both coordinates. It yields each Unicode scalar value together with its byte position. I prefer it over manually accumulating `len_utf8()` because the intent is clearer.
+
+## “Character” is still ambiguous
+
+Rust's `char` represents a Unicode scalar value, not necessarily one symbol perceived by a reader. An accented letter may be stored as one precomposed scalar value or as a base letter plus a combining mark. An emoji shown as one unit can contain several scalar values joined together.
+
+So there are at least three common positions:
+
+```text
+byte offset            useful for storage, slicing, protocols
+Unicode scalar index   useful for iterating Rust chars
+grapheme position      useful for many cursor and display operations
+```
+
+The standard library provides bytes and scalar-value iteration. User-perceived grapheme segmentation needs a Unicode-aware segmentation implementation and a stated Unicode version. I do not label `chars().count()` as a display width or cursor column.
+
+Terminal columns add another coordinate again. A grapheme can occupy zero, one, two, or context-dependent display columns. Search results alone cannot answer that layout question.
+
+## Boundary checks prevent accidental panics
+
+[`str::is_char_boundary`](https://doc.rust-lang.org/std/primitive.str.html#method.is_char_boundary) tells me whether a byte index is between complete UTF-8 scalar values. Slicing at byte one inside `é` panics even though one is within the string's byte length.
+
+For a parser, byte offsets are usually ideal. They match input buffers, diagnostic spans, and protocol positions. For an editor, I may keep byte positions internally but translate them at the presentation boundary. The important decision is to name the unit.
+
+I use names such as `byte_offset`, `scalar_index`, and `display_column`. A variable called only `position` lets incompatible units travel too far through a system.
+
+## Conversion has a cost
+
+Counting `text[..byte_offset].chars()` scans the prefix. Repeating this conversion for many matches can become quadratic if I repeatedly start from the beginning.
+
+When I need all character ordinals, I make one pass with `char_indices().enumerate()` and retain both values. When I mainly slice or parse, I keep byte offsets and avoid conversions that no consumer needs.
+
+This is also why random indexing by character number is not a basic `str` operation. UTF-8 cannot locate the thousandth scalar value without learning the widths of what came before, unless another index has been built.
+
+## My debugging checklist
+
+When a Rust string position looks wrong, I check:
+
+1. Does the API document bytes, scalar values, graphemes, or columns?
+2. Is the input entirely ASCII, accidentally hiding the difference?
+3. Will the position be used for slicing, display, or a protocol?
+4. Is it known to be a valid UTF-8 boundary?
+5. Am I repeating a linear conversion inside a loop?
+6. Do tests include multi-byte and combining sequences?
+
+The broad principle is to make coordinate systems visible. Rust returns a byte offset from `find` because that offset composes safely with its string representation. Translating it is fine, but the target unit must be chosen rather than assumed.

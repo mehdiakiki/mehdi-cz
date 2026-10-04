@@ -1,0 +1,81 @@
+---
+caseId: "RFA-302"
+title: "panic::resume_unwind Does Not Invoke the Panic Hook Again"
+date: "2026-09-06T01:22:00+01:00"
+lastmod: "2026-09-06T01:22:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "9cddd91c1fbcfc8b7622651a0320e719fcee56c0e1ef7bd1dd8542c9b4e6eccb"
+area: "concurrency-memory"
+symptom: "A panic payload caught and resumed crosses another catch boundary, but the configured panic hook runs only for the original panic."
+summary: "resume_unwind continues unwinding with an existing payload and deliberately bypasses the panic hook. Observability around an unwind boundary must distinguish a new panic from a resumed one."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["targets with panic=unwind"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust resume_unwind panic hook not called", "panic hook catch_unwind resume payload", "resume_unwind logging missing Rust"]
+evidence: ["Rust 1.98.1 custom counting hook", "caught original payload", "resumed payload with zero additional hook calls"]
+sources: ["https://doc.rust-lang.org/std/panic/fn.resume_unwind.html", "https://doc.rust-lang.org/std/panic/fn.catch_unwind.html", "https://doc.rust-lang.org/std/panic/fn.set_hook.html"]
+---
+
+I wrapped a plugin boundary with `catch_unwind`, attached context to its error path, and then resumed the panic so normal shutdown policy could handle it. My panic hook logged the original panic, but it did not log a second event when `resume_unwind` was called. At first I thought the resumed unwind had avoided the hook by accident.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-302/fail.rs) installs a counting hook, catches one panic, resets the counter, and resumes its payload inside another catch boundary. The second unwind is caught, while the hook counter stays at zero.
+
+## Resuming is not starting a new panic
+
+[`panic::resume_unwind`](https://doc.rust-lang.org/std/panic/fn.resume_unwind.html) resumes unwinding with a previously captured panic payload. Its documentation explicitly says that the panic hook is not invoked.
+
+This makes sense when I treat the payload as one failure moving through several abstraction boundaries. A hook runs when the panic begins. Catching and resuming it does not create a second root failure; it temporarily changes control flow so a boundary can clean up, translate local state, or decide whether to continue propagation.
+
+Calling `panic_any(payload)` would start another panic whose payload happens to contain a value. It is not the same operation and can change payload types, hook behavior, and diagnostics.
+
+## Hooks and catch boundaries happen at different phases
+
+[`set_hook`](https://doc.rust-lang.org/std/panic/fn.set_hook.html) configures a global callback that runs when a thread panics, before either unwinding or aborting. [`catch_unwind`](https://doc.rust-lang.org/std/panic/fn.catch_unwind.html) catches an unwind after the hook has already observed its beginning.
+
+The sequence for this case is:
+
+```text
+panic begins
+panic hook runs
+stack unwinds
+catch_unwind returns the payload
+local boundary performs work
+resume_unwind continues with that payload
+no second hook call
+outer catch observes the same unwind
+```
+
+RFA-293 covers the first half: catching a panic does not silence the original hook. This case covers the other half: resuming that panic does not notify it again.
+
+## Logging at both layers can create the opposite problem
+
+Once I understood the missing second hook, another risk became clear. If every catch boundary logs the payload and the global hook also logs it, one panic can produce several nearly identical alerts. Operators may believe several failures happened.
+
+I give each layer one responsibility. The hook records process-wide panic facts such as thread and location. A boundary records local context only when it can add something useful, such as the operation identifier or plugin name. If it resumes the unwind, the local record says it is propagation of an existing panic rather than a recovered error.
+
+Structured event identifiers help connect these observations without counting them as independent incidents.
+
+## Panic payloads are not ordinary error values
+
+The returned payload is a boxed `Any + Send` value. It may be a string, but Rust does not promise every panic uses one predictable string representation. Code that catches only to parse a message is fragile.
+
+I use `catch_unwind` narrowly around an actual unwind boundary, not as a replacement for `Result`. Foreign-function interfaces, task supervisors, and plugin hosts can need this containment. Normal application failures should preserve typed error information and explicit recovery behavior.
+
+Dropping a payload can itself be problematic if its destructor panics. Boundary code should be small, tested, and careful about what it does while already handling an unwind.
+
+## Abort strategy changes the available mechanism
+
+Unwind handling depends on the panic strategy. The `resume_unwind` documentation notes that under an aborting strategy the process aborts. A design requiring cleanup after `catch_unwind` cannot assume every production profile unwinds.
+
+I record the panic strategy beside the fixture and test the shipped profile. This is especially important when workspace profiles, target configuration, or embedded environments override defaults.
+
+No Rust panic mechanism is a safe way to catch foreign exceptions crossing an unsupported ABI boundary. The ABI and runtime contracts still apply.
+
+## What I test
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-302/fixed.rs) asserts one hook call for the original panic, zero additional calls for `resume_unwind`, and an error from the outer catch. It restores the previous global hook before leaving the fixture.
+
+Because hooks are global state, I serialize similar tests in a real suite. Parallel tests that replace the hook can interfere with each other. I also test the production panic profile, the context logged by each boundary, non-string payloads, and the policy used when recovery is unsafe.
+
+The core principle is that observability follows lifecycle, not merely control-flow boundaries. `resume_unwind` continues one existing panic and intentionally bypasses the hook. If I need an event at the resume site, I record it explicitly and label it as propagation rather than expecting Rust to announce a second panic.

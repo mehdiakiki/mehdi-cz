@@ -1,0 +1,83 @@
+---
+caseId: "RFA-293"
+title: "catch_unwind Runs the Panic Hook Before Catching"
+date: "2026-09-06T01:13:00+01:00"
+lastmod: "2026-09-06T01:13:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "69f42e0b508926a111ddd60a2333e012fa6c8d922a81ca44d8a8b9d4add7ba2d"
+area: "concurrency-memory"
+symptom: "A panic is returned as Err by catch_unwind, but the configured panic hook has already logged or counted it."
+summary: "catch_unwind catches an unwinding panic after the panic hook runs. Catching controls stack unwinding at a boundary; it does not make the panic silent, undo side effects, or catch aborting panics."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["targets using unwind panic strategy"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust catch_unwind still prints panic", "panic hook runs before catch_unwind", "silence expected caught panic Rust test"]
+evidence: ["Rust 1.98.1 custom panic hook", "caught panic result", "one hook invocation"]
+sources: ["https://doc.rust-lang.org/std/panic/fn.catch_unwind.html", "https://doc.rust-lang.org/std/panic/fn.set_hook.html", "https://doc.rust-lang.org/std/panic/fn.take_hook.html"]
+---
+
+I wrapped a risky callback in `catch_unwind` and still saw a panic message in the logs. The process continued and the call returned `Err`, so I first thought the catch had failed. It had not. The panic hook and the unwind boundary are different parts of the sequence.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-293/fail.rs) installs a counting hook, catches a panic, and wrongly expects zero hook calls. The count is one.
+
+## The hook runs before unwinding is caught
+
+[`catch_unwind`](https://doc.rust-lang.org/std/panic/fn.catch_unwind.html) executes a closure and returns `Err` when an unwinding panic crosses its boundary. The documentation explicitly notes that a custom panic hook runs before the panic is caught and before unwinding.
+
+The sequence is:
+
+```text
+panic begins
+panic hook runs
+stack unwinds
+catch_unwind boundary converts payload to Err
+```
+
+The default hook normally prints information to standard error. Therefore a caught panic can still produce visible output. A monitoring hook may also increment counters or submit an event before application code decides the panic was expected.
+
+## Catching is not transaction rollback
+
+Values dropped during unwinding run their destructors. Mutations performed before the panic remain unless application code explicitly restores them. I/O may already be sent, locks may become poisoned, and global counters may change.
+
+`catch_unwind` prevents that particular unwind from continuing past the boundary. It does not reverse the closure.
+
+For plugin or callback isolation, I combine the catch with a state design that can tolerate partial progress. If external actions must be atomic, I stage them before commit or give them idempotency and compensation rules.
+
+## It catches only unwinding panics
+
+A build can use an aborting panic strategy. Some panics can also abort rather than unwind. The standard function cannot catch process abortion.
+
+I never use `catch_unwind` as a general recovery mechanism for memory corruption, foreign exceptions, or invariants after unsafe code has gone wrong. Rust's safety rules must still hold before, during, and after unwinding.
+
+The `UnwindSafe` bound helps mark captured state that may expose broken invariants after a panic, but it is not proof that a domain operation can simply continue.
+
+## Panic hooks are global process state
+
+[`set_hook`](https://doc.rust-lang.org/std/panic/fn.set_hook.html) changes the hook for the whole process. A test that replaces it can affect other tests running concurrently. A library that silently replaces an application's hook can break logging and diagnostics.
+
+The fixture uses [`take_hook`](https://doc.rust-lang.org/std/panic/fn.take_hook.html) to save the previous hook and restores it immediately after the experiment. Real code also needs to restore it if an intermediate operation panics, which often calls for a small RAII guard and serialized test access.
+
+I prefer configuring panic reporting at the executable boundary. Libraries should rarely own global diagnostic policy.
+
+## Suppressing output changes evidence policy
+
+An expected-panic test may temporarily install a quiet hook. This can make test output readable, but it also hides every concurrent panic while that global hook is active.
+
+Instead, I isolate such tests, keep the replacement window short, and assert that the caught payload matches the expected failure. For production callbacks, I usually keep the hook and classify caught failures in monitoring rather than erasing them.
+
+Duplicate reporting is another risk. The hook reports once, then code handling `Err` reports again. I attach an event ID or choose one layer as the owner of alerting so one incident does not appear as two independent failures.
+
+## Dropping the panic payload may itself be difficult
+
+The returned `Err` contains the panic payload. The `catch_unwind` documentation warns that dropping that payload can itself panic for unusual payload types. Common string payloads are simple, but generic boundary code should not claim that handling every possible panic payload is infallible.
+
+Across an FFI boundary, I prevent unwinding from entering foreign code and translate expected application errors before they become panics. Catching can be one last boundary for Rust unwinds, not a replacement for normal `Result` errors.
+
+## What I test
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-293/fixed.rs) asserts both facts: the result is `Err`, and the hook ran exactly once. This prevents “caught” from being confused with “silent.”
+
+I test expected payload classification, hook restoration, mutations made before panic, destructor behavior, and the configured panic strategy. Tests changing the hook run serially.
+
+The core principle is that failure observation and failure propagation are separate. A panic hook observes the panic first; `catch_unwind` later stops an unwind at its boundary. Designing reliable recovery requires accounting for both, plus every side effect that occurred before the catch.

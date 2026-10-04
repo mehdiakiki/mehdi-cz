@@ -1,0 +1,79 @@
+---
+caseId: "RFA-682"
+title: "An mpsc Channel Remains Connected While Any Sender Clone Lives"
+date: "2026-09-06T08:42:00+01:00"
+lastmod: "2026-09-06T08:42:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "5a902e8c8349717298fe3f7504f7fa9f8bbafbd02581cf49bf3120aef767c7bf"
+area: "concurrency-memory"
+symptom: "Dropping the original Sender does not disconnect the receiver because another Sender clone is still alive."
+summary: "Channel closure is an ownership protocol: every sender must be dropped. Hidden clones can keep consumers waiting after producers appear finished."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["targets supporting std threads"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust mpsc channel not disconnecting", "receiver waits sender clone alive", "drop all Sender clones Rust"]
+evidence: ["Rust 1.98.1 runtime assertion", "original sender dropped with clone retained", "dropping every sender yields Disconnected"]
+sources: ["https://doc.rust-lang.org/std/sync/mpsc/fn.channel.html", "https://doc.rust-lang.org/std/sync/mpsc/struct.Receiver.html#method.try_recv", "https://doc.rust-lang.org/std/sync/mpsc/enum.TryRecvError.html"]
+---
+
+An `std::sync::mpsc` receiver becomes disconnected only after every sender for that channel is dropped. Dropping the variable returned by `channel()` is insufficient if a clone remains. The [failing fixture](/rust-failure-atlas/evidence/RFA-682/fail.rs) receives `Empty`, not `Disconnected`, while a hidden sender clone lives.
+
+## Closure follows ownership count
+
+The multi-producer design permits cloning `Sender` for several workers. The receiver cannot know whether a live producer will send later, so it reports disconnection only when no sending capability remains.
+
+[`try_recv`](https://doc.rust-lang.org/std/sync/mpsc/struct.Receiver.html#method.try_recv) distinguishes these states: `Empty` means no message is ready but sending is still possible; `Disconnected` means no future sends can succeed after buffered messages are exhausted.
+
+I treat channel close as a distributed ownership event inside the process. Every clone is one vote that production may continue.
+
+## Hidden clones create shutdown hangs
+
+A coordinator may drop its sender and then join a consumer that loops over the receiver. If a sender clone is stored in the coordinator itself, a worker pool, an error callback, or a long-lived struct, the loop never sees closure and join waits forever.
+
+The repair is lifecycle design, not a timeout. The [repaired fixture](/rust-failure-atlas/evidence/RFA-682/fixed.rs) drops both senders and observes disconnection. In larger systems I scope producer ownership so all clones are destroyed before waiting for receiver completion.
+
+Searching for `.clone()` helps, but clones can travel through constructors. Wrapper types and ownership diagrams make producers visible.
+
+## Buffered messages arrive before final disconnection
+
+After all senders drop, the receiver can still read messages already queued. Only after the buffer is empty does receive return a disconnected error. Consumer loops such as `for item in receiver` naturally drain then stop.
+
+This supports graceful shutdown: producers finish, capabilities drop, and the consumer processes remaining work. If work must be cancelled immediately, a separate cancellation protocol is needed because channel disconnection alone means no more input, not discard queued input.
+
+I document whether shutdown drains, abandons, or persists pending messages.
+
+## A sender held by the consumer is suspicious
+
+Sometimes a component receives messages and also stores a sender for recursive work. That creates a self-sustaining channel: the receiver cannot observe disconnection while it owns sending capability.
+
+This may be valid for event loops, but shutdown needs an explicit stop message or removal of the self-sender before drain. Weak ownership does not exist for std Sender, so architecture must break the cycle intentionally.
+
+An explicit command enum can carry `Shutdown`, yet producers can still send after it unless the protocol prevents them. Capability dropping and control messages solve different problems.
+
+## Empty is only a snapshot
+
+`try_recv` returning Empty does not mean the stream is finished. A producer may send immediately afterward. Poll loops that interpret Empty as completion lose late work.
+
+Blocking `recv`, timed receive, or a surrounding event loop defines waiting behaviour. Busy polling wastes CPU and can distort scheduler behaviour. I use `try_recv` when integrating with other work and retain a clear wakeup strategy.
+
+Tests avoid sleeps. They hold or drop sender owners deterministically and assert the exact `TryRecvError`. Integration tests verify that shutdown joins complete and queued work drains according to policy.
+
+## Clone ownership should follow task ownership
+
+I create a sender clone immediately before spawning the worker that needs it and move that clone into the worker. This makes its drop coincide with task completion. Keeping a large vector of spare clones in the pool manager extends channel life for reasons unrelated to useful production.
+
+When a worker can restart, the supervisor's sender ownership is documented separately. A restart capability may intentionally keep the channel open, but then normal worker completion cannot be the close signal. A cancellation token or explicit supervisor shutdown owns that transition.
+
+## My channel-lifecycle checklist
+
+- Where is every Sender clone owned?
+- Are all senders dropped before joining the consumer?
+- Does shutdown drain buffered messages or cancel them?
+- Does the consumer itself retain a sender capability?
+- Is Empty being mistaken for permanent completion?
+- Is an explicit shutdown command also required?
+- Can blocked senders or receivers prevent owner destruction?
+- Do tests assert ownership-driven closure without timing sleeps?
+
+The core principle is that channel completion is encoded by capability lifetime. Dropping one familiar sender says nothing about its clones. I design producer scopes so the last sender disappears at a deliberate shutdown boundary.

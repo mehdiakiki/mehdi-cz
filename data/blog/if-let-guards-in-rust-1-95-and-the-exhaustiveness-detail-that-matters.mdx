@@ -1,0 +1,174 @@
+---
+title: "if let Guards in Rust 1.95 and the Exhaustiveness Detail That Matters"
+date: "2026-12-21T09:00:00+01:00"
+tags: ["Rust 1.95", "if let guards", "pattern matching", "match exhaustiveness", "Rust language"]
+draft: false
+reviewed: true
+reviewedHash: "42058117ea6320139f2e19aed5967942d6b95e4dade96a6e80c8b461594f1e27"
+cluster: "rust-under-the-hood"
+campaign: "authority-2026"
+opportunity: "RUST-067"
+summary: "Rust 1.95 allows if-let patterns in match guards, including chained bindings. The guard refines an arm but does not make its pattern exhaustive, and evaluation has precise borrow rules."
+---
+
+I often meet a match arm that needs one more pattern hidden inside a condition. Before Rust 1.95, I could nest another `if let`, add a helper returning `bool`, or restructure the entire match. None is terrible, but the relationship between the two patterns becomes less visible.
+
+Rust 1.95 stabilizes `if let` guards on match arms. The useful part is not shorter syntax alone. A successful inner pattern can introduce bindings directly into the arm body.
+
+## A guard can bind another value
+
+```rust
+enum Command {
+    Run(String),
+    Stop,
+}
+
+fn describe(command: Command) {
+    match command {
+        Command::Run(name)
+            if let Some(first) = name.chars().next() =>
+        {
+            println!("running {name}, first character is {first}");
+        }
+        Command::Run(name) => println!("cannot run an empty name: {name:?}"),
+        Command::Stop => println!("stopped"),
+    }
+}
+```
+
+Both `name` from the arm pattern and `first` from the guard are available in the body. If the string is empty, the let pattern fails and matching continues to the next arm.
+
+The [Rust Reference section on match guards](https://doc.rust-lang.org/reference/expressions/match-expr.html#match-guards) defines this order: the arm pattern matches first, then the guard operands evaluate, and the arm succeeds only when all conditions and let patterns succeed.
+
+## The guarded arm is not exhaustive
+
+This is the detail I expect to cause the most confusion:
+
+```rust,compile_fail
+fn value(input: Option<&str>) -> usize {
+    match input {
+        Some(text) if let Ok(number) = text.parse::<usize>() => number,
+        None => 0,
+    }
+}
+```
+
+The match is missing `Some(_)`. The outer pattern `Some(text)` does not cover every `Some`, because parsing can fail.
+
+I need an unguarded or otherwise complete fallback:
+
+```rust
+fn value(input: Option<&str>) -> usize {
+    match input {
+        Some(text) if let Ok(number) = text.parse::<usize>() => number,
+        Some(_) => 0,
+        None => 0,
+    }
+}
+```
+
+I think of a guard as subtracting cases from an arm, never adding exhaustiveness. The compiler cannot generally prove an arbitrary guard is always true.
+
+## Guards can form left-to-right chains
+
+The new let guard can participate in a chain:
+
+```rust
+fn classify(input: Option<&str>) -> &'static str {
+    match input {
+        Some(text)
+            if let Ok(number) = text.parse::<u32>()
+                && number > 100 =>
+        {
+            "large number"
+        }
+        Some(_) => "other text",
+        None => "missing",
+    }
+}
+```
+
+Operands evaluate from left to right and stop at the first false condition or failed pattern. A binding created by an earlier let pattern is available to later operands and the arm body.
+
+This lets me write a small validation pipeline, but I stop before it becomes a hidden program. Three or four conditions with side effects are harder to read than a named parser function returning an enum.
+
+## `||` has a deliberate restriction
+
+When any guard operand is a let pattern, `||` cannot be used as another top-level guard operand because its scope and precedence would be ambiguous.
+
+A boolean subexpression can be parenthesized:
+
+```rust
+match Some("150") {
+    Some(text)
+        if let Ok(number) = text.parse::<i32>()
+            && (number < -100 || number > 100) =>
+    {
+        println!("outside the central band: {number}");
+    }
+    _ => {}
+}
+```
+
+The parentheses make it clear that the `||` belongs to a normal boolean expression after the successful binding.
+
+## The guard borrows before the arm moves
+
+Guard evaluation has careful move behaviour. Before the guard runs, Rust takes a shared reference to the matched part used by a binding. Only after the guard succeeds is the value moved or copied into the arm binding.
+
+This allows a failed guard to continue trying later arms without having already moved data out of the scrutinee. It also prevents mutation of the matched value inside the guard while that shared reference is active.
+
+I do not usually need to memorize the compiler implementation. I keep the practical rule: inspect in the guard, perform mutation in the selected arm body.
+
+## Or-pattern guards may run more than once
+
+The Reference has a non-obvious warning: with alternatives joined by `|`, a guard with side effects can execute multiple times as alternatives are tested.
+
+```rust
+use std::cell::Cell;
+
+let calls = Cell::new(0);
+
+match 1 {
+    1 | _ if {
+        calls.set(calls.get() + 1);
+        false
+    } => {}
+    _ => {}
+}
+
+assert_eq!(calls.get(), 2);
+```
+
+This is enough reason for me to keep guards pure. Logging inside a guard can duplicate lines; incrementing a metric can miscount; consuming external state would be much worse.
+
+## When I prefer another form
+
+I use an `if let` guard when the inner pattern only matters for selecting one match arm and its binding is used there.
+
+I prefer:
+
+- a nested `match` when inner failures need several distinct outcomes;
+- `let else` when success should continue in the surrounding function;
+- a parser returning a domain enum when the chain carries business meaning;
+- `matches!` when I need only a boolean and no binding afterward;
+- `assert_matches!` when a test should show the unexpected value.
+
+The nearby article on [`assert_matches!` in Rust 1.96](/blog/assert-matches-in-rust-1-96-better-failure-output-for-pattern-tests) covers that testing choice.
+
+## The pattern matrix I test
+
+For a guarded arm I write cases for:
+
+| Outer pattern | Inner let | Boolean tail | Expected arm |
+| --- | --- | --- | --- |
+| fails | not evaluated | not evaluated | later arm |
+| matches | fails | not evaluated | later arm |
+| matches | succeeds | false | later arm |
+| matches | succeeds | true | guarded arm |
+
+If the guard has an or-pattern, I test possible repeated evaluation or remove the side effect that made repetition observable.
+
+The [Rust 1.95 release notes](https://doc.rust-lang.org/releases.html#version-1950-2026-03-05) describe the stabilization in one line. The deeper value is in how it composes two patterns while preserving match control flow.
+
+My mental model is simple: the outer pattern proposes an arm, the guard borrows and refines it, successful let patterns introduce new names, and an unguarded path still has to cover every value the guard may reject. With that model, the syntax feels like a precise extension of `match`, not a special case to guess about.

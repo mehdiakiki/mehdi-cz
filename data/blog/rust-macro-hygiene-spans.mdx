@@ -1,0 +1,299 @@
+---
+title: "Rust Macro Hygiene: What $crate, Spans, and Call Sites Actually Control"
+date: "2026-09-09T19:00:00+01:00"
+tags: ["rust", "macros", "macro hygiene", "proc macro", "compiler internals"]
+draft: false
+reviewed: true
+reviewedHash: "7872ec6aea893465b6f69938b3eaedb7d8ecfd9d45eb8579ac29a6784c4a634d"
+cluster: "rust-under-the-hood"
+campaign: "authority-2026"
+opportunity: "RUST-003"
+summary: "Rust identifiers carry syntax context as well as text. Learn macro_rules hygiene, $crate paths, and procedural-macro spans for reliable expansion."
+---
+
+Two identifiers can both be written `value` and still not refer to the same binding after macro expansion. A generated call to `helper()` may resolve inside the caller's crate, while a generated local variable resolves in the macro's definition context.
+
+This is macro hygiene. It prevents accidental name capture, but it can feel inconsistent until I stop treating an identifier as only a string.
+
+A better model is:
+
+```text
+identifier = text + syntax context + source span
+```
+
+The exact compiler representation is more involved. This model is enough to understand most surprising resolutions.
+
+## The collision that does not collide
+
+This macro creates an internal variable named `temporary`:
+
+```rust
+macro_rules! double {
+    ($expression:expr) => {{
+        let temporary = $expression;
+        temporary * 2
+    }};
+}
+
+fn main() {
+    let temporary = 100;
+    let result = double!(21);
+
+    assert_eq!(result, 42);
+    assert_eq!(temporary, 100);
+}
+```
+
+A textual preprocessor could accidentally shadow or capture the caller's `temporary`. Rust does not identify the two locals only by their spelling. The local introduced by the macro has definition-site syntax context, so it is distinct from the caller's binding.
+
+This is why internal names in `macro_rules!` do not normally need globally unique prefixes.
+
+## Caller tokens keep caller context
+
+Now pass an identifier into the macro:
+
+```rust
+macro_rules! increment {
+    ($variable:ident) => {
+        $variable += 1;
+    };
+}
+
+fn main() {
+    let mut count = 0;
+    increment!(count);
+    assert_eq!(count, 1);
+}
+```
+
+The captured `$variable` token comes from the invocation. It keeps the context needed to resolve the caller's `count`.
+
+This gives me a useful distinction:
+
+- literal identifiers written in the macro body originate with the macro definition;
+- metavariable fragments substituted from the invocation keep their caller-provided token context.
+
+A macro can operate on a caller name when the caller passes that name. It should not reach into the caller and capture an unmentioned local by spelling.
+
+## `macro_rules!` uses mixed-site hygiene
+
+Declarative macros are described as having mixed-site hygiene. Different name categories use different resolution contexts:
+
+- loop labels, block labels, and local variables are looked up at the macro definition site;
+- other symbols, such as item names, are generally looked up at the invocation site.
+
+This explains a surprising example:
+
+```rust
+fn caller_helper() -> u32 {
+    41
+}
+
+macro_rules! call_helper {
+    () => {
+        helper() + 1
+    };
+}
+
+fn main() {
+    fn helper() -> u32 {
+        41
+    }
+
+    assert_eq!(call_helper!(), 42);
+    assert_eq!(caller_helper(), 41);
+}
+```
+
+The item path `helper()` is resolved where the macro is invoked. A different module importing the macro may not have that function, or may have a different one.
+
+For an exported macro calling its own crate's helper, relying on invocation-site lookup is fragile.
+
+## `$crate` names the defining crate
+
+An exported macro should use `$crate` for paths back into the crate that defines it:
+
+```rust
+// In the `metrics` crate:
+#[doc(hidden)]
+pub fn record_impl(name: &str, value: u64) {
+    // implementation
+}
+
+#[macro_export]
+macro_rules! record {
+    ($name:expr, $value:expr) => {
+        $crate::record_impl($name, $value)
+    };
+}
+```
+
+In a dependent crate:
+
+```rust
+use metrics::record;
+
+fn main() {
+    record!("requests", 1);
+}
+```
+
+`$crate` resolves to the defining crate even if the dependency is renamed in `Cargo.toml`. The caller does not need to import `record_impl`, and a local item with the same name cannot redirect the macro.
+
+This is stronger and clearer than writing a hard-coded `metrics::record_impl` path in the expansion.
+
+## `$crate` does not bypass visibility
+
+The helper in the example is `pub` for a reason. `$crate` controls lookup, not privacy.
+
+When an exported macro expands in another crate, referenced non-macro items must be visible from that invocation. A private helper remains private, and expansion will fail.
+
+`#[doc(hidden)] pub` is a common compromise for implementation items required by exported macros. It keeps them out of normal generated documentation but they are still public API from a compatibility and security perspective.
+
+Changing or removing such a helper can break downstream macro expansion. Treat it with the same care as another public symbol.
+
+## Paths inside exported macros should be deliberate
+
+This macro depends on caller imports:
+
+```rust
+#[macro_export]
+macro_rules! make_map {
+    () => {
+        HashMap::<String, String>::new()
+    };
+}
+```
+
+It fails unless `HashMap` is in scope at the invocation. Prefer an absolute standard-library path:
+
+```rust
+#[macro_export]
+macro_rules! make_map {
+    () => {
+        ::std::collections::HashMap::<::std::string::String, ::std::string::String>::new()
+    };
+}
+```
+
+For `no_std` support, the correct path depends on the crate's actual contract. An internal re-export under `$crate` can provide a stable path when necessary.
+
+The rule is not "fully qualify everything." It is to decide whether a name is intentionally supplied by the caller or owned by the macro crate.
+
+## A span is more than a location for an error underline
+
+Unlike `macro_rules!`, procedural macros are generally described as unhygienic: their output behaves broadly as if it was written beside the invocation. They construct token streams directly, and every token has a `Span`. The span carries source-location information used for diagnostics, and it also influences syntax context and name resolution.
+
+The stable `proc_macro::Span` constructors include:
+
+- `Span::call_site()`: resolve generated identifiers as if written at the invocation;
+- `Span::mixed_site()`: use context similar to `macro_rules!` mixed-site hygiene.
+
+Definition-site span construction exists behind an unstable feature. Libraries such as `syn`, `quote`, and `proc_macro2` provide higher-level tools, but they cannot remove the need to decide where a generated name should resolve.
+
+Changing a span can change both which symbol is found and where a compiler error points.
+
+## Generated identifiers need a resolution policy
+
+Suppose an attribute macro generates a call to `runtime::register()`.
+
+Questions appear immediately:
+
+1. Is `runtime` expected to be imported by the user?
+2. Is it a dependency of the proc-macro crate?
+3. Is it re-exported by a companion runtime crate?
+4. Can the user rename that dependency?
+5. Should an error point at the attribute, the annotated function, or a generated token?
+
+There is no universal span that answers these correctly.
+
+Proc-macro crates often need a companion normal library because a proc-macro crate has restrictions on what it exports. They may also use a crate-name lookup helper to find how a dependency is named by the caller. This is a packaging and resolution problem, not only token generation.
+
+## Preserve spans for user-written syntax
+
+When a macro re-emits or transforms a user's type, expression, or field, preserving the original span usually produces the best diagnostic:
+
+```text
+error points to the user's `UnknownType`
+instead of the whole `#[derive(...)]` line
+```
+
+When a macro invents glue syntax, call-site or mixed-site spans may be appropriate depending on desired resolution.
+
+A good procedural macro does not only generate valid Rust. It generates understandable compiler errors when the input is invalid.
+
+This is one reason parsing into a syntax tree and using quote interpolation is useful: interpolated user nodes generally retain their spans, while new tokens receive the span policy chosen by the macro tooling.
+
+## Hygiene does not solve semantic collisions
+
+Hygiene protects identifier resolution. It does not prevent every kind of generated conflict.
+
+A macro that emits the same public item name twice can still cause duplicate-definition errors:
+
+```rust
+macro_rules! make_function {
+    () => {
+        fn generated() {}
+    };
+}
+
+make_function!();
+// make_function!(); // duplicate item name in the same module
+```
+
+Likewise, generated trait implementations can overlap, symbols exported with `no_mangle` can collide, and files written by build scripts can overwrite each other.
+
+Hygiene is not a general namespace allocator. Item-level API design still matters.
+
+## Editions affect macro parsing too
+
+Declarative macro fragment specifiers, such as `expr` and `pat`, are interpreted according to edition-related rules attached to the macro definition. New language syntax can require new fragment variants or migration lints.
+
+This means a macro published from an older-edition crate and invoked by a newer-edition crate does not simply adopt every parsing rule of the caller.
+
+For cross-edition libraries, test the macro from real downstream fixture crates. Unit tests inside the defining crate cannot reproduce every resolution and edition boundary.
+
+## Test from outside the crate
+
+For an exported macro, I want at least these cases:
+
+1. Invocation with no convenient helper imports.
+2. The dependency renamed in `Cargo.toml`.
+3. A caller local or item using the same names as macro internals.
+4. Invocation from a nested module.
+5. Invalid input, checked for a useful diagnostic.
+6. Supported caller editions.
+7. Repeated expansion in the same module.
+
+Compile-pass and compile-fail fixtures are more valuable here than testing only the token string. Resolution happens after tokens are produced.
+
+## Debug the expansion, then debug the contexts
+
+When a name fails to resolve, expanded source is useful. Tools such as `cargo expand` can show the approximate generated code.
+
+But expansion text is not the full program. Pretty-printed output cannot display every hygiene context carried by tokens. Two identifiers that print the same may still resolve differently.
+
+Use this order:
+
+1. Inspect the expansion for the expected path and syntax.
+2. Identify whether each name came from the definition, invocation, or a proc-macro-created token.
+3. Check the span assigned to generated identifiers.
+4. Use `$crate` or explicit paths for defining-crate items.
+5. Reproduce the failure in a downstream crate.
+
+This avoids staring at identical identifier strings and expecting them to be identical compiler names.
+
+## What hygiene gives me
+
+Rust macros manipulate tokens with history. The text is only one part of an identifier.
+
+For `macro_rules!`, remember mixed-site hygiene and use `$crate` for defining-crate paths. For procedural macros, treat every generated span as a decision about resolution and diagnostics. In both cases, test across the crate boundary where users actually invoke the macro.
+
+Hygiene is doing me a favour: it prevents accidental capture. I only need to be explicit when capture or cross-crate lookup is intentional.
+
+## Further reading
+
+- [Hygiene in the Rust Reference](https://doc.rust-lang.org/reference/macros-by-example.html#hygiene)
+- [`$crate` paths and visibility](https://doc.rust-lang.org/reference/macros-by-example.html#the-crate-metavariable)
+- [`proc_macro::Span`](https://doc.rust-lang.org/proc_macro/struct.Span.html)
+- [Procedural macros in the Rust Reference](https://doc.rust-lang.org/reference/procedural-macros.html)

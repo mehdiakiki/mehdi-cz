@@ -1,0 +1,117 @@
+---
+title: "Why Aho–Corasick Streaming Still Needs a Buffer"
+date: "2026-09-10T16:20:00+01:00"
+lastmod: "2026-09-05T12:00:00+01:00"
+tags: ["rust", "aho-corasick", "streaming", "buffering", "algorithms"]
+draft: false
+reviewed: true
+reviewedHash: "981eb2dd56cc05a05de2c18dc4b096f13ef60e44a29f63e1ff70abdc9a5ff297"
+cluster: "rust-under-the-hood"
+campaign: "editorial"
+summary: "An automaton can recognize a cross-chunk match with little state, yet a streaming API may still need bytes. The missing distinction is recognition state versus output state."
+---
+
+When I first explain streaming Aho–Corasick, one question arrives quickly: if the automaton carries its state across reads, why does the Rust crate still use a buffer?
+
+The question is correct. The surprising part is that two different kinds of state are being mixed together.
+
+The automaton needs **recognition state** to decide what the next byte means. The API may need **output state** to return, replace, or delay bytes. A small state identifier can solve the first problem without solving the second one.
+
+## Recognition can be small
+
+Suppose the patterns are `error` and `failure`. After reading a chunk ending in `err`, the automaton can be in a state meaning “the suffix I have seen is also the prefix `err`.” When the next chunk begins with `or`, it can reach a match.
+
+The automaton does not need the complete earlier chunk to make that transition. A state identifier plus an absolute position can be sufficient for detection.
+
+This is why it is reasonable to say that scanning state can remain fixed as the stream grows. The state describes relevant history; it does not store that history byte for byte.
+
+## Returning an answer can need bytes
+
+Now change the operation. Instead of reporting `(pattern_id, start, end)`, the caller asks to replace every match and copy all unmatched text to an output writer.
+
+The scanner reads `erro`, but the stream pauses before the next byte. It does not yet know whether these four bytes will become `error` or whether they should pass through unchanged. If it has already written them to output, replacement may be too late. If it has discarded them, it cannot write them later.
+
+The safe design retains a bounded region until the result becomes unambiguous.
+
+This is the distinction I keep in design reviews:
+
+```text
+recognition state: what prefixes are still possible?
+output state:      which bytes are not yet safe to release?
+```
+
+One can be a number. The other may need actual input bytes.
+
+## Why the longest pattern matters
+
+Rust's [`AhoCorasick::stream_find_iter`](https://docs.rs/aho-corasick/latest/aho_corasick/struct.AhoCorasick.html#method.stream_find_iter) uses a constant amount of memory, but its internal buffer must be at least as large as the longest possible match.
+
+This bound has a useful meaning. If the longest pattern contains `L` bytes, a decision cannot be postponed forever because of a potential match longer than `L`. The implementation needs enough local input to search correctly and return match positions while reading incrementally.
+
+“Constant memory” therefore does not mean “no buffer.” It means memory is bounded by the compiled problem, rather than growing with the total stream length.
+
+I prefer saying this directly:
+
+> The scanner does not retain the stream. It retains the unresolved window required by its contract.
+
+If users can supply unbounded pattern lengths, the bound is technically constant after construction but can still be operationally dangerous. I validate pattern count, total pattern bytes, and maximum pattern length before building a searcher from untrusted input.
+
+## Detection, extraction, and replacement are different contracts
+
+Consider three APIs:
+
+```rust
+fn contains_match(chunk: &[u8]) -> bool;
+fn match_ranges(chunk: &[u8]) -> Vec<(u64, u64)>;
+fn replace_stream<R: Read, W: Write>(input: R, output: W);
+```
+
+The first needs the least output state. The second needs stable absolute offsets and perhaps pending decisions. The third must preserve all unmatched bytes in order and cannot emit a byte until it knows that byte is outside a future chosen match.
+
+Calling all three “streaming search” hides important differences. I write the product contract before optimizing storage:
+
+- Are only match IDs needed?
+- Must the matched text be returned?
+- Are matches overlapping?
+- Is output allowed to arrive later?
+- Which match wins when several patterns compete?
+- Can a consumer borrow bytes, or must results own them?
+
+Rust makes the last question visible through lifetimes. A result borrowing from a temporary input chunk cannot outlive that chunk. Returning owned offsets avoids copying matched text, but it moves the responsibility for retaining source bytes to the caller.
+
+## Match semantics can require delayed decisions
+
+With standard Aho–Corasick semantics, a match is reported when the automaton observes it. Leftmost-first and leftmost-longest semantics make different promises. A leftmost-longest matcher may need to continue after finding a shorter candidate because a longer pattern beginning at the same position can still win.
+
+The Rust crate supports stream searching only with standard match semantics. This is a semantic restriction, not an arbitrary missing method. The [official `MatchKind` documentation](https://docs.rs/aho-corasick/latest/aho_corasick/enum.MatchKind.html) shows how standard, leftmost-first, and leftmost-longest produce different results.
+
+When I require leftmost replacement over a true stream, I cannot just toggle an enum and expect identical buffering. I must decide whether to bound look-ahead, buffer more input, split the stream into defined records, or change the contract.
+
+## Buffering is not automatically a performance failure
+
+A buffer can be the correct tool. It can reduce tiny system calls, make input contiguous, simplify ownership, and hold bytes required for delayed output. The mistake is not using a buffer. The mistake is copying the same bytes into another growing allocation without identifying why.
+
+I separate four cases:
+
+1. **Reader buffering:** combines small reads into useful blocks.
+2. **Recognition state:** carries the automaton across blocks.
+3. **Boundary buffering:** retains an unresolved bounded window.
+4. **Whole-input materialization:** stores everything before doing useful work.
+
+Only the fourth necessarily destroys streaming memory behavior. The first three can be part of a good bounded design.
+
+## A review checklist I use
+
+For a new scanner, I ask:
+
+1. What is the maximum pattern length?
+2. Which bytes can be released immediately?
+3. Which result values borrow input?
+4. Can results be expressed as owned offsets?
+5. Does match selection require looking ahead?
+6. Is memory bounded by a documented configuration value?
+7. Does a test split every pattern at every byte?
+
+The deeper principle goes beyond Rust: compact algorithmic state does not prove a zero-buffer product API. The state needed to **know** an answer and the data needed to **deliver** that answer can be different.
+
+For the boundary correctness side, continue with [How to Search Across Chunk Boundaries in Rust](/blog/search-across-chunk-boundaries-rust-without-missing-matches). For the larger performance model, read [Zero-Copy Does Not Mean Zero Memory Access](/blog/zero-copy-does-not-mean-zero-memory-access-aho-corasick-rust).

@@ -1,0 +1,79 @@
+---
+caseId: "RFA-305"
+title: "fs::metadata Follows a Symlink; symlink_metadata Inspects It"
+date: "2026-09-06T01:25:00+01:00"
+lastmod: "2026-09-06T01:25:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "c722a639d1f35e4632a1e5bbdf7d26677eb3a7378550ca22a89ce081ab92c0fd"
+area: "ffi-targets"
+symptom: "Metadata queried for a symlink says the path is a regular file because fs::metadata reports information about the link target."
+summary: "fs::metadata follows symbolic links, while fs::symlink_metadata describes the directory entry at the supplied path. The right call depends on whether policy concerns the destination object or the link itself."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["Unix"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust metadata follows symlink", "symlink_metadata file_type is_symlink", "check symbolic link without following Rust"]
+evidence: ["Rust 1.98.1 Unix temporary directory", "relative symbolic link to regular file", "followed and unfollowed metadata comparison"]
+sources: ["https://doc.rust-lang.org/std/fs/fn.metadata.html", "https://doc.rust-lang.org/std/fs/fn.symlink_metadata.html", "https://doc.rust-lang.org/std/fs/struct.FileType.html#method.is_symlink"]
+---
+
+I wrote a cleanup check that rejected symbolic links before processing a path. It called `fs::metadata(path)` and then `file_type().is_symlink()`. A link to a regular file passed as a regular file. The method had answered correctly, but it answered about the destination rather than the directory entry I was trying to police.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-305/fail.rs) creates a relative symlink to a file. `fs::metadata` reports that the resolved object is a file and `is_symlink()` is false.
+
+## Two metadata calls answer two different questions
+
+[`fs::metadata`](https://doc.rust-lang.org/std/fs/fn.metadata.html) queries metadata for a path and follows symbolic links. If `link.txt` points to `target.txt`, the returned size, permissions, and file type normally describe `target.txt`.
+
+[`fs::symlink_metadata`](https://doc.rust-lang.org/std/fs/fn.symlink_metadata.html) does not follow the final symbolic link. Its result describes the link entry, allowing [`FileType::is_symlink`](https://doc.rust-lang.org/std/fs/struct.FileType.html#method.is_symlink) to identify it.
+
+I choose by naming the object in the requirement:
+
+```text
+Can the destination be opened as a regular file? -> metadata
+Is this path entry itself a symbolic link?       -> symlink_metadata
+```
+
+Neither call is the universally safer one. They expose different filesystem semantics.
+
+## A check followed by an operation can still race
+
+Changing the function repairs the fixture's mistaken observation, but it does not make every security policy safe. Another process may replace a path after metadata is checked and before it is opened, removed, or changed. Components earlier in the path can also be symlinks even when the final entry is not.
+
+This is the classic time-of-check/time-of-use problem. For hostile writable directories, I prefer handle-relative operating-system operations and flags that enforce the no-follow policy during the operation itself. The exact facilities are platform-specific and may require a carefully reviewed crate or FFI layer.
+
+I do not present `symlink_metadata` followed by `File::open` as an atomic guarantee. It is still useful for inventory, diagnostics, user interfaces, and non-adversarial workflows where the distinction is informational.
+
+## Broken links make the difference visible
+
+For a dangling symlink, followed metadata fails because the target cannot be resolved. Symlink metadata can still succeed because the link entry exists.
+
+This affects “exists” checks. A user may say the path exists because they can see a link in a directory, while destination-oriented code says it does not because there is no reachable target. I avoid compressing both questions into one Boolean.
+
+A useful status enum can distinguish missing entry, symlink with missing target, symlink to file, symlink to directory, direct file, direct directory, and access denied. Real policies often care about these differences.
+
+## Relative links are resolved from their containing directory
+
+The fixture creates a link whose stored target text is `target.txt`. That target is interpreted relative to the directory containing the link, not relative to the process working directory.
+
+This becomes important when copying or moving symlinks. Copying the text into another directory can change which object it reaches. Canonicalizing the resolved destination changes another property: it loses the original spelling and link boundary.
+
+I keep “link text,” “path used,” and “resolved destination” as separate values when building filesystem tooling.
+
+## Cross-platform behavior needs an explicit scope
+
+Rust exposes symlink creation through platform modules because permissions and object categories differ. Windows can distinguish file and directory symlink creation and may require privileges or developer settings. Unix has its own link and permission behavior.
+
+The RFA-305 evidence is intentionally scoped to Unix. Portable application code still uses the two standard metadata functions, but its setup, error expectations, and link policies need target-specific tests.
+
+Network filesystems and sandboxes can introduce additional behavior. I capture the filesystem and target environment in a bug report rather than assuming a local Linux observation describes every deployment.
+
+## What I test
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-305/fixed.rs) creates one file and one link, then checks both views. Followed metadata says regular file; symlink metadata says symbolic link. The fixture removes its temporary entries before asserting the result.
+
+For production path handling I test a direct file, direct directory, link to each, dangling link, relative link, absolute link, permission failure, and replacement between operations where the threat model includes concurrency. I test intermediate symlink components as well as the final component.
+
+I also verify what the later operation does. A perfect metadata classifier is insufficient if a subsequent open follows links under a policy that intended not to.
+
+The core principle is that a path can name a directory entry and, through that entry, a different destination object. `metadata` follows the link to describe the destination; `symlink_metadata` describes the final entry itself. I state which identity the policy protects before selecting the call.

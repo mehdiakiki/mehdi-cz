@@ -1,0 +1,122 @@
+---
+caseId: "RFA-055"
+title: "E0716: Why a Rust Temporary Is Dropped While Its Borrow Is Still Used"
+date: "2026-09-05T08:30:00+01:00"
+lastmod: "2026-09-05T08:30:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "fe9a7e3bb9499a5dccd65866837b9e50070b6104ba721667be1a39eb61d89c2b"
+area: "diagnostics-macros"
+symptom: "Borrowing from a constructed value in one let statement produces E0716: temporary value dropped while borrowed."
+summary: "A temporary owner usually dies at the end of its statement, while a reference stored in a local survives into the next one. Name the owner and make its required scope explicit."
+rustVersions: ["Rust 1.98.1"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust E0716 temporary value dropped while borrowed",
+    "String as_bytes temporary lifetime",
+    "consider using a let binding longer lived value",
+  ]
+evidence: ["Rust 1.98.1 compile failure", "temporary-scope timeline", "owner-binding repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/error_codes/E0716.html",
+    "https://doc.rust-lang.org/reference/destructors.html#temporary-scopes",
+  ]
+---
+
+E0716 often appears in a line that looks nicely compact:
+
+```rust
+let bytes = String::from("atlas").as_bytes();
+println!("{bytes:?}");
+```
+
+Rust 1.98.1 rejects the first line because the `String` is a temporary owner. `as_bytes` borrows from it, and `bytes` stores that reference for the next statement. The owner, however, would normally be dropped at the semicolon.
+
+The [failing fixture](/rust-failure-atlas/evidence/RFA-055/fail.rs) produces the exact diagnostic:
+
+```text
+error[E0716]: temporary value dropped while borrowed
+```
+
+This is close to E0515, but the boundary is different. E0515 tries to return a reference beyond a function. E0716 can happen entirely inside one function because a temporary's destruction scope is shorter than the local receiving its borrow.
+
+## Write the two lifetimes as a timeline
+
+The original expression performs several operations:
+
+1. Allocate a temporary `String`.
+2. Borrow its byte slice.
+3. Store the slice in `bytes`.
+4. Reach the end of the statement and drop the temporary `String`.
+5. Attempt to use `bytes` in the next statement.
+
+Step four would make step five invalid. The compiler prevents the dangling slice.
+
+The [Rust Reference section on temporary scopes](https://doc.rust-lang.org/reference/destructors.html#temporary-scopes) defines where temporaries are normally destroyed and lists contexts where their lifetime is extended. I do not rely on remembering every extension rule while debugging. I name the owner when a borrow needs to cross a statement.
+
+## Name the owner before naming the view
+
+The direct repair is:
+
+```rust
+let text = String::from("atlas");
+let bytes = text.as_bytes();
+println!("{bytes:?}");
+```
+
+Locals are dropped at the end of their enclosing scope, generally in reverse declaration order. `bytes` stops being used before `text` is dropped, so the reference is valid. The [repaired fixture](/rust-failure-atlas/evidence/RFA-055/fixed.rs) is compiled and executed under the recorded toolchain.
+
+This extra binding is valuable documentation. It tells a reviewer which value owns the memory and which value only views it.
+
+## Why some similar `let` expressions work
+
+Rust extends temporary lifetimes in selected syntactic contexts. For example, directly binding a reference can keep a temporary alive longer:
+
+```rust
+let text = &String::from("atlas");
+println!("{text}");
+```
+
+But lifetime extension is syntax-directed. Calling a method and storing the reference returned by that method does not imply that every temporary receiver is extended to the local's scope. Small refactors can therefore change whether an expression matches an extension rule.
+
+This is why I prefer an owner binding for non-trivial code. It is stable under method extraction, added adapters, and changes to the borrowed view.
+
+## Common real forms
+
+The same issue appears beyond `String::as_bytes`:
+
+```rust
+let name = config().service_name();
+let path = PathBuf::from(input).as_path();
+let guard = shared.clone().lock().unwrap();
+```
+
+Each line should trigger the same question: does the method return owned data, or a reference tied to its receiver? If it returns a reference and the receiver is temporary, the reference may outlive its owner.
+
+The mutex form deserves care. Naming the cloned `Arc` can extend the owner, but a guard also controls how long the lock remains held. A repair must preserve both memory validity and the intended synchronization boundary.
+
+## Do not repair it with an accidental allocation
+
+Calling `to_owned`, `to_vec`, or `to_string` on the borrowed result can make it independent from the temporary:
+
+```rust
+let bytes = String::from("atlas").as_bytes().to_vec();
+```
+
+This is correct if `bytes` should own a copy. It is not equivalent to extending the original owner: it allocates and copies. In a hot path, that distinction matters. I first decide whether the consumer needs ownership or only a view.
+
+Parentheses do not extend a lifetime, and writing an explicit lifetime annotation on `bytes` cannot change the temporary's drop point. The repair must either keep the owner alive or create independent owned data.
+
+## My discriminating check
+
+For a long expression, I split only the receiver into a local. If the compiler error disappears, I have proven that temporary ownership was the relevant boundary. I then choose the final design:
+
+- Keep the owner local and pass a view.
+- Move the owner into a longer-lived structure.
+- Return or store owned data.
+- Use a genuine static value when the data is fixed.
+
+The official [E0716 explanation](https://doc.rust-lang.org/error_codes/E0716.html) includes temporary lifetime extension examples. The operational lesson is short: when a reference survives a semicolon, make the value behind that reference visible. The resulting code is normally easier for both the compiler and the next engineer to reason about.

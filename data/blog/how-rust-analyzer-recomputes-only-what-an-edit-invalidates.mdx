@@ -1,0 +1,197 @@
+---
+title: "How rust-analyzer Recomputes Only What an Edit Invalidates"
+date: "2026-10-09T09:00:00+01:00"
+tags: ["rust-analyzer", "rust", "incremental computation", "Salsa", "compiler tooling"]
+draft: false
+reviewed: true
+reviewedHash: "73d288627eaa8fb330f4c71479bf6a548635ed9b5ebd115d0d9623efef3a86f9"
+cluster: "rust-under-the-hood"
+campaign: "authority-2026"
+opportunity: "RUST-020"
+summary: "rust-analyzer models IDE answers as queries over changing inputs. Trace how dependencies let a small edit preserve unrelated parsing and semantic work."
+---
+
+An editor asks the same questions after almost every keystroke: what does this name mean, what is its type, where is it defined, and which diagnostics remain valid?
+
+Recomputing the whole workspace for each letter would make a large Rust project unusable. Returning cached answers without understanding their dependencies would make the editor wrong.
+
+rust-analyzer solves this with incremental, query-based computation.
+
+## The input is a changing model of the project
+
+The editor sends file changes. The project loader supplies a crate graph, build configuration, dependencies, and source roots. From these inputs, rust-analyzer computes higher-level facts only when a feature asks for them.
+
+```text
+inputs
+  ├── file text
+  ├── crate graph
+  ├── configuration and cfg flags
+  └── dependency metadata
+          |
+          v
+derived queries
+  ├── parse this file
+  ├── collect this module's items
+  ├── resolve this path
+  ├── infer this function body
+  └── find references for this symbol
+```
+
+The [rust-analyzer architecture documentation](https://rust-analyzer.github.io/book/contributing/architecture.html) describes the analysis as a pure function of the input and uses an incremental database to apply a small input change cheaply. This is the central model, even though implementation details evolve.
+
+## A cached answer also remembers dependencies
+
+Memoization alone says:
+
+```text
+query key -> previous result
+```
+
+Incremental computation needs more:
+
+```text
+query key -> previous result + inputs and queries observed while computing it
+```
+
+Suppose type inference for `checkout` asked for:
+
+- the body of `checkout`;
+- the signature of `price`;
+- the `Money` type;
+- trait implementations relevant to one expression.
+
+When another file changes, the database can ask whether any of these dependencies changed. If not, the cached inference result can remain valid.
+
+This is more precise than “invalidate the crate when one file changes.”
+
+## Follow one private body edit
+
+Consider:
+
+```rust
+fn tax(cents: u64) -> u64 {
+    cents / 5
+}
+
+fn receipt_label(order: u64) -> String {
+    format!("order-{order}")
+}
+```
+
+I edit `tax` to use a checked policy. A simplified dependency trace is:
+
+```text
+file text changed
+   -> parse(file) may produce a new tree
+      -> item structure may remain equivalent
+      -> tax body changed
+         -> infer(tax) becomes stale
+         -> diagnostics(tax) become stale
+
+receipt_label body unchanged
+   -> its body identity remains usable
+   -> infer(receipt_label) can remain reusable
+```
+
+This is an explanatory graph, not the exact internal query list. The exact boundaries can change. What matters is that dependencies are tracked at finer granularity than “workspace.”
+
+## A signature edit travels further
+
+Now change:
+
+```rust
+fn tax(cents: u64) -> u64
+```
+
+to:
+
+```rust
+fn tax(cents: u64, country: Country) -> u64
+```
+
+The function's interface changed. Queries that resolve calls or infer caller bodies can observe it:
+
+```text
+tax signature
+   ├── call in checkout
+   │      └── inference and diagnostics for checkout
+   └── call in refund
+          └── inference and diagnostics for refund
+```
+
+The edit may still leave unrelated functions reusable. “Public-looking” is not the database rule by itself; observed dependency is. The signature example simply creates more likely observers.
+
+## Laziness prevents work nobody requested
+
+After an edit, rust-analyzer does not need to eagerly recompute every possible IDE answer. Opening completion near one expression asks for a different slice of analysis than finding every reference in the workspace.
+
+This gives two savings:
+
+```text
+incremental: reuse a still-valid previous result
+lazy:        do not compute an unrequested result yet
+```
+
+It also explains why the first use of a feature can be slower than the next use, and why an edit near the cursor may be more noticeable than a change in a distant crate.
+
+## Stable identities matter
+
+If every syntax edit gave every item a completely unrelated identity, dependency tracking would lose reuse. rust-analyzer creates representations that let semantic items survive ordinary edits when their relevant structure is still recognisable.
+
+There is a limit. Inserting a new item, moving code across modules, changing macro expansion, or changing conditional compilation can reshape identities and dependencies more widely than editing one expression.
+
+I learned from contributing to rust-analyzer that performance questions become clearer when I ask which identity changed and which query depended on it. “The cache was cleared” is usually too broad to be useful.
+
+## Macros widen the apparent edit
+
+One small token inside a macro definition can change generated items in many call sites. A build-script or procedural-macro input can also alter code that is not visible in the edited file.
+
+The dependency chain can be:
+
+```text
+macro definition
+   -> expansion at call site A -> generated items A
+   -> expansion at call site B -> generated items B
+   -> name resolution and inference using those items
+```
+
+This is valid invalidation, not necessarily a failure of incrementality. The observable result really did change in several places.
+
+## Cancellation is another part of editor correctness
+
+While a costly query runs, the user may type again. Its answer now belongs to an old input revision.
+
+The editor integration must be able to abandon obsolete work and restart from the newest state. Otherwise the system can spend time completing answers that should never be displayed.
+
+I think of the loop as:
+
+```text
+snapshot revision 104
+start references query
+file edit creates revision 105
+cancel obsolete computation
+answer from revision 105
+```
+
+Reuse and cancellation solve different problems. Reuse avoids repeating valid work. Cancellation avoids finishing irrelevant work.
+
+## How I diagnose an edit that invalidates too much
+
+I reduce the observation before profiling internals:
+
+1. Is the delay parsing, macro expansion, project loading, name resolution, inference, or the editor client?
+2. Does the same delay happen after a whitespace-only edit?
+3. Does it happen outside a macro-heavy file?
+4. Did `Cargo.toml`, features, build-script output, or the crate graph change?
+5. Is one IDE request asking for workspace-wide results?
+6. Can I reproduce it in a small workspace with one measured edit?
+
+Only then do internal query logs or profiles have a clear question to answer.
+
+## The important difference from rustc's disk cache
+
+rustc incremental compilation reuses compiler work across build sessions. rust-analyzer maintains a long-running editor model and repeatedly answers interactive queries as its inputs change.
+
+They share dependency-graph ideas, but their workloads and boundaries are not identical. For the compiler side, see [What Invalidates Rust's Incremental Compilation Cache?](/blog/what-invalidates-rusts-incremental-compilation-cache).
+
+The useful mental model for rust-analyzer is: an edit changes inputs, not the entire world. Queries that observed those changes become candidates for recomputation. Unrelated answers remain reusable, and unrequested answers can remain uncomputed.

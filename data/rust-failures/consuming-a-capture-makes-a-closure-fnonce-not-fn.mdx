@@ -1,0 +1,81 @@
+---
+caseId: "RFA-549"
+title: "Consuming a Rust Capture Makes a Closure FnOnce, Not Fn"
+date: "2026-09-06T06:28:00+01:00"
+lastmod: "2026-09-06T06:28:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "0730516db45e5a518b258ed6809dc846c78a0e594a596ebdd0ee8f0537afc7dc"
+area: "diagnostics-macros"
+symptom: "Passing a closure that drops its captured String to run_twice fails with E0525 because consuming the capture permits only one call, while the function requires Fn."
+summary: "Closure call traits follow what the body does with captured values. A callback that moves from its environment is one-shot unless ownership or the API changes."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust E0525 closure FnOnce not Fn", "closure consumes captured String cannot call twice", "Fn FnMut FnOnce capture behaviour Rust"]
+evidence: ["Rust 1.98.1 E0525 compile failure", "drop consumes captured payload in closure", "borrow-only repeated callback repair"]
+sources: ["https://doc.rust-lang.org/error_codes/E0525.html", "https://doc.rust-lang.org/std/ops/trait.FnOnce.html", "https://doc.rust-lang.org/book/ch13-01-closures.html#moving-captured-values-out-of-closures-and-the-fn-traits"]
+---
+
+Rust does not choose `Fn`, `FnMut`, or `FnOnce` from whether I wrote the `move` keyword. It derives the call capabilities from what the closure body does with captured values. Consuming a capture makes the closure one-shot.
+
+The [failing fixture](/rust-failure-atlas/evidence/RFA-549/fail.rs) captures a `String` and calls `drop(payload)`. `drop` takes ownership, so after one invocation the closure environment no longer contains its payload. `run_twice` requires `Fn`, producing E0525.
+
+## FnOnce is the foundational call contract
+
+Every closure can be called at least according to `FnOnce` if its value is available. [`FnOnce`](https://doc.rust-lang.org/std/ops/trait.FnOnce.html) takes the closure receiver by value, allowing the call to consume captured state.
+
+`FnMut` permits repeated calls through mutable access to the environment. `Fn` permits repeated calls through shared access. A closure may implement more than one of these when its body allows it.
+
+The consuming body in the fixture cannot implement the repeated-call traits because there is no second `String` to drop.
+
+## The caller's bound is a behavioural promise
+
+`run_twice<F: Fn()>(action: F)` says it may call `action` repeatedly without exclusive mutation of the closure environment. This is stronger than `FnOnce`.
+
+Changing the bound to `FnOnce` would make the closure acceptable, but the function body could then call it only once. Removing the second call just to satisfy the bound changes the API's purpose.
+
+The [official E0525 page](https://doc.rust-lang.org/error_codes/E0525.html) frames the error as a mismatch between the closure's inferred call trait and the trait required by its use site.
+
+## Borrowing supports repeatable observation
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-549/fixed.rs) prints `payload`, which only borrows it. The environment retains the owned string after each call, so the closure can implement `Fn` and run twice.
+
+This matches a repeated observer callback. If the operation semantically consumes a message, repeating it is probably the wrong contract. The type mismatch exposes that product decision.
+
+I first classify the callback as observer, updater, or consumer, then choose `Fn`, `FnMut`, or `FnOnce`.
+
+## Move closures can still implement Fn
+
+`move || println!("{payload}")` moves the `String` into the closure environment, but each call only borrows that stored string. Such a closure can still be repeatable.
+
+Conversely, a non-`move` closure can consume a captured value depending on inference and context. The `move` keyword controls how capture occurs; the body controls how calling uses the environment.
+
+The Rust Book explains [moving captures and the Fn traits](https://doc.rust-lang.org/book/ch13-01-closures.html#moving-captured-values-out-of-closures-and-the-fn-traits) with this distinction.
+
+## Cloning inside the closure changes cost and semantics
+
+A repeated callback can clone the captured payload on each call and consume the clone. This preserves the original environment but creates a new owned value every time.
+
+That is correct when each invocation truly needs an independent payload, such as queueing separate owned messages. It is wasteful when the callee could borrow. I make the duplication visible and test retry behaviour so a repeated callback does not accidentally repeat an irreversible side effect.
+
+## FnMut covers evolving callback state
+
+A closure that increments a captured counter generally implements `FnMut` and `FnOnce`, but not `Fn`. An API invoking it repeatedly can accept `F: FnMut()` and bind the callback mutably.
+
+This is common for iterators and local processing. It is different from consuming a capture: mutated state remains in the closure for the next call, while a moved-out value is gone.
+
+When callbacks cross threads or async tasks, `Send`, `'static`, and synchronization add independent constraints. I solve the call trait first rather than bundling all closure errors together.
+
+## My E0525 checklist
+
+- Which call trait does the receiving API require?
+- Does the closure body borrow, mutate, or move a capture?
+- Which exact expression consumes the captured value?
+- Is the callback conceptually repeatable or one-shot?
+- Can the operation borrow instead of take ownership?
+- Is cloning per call semantically necessary and affordable?
+- Would `FnMut` accurately describe evolving retained state?
+- Am I confusing `move` capture with move-out during invocation?
+
+The core principle is that closure traits describe repeatability. I make observers borrow, stateful callbacks mutate retained state, and consumers explicitly one-shot rather than weakening bounds until code happens to compile.

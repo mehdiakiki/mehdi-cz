@@ -1,0 +1,211 @@
+---
+title: "When a Canonical Model Loses Provider-Specific Meaning"
+date: "2026-09-16T19:00:00+01:00"
+tags: ["canonical data model", "data normalization", "API integration", "data provenance", "system design"]
+draft: false
+reviewed: true
+reviewedHash: "8a8b8ac04e1c506c8cee0a6b2676dcb520aa73dc9ef1f73b6ca29835831c3c09"
+cluster: "reliable-data-integrations"
+campaign: "authority-2026"
+opportunity: "DATA-017"
+summary: "A lossiness ledger and test strategy for keeping a useful canonical model without silently erasing provider-specific meaning."
+---
+
+A canonical model gives an integration system one vocabulary. It prevents every product feature from learning the JSON shape of every provider. I use this boundary often because it makes a growing integration product possible to reason about.
+
+But a canonical model is not automatically faithful. Two fields can have the same name and different meaning. Three provider states can become one nullable field. A value can survive the import and still be impossible to write back correctly.
+
+This is the failure I want to make visible: normalization is sometimes a lossy operation.
+
+The answer is not to copy every provider object into the domain. That only moves the coupling inward. I keep the internal model, but I record where translation loses information and decide whether that loss is acceptable.
+
+## A small example that already loses meaning
+
+Imagine three scheduling providers:
+
+```text
+Provider A: status = "cancelled", cancellation_reason = "customer_request"
+Provider B: active = false, archived_at = null
+Provider C: lifecycle = "removed_by_policy"
+```
+
+The product model has this:
+
+```ts
+type Event = {
+  id: string
+  active: boolean
+}
+```
+
+All three records can become `active: false`. The application can display a disabled event. But it cannot answer:
+
+- Was the event cancelled, archived, or removed?
+- May the user restore it?
+- Should it be exported as a cancellation or a deletion?
+- Is the provider-specific reason important for audit or support?
+
+The mapping is valid TypeScript and invalid product semantics.
+
+## I separate normalization from compression
+
+Normalization changes representation while preserving the distinctions the product needs. Compression deliberately removes distinctions.
+
+This mapping may be normalizing:
+
+```text
+"enabled" | "active" | 1  → Active
+```
+
+This one is probably compressing:
+
+```text
+CancelledByUser | CancelledByProvider | Archived | Deleted → Inactive
+```
+
+Compression is not always wrong. A reporting feature may only need active versus inactive. It becomes dangerous when nobody wrote down that the other meanings disappeared.
+
+Microsoft's [anti-corruption layer pattern](https://learn.microsoft.com/en-us/azure/architecture/patterns/anti-corruption-layer) describes a translation boundary between systems with different semantics. I treat loss analysis as part of that translation, not as a cleanup after the adapter is finished.
+
+## The lossiness ledger
+
+For every non-trivial mapping, I keep a small ledger beside the adapter contract:
+
+| Provider concept | Canonical representation | Meaning lost | Round-trip safe? | Product decision |
+| --- | --- | --- | --- | --- |
+| cancelled with reason | `Inactive` | reason and actor | No | Preserve lifecycle evidence |
+| amount in minor units | decimal amount | original scale | Only with currency metadata | Store currency and scale |
+| missing field | `null` | absent versus explicit null | No | Model presence separately |
+| unknown enum string | `Other` | original value | No | Keep raw variant text |
+| local timestamp | UTC instant | source zone and ambiguity | Sometimes | Keep source zone and text |
+| ordered labels | set of labels | order and duplicates | No | Confirm order has no meaning |
+
+This is not documentation for its own sake. Each row points to a test and a product consequence.
+
+I ask five questions:
+
+1. Can I reproduce the provider value after importing it?
+2. If not, is export or reconciliation required later?
+3. Can two different provider facts collapse into the same canonical value?
+4. Could the provider add a new state without changing its schema?
+5. What will support see when a user disputes the result?
+
+## Keep three layers, not one giant model
+
+The structure that works well for me has three layers:
+
+```text
+provider payload
+      ↓ validate
+provider observation
+      ↓ interpret
+canonical domain fact
+```
+
+The provider payload is the input at a specific API version. The observation is a typed account of what that provider said, including its identity, revision, time and unknown variants. The canonical fact is the meaning the product has accepted.
+
+For example:
+
+```ts
+type ProviderObservation = {
+  provider: "a" | "b" | "c"
+  externalId: string
+  observedVersion: string
+  lifecycle: KnownLifecycle | { unknown: string }
+  sourceUpdatedAt?: string
+  receivedAt: string
+}
+
+type CanonicalEvent = {
+  id: string
+  availability: "usable" | "not_usable"
+}
+```
+
+I do not require the whole raw payload to live forever. It can contain private data and create retention obligations. I preserve the smallest evidence needed to explain or reverse the lossy mapping: original enum text, provider identity, revision, source time, mapping version, and sometimes an encrypted short-lived payload reference.
+
+The [stable internal model](/blog/stable-internal-model-api-integrations) protects the product from external schemas. The [provider adapter contract](/blog/provider-adapters-should-translate-behaviour-not-only-json) protects it from external behaviour. The observation layer protects useful source meaning without contaminating every domain type.
+
+## Absence deserves its own type
+
+Many losses start when `undefined`, missing, `null`, empty and default become the same value.
+
+For an update, I may need this shape:
+
+```ts
+type FieldObservation<T> =
+  | { kind: "not_returned" }
+  | { kind: "explicitly_cleared" }
+  | { kind: "present"; value: T }
+  | { kind: "unrecognized"; raw: unknown }
+```
+
+`not_returned` means the response says nothing about ownership or current value. It must not clear a field. `explicitly_cleared` is a real update. `unrecognized` prevents a new provider state from silently becoming a product default.
+
+This extra precision belongs at the boundary. Downstream features can consume a simpler accepted fact after policy has decided what the observation means.
+
+## Round-trip tests expose the lie
+
+An ordinary adapter test checks one direction:
+
+```text
+provider value → canonical value
+```
+
+I also test:
+
+```text
+provider value → canonical value → provider write
+```
+
+The result does not need to be byte-identical, but it must be semantically equivalent for every mapping claimed as round-trip safe.
+
+My useful test groups are:
+
+- every documented provider enum plus an unknown value;
+- missing, null, empty, zero and false;
+- timestamp offsets around daylight-saving transitions;
+- money with zero, two and three decimal minor-unit scales;
+- repeated and reordered collection values;
+- import followed by export without a user edit;
+- a newer provider payload read by the previous mapping version;
+- reconciliation after provider evidence has expired.
+
+Property tests help with large value spaces. Fixtures help humans inspect important semantic cases. I use both.
+
+## Write direction changes what “canonical” means
+
+A read-only analytics model can discard more source detail than a bidirectional operational model. If data will be written back, the system must know whether a canonical value has one valid provider representation or several.
+
+Suppose both `Archived` and `Cancelled` became `Inactive`. Writing `Inactive` back requires inventing a provider action. That is not serialization. It is a business decision.
+
+I therefore mark mappings as one of:
+
+```text
+lossless_read_write
+lossless_read_only
+lossy_but_accepted
+lossy_requires_evidence
+unsupported
+```
+
+Unsupported is a healthy answer. It is stronger than pretending an ambiguous write is safe.
+
+## Observe loss in production
+
+Provider behaviour changes after tests are written. I measure:
+
+- unknown enum values by provider and API version;
+- mapping fallbacks and default branches;
+- fields dropped because the product has no representation;
+- failed round-trip preconditions;
+- writes requiring a provider-specific assumption;
+- records that cannot be explained from retained provenance.
+
+I alert on a new unknown category, not on every occurrence forever. A gradual increase in fallback use often reveals provider drift before users report it.
+
+## My practical rule
+
+A canonical model should preserve product meaning, not every byte. But every discarded distinction must be deliberate.
+
+I keep a lossiness ledger, model absence and unknown values explicitly, preserve minimal provenance, classify round-trip safety, and test import-export behaviour. This lets the domain stay clean without becoming confidently wrong about what an external system said.

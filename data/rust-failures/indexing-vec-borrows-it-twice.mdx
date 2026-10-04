@@ -1,0 +1,116 @@
+---
+caseId: "RFA-052"
+title: "Why `values[values.len() - 1] = x` Borrows the Vec Twice"
+date: "2026-09-05T08:30:00+01:00"
+lastmod: "2026-09-05T08:30:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "c732de8423fbc5e1ad704c17e6cdcb74518bb3ff938555f4f5afc40041186dcc"
+area: "diagnostics-macros"
+symptom: "Assigning through values[values.len() - 1] fails because the same vector is borrowed as mutable and immutable."
+summary: "An indexed assignment needs a mutable borrow of the collection while its index expression may borrow the same collection immutably. Separate the computation to expose the evaluation boundary."
+rustVersions: ["Rust 1.98.1"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust cannot borrow vector immutable mutable same line E0502",
+    "values values len index borrow error",
+    "Rust vec last element assignment borrow",
+  ]
+evidence: ["Rust 1.98.1 compile failure", "evaluation-order reduction", "local-index repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/error_codes/E0502.html",
+    "https://doc.rust-lang.org/std/ops/trait.IndexMut.html",
+  ]
+---
+
+This line looks harmless in many languages:
+
+```rust
+values[values.len() - 1] = 0;
+```
+
+It asks for the last index and then writes at that index. Still, Rust 1.98.1 rejects it with E0502:
+
+```text
+cannot borrow `*values` as immutable because it is also borrowed as mutable
+```
+
+I find this case useful because there is no thread, unsafe code, or long-lived reference. Both borrows are hidden inside one expression. The [failing fixture](/rust-failure-atlas/evidence/RFA-052/fail.rs) keeps the case small enough that evaluation becomes visible.
+
+## Translate the syntax into operations
+
+Index assignment uses mutable indexing. Conceptually, the left side needs something like this:
+
+```rust
+*std::ops::IndexMut::index_mut(values, index) = 0;
+```
+
+The [`IndexMut` contract](https://doc.rust-lang.org/std/ops/trait.IndexMut.html) receives `&mut self`. The receiver is therefore a mutable borrow of `values`. But before the final location is known, the index expression calls:
+
+```rust
+values.len()
+```
+
+`len` needs a shared borrow. The source expression consequently asks the same vector for a mutable borrow used by indexed assignment and an immutable borrow used to calculate the index. Their required evaluation overlaps, so E0502 is correct.
+
+This is different from two independent vectors. It is also different from using an index already stored in a local. The conflict comes from the receiver being used again inside the argument which tells the receiver what to mutate.
+
+## The smallest repair is also the best diagnostic
+
+I separate the read from the mutation:
+
+```rust
+let last = values.len() - 1;
+values[last] = 0;
+```
+
+The first statement borrows `values` immutably and produces a plain `usize`. That borrow ends. The second statement begins the mutable indexing borrow and uses only the integer. The [repaired fixture](/rust-failure-atlas/evidence/RFA-052/fixed.rs) asserts the final vector and is compiled and executed by the Atlas verifier.
+
+This local is not a workaround for an unintelligent compiler. It states the sequencing requirement directly: observe the collection first, then mutate it.
+
+## Why a similar method call may compile
+
+People sometimes compare this with a method call that appears to borrow the receiver and an argument:
+
+```rust
+values.push(values.len() as i32);
+```
+
+Rust supports a limited behavior called two-phase borrowing for some implicit mutable method receivers. It can reserve the mutable borrow, evaluate arguments, and activate the mutable borrow for the call. This does not mean every syntactic use of `&mut` receives the same treatment. Indexed assignment is a common place where expecting method-call behavior gives the wrong prediction.
+
+I avoid memorizing a list of lucky expressions. When the receiver appears again inside an argument or index, I split observation and mutation. The explicit form is clearer to a reviewer and remains correct if the expression becomes more complicated.
+
+## The empty-vector failure is separate
+
+After fixing the borrow error, `values.len() - 1` can still underflow for an empty vector. This is not part of E0502. A production repair should normally express absence:
+
+```rust
+if let Some(last) = values.last_mut() {
+    *last = 0;
+}
+```
+
+`last_mut` communicates the actual goal and returns `None` when the vector is empty. It avoids both manual index arithmetic and a possible panic. If an empty vector is an invariant violation, `values.last_mut().expect("values must not be empty")` records that decision explicitly.
+
+This distinction matters in debugging. The local-index version proves the borrow mechanism. The `last_mut` version may be the better application interface. I do not mix them before I understand which failure I am testing.
+
+## General form of this failure
+
+The same shape can appear with maps, matrices, custom `IndexMut` implementations, and nested method calls:
+
+```text
+receiver[expression_that_reads(receiver)] = value
+```
+
+I reduce it into three moments:
+
+1. Compute the information needed to locate the element.
+2. End the observation borrow.
+3. Start the mutation borrow and perform the write.
+
+The official [E0502 page](https://doc.rust-lang.org/error_codes/E0502.html) describes incompatible mutable and immutable borrows. This case adds the non-obvious part: compact indexing syntax can create both borrows even when no `&` or `&mut` is visible in the original line.
+
+Once I expand the indexing operation, the diagnostic stops looking arbitrary. The compiler is protecting the exclusivity promised by `&mut Vec<T>`, and the two-line version provides an exact, inexpensive proof that the borrows no longer overlap.

@@ -1,0 +1,98 @@
+---
+caseId: "RFA-154"
+title: "Rust HashMap::insert Keeps the Original Equal Key"
+date: "2026-09-05T15:54:00+01:00"
+lastmod: "2026-09-05T15:54:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "71fbaea2b26b89bd2687a8f279c1ece5896d37d5076f4ba22b16223f280025bb"
+area: "concurrency-memory"
+symptom: "Inserting a new key equal to an existing HashMap key updates the value but get_key_value still exposes fields from the original key object."
+summary: "HashMap::insert replaces the value for an equal key while retaining the stored key. If non-identity key fields must change, model them as value data or deliberately remove and insert the entry."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets with std::collections"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust HashMap insert keeps old key", "HashMap equal key replace value not key", "get_key_value returns original key Rust"]
+evidence: ["Rust 1.98.1 runtime assertion", "identity-only equality", "remove-then-insert repair"]
+sources: ["https://doc.rust-lang.org/std/collections/struct.HashMap.html#method.insert", "https://doc.rust-lang.org/std/collections/struct.HashMap.html#method.get_key_value", "https://doc.rust-lang.org/std/hash/trait.Hash.html"]
+---
+
+A map key is often treated as though it were replaced whenever I insert a newer equivalent key. Rust's `HashMap` makes a more precise promise: the value changes, but the original key stays stored.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-154/fail.rs) defines `ServiceKey { id, label }`. Equality and hashing use only `id`. It first inserts `{ id: 7, label: "old" }`, then inserts `{ id: 7, label: "new" }`. The value becomes `"v2"`, while [`get_key_value`](https://doc.rust-lang.org/std/collections/struct.HashMap.html#method.get_key_value) returns the key whose label is still `"old"`.
+
+## Equal keys identify one entry
+
+Hash maps use `Hash` to find a candidate bucket and `Eq` to decide whether a key identifies an existing entry. In the fixture, both keys are equal because they share `id = 7`.
+
+The [`HashMap::insert`](https://doc.rust-lang.org/std/collections/struct.HashMap.html#method.insert) documentation says that when the map already contains the key, it updates the value and retains the old key. It returns the old value.
+
+So the operation behaves like:
+
+```text
+stored key: old key object remains
+stored value: replaced by new value
+argument key: used for lookup, then dropped
+```
+
+This is not observable when keys are integers or strings with equality over all their visible data. It becomes visible when equality ignores metadata, uses a normalized identity, or allows borrowed lookup forms.
+
+## Equality defines identity, not freshness
+
+The custom `ServiceKey` says `id` is identity and `label` is not. That can be a valid design, but it raises a modelling question: why is mutable descriptive data inside the key?
+
+If `label` should change over time, I usually move it into the value:
+
+```rust
+HashMap<ServiceId, ServiceRecord>
+```
+
+`ServiceId` contains only stable identity. `ServiceRecord` holds label, status, and other replaceable fields. Now ordinary `insert` or entry updates match the domain semantics.
+
+This also reduces risk around the [`Hash` contract](https://doc.rust-lang.org/std/hash/trait.Hash.html). Equal keys must hash equally, and mutating a key so its equality or hash changes while stored is a logic error. Keeping keys small and immutable makes that invariant easier to protect.
+
+## Remove and insert when the key object must change
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-154/fixed.rs) removes the equal entry, then inserts the replacement key and value:
+
+```rust
+services.remove(&replacement);
+services.insert(replacement, "v2");
+```
+
+The stored label is now `"new"`. This is correct for the fixture, but the two operations are not one atomic map update. In concurrent code an external lock must cover both if other observers cannot see the gap. With a local `HashMap` behind exclusive access, the sequence is straightforward.
+
+If I need the old key or value, APIs such as `remove_entry` can return both. I choose the operation based on ownership rather than cloning data unnecessarily.
+
+For simple value updates, I do not remove. The entry API or `insert` is better because retaining the canonical key may be exactly what I want.
+
+## Retaining the original key can be useful
+
+Suppose lookup accepts differently cased names but the first spelling becomes canonical. Equality may normalize case. Inserting `"EXAMPLE"` after `"Example"` can update associated data without changing the displayed canonical spelling.
+
+Similarly, a key may hold an interned object, allocation, or richer representation while borrowed lookups use a lightweight equivalent form. Keeping the existing key avoids needless replacement and preserves canonical identity.
+
+The behaviour is therefore not an accident. The mistake is expecting update semantics that the map never promised.
+
+## get and get_key_value answer different questions
+
+`get(&lookup)` returns only the value, so the retained-key detail stays hidden. `get_key_value(&lookup)` returns references to both the stored key and value. I use it when debugging canonicalization or checking which representative of an equivalence class lives in the map.
+
+The lookup key does not need to be the same object as the stored key. It only needs the compatible hashing and equivalence relation required by the API. Seeing a different stored representation is normal.
+
+This is especially important with IDs constructed from external systems. If several provider identifiers normalize to one internal identity, I do not put provider-specific display data into the identity key and then expect reinsertion to refresh it. I store provenance and display fields in the record.
+
+## My review questions
+
+When an equal-key insertion leaves stale-looking metadata, I check:
+
+1. Which fields participate in `Eq`?
+2. Do exactly compatible fields participate in `Hash`?
+3. Is the ignored field really part of identity, or should it be value data?
+4. Does the application want the first, latest, or explicitly chosen canonical key?
+5. Is remove-then-insert safe under the surrounding synchronization?
+6. Can `get_key_value` make the stored representative visible in tests?
+
+I add tests with two distinct objects that compare equal. Re-inserting the exact same literal cannot reveal the contract.
+
+The broad principle is to separate identity from attributes. `HashMap` uses equality to decide entry identity and `insert` to replace the entry's value. It does not treat an equal key argument as a newer version of the key. Once my data model makes that boundary explicit, the retained original key becomes predictable and often useful.

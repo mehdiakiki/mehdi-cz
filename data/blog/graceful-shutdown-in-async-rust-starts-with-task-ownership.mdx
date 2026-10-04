@@ -1,0 +1,258 @@
+---
+title: "Graceful Shutdown in Async Rust Starts With Task Ownership"
+date: "2026-11-17T09:00:00+01:00"
+tags: ["rust", "Tokio", "graceful shutdown", "task ownership", "cancellation"]
+draft: false
+reviewed: true
+reviewedHash: "c2f8cea88faad1bcb402aed278ac2788fde7b9b73ab0880180921fbcf6233ed9"
+cluster: "rust-under-the-hood"
+campaign: "authority-2026"
+opportunity: "RUST-045"
+summary: "Graceful shutdown is a task-ownership protocol: stop accepting work, notify every owned task, finish or record in-flight effects, wait under a deadline, and prove what remains."
+---
+
+Listening for Ctrl-C is not graceful shutdown. It is only the event that begins shutdown.
+
+A service shuts down cleanly when it knows which work it owns, stops creating more work, tells every owned task to finish, and waits until the task tree reaches a known state.
+
+I use this order:
+
+```text
+detect -> stop admission -> notify -> drain or record -> join -> force by policy
+```
+
+Changing the order creates the common shutdown bugs.
+
+## The task tree is the real resource graph
+
+An async service often looks like this:
+
+```text
+process
+├── listener loop
+│   ├── connection task 17
+│   │   ├── request task
+│   │   └── background write
+│   └── connection task 18
+├── queue consumer
+│   └── retry task
+└── metrics exporter
+```
+
+If a child calls `tokio::spawn` and forgets the handle, ownership becomes invisible. The process may exit while the task owns a message, file, permit, or remote effect.
+
+My rule is that every spawned task belongs to a tracker, a supervisor, or a component whose shutdown method joins it. “The runtime will drop it” is forced termination, not lifecycle design.
+
+## Stop admission before asking workers to finish
+
+Suppose I cancel workers first but leave the HTTP listener or queue receiver active. New work can arrive while the consumer pool is disappearing.
+
+The boundary closes first:
+
+```text
+HTTP: stop accepting connections or return unavailable
+queue: pause/close consumption without acknowledging new messages
+channel: drop producers or close the receiver by policy
+scheduler: stop creating new periodic jobs
+websocket: reject new sessions
+```
+
+Then the amount of in-flight work can only decrease.
+
+## A reference ownership pattern
+
+Tokio's [graceful shutdown guide](https://tokio.rs/tokio/topics/shutdown) separates detection, notification, and waiting. I use `CancellationToken` for notification and `TaskTracker` for ownership:
+
+```rust
+use std::time::Duration;
+use tokio::net::TcpListener;
+use tokio::time::timeout;
+use tokio_util::{sync::CancellationToken, task::TaskTracker};
+
+async fn run(listener: TcpListener) -> anyhow::Result<()> {
+    let stop = CancellationToken::new();
+    let tasks = TaskTracker::new();
+
+    loop {
+        tokio::select! {
+            signal = tokio::signal::ctrl_c() => {
+                signal?;
+                break; // admission stops here
+            }
+            accepted = listener.accept() => {
+                let (stream, _) = accepted?;
+                let task_stop = stop.clone();
+
+                tasks.spawn(async move {
+                    serve_connection(stream, task_stop).await;
+                });
+            }
+        }
+    }
+
+    stop.cancel();
+    tasks.close();
+
+    timeout(Duration::from_secs(20), tasks.wait()).await?;
+    Ok(())
+}
+```
+
+The example keeps spawning in the same loop that owns admission. After `break`, this path cannot create another tracked connection task. Real services may have several admission loops, so I stop and join all of them before assuming the tracker is closed-world.
+
+The `tokio-util` [TaskTracker documentation](https://docs.rs/tokio-util/latest/tokio_util/task/task_tracker/struct.TaskTracker.html) defines `wait` in terms of the tracker being closed and empty. Both conditions matter.
+
+## Notification is cooperative
+
+Calling `stop.cancel()` makes cancellation observable. It does not interrupt arbitrary code.
+
+Each task chooses safe cancellation points:
+
+```rust
+async fn worker(stop: CancellationToken) {
+    loop {
+        tokio::select! {
+            _ = stop.cancelled() => break,
+            message = receive() => {
+                let Some(message) = message else { break };
+                finish_or_record(message).await;
+            }
+        }
+    }
+}
+```
+
+If `finish_or_record` includes several effects, cancelling it halfway may be less safe than finishing one bounded unit. I decide per operation:
+
+```text
+cancel before reservation
+finish after durable reservation
+record ambiguous remote outcome for reconciliation
+release permits and leases in all paths
+```
+
+The article [What tokio::select! Cancels at Every Loop Iteration](/blog/what-tokio-select-cancels-at-every-loop-iteration) explains what happens when a cancellation branch wins.
+
+## A token does not prove that every task heard it
+
+A cloned `CancellationToken` is useful only when the task checks it. A child may be:
+
+```text
+blocked in synchronous code
+waiting on a branch that never selects cancellation
+running a long CPU loop
+stuck behind a lock held by another shutting-down task
+sleeping in a retry helper that owns no token
+```
+
+This is why notification and joining are separate phases. The join result tells me which tasks actually terminated.
+
+[How One Blocking Function Stalls an Async Rust Executor](/blog/how-one-blocking-function-stalls-an-async-rust-executor) covers the special problem of blocking jobs: once started, they usually cannot be preempted by aborting an async handle.
+
+## Graceful needs a deadline and an escalation policy
+
+Waiting forever is not graceful. Orchestrators and deploy systems eventually send a hard termination signal.
+
+I divide the available budget:
+
+```text
+total platform grace period:       30 s
+stop admission and notify:          2 s
+normal drain:                       20 s
+record remaining identities:         3 s
+flush essential telemetry:           2 s
+safety margin before hard kill:       3 s
+```
+
+At the deadline I need a deliberate choice:
+
+- abort tasks whose effects are idempotent and recoverable;
+- persist work identities for a later reconciler;
+- nack or allow a queue lease to expire;
+- leave an operation running only when the platform permits it;
+- fail the shutdown and block deployment if losing state is unacceptable.
+
+I never hide deadline expiry behind `Ok(())`.
+
+## Draining is not the same as durability
+
+An in-memory channel can be empty while a worker still owns the last item. A task can finish while a remote server's response remains ambiguous. A local buffer can flush while the operating system has not persisted bytes.
+
+For each work class, I define its terminal evidence:
+
+| Work | Safe shutdown evidence |
+| --- | --- |
+| read-only request | response completed or caller disconnected |
+| queue item | durable effect plus acknowledgement, or lease returned |
+| email/payment | stable effect ID and confirmed or reconcilable outcome |
+| local file | required flush/sync level completed |
+| periodic refresh | old generation remains valid or new one activated |
+
+“Task returned” and “business work is safe” are related but different facts.
+
+## Locks can deadlock the shutdown order
+
+Imagine a supervisor holds a state lock while it waits for a child. The child needs the same lock to save its final checkpoint.
+
+```text
+supervisor: lock -> cancel -> join child -> unlock
+child:                         wait for lock -> checkpoint -> exit
+```
+
+Neither finishes.
+
+I change it to:
+
+```text
+lock -> mark state stopping -> unlock
+cancel
+join
+lock -> record stopped result -> unlock
+```
+
+No component holds a scarce lock, database transaction, or channel permit while joining its descendants.
+
+## Shutdown errors are data
+
+I collect task outcomes instead of discarding them:
+
+```text
+completed normally
+cancelled before work
+drained final work
+panicked
+timed out
+aborted after deadline
+left recoverable identity
+left ambiguous external effect
+```
+
+This summary belongs in structured logs and deployment diagnostics. It makes a slow shutdown debuggable without logging customer payloads.
+
+## My shutdown test
+
+I start the service with:
+
+```text
+one idle connection
+one request before its durable commit
+one request after commit but before response
+one full channel with blocked senders
+one retry sleeping
+one blocking operation
+```
+
+Then I trigger shutdown and assert:
+
+- no new work is admitted after the boundary closes;
+- every tracked task receives or observes the lifecycle change;
+- committed effects are not repeated under a new identity;
+- uncommitted queue work becomes available again or is recorded;
+- all permits and locks are released;
+- the tracker empties before the deadline in the normal case;
+- deadline escalation names every unfinished task class;
+- a second shutdown signal follows a documented faster path.
+
+I also run the test while dependencies are slow or unavailable. Happy-path shutdown is usually easy.
+
+Graceful shutdown begins long before the signal. It begins when each task is spawned under visible ownership and each effect has a recoverable terminal state. Once this task tree exists, cancellation is no longer hope: it is a protocol I can test.

@@ -1,0 +1,78 @@
+---
+caseId: "RFA-288"
+title: "Duration::checked_div(0) Returns None"
+date: "2026-09-06T01:08:00+01:00"
+lastmod: "2026-09-06T01:08:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "a619422147c02c321aced9f1af488aa4342178b9bf8d1bf7be52f212926c344c"
+area: "upgrades-compatibility"
+symptom: "Dividing a Duration through checked_div with a zero divisor produces None, and code that unwraps the checked result still panics."
+summary: "checked_div moves invalid duration division into Option; it does not invent a zero or infinite duration. Callers must give the zero-divisor case domain meaning before unwrapping."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets with std"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust Duration checked_div zero None", "divide Duration by zero without panic", "Duration checked division Option Rust"]
+evidence: ["Rust 1.98.1 five-second Duration", "zero divisor returns None", "domain error wrapper"]
+sources: ["https://doc.rust-lang.org/std/time/struct.Duration.html#method.checked_div", "https://doc.rust-lang.org/std/time/struct.Duration.html#method.checked_mul", "https://doc.rust-lang.org/std/option/enum.Option.html"]
+---
+
+I had a duration and a worker count, and I wanted an average allocation per worker. The count reached zero during startup. Switching to `checked_div` avoided division inside the method, but my following `unwrap` simply moved the panic one line later.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-288/fail.rs) asks a five-second duration to divide by zero and wrongly expects a duration result. [`Duration::checked_div`](https://doc.rust-lang.org/std/time/struct.Duration.html#method.checked_div) returns `None`.
+
+## Checked means the failure is represented
+
+Checked arithmetic does not guarantee a numeric answer. It guarantees that the operation reports when no representable answer follows its contract.
+
+For division by zero, `Duration` cannot return an infinite or undefined duration. The type represents a finite, nonnegative span with seconds and subsecond nanoseconds. `None` is the checked operation's way to keep that invalid state out of the value.
+
+Calling `unwrap` immediately discards this benefit. I treat `Option` as a request to decide policy, not as ceremony to remove.
+
+## Zero may describe several domain failures
+
+A zero divisor can mean no workers are configured, no samples were observed, a parser accepted an invalid field, or a race exposed a temporarily empty set. Each deserves a different response.
+
+For configuration, returning an error before the service starts may be best. For metrics, skipping an average and recording “no samples” may be correct. For a scheduler, using a fallback worker count might hide a dangerous configuration mistake.
+
+This decision does not belong in `Duration`. The standard type reports the arithmetic boundary and leaves the domain meaning to the caller.
+
+## `None` can also protect representation limits
+
+The family of checked duration methods makes overflow explicit. [`checked_mul`](https://doc.rust-lang.org/std/time/struct.Duration.html#method.checked_mul), for example, returns `None` when the resulting span cannot fit in `Duration`.
+
+That means I avoid translating every `None` into the vague message “division by zero” in a generic arithmetic wrapper. The operation and inputs should provide enough context to distinguish an invalid divisor from a representational overflow.
+
+For this specific method, validating the divisor before calling it can produce the clearest error. Keeping the checked call as well makes the arithmetic boundary robust if surrounding code changes.
+
+## Duration is not a signed timestamp difference
+
+`Duration` represents a nonnegative span. It is not a general signed quantity and it is not a wall-clock timestamp. When an average can be conceptually negative, or when clock movement matters, forcing the result into `Duration` has already selected the wrong model.
+
+I separate time points, elapsed monotonic spans, deadlines, rates, and signed differences at the type boundary. Division is then performed only on the kind of quantity for which the result makes sense.
+
+This becomes important when integer counts and nanosecond resolution meet. A duration divided among many recipients may round down at the representable resolution. A small positive duration can therefore yield `Duration::ZERO` even with a nonzero divisor. Zero output and invalid division are different states.
+
+## Preserve context while converting Option
+
+[`Option`](https://doc.rust-lang.org/std/option/enum.Option.html) can be converted into a `Result` with `ok_or` or `ok_or_else`. I use a domain error mentioning the operation and divisor:
+
+```rust
+duration.checked_div(workers).ok_or(ScheduleError::NoWorkers)
+```
+
+This creates a useful failure boundary for logs and callers. Returning `Option<Duration>` is also fine when absence is already meaningful and no explanation is required.
+
+What I avoid is silently replacing `None` with `Duration::ZERO`. That makes “no valid division” indistinguishable from a valid result rounded to zero.
+
+If a public API accepts the divisor, I reject zero at that boundary and keep the original value in the error context. If the divisor is derived internally, I trace the count to its source. The arithmetic symptom can otherwise hide the more useful fact that discovery returned no workers or filtering removed every sample.
+
+## What I test
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-288/fixed.rs) wraps the operation in a small function that rejects zero with a domain error and successfully divides by two.
+
+My tests cover zero, one, divisors larger than the nanosecond count, ordinary even and uneven divisions, the maximum expected duration, and conversions from external signed or wide integer values. I assert both the returned span and the chosen rounding behavior.
+
+At service boundaries, I validate counts before performing time arithmetic and keep the checked operation. The first produces a clear domain message; the second protects the representation contract.
+
+The core principle applies to every checked API: checked arithmetic turns an exceptional numeric condition into data, but the caller must still handle that data. `Duration::checked_div(0)` returning `None` is the safety mechanism working, not an incomplete answer waiting to be unwrapped.

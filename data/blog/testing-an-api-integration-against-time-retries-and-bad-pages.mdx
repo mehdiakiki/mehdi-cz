@@ -1,0 +1,279 @@
+---
+title: "Testing an API Integration Against Time, Retries, and Bad Pages"
+date: "2026-09-24T09:00:00+01:00"
+tags: ["api integration", "testing", "retries", "pagination", "reliability"]
+draft: false
+reviewed: true
+reviewedHash: "bf95176ffbf8541795a17afc719e1ad9ac55b0a9d2d299fec72dc3294966e9e6"
+cluster: "reliable-data-integrations"
+campaign: "authority-2026"
+opportunity: "DATA-025"
+summary: "A useful fake provider controls time, pagination, throttling, malformed data, and ambiguous writes. Test the integration protocol, not only JSON decoding."
+---
+
+The easiest API integration test returns one valid JSON response and checks one database row. It proves that the happy-path mapper works.
+
+It does not prove that the integration survives the provider.
+
+Real failures are sequences: page one succeeds, page two returns `429`, the retry times out after the server applied a write, the access token expires, or a cursor returns a record already seen.
+
+I build a fake provider that can control the sequence, not only the response body.
+
+## Test the protocol around the payload
+
+An integration contract includes more than fields:
+
+```text
+request construction
+authentication and refresh
+pagination
+rate-limit signals
+timeouts and deadlines
+retry classification
+idempotency
+schema and semantic mapping
+checkpoint advancement
+```
+
+A static fixture is still valuable for mapping tests. It should not carry the full responsibility of integration testing.
+
+I use three test layers:
+
+| Layer | Main question | Typical tool |
+| --- | --- | --- |
+| mapper unit tests | Does this payload become the correct internal meaning? | JSON fixtures |
+| protocol tests | Does the client react correctly across a response sequence? | stateful fake server |
+| provider verification | Does the real provider still satisfy observed assumptions? | sandbox or safe read-only probe |
+
+Each layer fails for a more specific reason.
+
+## A fake provider needs a script
+
+I define expected requests and planned outcomes:
+
+```ts
+type PlannedResponse =
+  | { kind: "http"; status: number; headers?: Record<string, string>; body: unknown }
+  | { kind: "disconnect_after_apply"; storedResult: unknown }
+  | { kind: "delay"; durationMs: number; then: PlannedResponse };
+
+type ExpectedCall = {
+  method: string;
+  path: string;
+  query?: Record<string, string>;
+  requiredHeaders?: Record<string, string>;
+  response: PlannedResponse;
+};
+```
+
+The fake consumes one expected call at a time. At the end of a test it fails if an expected request was not made or an unexpected request arrived.
+
+This catches bugs that a loose mock misses:
+
+- the same page is fetched in a loop;
+- a retry loses its idempotency key;
+- the refresh token is sent to the resource endpoint;
+- a cursor is URL-encoded twice;
+- the client retries a permanent `400`;
+- a deadline is reset on every attempt.
+
+The fake is strict about behaviour and flexible about irrelevant details such as header order.
+
+## Make time an input
+
+Tests with real sleep are slow and unreliable. More importantly, they cannot inspect the intended schedule precisely.
+
+I pass a clock and sleeper into retry and token logic:
+
+```ts
+interface Clock {
+  now(): Date;
+  sleep(ms: number): Promise<void>;
+}
+
+class TestClock implements Clock {
+  currentMs = 0;
+  sleeps: number[] = [];
+
+  now() {
+    return new Date(this.currentMs);
+  }
+
+  async sleep(ms: number) {
+    this.sleeps.push(ms);
+    this.currentMs += ms;
+  }
+}
+```
+
+Now a test can assert that `Retry-After: 7` produced at least a seven-second delay without waiting seven seconds. With a seeded random source, I can also verify that jitter remains within a declared range.
+
+Time control is needed beyond retries:
+
+- access-token expiry;
+- signed-request timestamps;
+- cursor validity;
+- overlap windows;
+- lease expiry;
+- end-to-end deadlines;
+- delayed webhooks.
+
+If production code reads the wall clock directly in many places, these cases become hard to reproduce.
+
+## Test a retry as one bounded operation
+
+A retry loop has at least three limits:
+
+```text
+attempt timeout < remaining operation deadline
+attempt count <= policy maximum
+all retries <= shared retry budget
+```
+
+I test the complete elapsed time, not only the number of calls. An exponential schedule plus per-attempt timeouts can exceed the user's deadline even when each setting looks small.
+
+Useful scripted cases include:
+
+| Sequence | Expected result |
+| --- | --- |
+| `503`, then `200` | one delayed retry, then success |
+| `429 Retry-After: 10`, then `200` | provider delay respected |
+| `400` | no retry |
+| timeout, timeout, timeout | stop at operation deadline |
+| SDK retries internally, client retry enabled | outer policy does not multiply attempts unexpectedly |
+| many concurrent `503`s | global retry budget limits added load |
+
+Microsoft's [transient-fault guidance](https://learn.microsoft.com/en-us/azure/architecture/best-practices/transient-faults) recommends deterministic fault injection, mock resources returning different errors, and high-concurrency tests. It also warns that nested retry layers can multiply load. I turn those points into assertions in the client harness.
+
+## Build bad pagination deliberately
+
+Pagination failures are rarely one malformed page. I make the fake provider generate these histories:
+
+### Duplicate across a boundary
+
+```text
+page 1: [A, B, C], next=t2
+page 2: [C, D, E], next=null
+```
+
+The destination should converge without creating two `C` records. The run should still report that the source repeated an identity if this is unexpected.
+
+### Empty page with a next token
+
+```text
+page 1: [], next=t2
+page 2: [A], next=null
+```
+
+A client that stops on an empty result loses `A`. Completion must follow the provider's explicit pagination contract.
+
+### Repeated token
+
+```text
+page 1: [A], next=t2
+page 2: [B], next=t2
+```
+
+I detect a token cycle or enforce a maximum page count. Otherwise a provider bug becomes an infinite job and quota drain.
+
+### Mutation during traversal
+
+The fake inserts, deletes, or moves a record between page requests. Offset pagination may duplicate or skip records. A snapshot token or stable `(updated_at, id)` cursor may behave differently. The test should encode the guarantee the provider actually offers.
+
+### One malformed record
+
+```text
+page 1: [valid A, invalid B, valid C]
+```
+
+The expected result depends on policy: stop the page, quarantine B and continue, or reject the full snapshot. I make the decision explicit instead of accepting whichever exception path happens naturally.
+
+## Simulate the ambiguous write
+
+The most important write failure happens after the provider applies the request but before the client receives the response.
+
+```text
+client ──create──> provider stores resource
+client <── response connection breaks
+```
+
+From the client side this looks like a timeout. A blind retry can create a duplicate.
+
+My fake stores the first result, closes the connection, then observes the next call. The test passes only if one of these contracts holds:
+
+- the same idempotency key returns the original result;
+- a client-chosen external identifier makes create repeatable;
+- the client reconciles by a stable lookup before retrying;
+- the operation is declared unsafe to retry and enters manual recovery.
+
+HTTP's idempotent-method rules exist partly because a client can lose the response and not know whether the server applied the request. [RFC 9110](https://www.rfc-editor.org/rfc/rfc9110#section-9.2.2) describes this uncertainty. Provider-specific idempotency contracts must still be verified.
+
+## Token refresh needs concurrency tests
+
+One expired access token can make a hundred workers refresh at the same time.
+
+I freeze the clock just after expiry, start many requests, and make the refresh endpoint slow. The expected result is normally:
+
+```text
+many callers → one refresh in flight → shared new token → requests resume
+```
+
+Then I test the failure cases:
+
+- refresh returns a permanent credential error;
+- refreshed token is already near expiry;
+- a caller is cancelled while waiting;
+- the old token receives `401` for a reason unrelated to expiry;
+- two processes cannot share the in-memory single-flight lock.
+
+The last case may require a distributed lease or accepting a small bounded number of refreshes. The test documents the chosen boundary.
+
+## Preserve requests and outcomes as evidence
+
+The fake should expose a structured transcript:
+
+```json
+{
+  "at_ms": 7000,
+  "attempt": 2,
+  "method": "GET",
+  "path": "/accounts",
+  "query": {"cursor": "t2"},
+  "response": 200
+}
+```
+
+I exclude secret header values but keep their presence and identity where useful. When a test fails, the transcript should make the protocol error obvious without enabling debug logging across the entire suite.
+
+## Keep the real-provider probe narrow
+
+A fake can drift from reality. I add a small provider check when a safe sandbox or read-only endpoint exists:
+
+- authenticate using the supported method;
+- fetch one known resource and one page boundary;
+- record headers important to retry or pagination;
+- verify known and unknown fields;
+- avoid destructive actions and uncontrolled volume.
+
+This test does not replace the deterministic suite. It tells me when to update its assumptions.
+
+## The failure matrix I require
+
+Before I trust an integration, I want evidence for:
+
+- each retryable and terminal status class;
+- timeout before and after a possible side effect;
+- rate-limit delay and shared retry budget;
+- token expiry with concurrent callers;
+- empty, duplicate, malformed, changing, and cyclic pages;
+- crash before and after checkpoint advancement;
+- unknown enum and missing-field mapping;
+- redacted but useful diagnostics.
+
+The list grows from real incidents and provider changes. It is a living protocol suite, not a one-time test plan.
+
+## What this changes in the design
+
+A stateful fake does more than find bugs. It forces time, identity, retry policy, checkpoint meaning, and provider behaviour to become explicit interfaces.
+
+That is why I build it early. A valid JSON fixture proves I can parse yesterday's response. A controlled provider history proves the integration has a recovery model for tomorrow's failure.

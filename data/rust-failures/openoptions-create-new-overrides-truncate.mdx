@@ -1,0 +1,116 @@
+---
+caseId: "RFA-196"
+title: "Why OpenOptions::create_new Overrides truncate"
+date: "2026-09-05T17:35:00+01:00"
+lastmod: "2026-09-05T17:35:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "9eb0bc9fb7e989ff6c2d6576a2dc7c899fb387b08bc01bbb407279a9be05891e"
+area: "ffi-targets"
+symptom: "OpenOptions configured with truncate and create still refuses an existing file and leaves its original bytes unchanged."
+summary: "create_new requests atomic exclusive creation and makes create and truncate irrelevant. Treat it as a file-existence policy, use truncate without create_new for deliberate replacement, and never replace atomic creation with an exists-then-open check."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets with std and a filesystem"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust OpenOptions create_new truncate ignored",
+    "create_new existing file not truncated",
+    "OpenOptions create truncate create_new precedence",
+  ]
+evidence:
+  ["Rust 1.98.1 temporary file", "AlreadyExists without truncation", "explicit overwrite repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/std/fs/struct.OpenOptions.html#method.create_new",
+    "https://doc.rust-lang.org/std/fs/struct.OpenOptions.html#method.truncate",
+    "https://doc.rust-lang.org/std/fs/struct.File.html#method.create_new",
+  ]
+---
+
+An `OpenOptions` builder can contain flags that look contradictory. Rust does not resolve every combination by the order in which builder methods were called.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-196/fail.rs) creates a file containing `keep me`, then requests write access with `create`, `truncate`, and `create_new` all enabled. The open fails and the original bytes remain. `truncate(true)` does not empty the existing file.
+
+## `create_new` states a stronger existence policy
+
+[`OpenOptions::create_new`](https://doc.rust-lang.org/std/fs/struct.OpenOptions.html#method.create_new) asks the operating system to create a new file and fail if anything already exists at that target. When it is true, the standard documentation says that `create` and `truncate` are ignored.
+
+So the builder does not mean “create a new file, otherwise truncate the old one.” It means “succeed only if this name was absent.”
+
+The expected error for a normal existing file is `AlreadyExists`, though the documentation leaves room for another error depending on the situation. A dangling symbolic link also counts as an existing target for this policy.
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-196/fixed.rs) first verifies the exclusive-create result and unchanged content. It then builds a separate overwrite policy using write plus truncate without `create_new`.
+
+## Builder call order is not precedence
+
+This code remains exclusive creation:
+
+```rust
+options.create_new(true).truncate(true);
+```
+
+Reversing the calls remains exclusive creation:
+
+```rust
+options.truncate(true).create_new(true);
+```
+
+Each method sets a field in the builder. The later call does not cancel a different option unless the API documents such a relationship. I inspect the final combination rather than reading the chain as an imperative story.
+
+If a shared helper supplies options, I log or test the complete final policy. A hidden `create_new(true)` from a security wrapper can otherwise make a local `truncate(true)` look broken.
+
+## Atomic creation is the reason this option exists
+
+[`File::create_new`](https://doc.rust-lang.org/std/fs/struct.File.html#method.create_new) provides the common exclusive-create policy directly. The important guarantee is that checking absence and creating are one atomic operation from the API's perspective.
+
+Replacing it with this pattern is unsafe under concurrency:
+
+```text
+if path does not exist
+    create path
+```
+
+Another process can create or redirect the path between the check and the creation. This time-of-check/time-of-use window matters for lock files, unique job claims, uploads, and security-sensitive output.
+
+When I need “must be new,” I keep `create_new` and handle the collision. I do not weaken it merely to make an error disappear.
+
+## Overwrite and create-if-missing are different policies
+
+For deliberate replacement, `write(true).truncate(true)` opens an existing file and reduces its length to zero when the open succeeds. Add `create(true)` only if a missing destination should also be created.
+
+That operation is not an atomic whole-file content replacement. A crash after truncation can leave an empty or partial file. For important configuration or state, I normally write a temporary file in the same filesystem, flush it as required, and rename it according to the platform's guarantees.
+
+[`OpenOptions::truncate`](https://doc.rust-lang.org/std/fs/struct.OpenOptions.html#method.truncate) also requires write access. Asking for truncation on a read-only open is invalid rather than an implicit request for write permission.
+
+I model at least three separate intentions:
+
+```text
+must not exist             -> create_new
+may exist, replace content -> write + truncate (+ create if missing is allowed)
+must exist, edit content   -> write without create or truncate
+```
+
+Clear helper names such as `create_unique_output` and `open_for_replacement` prevent callers from assembling flags repeatedly.
+
+## Failure should not mutate the protected file
+
+The evidence checks both the error and the bytes afterward. Asserting only `is_err()` would miss a destructive implementation that truncated before reporting the collision.
+
+The exclusive operation must make the existence decision without first applying the ordinary truncation policy. This is a useful property to preserve in wrapper tests.
+
+The fixture uses a process-specific name in the temporary directory, closes handles before cleanup, and removes the file before its final assertion. It does not leave state behind when the intentional panic occurs.
+
+In production, a process ID alone is not a secure unique-name strategy. The fixture controls its environment; a real temporary-file policy needs stronger creation primitives and permissions.
+
+## Errors still need context
+
+`AlreadyExists` is useful evidence, but open can fail for permissions, missing parent directories, invalid names, read-only filesystems, and platform-specific sharing rules. I preserve the original error and path context instead of translating every failure into “already exists.”
+
+I also avoid logging sensitive full paths without considering the environment. Good diagnostics can include the operation policy, safe path identity, and error kind.
+
+## My OpenOptions review
+
+When flags appear to fight, I write the desired existence and content policy in one sentence. Then I verify access mode, creation mode, truncation, append behaviour, and platform extensions; check documented precedence; reproduce against both missing and existing targets; and inspect content after a failed open.
+
+The core principle is that configuration builders describe one combined operation. Method order is not control flow. `create_new` deliberately dominates creation and truncation because atomic nonexistence is the point of the option.

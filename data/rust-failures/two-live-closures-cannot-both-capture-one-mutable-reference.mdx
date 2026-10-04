@@ -1,0 +1,88 @@
+---
+caseId: "RFA-548"
+title: "Two Live Rust Closures Cannot Both Capture One Mutable Reference"
+date: "2026-09-06T06:27:00+01:00"
+lastmod: "2026-09-06T06:27:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "229056756a3de325518e7b0aa15c6f760cd4b9383c4d51100044809e97e117ed"
+area: "concurrency-memory"
+symptom: "Creating reserve and commit closures that both capture total for mutation fails with E0524 because both closure values would hold unique access at once."
+summary: "Separate stored closures cannot each own simultaneous mutable access to one place. Pass state at call time, serialize closure lifetimes, or choose explicit shared-state machinery."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust E0524 two closures require unique access", "multiple closures capture same mutable reference", "pass mutable state into closure Rust"]
+evidence: ["Rust 1.98.1 E0524 compile failure", "reserve and commit both capture mutable total", "call-scoped mutable parameters repair"]
+sources: ["https://doc.rust-lang.org/error_codes/E0524.html", "https://doc.rust-lang.org/reference/types/closure.html#capture-modes", "https://doc.rust-lang.org/std/cell/struct.RefCell.html"]
+---
+
+Two callbacks may run one after another, yet storing both can require their captured environments to coexist. If each environment contains mutable access to the same value, Rust reports E0524 before either callback runs.
+
+The [failing fixture](/rust-failure-atlas/evidence/RFA-548/fail.rs) creates `reserve` and `commit`. Both closures mutate `total`, and both closure values remain live until their calls.
+
+## Each capture claims unique access
+
+Because a closure body writes through `total`, capture inference gives that closure the access it needs. The first closure holds mutable access so it can be invoked later. Creating the second would require another mutable access during the same period.
+
+Sequential call order does not change the simultaneous existence of the two stored access paths. The compiler cannot represent them as independent `&mut` aliases and then hope callers preserve an order.
+
+The [official E0524 explanation](https://doc.rust-lang.org/error_codes/E0524.html) describes exactly this situation: more than one closure requires unique access at the same time.
+
+## Pass the state at call time
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-548/fixed.rs) makes both closures accept `&mut u32`. They capture no `total`. Each invocation borrows total briefly, finishes, and returns access to the caller.
+
+This separates stored behaviour from stored state. It is often the cleanest model for pipeline steps and local strategies:
+
+```text
+reserve behaviour + caller-provided state
+then commit behaviour + same caller-provided state
+```
+
+The caller remains responsible for sequencing. The closure types can be kept together because neither owns an outstanding exclusive borrow.
+
+## End one closure before constructing the next
+
+If callbacks truly must capture the environment, I can create, call, and finish the first closure before creating the second. A nested block makes this lifetime obvious.
+
+This works only when the first closure is no longer needed. If both must be returned, stored, or selected later, their ownership design must change.
+
+The Reference details [closure capture modes](https://doc.rust-lang.org/reference/types/closure.html#capture-modes). I inspect whether the closure captures a field, dereferenced reference, or whole variable, because capture precision can affect which places conflict.
+
+## RefCell permits shared ownership with runtime exclusivity
+
+For single-threaded callbacks stored in a registry, `Rc<RefCell<State>>` can give each closure an owned handle. Each call uses `borrow_mut`, and overlapping mutable borrows panic at runtime.
+
+The [`RefCell` documentation](https://doc.rust-lang.org/std/cell/struct.RefCell.html) states this runtime borrow model. It is not “turning off” Rust's rule; it moves enforcement from compile time to checked runtime state.
+
+I use it when callbacks really outlive a simple stack borrow and ownership is genuinely shared. For two immediate calls in one function, explicit parameters are much simpler.
+
+## Concurrent callbacks require synchronization, not RefCell
+
+Across threads or async tasks that may execute concurrently, shared state needs a suitable synchronized owner such as `Arc<Mutex<T>>`, an atomic, or message passing. The right choice depends on contention, invariants, cancellation, and blocking behaviour.
+
+E0524 itself is a compile-time aliasing failure, not evidence that a mutex is automatically appropriate. First I ask whether state can remain caller-owned and flow through explicit arguments.
+
+## Split state when operations are independent
+
+If `reserve` touches one field and `commit` touches another, capturing disjoint field references may be possible. Splitting a struct into independent components can make the architecture and borrow graph agree.
+
+I avoid unsafe manual aliasing. When a collection needs disjoint mutable pieces, safe APIs such as `split_at_mut` provide the proof. If operations must preserve one cross-field invariant, a single owner and sequential methods are often better.
+
+## Tests should exercise the callback lifetime, not only its result
+
+A rewrite can produce the same final number while changing whether callbacks may be stored, reordered, or invoked again. I test the required call sequence and keep a small compile fixture for the ownership shape. When the callbacks enter a public API, I also document whether the caller lends state per call or the callback retains state between calls. That contract prevents a later refactor from quietly reintroducing overlapping captures behind a more complicated type alias.
+
+## My E0524 checklist
+
+- Which exact place does each closure mutate?
+- Do both closure values need to exist at the same time?
+- Can state become an explicit argument to each closure?
+- Can the first closure finish before the second is created?
+- Are the mutated fields genuinely disjoint?
+- Must callbacks be stored beyond the current stack phase?
+- If shared state is real, is runtime borrowing or synchronization appropriate?
+- Who owns sequencing and invariant preservation?
+
+The core principle is that stored closures can store access rights. I avoid simultaneous unique captures by lending state at invocation time or by choosing an explicit shared-state model when the lifetime truly demands it.

@@ -1,0 +1,100 @@
+---
+caseId: "RFA-409"
+title: "Vec::into_boxed_slice Removes Excess Capacity"
+date: "2026-09-06T03:49:00+01:00"
+lastmod: "2026-09-06T03:49:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "eac03a31d1928b7e88aa441fc884eebeb647b7d3be96015223f4030c6af46c19"
+area: "concurrency-memory"
+symptom: "A three-element Vec with capacity thirty-two becomes a Vec with capacity three after an into_boxed_slice and into_vec round trip."
+summary: "Vec::into_boxed_slice converts growable storage into an exactly sized boxed slice and removes excess capacity. Keep Vec ownership when spare capacity is intentional; use Box<[T]> when fixed-length ownership is the contract."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets with an allocator"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust Vec into_boxed_slice removes excess capacity", "Box slice into Vec capacity equals length", "Vec capacity lost boxed slice conversion"]
+evidence: ["Rust 1.98.1 capacity-thirty-two Vec", "three initialized elements", "boxed-slice round-trip capacity three"]
+sources: ["https://doc.rust-lang.org/std/vec/struct.Vec.html#method.into_boxed_slice", "https://doc.rust-lang.org/std/primitive.slice.html#method.into_vec", "https://doc.rust-lang.org/std/vec/struct.Vec.html#method.capacity"]
+---
+
+I converted a vector into a boxed slice and later back into a vector. The elements survived, but the spare capacity did not. This is part of the conversion contract, not an allocator accident.
+
+The [failing fixture](/rust-failure-atlas/evidence/RFA-409/fail.rs) creates capacity for thirty-two bytes and initializes only three. After `into_boxed_slice().into_vec()`, length and capacity are both three.
+
+## Vec and boxed slices express different ownership shapes
+
+A `Vec<T>` owns a growable sequence. Its state includes a length and a capacity. Slots from length to capacity are not initialized elements, but they allow future growth without necessarily reallocating.
+
+A `Box<[T]>` owns one fixed-length slice. It has no public spare-capacity concept. Its dynamically sized slice metadata records the element count represented by the box.
+
+[`Vec::into_boxed_slice`](https://doc.rust-lang.org/std/vec/struct.Vec.html#method.into_boxed_slice) crosses from the growable contract to the fixed-length contract and removes excess capacity.
+
+## The conversion may need to change the allocation
+
+If length already equals capacity, the existing allocation shape is suitable for the boxed slice. With excess capacity, the conversion is allowed to shrink or reallocate so only the initialized slice remains represented.
+
+I therefore treat conversion as a pointer-invalidating boundary. Raw pointers or foreign views into the Vec cannot be assumed to identify the boxed allocation afterward.
+
+Safe references cannot normally outlive consuming the vector, which prevents this mistake in ordinary Rust. Raw integrations must document the boundary themselves.
+
+## The round trip makes the removed capacity visible
+
+Boxed slices do not expose a `capacity` method. The fixture converts the box back using slice [`into_vec`](https://doc.rust-lang.org/std/primitive.slice.html#method.into_vec). The new vector uses the boxed slice allocation and has capacity matching its length.
+
+This round trip is an evidence technique, not a recommendation to convert twice in production. It reveals the fixed allocation contract with a familiar `Vec::capacity` observation.
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-409/fixed.rs) asserts that all three values remain and capacity equals length.
+
+## This is not clear or truncate
+
+`clear` sets vector length to zero and drops elements but normally retains allocation. `truncate` shortens to a requested length and also retains capacity. Both keep the value as a growable Vec.
+
+Converting into a boxed slice preserves all current elements while changing ownership shape and discarding excess capacity. These operations answer different lifecycle questions:
+
+- remove elements but reuse storage: `clear` or `truncate`;
+- keep elements and future growth: retain `Vec`;
+- keep elements as fixed owned slice: `into_boxed_slice`.
+
+I choose based on the next owner, not as a generic memory-cleanup trick.
+
+## Fixed length does not mean immutable elements
+
+`Box<[T]>` can still be mutably accessed when the box is mutable. The fixed part is the number of elements and allocation shape, not whether `T` values can change.
+
+This makes boxed slices useful for completed batches, lookup tables, and buffers whose size is final but contents may still be updated. The type tells callers that push and pop are no longer supported.
+
+If resizing returns later, converting back to Vec is explicit and begins with capacity equal to the current length, so the next growth may allocate.
+
+## Compactness has a cost boundary
+
+Discarding excess capacity can save memory for many long-lived completed vectors. It can also require allocation work and copying during conversion, depending on the allocator and original shape.
+
+For one tiny temporary vector, conversion may cost more than retained spare bytes matter. For millions of stored lists, the aggregate saving can be important.
+
+I measure retained memory, conversion throughput, and later growth. A type-level fixed-size contract can still be valuable even when memory savings are small.
+
+## Capacity is in elements
+
+[`Vec::capacity`](https://doc.rust-lang.org/std/vec/struct.Vec.html#method.capacity) counts elements, not bytes. Removing twenty-nine spare `u8` slots is different from removing twenty-nine spare large records.
+
+Allocator bookkeeping and size classes also affect process-level resident memory. Capacity describes the Vec's usable element allocation, not an exact promise about bytes returned to the operating system.
+
+I keep claims at the right layer: excess vector capacity is removed from the resulting collection contract. System RSS may not immediately fall.
+
+## Zero-sized types remain special
+
+Vectors of zero-sized types report special capacity behavior because elements require no allocation storage. A boxed slice still carries a length, but a round-trip capacity observation does not model ordinary allocated types.
+
+The fixture uses `u8` intentionally. When allocation behavior is the subject, I avoid zero-sized elements and record element size.
+
+## My ownership review
+
+Before converting, I ask:
+
+- Is the collection finished growing?
+- Does the next API benefit from a fixed-length type?
+- Is excess capacity significant across the expected number of values?
+- Are any raw pointers or foreign handles tied to the old allocation?
+- Will the value soon become a Vec and grow again?
+
+The core principle is that conversion can change more than method availability. `Vec::into_boxed_slice` turns growable ownership into exact slice ownership and removes unused capacity. That makes the result compact and honest when length is final, but it deliberately gives up reserved growth space.

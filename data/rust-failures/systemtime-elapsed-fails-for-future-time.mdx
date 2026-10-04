@@ -1,0 +1,87 @@
+---
+caseId: "RFA-229"
+title: "SystemTime::elapsed Returns an Error for a Future Wall-Clock Time"
+date: "2026-09-06T00:09:00+01:00"
+lastmod: "2026-09-06T00:09:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "0680a040256a4cc00a3f1fd888e19dfa5f65b24a4a2ba40d6f8719a26653a694"
+area: "ffi-targets"
+symptom: "Calling elapsed on a SystemTime one hour in the future returns SystemTimeError instead of a negative or zero duration."
+summary: "SystemTime is a fallible wall-clock coordinate, and Duration cannot represent a negative span. Handle direction explicitly for timestamps and use Instant for in-process monotonic elapsed measurements."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets with system clocks; clock behaviour is platform-specific"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust SystemTime elapsed future returns error",
+    "SystemTimeError elapsed clock went backwards",
+    "SystemTime versus Instant elapsed Rust",
+  ]
+evidence: ["Rust 1.98.1 future wall-clock value", "direction-bearing SystemTimeError", "monotonic Instant repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/std/time/struct.SystemTime.html#method.elapsed",
+    "https://doc.rust-lang.org/std/time/struct.SystemTimeError.html",
+    "https://doc.rust-lang.org/std/time/struct.Instant.html",
+  ]
+---
+
+I stored a wall-clock deadline and later called `elapsed` on it to calculate age. Before the deadline arrived, the call returned an error. My code had treated elapsed time as always non-negative and used `unwrap`.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-229/fail.rs) constructs a `SystemTime` one hour ahead of now. [`SystemTime::elapsed`](https://doc.rust-lang.org/std/time/struct.SystemTime.html#method.elapsed) returns `Err` because the stored time is later than the current system time.
+
+## Duration has no negative representation
+
+`Duration` represents a non-negative span. When the direction is “now occurs before this stored time,” `SystemTime::elapsed` cannot return a negative duration. It returns [`SystemTimeError`](https://doc.rust-lang.org/std/time/struct.SystemTimeError.html), whose `duration` method reports how far the comparison lies in the opposite direction.
+
+The error is useful information, not only a clock malfunction. A future timestamp can be completely expected when it represents a deadline, token activation time, scheduled publication, or timestamp from a machine with clock skew.
+
+Treating the error as zero silently changes the model from signed difference to clamped age. Sometimes that is wanted, but I name the clamp and test it.
+
+## Wall time can move while a process runs
+
+`SystemTime` represents the system clock used for communication with filesystems and external processes. That clock can be adjusted. Network time synchronization, administrator changes, virtualization, and platform behaviour can make two observations disagree with simple elapsed-time assumptions.
+
+A stored time that was in the past can appear in the future after a backward adjustment. Code that uses wall time for request latency, retry intervals, or lock expiry can wait too long, retry too soon, or panic.
+
+This does not mean wall time is wrong for timestamps. It means timestamps and monotonic intervals are different kinds of data.
+
+## Instant is the in-process elapsed-time tool
+
+[`Instant`](https://doc.rust-lang.org/std/time/struct.Instant.html) is a monotonically nondecreasing clock abstraction intended for measuring intervals. The [repaired program](/rust-failure-atlas/evidence/RFA-229/fixed.rs) uses `Instant::now()` for elapsed measurement and separately handles the future `SystemTime` error.
+
+An `Instant` is opaque. I cannot serialize it as a universal timestamp or compare it meaningfully across processes. That limitation protects the distinction: it measures relationships within its supported clock context rather than claiming a civil date.
+
+Platform details still matter. Rust documents that `Instant` is not guaranteed to be steady, that suspend handling varies, and that rare platform bugs can violate monotonic assumptions. It is nevertheless the correct standard abstraction for ordinary in-process durations.
+
+## Deadlines often need both clocks for different reasons
+
+A persisted job scheduled for tomorrow needs wall time so it survives restarts and can be understood externally. Once a process loads the job, a timeout protecting one attempt is better expressed with an `Instant` deadline.
+
+I avoid converting a distant wall-clock deadline into one monotonic sleep without rechecking policy. The system clock can change, and the product may require the job to follow corrected civil time. A scheduler can bound sleeps, wake periodically, compare wall time again, and record skew.
+
+For protocol expiry, I also define tolerance. Rejecting a token at an exact wall-clock boundary without accounting for skew can make distributed systems brittle.
+
+## Direction belongs in the type or branch
+
+When I compare two `SystemTime` values, I keep the `Result` until I have decided what either direction means:
+
+```rust
+match now.duration_since(timestamp) {
+    Ok(age) => classify_past(age),
+    Err(error) => classify_future(error.duration()),
+}
+```
+
+This is clearer than calling `elapsed` and mapping every error to a generic failure. A future value can be accepted, rejected, delayed, or flagged depending on the domain.
+
+If signed time arithmetic is central to the application, I use a time representation whose signed differences and calendar rules match the requirement, while keeping monotonic timeout logic separate.
+
+## My tests do not change the machine clock
+
+Clock-adjustment tests are difficult and invasive. The minimal fixture deterministically creates a future `SystemTime` using addition and observes the direction error. It does not depend on racing a one-second boundary or modifying host configuration.
+
+Application tests inject a clock abstraction so past, equal, future, and backward-jump cases are controlled. For monotonic timeouts, I use runtime-supported paused time or an injected monotonic source where appropriate. Assertions use ranges only when real clock progress is unavoidable.
+
+The core principle is that time coordinates and durations are not interchangeable. `SystemTime` answers where something sits on an adjustable external clock; `Instant` measures a local monotonic interval. I preserve direction when comparing timestamps and choose the clock from the promise the system must keep.

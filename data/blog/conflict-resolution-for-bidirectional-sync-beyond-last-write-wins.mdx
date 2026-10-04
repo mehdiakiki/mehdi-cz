@@ -1,0 +1,181 @@
+---
+title: "Conflict Resolution for Bidirectional Sync Beyond Last-Write-Wins"
+date: "2026-09-17T17:00:00+01:00"
+tags: ["bidirectional sync", "conflict resolution", "CRDT", "data synchronization", "distributed systems"]
+draft: false
+reviewed: true
+reviewedHash: "a42c104f50a6540df0854346ae2cadd5ee69b9a26c6311b19c0a41bc0964ca78"
+cluster: "reliable-data-integrations"
+campaign: "authority-2026"
+opportunity: "DATA-018"
+summary: "A practical comparison of conflict policies that preserve business intention when two synchronized systems edit the same entity."
+---
+
+Last-write-wins is attractive because it always returns one value. This is not the same as resolving a conflict correctly.
+
+In a bidirectional synchronization system, two valid edits can happen while either side is offline or before the other edit becomes visible. Choosing the largest timestamp gives convergence if the timestamps and tie-breaker are deterministic. It says nothing about which business intention should survive.
+
+I design conflict resolution per field and operation. Some conflicts should merge. Some should be rejected. Some should wait for a human. A few can use last-write-wins safely. The important work is making that policy explicit before production chooses it accidentally.
+
+## One customer, two legitimate edits
+
+At version 40, both systems know:
+
+```text
+name = "North Workshop"
+phone = "+212 500 000"
+plan = "standard"
+labels = {"customer"}
+```
+
+Then they diverge:
+
+```text
+System A, based on v40:
+  phone = "+212 500 111"
+  labels += "priority"
+
+System B, based on v40:
+  name = "North Workshop SARL"
+  plan = "cancelled"
+```
+
+An entity-level last-write-wins policy can erase the phone and label edits when B's object arrives later. A naive field merge can preserve the name and phone but still reactivate a cancelled account if another update carries an old `plan` value.
+
+There is no useful policy until we know what each field means and who may change it.
+
+## Prevent conflicts before resolving them
+
+My first tool is [field ownership](/blog/define-field-ownership-before-you-build-bidirectional-sync). If billing owns `plan`, a profile provider should never compete for it. If system A owns phone verification and system B only displays the phone, the direction is clear.
+
+Ownership removes false conflicts. It does not remove genuine collaborative fields such as labels, notes or availability.
+
+For each writable field I record:
+
+```text
+authority
+operation semantics
+base version required?
+concurrent edits possible?
+automatic merge rule
+invariant after merge
+evidence kept for review
+```
+
+## Seven policies and what they really buy
+
+| Policy | Good fit | Preserves intention | Metadata/cost | Main failure |
+| --- | --- | --- | --- | --- |
+| One authoritative side | Billing status, verified identity | Yes, if authority is correct | Low | Wrong ownership blocks a valid edit |
+| Compare-and-reject | Inventory count, approval state | High | Base version and retry UX | Requires caller to resolve |
+| Per-field version merge | Independent profile fields | Medium to high | Version per field | Hidden cross-field invariants |
+| Operation merge | Counters, add/remove commands | High for defined operations | Operation IDs and order/causality | Cannot infer missing intention |
+| Set/CRDT merge | Tags, memberships with clear algebra | High within its data type | Causal or tombstone metadata | Product rule may not match the algebra |
+| Manual review | Legal names, ambiguous deletes | High with evidence | Queue and operator time | Backlog becomes a second failure |
+| Last-write-wins | Replaceable cache-like preference | Low | Timestamp plus tie-breaker | Silently discards a valid write |
+
+The table is a decision aid, not a ranking. Compare-and-reject is excellent when a user is present and can refresh. It is painful in an unattended overnight sync. Manual review is correct for a rare high-risk ambiguity and disastrous for thousands of routine label edits.
+
+## Use operations when state hides intention
+
+Suppose A has `labels = {customer, priority}` and B has `labels = {customer, newsletter}`. Union gives all three labels. That looks good until one side intentionally removed `customer`.
+
+The final sets do not tell me whether absence means “never added,” “not observed,” or “removed.” An operation log can:
+
+```json
+{ "opId": "a-81", "base": 40, "action": "add_label", "value": "priority" }
+{ "opId": "b-19", "base": 40, "action": "remove_label", "value": "customer" }
+```
+
+Now the merge policy can preserve both intentions. It must remember enough removal evidence so an old add does not resurrect the label.
+
+Conflict-free replicated data type research gives formal conditions under which independently updated replicas converge. The original [CRDT paper](https://perso.lip6.fr/Marc.Shapiro/papers/2011/CRDTs_SSS-2011.pdf) distinguishes state-based and operation-based approaches and their delivery requirements. I use this result where the product operation has a suitable algebra. I do not call every timestamp merge a CRDT, and I do not force a CRDT onto a workflow with human approval or a unique business authority.
+
+## Detect concurrency instead of guessing from time
+
+Two timestamps tell me an order chosen by clocks. They do not tell me whether update B had observed update A.
+
+A base version gives a stronger signal:
+
+```text
+current canonical version: 42
+incoming update base:      40
+```
+
+The update is stale. If the fields changed since version 40 do not overlap, I may merge. If they overlap, I apply that field's policy.
+
+For several independent writers, version vectors can describe causality more precisely, at the cost of more metadata. For two fixed systems, a pair of observed sequence numbers may be enough. I add causal machinery only when a real concurrency case needs it.
+
+Wall-clock time remains useful for display, deadlines and investigation. I avoid treating it as proof that one edit knew about another.
+
+## Merge fields, then validate the entity
+
+Independent field merging can create an impossible combination:
+
+```text
+status = cancelled
+next_billing_date = tomorrow
+```
+
+The individual updates were valid in their original states. The merged entity violates a cross-field invariant.
+
+My resolution function therefore has two stages:
+
+```text
+resolve each changed field according to policy
+                    ↓
+validate the complete candidate entity
+                    ↓
+accept, compensate, or send evidence to review
+```
+
+Validation is part of conflict resolution. It is not a database constraint I hope will catch everything at the end.
+
+## A deterministic decision record
+
+Every resolved conflict produces evidence:
+
+```json
+{
+  "entity": "customer/internal-812",
+  "baseVersion": 40,
+  "leftVersion": "a:81",
+  "rightVersion": "b:19",
+  "changedFields": ["phone", "name", "plan", "labels"],
+  "policyVersion": "customer-merge-7",
+  "decisions": {
+    "phone": "accept_a",
+    "name": "accept_b",
+    "plan": "billing_authority_b",
+    "labels": "operation_merge"
+  },
+  "resultVersion": 43
+}
+```
+
+The record makes retries deterministic and support explanations possible. I keep source payloads only under an appropriate privacy and retention policy; the decision usually needs identifiers, versions, operations and hashes rather than every personal field.
+
+## Test interleavings, not only examples
+
+A merge function can look correct for A-then-B and fail for B-then-A. I test:
+
+- both delivery orders;
+- each update duplicated;
+- either update delayed until after a restart;
+- the same timestamp with a deterministic tie-breaker;
+- unrelated and overlapping field edits;
+- add versus remove of the same set element;
+- deletion versus update;
+- an old event arriving after the merged result;
+- policy-version upgrades during replay;
+- entity invariants after every result.
+
+For policies claiming convergence, I generate operation permutations and assert equal final state. For policies that reject or review, I assert equal decision records instead of inventing an automatic result.
+
+The existing [last-write-wins analysis](/blog/last-write-wins) goes deeper into why LWW is a data-loss policy. This article's wider point is that one resolver should not own every kind of field.
+
+## My practical rule
+
+I resolve conflicts at the smallest boundary that has business meaning. I prevent them with ownership, detect them with versions or causal evidence, merge operations when the algebra matches, validate the complete entity, and keep a deterministic decision record.
+
+Last-write-wins remains one tool. It is appropriate only when losing either concurrent value is an accepted product decision. If I cannot say that clearly, a timestamp is hiding the conflict, not resolving it.

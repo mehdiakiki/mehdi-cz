@@ -1,0 +1,87 @@
+---
+caseId: "RFA-240"
+title: "Why str::get Returns None for an In-Bounds UTF-8 Range"
+date: "2026-09-06T00:20:00+01:00"
+lastmod: "2026-09-06T00:20:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "5d8ef775dcf5e9a3f442570925289ad47dcbaa3e894e5f197a12f9806c028000"
+area: "ffi-targets"
+symptom: "str::get returns None for byte offset 1 in a non-empty string even though the offset is below len."
+summary: "A Rust string range must be inside the byte length and begin and end on UTF-8 character boundaries. get reports an invalid range with None; derive a boundary from the text unit your application means."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust str get returns None in bounds", "string slice get UTF-8 character boundary", "safe substring byte index Rust"]
+evidence: ["Rust 1.98.1 multibyte text", "in-bounds non-boundary range", "char_indices repair"]
+sources: ["https://doc.rust-lang.org/std/primitive.str.html#method.get", "https://doc.rust-lang.org/std/primitive.str.html#method.is_char_boundary", "https://doc.rust-lang.org/std/primitive.str.html#method.char_indices"]
+---
+
+I sometimes see `get` described as the safe version of string indexing. This is useful, but it can create a wrong expectation: every number smaller than `len()` does not identify a place where a `str` may be cut.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-240/fail.rs) uses `"éclair"`. Its byte length is seven. Byte offset 1 is therefore inside the allocation, but [`str::get`](https://doc.rust-lang.org/std/primitive.str.html#method.get) returns `None` for `1..`. That position splits the two-byte UTF-8 encoding of `é`.
+
+## A valid range has two independent conditions
+
+A range used for a string slice must be within `0..=len()`. It must also start and end at UTF-8 character boundaries. Integer bounds prove only the first condition.
+
+This explains why the indexing syntax and `get` appear to disagree only in error handling:
+
+```rust
+let text = "éclair";
+let optional = text.get(1..); // None
+let direct = &text[1..];      // panics
+```
+
+Both operations enforce the same representation invariant. `get` returns `Option`; indexing chooses a panic for an invalid range. It does not make the invalid byte a usable text boundary.
+
+## len counts bytes
+
+Rust strings contain valid UTF-8. Their [`len`](https://doc.rust-lang.org/std/primitive.str.html#method.len) is a byte length because byte addressing is what makes slicing constant time.
+
+For ASCII, every byte is also a character boundary. Tests containing only English identifiers can hide the distinction for years. The first accented name or emoji then makes an apparently ordinary offset fail.
+
+I make units visible in names: `byte_offset`, `scalar_index`, or `grapheme_limit`. A generic `position` is too easy to pass into the wrong API.
+
+## Find the boundary for the question being asked
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-240/fixed.rs) wants the text after the first Unicode scalar value. It uses [`char_indices`](https://doc.rust-lang.org/std/primitive.str.html#method.char_indices) to obtain the byte position of the second scalar and passes that position to `get`.
+
+This is different from blindly replacing `1` with `2`. Two happens to be correct for `é`, but another scalar may use one, three, or four bytes. The iterator performs the conversion from scalar position to byte boundary.
+
+If the original input already provides a byte offset, [`is_char_boundary`](https://doc.rust-lang.org/std/primitive.str.html#method.is_char_boundary) is a direct validation step. A parser can reject a malformed offset rather than changing its meaning.
+
+## Character is still an overloaded word
+
+`char_indices` iterates Unicode scalar values. It does not identify user-perceived grapheme clusters. A visible symbol may contain a base scalar and combining marks, while an emoji can join several scalars.
+
+For a protocol parser, scalar boundaries may be exactly right. For a text editor cursor or user-facing maximum, grapheme segmentation may be needed. Rust's standard library guarantees UTF-8 validity; it does not guess the product's definition of one visible character.
+
+This distinction matters for repairs. Calling `.chars().nth(n)` and collecting the remainder can answer a scalar question but changes complexity and can allocate. A specialised Unicode segmentation library answers a grapheme question. Keeping byte offsets is efficient when the surrounding system already speaks bytes.
+
+## None can hide more than one cause
+
+`get` also returns `None` when a range is reversed or out of bounds. Production diagnostics should not translate every `None` into “bad Unicode.” I log the requested bounds, byte length, and boundary checks when the source is untrusted.
+
+For a range `start..end`, useful checks are:
+
+```text
+start <= end
+end <= text.len()
+text.is_char_boundary(start)
+text.is_char_boundary(end)
+```
+
+The order matters if the code performs direct indexing during diagnosis. `is_char_boundary` itself safely returns false for indexes beyond the length, which makes it suitable for validation.
+
+## Do not round silently without a policy
+
+Moving an invalid offset backward to the previous boundary can be correct for a byte-size preview. Moving forward may be correct for consuming the scalar touched by a cursor. Rejecting the offset is often correct for a wire protocol.
+
+There is no universal safe rounding rule because rounding changes application data. I write the policy next to the conversion and test it at zero, at the end, around every multi-byte scalar, and beyond the end.
+
+## What I test
+
+My small regression set contains ASCII, `é`, a four-byte emoji, combining text, empty input, and ranges whose start or end is invalid. It tests both `get` and the chosen conversion helper.
+
+The core principle is that being inside storage is not enough to be a valid boundary in a structured representation. `str::get` protects both memory bounds and UTF-8 validity. `None` is not a mysterious Unicode failure; it says the requested range cannot represent a borrowed `str` without breaking one of those conditions.

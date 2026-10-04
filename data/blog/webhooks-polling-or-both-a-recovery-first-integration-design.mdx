@@ -1,0 +1,192 @@
+---
+title: "Webhooks, Polling, or Both? A Recovery-First Integration Design"
+date: "2026-09-08T19:00:00+01:00"
+tags: ["webhooks", "polling", "data integration", "reliability", "system design"]
+draft: false
+reviewed: true
+reviewedHash: "77de74495fa2c8cb990dc49e48c9f70caff5e71c7ade888a830a7cd1e4be7fc9"
+cluster: "reliable-data-integrations"
+campaign: "authority-2026"
+opportunity: "DATA-008"
+summary: "A decision and failure matrix for combining low-latency webhooks with polling and reconciliation so an integration can recover from missed, duplicate, or reordered events."
+---
+
+When I build an integration, I rarely ask only, “Does this API provide webhooks?” I ask a more useful question: **How will my copy become correct again after notifications fail?**
+
+Webhooks are good at making changes arrive quickly. Polling is good at discovering that something was missed. In many production systems, I want both.
+
+This is not because webhooks are bad. A webhook is a notification delivered across networks, queues, deployments, and provider incidents. Every part can fail. A reliable design accepts this and gives the system a path back to convergence.
+
+## My short decision rule
+
+I start with this matrix:
+
+| Source capability | Main path | Recovery path | Typical result |
+| --- | --- | --- | --- |
+| Ordered change feed with durable cursor | Consume feed | Resume cursor, then reconcile | Best when available |
+| Webhooks plus list/update API | Webhooks | Incremental polling and periodic scan | Common practical design |
+| Polling API with updated timestamp | Incremental polling | Overlap windows and periodic scan | Higher latency, recoverable |
+| Snapshot-only API | Scheduled full scan | Compare generations | Simple but can be expensive |
+| Webhooks without reliable read API | Durable webhook inbox | Provider redelivery and manual repair | Fragile dependency |
+
+The main path optimizes freshness. The recovery path optimizes correctness.
+
+If losing one event could permanently corrupt the local state, I do not consider the design complete.
+
+## What a webhook actually promises
+
+A webhook normally means the provider will attempt an HTTP delivery. It does not automatically mean:
+
+- exactly one delivery;
+- delivery in event order;
+- delivery before later API reads;
+- infinite retries;
+- a complete object in the payload;
+- permanent replay history.
+
+For example, Stripe documents automatic retries, duplicate events, and the fact that event ordering is not guaranteed. GitHub recommends responding quickly, processing asynchronously, and using the delivery identifier when handling redeliveries. These are normal webhook properties, not provider defects. See the official [Stripe webhook guide](https://docs.stripe.com/webhooks) and [GitHub webhook best practices](https://docs.github.com/en/webhooks/using-webhooks/best-practices-for-using-webhooks).
+
+I therefore treat a webhook as **evidence that something may have changed**, not as the only copy of truth.
+
+## The durable inbox comes first
+
+My webhook handler does as little synchronous work as possible:
+
+1. read the raw request within a strict size limit;
+2. verify the signature and timestamp;
+3. derive a provider-scoped delivery ID;
+4. store the accepted delivery in a durable inbox;
+5. return success;
+6. process it asynchronously.
+
+The inbox has a uniqueness constraint such as:
+
+```text
+tenant + provider account + delivery ID
+```
+
+This turns duplicate delivery into a normal idempotent result. The worker can retry independently from the provider without asking the provider to send the event again.
+
+I store enough metadata to investigate delivery and parsing, but I apply retention and redaction rules to the payload. A durable inbox should not become unlimited storage for sensitive external data.
+
+## Fetch current state when the event is only a hint
+
+Some webhook payloads are complete snapshots. Others contain only an object ID or a partial set of changed fields. Partial payloads are dangerous when applied as replacements.
+
+Suppose the local record has fields `name`, `status`, and `plan`, while an event contains only:
+
+```json
+{ "id": "cus_42", "status": "active" }
+```
+
+Replacing the local object with this payload silently deletes `name` and `plan`. I need a provider contract saying whether omission means “unchanged,” “unknown,” or “deleted.”
+
+When the webhook is only a change signal, I enqueue the object ID and fetch its current representation from the API. Several quick changes can then collapse into one refresh. This also helps when events arrive out of order: a current-state read is often more useful than replaying old partial states.
+
+It is not universal. If the provider API is eventually consistent or the event carries an authoritative version, I may need to delay, compare versions, or apply the event itself. The contract decides.
+
+## Polling is the repair loop
+
+The polling side should not download everything every minute. I prefer an incremental API with a durable cursor, change token, monotonically increasing version, or updated timestamp.
+
+A basic loop is:
+
+```text
+load committed checkpoint
+request next page after checkpoint
+validate and apply records idempotently
+commit the returned checkpoint only after effects are durable
+repeat
+```
+
+The poller repairs several webhook failures:
+
+- a webhook exhausted its retry period;
+- our endpoint was misconfigured;
+- signature verification rejected valid deliveries because clocks drifted;
+- an event was accepted but lost before durable storage;
+- a new event type was ignored by an old worker;
+- events arrived in an order the consumer did not expect.
+
+For timestamp-based polling, I use an overlap window and idempotent processing. Asking for records updated strictly after the last timestamp can miss two records that share the same timestamp or a late commit whose clock appears older. A tuple such as `(updated_at, stable_id)` is safer when the API supports it.
+
+## Periodic reconciliation catches semantic gaps
+
+Incremental polling can share the same blind spot as webhooks. Perhaps the provider never emits deletion events. Perhaps an administrator changes a field through an endpoint that does not update the expected timestamp. Perhaps our cursor state was already wrong.
+
+I add a slower reconciliation job that compares the source and local view. This may be:
+
+- a complete ID scan each night;
+- partitions rotated across several hours;
+- counts and hashes followed by a targeted scan;
+- a full scan after an invalid cursor;
+- a user-triggered repair for one connected account.
+
+The job should produce differences, not blindly overwrite records. It can then apply the same version, field-ownership, and deletion rules as the live path. [Reconciliation Across Systems](/blog/reconciliation-cross-system-sync) covers this convergence loop in more detail.
+
+## The failure matrix I write before implementation
+
+I use a small table during design review:
+
+| Failure | Detection | Automatic recovery | Safety condition |
+| --- | --- | --- | --- |
+| Duplicate webhook | Inbox uniqueness conflict | Mark duplicate complete | Same delivery cannot create a second effect |
+| Missing webhook | Poller or reconciliation finds newer source state | Apply missing change | Updates are idempotent and version-aware |
+| Reordered events | Source version is older than local version | Ignore stale event | Version comparison is authoritative |
+| Worker crashes after effect | Inbox remains unfinished and is retried | Reprocess | Effect has idempotency key |
+| Cursor expires | Provider returns invalid-token response | Start controlled full sync | New generation cannot mix with old progress |
+| Object deleted silently | Reconciliation sees absence | Apply tombstone policy | Absence is proven in a complete scope |
+| Provider is unavailable | Timeout/circuit metrics rise | Backoff and resume | Checkpoint has not advanced |
+
+This table forces each failure to have both a detection signal and a recovery action. “We will inspect logs” is useful for diagnosis but is not an automatic recovery path.
+
+## Avoid two writers with different rules
+
+When webhook and polling workers are implemented separately, they often develop different behaviour. One treats a missing field as null. Another preserves it. One compares versions. Another uses arrival time.
+
+I make both paths call the same application operation:
+
+```text
+apply_source_observation(source, object, version, observed_at)
+```
+
+That operation owns identity mapping, field authority, version ordering, tombstones, and idempotency. Webhooks and polling are only two ways to obtain an observation.
+
+This reduces the most subtle risk of the hybrid approach: the recovery mechanism making state less correct than the live mechanism.
+
+## What I measure
+
+Request counts alone do not show integration health. I watch:
+
+- webhook acceptance and signature rejection rates;
+- inbox age and retry count;
+- provider event time to local apply time;
+- polling checkpoint age;
+- reconciliation differences by type;
+- stale events ignored;
+- invalid cursors and full-sync frequency;
+- records waiting for manual repair.
+
+The strongest signal is often **convergence lag**: how long a real source change remains incorrect locally. It includes both fast-path latency and recovery behaviour.
+
+## Choosing one path can still be correct
+
+I do not add webhooks only because they exist. Polling alone can be simpler when changes are infrequent, the freshness target is relaxed, and the provider offers an efficient incremental endpoint.
+
+Webhooks alone can be reasonable when the provider gives durable ordered replay with a cursor and strong retention. At that point, the “webhook” behaves more like a change feed. I still plan what happens when retention expires.
+
+Full snapshots can also be enough for a small dataset. Reliability is not the largest architecture; it is having a recovery method proportional to the need.
+
+## My default answer
+
+For a typical SaaS integration, my answer is webhooks **and** polling:
+
+- webhooks for low latency;
+- a durable inbox for retries and deduplication;
+- incremental polling for missed changes;
+- periodic reconciliation for gaps in the change model;
+- one version-aware apply function shared by all paths.
+
+This design accepts duplicates and temporary disagreement. It does not accept permanent silent drift.
+
+Stripe also documents how to [process undelivered webhook events](https://docs.stripe.com/webhooks/process-undelivered-events), which is a concrete example of combining delivery handling with API-based recovery. The next important component is a durable cursor: a checkpoint that survives crashes without skipping unapplied pages.

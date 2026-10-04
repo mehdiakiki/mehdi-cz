@@ -1,0 +1,107 @@
+---
+caseId: "RFA-094"
+title: "E0793: Why a Reference to a Packed Field Is Unaligned"
+date: "2026-09-05T09:14:00+01:00"
+lastmod: "2026-09-05T09:14:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "d835cfbe4e9392727dbeaf10a76f4cfebfdb3af3b4601a365c1a6118853fcbd9"
+area: "ffi-targets"
+symptom: "Taking a reference to a field of #[repr(packed)] produces E0793 even inside unsafe code."
+summary: "Packing may place a field below its required alignment, and creating the reference is already invalid. Copy Copy fields by value or form a raw pointer without an intermediate reference for unaligned access."
+rustVersions: ["Rust 1.98.1"]
+targets: ["all targets; alignment requirements vary"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust E0793 reference to packed field unaligned",
+    "repr packed println field error",
+    "read_unaligned packed struct",
+  ]
+evidence: ["Rust 1.98.1 compile failure", "alignment calculation", "by-value field copy repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/error_codes/E0793.html",
+    "https://doc.rust-lang.org/reference/type-layout.html#the-alignment-modifiers",
+  ]
+---
+
+A packed layout can make an innocent reference invalid:
+
+```rust
+#[repr(packed)]
+struct Header {
+    tag: u8,
+    length: u32,
+}
+
+let header = Header { tag: 1, length: 42 };
+let length = &header.length;
+```
+
+Rust 1.98.1 reports E0793: the reference to the packed field is unaligned. The [failing fixture](/rust-failure-atlas/evidence/RFA-094/fail.rs) reproduces the error.
+
+Putting the line inside an unsafe block does not make the reference legal. Rust references always carry validity requirements, including proper alignment. Unsafe code may perform operations with extra proof obligations, but it cannot create an invalid reference and call that valid.
+
+## Packing changes offsets and possible addresses
+
+Without packing, the compiler normally inserts padding so `length` begins at an address aligned for `u32`. With `repr(packed)`, the structure's alignment is reduced and padding between fields can disappear. `length` may begin one byte after the structure address.
+
+The [Reference layout section](https://doc.rust-lang.org/reference/type-layout.html#the-alignment-modifiers) defines packed alignment modifiers and their effect. The [E0793 explanation](https://doc.rust-lang.org/error_codes/E0793.html) states that creating an unaligned reference is undefined behavior even if the reference is never dereferenced.
+
+Some processors can perform unaligned loads in hardware. That does not relax Rust's reference contract. Compiler optimizations are allowed to assume a `&u32` is correctly aligned.
+
+## Copying by value avoids creating a reference
+
+For a Copy field, direct value access is the simplest repair:
+
+```rust
+let length = header.length;
+assert_eq!(length, 42);
+```
+
+The [fixed fixture](/rust-failure-atlas/evidence/RFA-094/fixed.rs) uses this approach. The compiler can generate an appropriate unaligned load into an aligned local variable. The later reference, if any, points to the local.
+
+This also explains a surprising formatting error. `println!("{}", header.length)` may implicitly borrow its argument, producing E0793. Copy first, then format the local.
+
+## Raw pointers support explicit unaligned operations
+
+For non-Copy access or binary parsing code, a raw pointer may be needed. It must be formed without first creating a reference, using a raw address expression such as `&raw const packed.field` or `addr_of!`. Then `read_unaligned` can copy the value from that address when its other safety conditions are satisfied.
+
+The order matters. Writing `&packed.field as *const _` creates the invalid reference before converting it. The raw pointer conversion comes too late.
+
+An unaligned write has additional ownership and drop concerns. Writing over a non-Copy value without handling the old value correctly can leak or double-drop resources. Packed structures are easiest to use with plain wire-format fields.
+
+## repr(packed) is not a complete protocol parser
+
+Mapping bytes directly to a Rust struct still leaves endianness, field validity, versioning, and length checks. A `u32` loaded from network bytes may need `from_le_bytes` or `from_be_bytes`. Enums and booleans do not accept every bit pattern.
+
+I often parse from a byte slice into normal aligned Rust values instead of keeping a packed reference-shaped view. The copies are small, the checks are explicit, and the internal model is safe to use.
+
+For FFI, I verify the foreign compiler's packing rules, target flags, and header definitions. Rust and C must agree on more than the total size.
+
+## Why unsafe around the whole function is worse
+
+A wide unsafe block can hide where raw access occurs while still not legalizing invalid references. I keep the operation narrow and state:
+
+- how the pointer was formed without a reference,
+- how many initialized bytes are available,
+- why the selected field type accepts the bits,
+- which byte order applies,
+- and why the read does not violate ownership.
+
+The alignment proof is only one part.
+
+## My first checks
+
+For E0793 I inspect the layout and the expression for implicit borrows. Formatting, comparisons, method calls, and pattern matching may take a reference even when no `&` is written.
+
+Then I choose:
+
+1. Copy a Copy field into an aligned local.
+2. Parse bytes into an ordinary Rust type.
+3. Use a raw pointer plus an explicit unaligned operation when zero-copy layout access is truly needed.
+
+I never repair it by manufacturing `&*raw_pointer`; that recreates the same invalid reference.
+
+E0793 is strict because references are a foundational compiler promise. Packed data can exist, and Rust can read it, but the unaligned location must remain represented as bytes or a raw pointer until a valid aligned value is produced.

@@ -1,0 +1,130 @@
+---
+caseId: "RFA-069"
+title: "E0210: Why `From<LocalWrapper<T>> for T` Still Breaks Rust's Orphan Rule"
+date: "2026-09-05T08:35:00+01:00"
+lastmod: "2026-09-05T08:35:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "cc2dc86d1fd602a3e2f3470f459354b73ca75b4c0e36f1207fecdb8fbc7e3bae"
+area: "diagnostics-macros"
+symptom: "Implementing From LocalWrapper T for T fails with E0210 even though the wrapper in the trait arguments is local."
+summary: "A local type somewhere in a foreign-trait impl is not enough. Read Self and trait parameters in coherence order: no uncovered generic may appear before the first local type. Reverse the conversion or introduce a local target."
+rustVersions: ["Rust 1.98.1"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust E0210 type parameter must be covered local type From Wrapper",
+    "uncovered type parameter before first local type",
+    "Rust orphan rule From local generic wrapper",
+  ]
+evidence: ["Rust 1.98.1 compile failure", "impl-header ordering", "local-target conversion repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/error_codes/E0210.html",
+    "https://doc.rust-lang.org/reference/items/implementations.html#orphan-rules",
+  ]
+---
+
+The short orphan-rule explanation—“either the trait or the type must be local”—is not complete for generic implementations. This impl contains a local wrapper and still fails:
+
+```rust
+struct Wrapper<T>(T);
+
+impl<T> From<Wrapper<T>> for T {
+    fn from(value: Wrapper<T>) -> T {
+        value.0
+    }
+}
+```
+
+Rust 1.98.1 reports E0210 because `T` is uncovered before the first local type. The [failing fixture](/rust-failure-atlas/evidence/RFA-069/fail.rs) preserves the exact diagnostic.
+
+`From` belongs to the standard library. The target `T` can be any type, including one owned by another crate. The local `Wrapper<T>` appears as the trait argument, but it appears too late in the coherence ordering to reserve this implementation safely.
+
+## Read the header in coherence order
+
+For a foreign trait written conceptually as:
+
+```text
+impl<P...> ForeignTrait<T1, ..., Tn> for T0
+```
+
+the orphan check considers `T0` first, followed by `T1` through `Tn`. In this case:
+
+```text
+T0 = T
+T1 = Wrapper<T>
+```
+
+The uncovered generic `T` appears as the self type before the first local nominal type `Wrapper<T>`. That gives this crate too broad a claim over a foreign trait applied to arbitrary target types.
+
+The [Reference orphan rules](https://doc.rust-lang.org/reference/items/implementations.html#orphan-rules) define the covered-parameter condition precisely. A parameter nested inside a local nominal type is covered at that position; a bare `T` is not.
+
+## Reverse the conversion when the local wrapper is the target
+
+This direction is allowed:
+
+```rust
+impl<T> From<T> for Wrapper<T> {
+    fn from(value: T) -> Self {
+        Self(value)
+    }
+}
+```
+
+Now the self type `T0` is the local `Wrapper<T>`. The first local type arrives before the bare trait argument `T`, and the parameter inside the wrapper is covered. The [repaired fixture](/rust-failure-atlas/evidence/RFA-069/fixed.rs) compiles and verifies the wrapped value on Rust 1.98.1.
+
+This repair provides conversion _into_ the wrapper. It does not provide a generic `Into<T>` conversion back out, because the prohibited direction remains prohibited.
+
+## Use an inherent method for extraction
+
+The wrapper owns its API, so extraction can be explicit:
+
+```rust
+impl<T> Wrapper<T> {
+    fn into_inner(self) -> T {
+        self.0
+    }
+}
+```
+
+`into_inner` is often clearer than a fully generic conversion. It tells readers that one layer is being removed and avoids possible ambiguity with other `Into` targets.
+
+A local extraction trait is another option when generic code needs a bound, but creating a trait only to mimic one inherent method may not improve the design.
+
+## Fundamental types do not make every parameter covered
+
+References and `Box` receive special treatment in parts of coherence, but nesting a parameter arbitrarily does not always give a local ownership claim. Type aliases also do not create a new nominal local type; they remain aliases for the underlying type.
+
+When the rules feel surprising, a true newtype is more reliable than an alias:
+
+```rust
+struct LocalTarget<T>(T);
+```
+
+The crate owns `LocalTarget`, can attach invariants, and can place foreign-trait implementations at a coherence position beginning with a local type.
+
+## Why the order restriction exists
+
+Without it, two crates could each use their own local trait argument wrapper to implement the same foreign trait for the same arbitrary foreign target. A downstream crate combining them would face overlapping implementations even though neither upstream crate knew about the other.
+
+The ordered local-type rule assigns a predictable ownership point. It is part of Rust's ability to compile crates separately and still guarantee one applicable trait implementation.
+
+## My worksheet for E0210
+
+I rewrite the header as a list:
+
+```text
+[Self, trait argument 1, trait argument 2, ...]
+```
+
+Then I mark:
+
+1. The first local nominal type.
+2. Every bare generic parameter before it.
+3. Whether each earlier parameter is covered by a local type.
+
+Changing where-clauses does not fix an uncovered ordering claim. Reordering source declarations also does nothing. I need a local trait, a local target/self type, a legal ordering, or an inherent operation.
+
+The official [E0210 explanation](https://doc.rust-lang.org/error_codes/E0210.html) gives multi-parameter examples where changing type order changes legality. For `From`, the self type is the conversion destination. Remembering that one fact makes this common wrapper case easier: a local source argument does not grant the crate a blanket foreign-trait implementation for every possible destination `T`.

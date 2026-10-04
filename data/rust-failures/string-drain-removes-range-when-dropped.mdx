@@ -1,0 +1,102 @@
+---
+caseId: "RFA-192"
+title: "Why Dropping String::Drain Still Removes the Whole Range"
+date: "2026-09-05T17:31:00+01:00"
+lastmod: "2026-09-05T17:31:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "afcc6af8087ad485e2aea8c04886ba65bb6f09f7602507e5310706b029a9f120"
+area: "concurrency-memory"
+symptom: "Reading one character from String::drain and dropping the iterator removes every character in the selected range."
+summary: "String::drain separates the range being removed from the removed characters being yielded. Dropping the iterator completes removal of the selected range, so select a smaller range for partial mutation and collect only when the removed text is needed."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets with alloc"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust String drain dropped before consumed",
+    "String drain removes whole range",
+    "partial iteration String Drain behavior",
+  ]
+evidence: ["Rust 1.98.1 ASCII boundary fixture", "single yielded character", "range-sized repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/std/string/struct.String.html#method.drain",
+    "https://doc.rust-lang.org/std/string/struct.Drain.html",
+    "https://doc.rust-lang.org/std/string/struct.String.html#method.remove",
+  ]
+---
+
+I created a `String::drain` over four characters, called `next` once, and expected only that returned character to disappear. The string lost the complete selected range.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-192/fail.rs) starts with `abcdef`, drains byte range `1..5`, and reads only `b`. When the iterator leaves its small scope, the string is `af`, not `acdef`.
+
+The important distinction is that the range chooses the mutation. Iteration chooses how much removed data I receive.
+
+## `drain` is not a lazy removal predicate
+
+[`String::drain`](https://doc.rust-lang.org/std/string/struct.String.html#method.drain) removes a specified range and returns the removed characters as an iterator. The mutable borrow of the string stays active while that iterator exists.
+
+Advancing the iterator gives ownership of removed characters to my code. Not advancing it does not cancel the remaining removal. When the [`Drain`](https://doc.rust-lang.org/std/string/struct.Drain.html) is dropped normally, its cleanup leaves the original string with the whole range removed.
+
+This is different from `Vec::extract_if`, where unvisited values are retained. Both APIs return iterators and mutate collections, but their destructor contracts serve different purposes.
+
+The type name alone is not enough to predict partial-consumption behaviour. I read the method's drop and leaking notes for every mutating iterator.
+
+## Make the range match the intended mutation
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-192/fixed.rs) wants to remove one ASCII character, so it drains `1..2`. Dropping after the first yielded character now removes exactly the requested portion.
+
+For general Unicode text I cannot add one byte blindly. String ranges must begin and end on UTF-8 character boundaries. I find the next boundary through `char_indices` or use [`String::remove`](https://doc.rust-lang.org/std/string/struct.String.html#method.remove) with a known valid character boundary.
+
+`remove` returns one `char` and shifts the following bytes. It is direct when one scalar value is the real operation. For a range, `drain` expresses the bulk change better.
+
+Neither operation understands a user-perceived grapheme such as an accented character assembled from several scalar values or an emoji sequence. That needs a Unicode segmentation policy outside the standard library.
+
+## Collect when removed text is part of the result
+
+Sometimes I need both sides of the operation: the shortened source and the removed substring. Then I exhaust the iterator by collecting it:
+
+```rust
+let removed: String = text.drain(start..end).collect();
+```
+
+Collection is not required to make removal happen, but it is required to retain all removed characters. If I call only `next`, the rest are dropped during cleanup and are no longer recoverable.
+
+I make this ownership visible in the function return type. A function that merely mutates can return `()`. A function that cuts text for later use returns the drained `String`.
+
+## The borrow checker prevents an inconsistent view
+
+While a `Drain` exists, it holds a mutable borrow of the source string. I cannot inspect or modify the source through another safe reference. The nested scope in the fixture is therefore meaningful: after the closing brace, cleanup has run and the final string can be observed.
+
+Trying to work around this with raw pointers would remove the protection while the string may be shifting bytes. The correct code shape is to finish or drop the drain, then access the source.
+
+This also gives a useful debugging point. I log the original range and yielded text before leaving the scope, then the final source afterward. Mixing these moments in one expression makes the transition harder to see.
+
+## Forgetting the iterator is not cancellation
+
+The documentation has a stronger warning for `mem::forget`. If a drain is leaked instead of dropped, the string may retain drained characters or lose arbitrary characters, including some outside the requested range.
+
+`mem::forget` is safe to call, so collection APIs must remain memory-safe even when destructors do not run. They do not promise normal logical results in that situation.
+
+I never use forgetting as a way to abort a drain. If an operation needs transactional cancellation, I compute and validate the range first, then perform the mutation only after every fallible step succeeds.
+
+Panics deserve the same thought. I keep processing of removed characters small, or collect them before running complex logic, so the string transition has an understandable boundary.
+
+## Similar iterators do not share one drop rule
+
+Three nearby APIs make a useful comparison:
+
+```text
+String::drain       drop removes the rest of the chosen range
+Vec::splice         drop removes the range and installs replacements
+Vec::extract_if     drop retains unvisited candidate elements
+```
+
+The behaviour follows each operation's promise, not a universal rule about laziness. The Atlas connects these cases because this comparison is easier to remember than three isolated surprises.
+
+## My text-drain checks
+
+When more text disappears than expected, I check the selected byte range first. Then I ask whether the returned iterator was fully consumed, dropped, or leaked; whether the boundaries are valid UTF-8; whether I needed the removed text; and whether a one-character method would state the intent more accurately.
+
+The core principle reaches beyond strings: mutation scope and result consumption can be separate. `String::drain` commits to removing a range. Its iterator is a channel for observing the removed characters, not a control for how much of the range will be changed.

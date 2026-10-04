@@ -1,0 +1,92 @@
+---
+caseId: "RFA-183"
+title: "Why HashMap::get_disjoint_mut Panics on Duplicate Keys"
+date: "2026-09-05T17:22:00+01:00"
+lastmod: "2026-09-05T17:22:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "eb21732df07197fb958c5bd0264d6f13b1b743982324471ff2cf8b61f8aeca53"
+area: "concurrency-memory"
+symptom: "HashMap::get_disjoint_mut panics when the query array contains the same key twice instead of returning one Some and one None."
+summary: "get_disjoint_mut can safely return several mutable references only when their keys identify different entries. Duplicate or equivalent keys are a contract error and panic; missing distinct keys simply return None."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets with std collections"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust HashMap get_disjoint_mut duplicate keys panic",
+    "get_disjoint_mut overlapping keys",
+    "multiple mutable HashMap values safely Rust",
+  ]
+evidence: ["Rust 1.98.1 duplicate-key panic", "two equal queries", "distinct-key repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/std/collections/struct.HashMap.html#method.get_disjoint_mut",
+    "https://doc.rust-lang.org/std/collections/struct.HashMap.html#method.get_disjoint_unchecked_mut",
+  ]
+---
+
+Getting two mutable values from one map is harder than calling `get_mut` twice. The first borrow normally keeps the whole map mutably borrowed, so Rust cannot prove the second lookup is disjoint.
+
+`get_disjoint_mut` solves that problem, but the keys become part of a runtime aliasing contract.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-183/fail.rs) requests `"blue"` twice. Rust 1.98.1 panics with `duplicate keys found`.
+
+## Safe mutable references cannot overlap
+
+[`HashMap::get_disjoint_mut`](https://doc.rust-lang.org/std/collections/struct.HashMap.html#method.get_disjoint_mut) accepts a fixed-size array of borrowed keys and returns an equally sized array of optional mutable references.
+
+For soundness, it can return at most one `&mut V` for any stored value. Two equal query keys would both identify the same value, so returning two successful references is impossible.
+
+The API does not turn the second duplicate into `None`. `None` means that a distinct queried key is absent from the map. Duplicate input is a violation of the method's precondition and panics.
+
+## Equality matters, not spelling or address
+
+Keys overlap according to their `Eq` and `Hash` behaviour. Two separate strings with equal contents are duplicates. A case-insensitive key wrapper may consider differently cased text equal.
+
+Validating duplicates by pointer identity or source position is therefore insufficient. The validation policy must match the map's borrowed lookup semantics.
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-183/fixed.rs) requests two visibly distinct existing keys, then mutates both returned values.
+
+## Missing and duplicate inputs need separate product decisions
+
+For distinct keys, the output position is `None` when that key is missing. The other positions can still contain valid mutable references.
+
+Application code should decide whether missing data is expected. A transfer between two accounts, for example, may require both values. A batch update may skip missing optional records.
+
+Duplicates are also domain-dependent. I can reject the request, deduplicate it before borrowing, or combine repeated updates into one operation. Silently dropping repetitions can change meaning when each occurrence represents an increment.
+
+## The safe check has a cost
+
+The documentation notes that duplicate detection currently has quadratic time complexity in the number of requested keys. For the small fixed groups this method targets, that can be a good trade for a safe API.
+
+If `N` becomes large, I measure the complete operation and reconsider the data flow. Sorting or hashing request identities before the call may make sense, but it changes output ordering and duplicate handling. Repeatedly asking for hundreds of simultaneous mutable references may indicate that a staged update or different representation fits better.
+
+## The unchecked version moves the proof to me
+
+[`get_disjoint_unchecked_mut`](https://doc.rust-lang.org/std/collections/struct.HashMap.html#method.get_disjoint_unchecked_mut) avoids the overlap check, but calling it with overlapping keys is undefined behaviour even when the returned references are never used.
+
+This is not a performance switch to enable because production data “should be unique.” It requires a proof that equality cannot overlap for every input reaching the call.
+
+I keep the safe method unless profiling shows the check matters and the surrounding type structure can carry a reviewed uniqueness invariant.
+
+## Why ordinary indexing is not a replacement
+
+Sequentially reading values, calculating new owned results, and then writing them back can avoid simultaneous borrows. This is often simplest when values are cheap to clone or updates depend only on snapshots.
+
+Removing one value from the map temporarily is another technique, but panic and early-return paths must restore it. That approach changes map observability during the operation.
+
+`get_disjoint_mut` is strongest when a small, already validated group must be updated in place together.
+
+## My multi-borrow checklist
+
+When this operation panics or becomes awkward, I check:
+
+1. Can any query keys compare equal under the map's real key semantics?
+2. Should duplicates be rejected, merged, or applied repeatedly?
+3. Are missing distinct keys allowed?
+4. Is simultaneous mutable access actually required?
+5. Is `N` small enough that the safe overlap check is reasonable?
+6. If unsafe is proposed, where is uniqueness proved and regression-tested?
+
+The core principle is that disjointness is a semantic property. Rust can verify it dynamically for the safe API, but it cannot invent a meaning for duplicate requests. `get_disjoint_mut` returns `None` for absence and panics for overlap because those are fundamentally different states.

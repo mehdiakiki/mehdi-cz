@@ -1,0 +1,84 @@
+---
+caseId: "RFA-354"
+title: "Read::Take::set_limit Replaces the Remaining Byte Budget"
+date: "2026-09-06T02:14:00+01:00"
+lastmod: "2026-09-06T02:14:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "3e8a4f6d7504ae29726a6b62818ad76c21a3dbcadb1757282cb4dfe3f2454df2"
+area: "ffi-targets"
+symptom: "After three bytes are read through a five-byte Take adapter, set_limit(5) permits five more bytes rather than only two."
+summary: "Take::limit reports the budget remaining now. set_limit replaces that remaining budget without considering bytes already read or the previous cap, which is useful for staged protocols but unsafe as a reset-to-original assumption."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust Take set_limit remaining bytes", "Read take reset limit", "set_limit exceeds original Take limit Rust"]
+evidence: ["Rust 1.98.1 Cursor behind Take", "three-byte read leaves limit two", "set_limit five permits bytes d through h"]
+sources: ["https://doc.rust-lang.org/std/io/struct.Take.html#method.set_limit", "https://doc.rust-lang.org/std/io/struct.Take.html#method.limit", "https://doc.rust-lang.org/std/io/trait.Read.html#method.take"]
+---
+
+I once treated a [`Take`](https://doc.rust-lang.org/std/io/struct.Take.html) limit as an original absolute ceiling stored beside the reader. After consuming part of a message, I called `set_limit(original_limit)` to “restore” the adapter. Instead, I granted a new budget starting at the current position.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-354/fail.rs) wraps eight bytes with a limit of five and reads `abc`. The remaining limit is then two. Calling `set_limit(5)` allows five additional bytes, `defgh`, rather than only `de`.
+
+## Take stores what may still be read
+
+`Read::take(limit)` creates an adapter that returns at most `limit` bytes before reporting an adapter-level EOF. Its [`limit()`](https://doc.rust-lang.org/std/io/struct.Take.html#method.limit) method reports the number of bytes that can still be read, not the cap supplied at construction.
+
+Each successful read reduces this counter. Starting from five and consuming three leaves two. The adapter does not need to remember that five was once the original value.
+
+The underlying reader may also end earlier. A remaining limit of ten does not prove that ten source bytes exist; it only says the adapter will not impose EOF before that budget is spent.
+
+## set_limit assigns a new counter
+
+[`set_limit`](https://doc.rust-lang.org/std/io/struct.Take.html#method.set_limit) sets the number of bytes that can be read from now before this adapter reports EOF. The documentation is unusually explicit: the amount already read and the previous limit do not matter, just as if I constructed a new `Take` at the current source position.
+
+This makes the call useful for phased protocols. I can permit exactly the declared payload length after reading a header. But it also means `set_limit(5)` is not “return to a total maximum of five bytes.” It is “allow up to five more bytes.”
+
+## Adapter EOF is not necessarily source EOF
+
+When the budget reaches zero, reads through `Take` return zero bytes even if the wrapped source contains more data. This is a boundary created by the adapter.
+
+If I raise the limit, reading can resume from the underlying reader's current position. The earlier zero therefore did not establish that a file, socket, or cursor was physically exhausted.
+
+This distinction matters in parsers. A bounded reader can safely isolate one frame, but code must not interpret its boundary as proof that the transport has closed.
+
+## Track a total separately when the policy is cumulative
+
+If the rule is “this operation may consume at most five bytes in total,” I do not reset the remaining budget to five. I preserve the adapter, inspect its current limit, or track the consumed total in a separate checked counter.
+
+For an original cap `cap`, a total `consumed`, and a desired cumulative ceiling, the remaining allowance is derived deliberately. I use checked arithmetic for values coming from untrusted lengths. Silently wrapping a size calculation can defeat the boundary the adapter was meant to enforce.
+
+Sometimes the cleanest design is to create one `Take` for one protocol field and consume it fully before returning to the parent reader. That gives each bound a clear lifetime.
+
+## Staged budgets can be correct
+
+Not every reset is a bug. Imagine a decoder that first permits a fixed header, validates its length, then permits exactly the declared payload. Replacing the limit matches those phases.
+
+I write the transition as a new remaining budget and name the variable accordingly:
+
+```rust
+reader.set_limit(payload_bytes_remaining);
+```
+
+Names such as `max_message_size` are dangerous if passed repeatedly without subtracting prior consumption. Names do not change API semantics, but good names reveal whether a value is a total cap or a remaining allowance.
+
+## Buffered readers require one more layer of care
+
+`Take` can wrap a buffered reader, or a buffered reader can wrap `Take`; these arrangements create different read-ahead boundaries. A `BufReader<Take<R>>` cannot fill beyond the take budget. A `Take<BufReader<R>>` limits what the outer consumer receives while the inner buffer may already hold later source bytes.
+
+Neither arrangement is automatically wrong. I choose based on whether read-ahead past a frame boundary is acceptable and whether the same buffer will parse the next frame. I avoid unwrapping and discarding unread buffered bytes.
+
+## Tests should measure the counter after every phase
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-354/fixed.rs) checks the initial effect indirectly, reads three bytes, and asserts that `limit()` is two. It then sets the limit to five, confirms five, reads the remaining source bytes, and confirms the counter reaches zero.
+
+This is stronger than asserting only the final data because it locates the semantic transition. For a real parser I also test source EOF before the budget, budget EOF before source EOF, a zero limit, short reads, and declared lengths near numeric boundaries.
+
+No network timing is needed for this contract. A `Cursor<Vec<u8>>` gives deterministic evidence of the adapter logic.
+
+## The core principle is to name the reference point
+
+Many limits sound absolute while their APIs operate relative to current state. A retry count can mean total attempts or attempts remaining. A timeout can mean a deadline or a fresh duration. An I/O limit can mean total bytes or bytes from now.
+
+`Take::set_limit` works from now. It replaces the remaining counter and does not reconstruct history. Once I state that reference point, the five extra bytes in the fixture are exactly what the API promises.

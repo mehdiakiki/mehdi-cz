@@ -1,0 +1,88 @@
+---
+caseId: "RFA-132"
+title: "Why a Mutated HashMap Key Can Become Unreachable"
+date: "2026-09-05T12:32:00+01:00"
+lastmod: "2026-09-05T12:32:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "ba7c26bcaf5849fe0f6c01c290dab87ed3451b9115766f23bbb43b63b5ee330d"
+area: "concurrency-memory"
+symptom: "A HashMap still owns an entry, but lookup by the key's new visible value returns None after interior mutability changed data used by Hash and Eq."
+summary: "HashMap requires a key's hash and equality behaviour to remain stable while inserted. Interior mutation can violate that invariant without unsafe code, leaving the entry in a bucket chosen for its old hash; remove before changing identity or use immutable keys."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["targets with std::collections"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust HashMap mutate key after insertion unreachable", "interior mutable HashMap key logic error", "Hash Eq changes while key in HashMap"]
+evidence: ["Rust 1.98.1 deterministic lookup failure", "changed key hash after insertion", "remove-change-reinsert repair"]
+sources: ["https://doc.rust-lang.org/std/collections/struct.HashMap.html", "https://doc.rust-lang.org/std/hash/trait.Hash.html"]
+---
+
+The [failing program](/rust-failure-atlas/evidence/RFA-132/fail.rs) inserts a key whose identity comes from `Rc<Cell<u32>>`. Another handle changes the cell from `7` to `8`. Looking up a freshly constructed key with value `8` then returns `None`, although iterating the map would still reveal the stored entry.
+
+No memory-unsafe operation is present. The program broke a logical contract required by the collection.
+
+## A hash table remembers where the old key belonged
+
+On insertion, `HashMap` hashes the key and uses that result to choose where to search and store the entry. On lookup, it hashes the query and searches the corresponding region, then uses equality to find the exact key.
+
+If an inserted key changes from hash A to hash B, the table does not receive an event telling it to relocate that entry. A later lookup starts from B while the entry remains where A placed it.
+
+The [`HashMap` documentation](https://doc.rust-lang.org/std/collections/struct.HashMap.html) explicitly says it is a logic error for a key's hash or equality to change while it is in the map. It also explains that resulting behaviour is encapsulated to the map and is not undefined behaviour, but it may include wrong results, panics, leaks, or non-termination.
+
+“Not undefined behaviour” is not the same as “supported.” It means the failure should not escape into arbitrary memory unsafety.
+
+## Equality and hashing form one contract
+
+The [`Hash` trait documentation](https://doc.rust-lang.org/std/hash/trait.Hash.html) requires equal keys to produce equal hashes. A correct implementation must also remain consistent with `Eq`.
+
+For a map key, I check two dimensions:
+
+```text
+same moment:  k1 == k2 implies hash(k1) == hash(k2)
+over time:    hash and equality of an inserted key remain stable
+```
+
+A custom implementation can satisfy the first at every instant but violate the second through interior mutability. That is what the fixture does: both `Hash` and `Eq` read the same current cell value, yet the current value changed after insertion.
+
+## Rust's borrowing rules do not prevent every mutation
+
+The map does not normally give callers a mutable reference to an inserted key. This protects the common case. But `Cell`, `RefCell`, atomics, mutexes, global state, and shared pointers can change values through a shared reference.
+
+Custom `Hash` or `Eq` implementations can also consult external state such as locale, configuration, or a mutable registry. Even if the key fields look immutable, this creates time-dependent identity.
+
+I keep collection identity based on plain, stable data: integer IDs, owned strings, fixed tuples, or dedicated newtypes whose compared and hashed fields cannot change.
+
+## Remove, change, and reinsert
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-132/fixed.rs) uses immutable `u32` keys. To change identity, it removes the value under `7` and inserts it under `8`.
+
+This sequence allows the map to compute the correct placement for the new key. In a real application I perform it through one owning API so there is no interval where another component mutates shared key state behind the collection.
+
+If I need mutable metadata associated with an entity, I put that data in the map value, not in the part of the key used for identity:
+
+```rust
+HashMap<EntityId, MutableEntityState>
+```
+
+The stable ID answers “which entity?” while the value answers “what is its current state?”
+
+## Rebuilding is a recovery tool, not the design
+
+When a system already contains corrupted logical keys, ordinary `get` or `remove` may not find them. Iterating or draining the complete map and rebuilding a new map can rehash every key from its current state.
+
+This can recover accessibility, but it does not solve concurrent or future mutation. It may also discover that two formerly distinct keys became equal, forcing a conflict policy. I treat rebuilding as migration or repair, then change the representation.
+
+For caches, indexes, and deduplication maps, I add invariant tests that mutate every allowed value field and confirm key lookup remains stable. Property tests can compare equivalent keys and their hashes, although they must also model time if interior state exists.
+
+## My debugging sequence
+
+When a map entry appears during iteration but cannot be found, I do this:
+
+1. Print or record the lookup key's current hash and equality-relevant fields.
+2. Inspect the stored key through iteration without assuming `get` works.
+3. Audit `Hash` and `Eq` for interior or external mutable state.
+4. Check whether the key changed after insertion through another shared handle.
+5. Rebuild the map only as a controlled recovery step.
+6. Redesign around an immutable identity and move mutable state into the value.
+
+The wider principle is that data structures depend on semantic invariants that the type system cannot always enforce. Safe Rust prevents memory corruption here, but reliable behaviour still depends on keeping collection identity stable for the complete time an item is indexed.

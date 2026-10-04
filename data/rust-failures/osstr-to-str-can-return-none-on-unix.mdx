@@ -1,0 +1,80 @@
+---
+caseId: "RFA-326"
+title: "OsStr::to_str Can Return None on Unix"
+date: "2026-09-06T01:46:00+01:00"
+lastmod: "2026-09-06T01:46:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "d9de36f343d86e5244c3b17042cb86eeca80ce1f957032579b297faf74e055cd"
+area: "ffi-targets"
+symptom: "A valid Unix path or process argument cannot be borrowed as str because the operating-system string contains bytes that are not valid UTF-8."
+summary: "Unix OsString can preserve arbitrary non-NUL bytes while Rust str requires UTF-8. Keep operating-system values as OsStr, use Unix byte extensions when exact bytes matter, and choose lossy display only for presentation."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["Unix"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust OsStr to_str returns None Unix", "non UTF-8 filename Rust", "OsString invalid UTF-8 bytes"]
+evidence: ["Rust 1.98.1 Unix OsString", "explicit invalid UTF-8 byte", "lossy display and exact-byte recovery"]
+sources: ["https://doc.rust-lang.org/std/ffi/struct.OsStr.html#method.to_str", "https://doc.rust-lang.org/std/ffi/struct.OsStr.html#method.to_string_lossy", "https://doc.rust-lang.org/std/os/unix/ffi/trait.OsStringExt.html"]
+---
+
+I once wrote a directory walker that called `path.to_str().unwrap()` before sending names to a filter. It worked on my repository and failed on a valid Unix filename created from non-UTF-8 bytes.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-326/fail.rs) constructs exactly such an `OsString`. Calling `to_str()` returns `None`.
+
+## Operating-system strings are not Rust strings
+
+[`OsStr::to_str`](https://doc.rust-lang.org/std/ffi/struct.OsStr.html#method.to_str) returns an `Option<&str>` because conversion is possible only when the entire operating-system string is valid Unicode in the required representation. A Rust `str` always contains valid UTF-8.
+
+On Unix, file names and process arguments are byte-oriented at the operating-system boundary, with NUL reserved by many system interfaces. They need not be UTF-8. [`OsStringExt::from_vec`](https://doc.rust-lang.org/std/os/unix/ffi/trait.OsStringExt.html) therefore lets Unix-specific code construct an owned OS string directly from bytes.
+
+The mismatch is not corrupt data. It is two different validity models meeting.
+
+## Keep paths as paths for as long as possible
+
+Most filesystem operations accept `Path` or `OsStr`. I do not need to convert a path to text to open it, join another component, inspect metadata, rename it, or pass it to a child process.
+
+Early conversion makes a portable filesystem program reject values the operating system itself accepts. It can also encourage string concatenation where `PathBuf::push` would preserve separators and platform behaviour.
+
+I convert only at a boundary that truly needs Unicode, such as a JSON field or a text-only search index. At that boundary, conversion failure becomes an explicit product decision.
+
+## Lossy conversion is for display, not identity
+
+[`to_string_lossy`](https://doc.rust-lang.org/std/ffi/struct.OsStr.html#method.to_string_lossy) replaces invalid sequences with the Unicode replacement character. The [repaired fixture](/rust-failure-atlas/evidence/RFA-326/fixed.rs) shows `f`, an invalid byte, and `o` becoming `f�o` for display.
+
+That output may be appropriate in a log or terminal message where readable best effort is valuable. It must not become a canonical key. Different invalid byte sequences can collapse into the same lossy string, so round-tripping and identity are lost.
+
+The fixture also recovers the original bytes with the Unix extension trait. Exact byte handling stays behind a target-specific API, which makes the portability boundary visible.
+
+## Serialization needs a reversible representation
+
+JSON object strings are Unicode text. A backup manifest or remote execution protocol that must reproduce every Unix path cannot store only `to_string_lossy()` output.
+
+I use an explicit encoding for raw bytes, often paired with a human-readable lossy field. The schema says which representation is authoritative and which platforms can consume it. Base64, hex, or an array of byte values can work; the important property is reversibility.
+
+I do not label raw path bytes as UTF-8. That creates invalid assumptions in every later consumer.
+
+## Logging must remain useful without becoming ambiguous
+
+For logs, I want operators to recognise a path and still distinguish unexpected bytes. One approach is a display form plus an escaped byte form. Structured logs can retain both.
+
+I also avoid using raw untrusted path text as a terminal control surface. Escaping control characters and separators prevents a filename from forging a new log line or making two records look like one.
+
+This is separate from UTF-8 validity. A perfectly valid Unicode string can still contain confusing control characters.
+
+## Cross-platform code should not assume Unix bytes everywhere
+
+The `std::os::unix::ffi` traits are intentionally Unix-specific. Other platforms represent OS strings differently. A portable library can keep opaque `OsStr` values in its core and place exact representation logic behind target modules.
+
+If an application protocol requires UTF-8 paths on every participant, I validate that rule explicitly and report unsupported names. That is a product limitation, not a general property of `Path`.
+
+## Tests should create the difficult name directly
+
+Source files and shell scripts are awkward ways to create invalid UTF-8 fixtures. On Unix, constructing `OsString` from bytes makes the case deterministic. For an integration test I create a temporary directory entry using that path, perform the real operation, and clean it up using the original `PathBuf` rather than its display form.
+
+My test matrix includes valid ASCII, valid non-ASCII UTF-8, an invalid byte, empty components where APIs allow them, and names containing display-confusing characters. Target-specific tests are conditionally compiled rather than pretending all OS strings share one representation.
+
+## What RFA-326 establishes
+
+The evidence is scoped to Unix and Rust 1.98.1. It proves that a valid `OsString` can fail UTF-8 borrowing, that lossy display inserts a replacement character, and that exact bytes remain available through the Unix extension.
+
+The core principle is representation honesty. Operating-system identifiers, human text, and serialized strings overlap but are not identical domains. I keep `OsStr` opaque while doing OS work, preserve exact bytes when identity matters, and make any lossy presentation obvious at its boundary.

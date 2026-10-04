@@ -1,0 +1,102 @@
+---
+caseId: "RFA-147"
+title: "Rust Iterator::map_while Is Not Fused After None"
+date: "2026-09-05T15:47:00+01:00"
+lastmod: "2026-09-05T15:47:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "f285ff4ad377c11114ff6e843cb6818584c4a77a5461646b2349ad583d67963c"
+area: "concurrency-memory"
+symptom: "A map_while iterator returns Some again after it already returned None, breaking code that used the first None as permanent exhaustion."
+summary: "map_while stops the current next call when its closure returns None, but the adapter is documented as not fused. If a consumer can poll after None, add fuse or make permanent termination part of the state machine."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust map_while returns Some after None", "map_while iterator not fused", "Iterator fuse after map_while None"]
+evidence: ["Rust 1.98.1 runtime assertion", "post-None next call", "Iterator::fuse repair"]
+sources: ["https://doc.rust-lang.org/std/iter/trait.Iterator.html#method.map_while", "https://doc.rust-lang.org/std/iter/trait.Iterator.html#method.fuse", "https://doc.rust-lang.org/std/iter/trait.FusedIterator.html"]
+---
+
+For a long time I carried a convenient mental shortcut: once an iterator returns `None`, it is finished. This is true for many iterators, and a normal `for` loop makes it look universal. It is not the complete `Iterator` contract.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-147/fail.rs) maps `[1, 2, 3, 4]`. Its closure returns `None` only for `2`. Three calls to `next` produce `Some(1)`, `None`, then `Some(3)`. The third result surprises code that assumes the first `None` permanently ended the sequence.
+
+## None ends one request, not always the iterator
+
+The basic `Iterator::next` method returns either the next item or `None`. The general trait permits an iterator to produce another item on a later call. Permanent exhaustion is an additional guarantee represented by `FusedIterator`.
+
+[`map_while`](https://doc.rust-lang.org/std/iter/trait.Iterator.html#method.map_while) applies a closure until that closure returns `None`. Its documentation explicitly says the iterator is not fused and recommends `fuse` if this behaviour matters.
+
+In the fixture, the underlying array iterator keeps advancing:
+
+```text
+input 1 -> closure returns Some(1)
+input 2 -> closure returns None
+input 3 -> a later next calls the closure again -> Some(3)
+```
+
+`map_while` has not stored a permanent “stopped” bit. The first `None` is observable, but it does not rewrite all future calls.
+
+## Why a for loop usually hides it
+
+A `for` loop stops as soon as `next` returns `None`. It does not call again to see whether the iterator resumes. So this code yields only `1`:
+
+```rust
+for value in values.map_while(parse) {
+    consume(value);
+}
+```
+
+The non-fused detail becomes visible with manual iteration, parsers, custom combinators, test helpers, or any interface that may poll more than once after completion. It also matters when I pass an iterator into generic code whose assumptions are stronger than the `Iterator` trait itself.
+
+This is why the type-level distinction exists. “Most consumers stop” is not the same guarantee as “every future call returns `None`.”
+
+## Fuse records permanent completion
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-147/fixed.rs) adds:
+
+```rust
+.map_while(transform)
+.fuse()
+```
+
+[`Iterator::fuse`](https://doc.rust-lang.org/std/iter/trait.Iterator.html#method.fuse) wraps the iterator and remembers when `None` first appears. Later `next` calls return `None` without asking the inner iterator for another item.
+
+That small state bit changes the observable protocol:
+
+```text
+ordinary Iterator: Some*, None, then unspecified by the base trait
+fused Iterator:    Some*, None, None, None ...
+```
+
+The [`FusedIterator` marker trait](https://doc.rust-lang.org/std/iter/trait.FusedIterator.html) lets generic code know the second rule is promised. I do not implement this marker because an iterator happens to behave that way in my current tests. I implement it only when the design makes resumption impossible.
+
+## map_while is not filter_map
+
+Another source of confusion is the similar name. `filter_map` treats `None` as “skip this item” and keeps scanning in the same consumer call sequence. `map_while` exposes `None` from `next`, which causes collectors and loops to stop.
+
+If invalid items should be ignored, I use `filter_map`. If the first invalid item marks the end of a prefix, I use `map_while`. If the iterator may be manually polled afterward and must remain finished, I also use `fuse`.
+
+The choice describes different data semantics, not only style.
+
+## A parser example makes the risk clearer
+
+Imagine reading numeric header lines until a blank line. A consumer collects the prefix, then hands the same iterator to another stage. If the first stage uses `map_while`, the blank line is consumed and the following body lines remain available. That may be exactly the intention.
+
+If instead the iterator is exposed as a permanently completed result stream, allowing a later caller to resume into the body violates that API. The repair can be `fuse`, but it can also be a better boundary: return the parsed header and the remaining input as two explicit values.
+
+I first decide whether resumption is useful. Then I encode the answer.
+
+## My verification checklist
+
+For an iterator termination bug, I test the sequence of calls, not only `collect()`:
+
+1. Record every `Some` and the first `None`.
+2. Call `next` again at least twice.
+3. Check the adapter's `FusedIterator` implementation, not its name.
+4. Decide whether the consumer is allowed to poll after completion.
+5. Add `fuse` at the boundary that promises permanent exhaustion.
+
+I also avoid relying on a downstream adapter to fuse by accident. The place that exports the contract should make it clear.
+
+The wider principle is useful in systems code: an end signal can describe the current interaction or a permanent state transition. `map_while` gives the first. `fuse` adds the second. When I state which one my code needs, the surprising `Some` after `None` stops being mysterious.

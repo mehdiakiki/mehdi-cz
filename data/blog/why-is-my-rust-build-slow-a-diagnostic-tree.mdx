@@ -1,0 +1,201 @@
+---
+title: "Why Is My Rust Build Slow? A Diagnostic Tree"
+date: "2026-09-09T06:40:00+01:00"
+lastmod: "2026-09-09T06:40:00+01:00"
+tags: ["rust", "cargo", "compile times", "build performance", "rustc"]
+draft: false
+reviewed: true
+reviewedHash: "560789d9adf2097425488450a8d13b4357364110354d2736261fa4c3022006d3"
+cluster: "rust-under-the-hood"
+campaign: "editorial"
+summary: "A measured decision tree for slow Rust builds: use cargo --timings for the shape, the Cargo fingerprint log for unexpected rebuilds, and -Ztime-passes for the phase inside one crate."
+---
+
+A slow Rust build is almost always one of four situations: a single crate that dominates the wall clock, a dependency graph that cannot use the cores you have, a rebuild that fires when nothing meaningful changed, or the link step. These four have nothing in common, so a fix for one does nothing for the others. Before I change any setting, I run three commands that tell me which of the four I have. This article is that tree, with the measurements I ran to check each branch.
+
+Toolchain: `rustc 1.95.0-nightly (3a70d0349 2026-02-27)` and `cargo 1.95.0-nightly (f298b8c82 2026-02-24)`, x86-64 Linux, 16 logical cores. I measure on that nightly because step 3 uses a `-Z` flag, and stable at the time of writing, 1.98, refuses every `-Z` option. The fixture is in `experiments/rust-atlas/build-times`, has no external dependencies, so every command runs with `--offline`, and every time below is the median of three runs.
+
+## The three commands, in order
+
+```text
+1. What is the shape of the build?
+   cargo build --timings
+
+2. Why did this unit rebuild at all?
+   CARGO_LOG=cargo::core::compiler::fingerprint=info cargo build
+
+3. Which compiler phase is slow inside that one crate?
+   cargo rustc -p <crate> -- -Ztime-passes
+```
+
+The order matters. Question 3 is meaningless before question 2: a crate that recompiles for a bad reason should stop recompiling, not be made faster.
+
+## Step 1: `cargo build --timings` tells me the shape
+
+`cargo build --timings` writes an HTML report with one row per compilation unit: a start time, a duration, and a split between the frontend and the codegen part. Cargo also stores that schedule as a JavaScript array inside the HTML, so I parse it into a table instead of reading the chart.
+
+Here is a clean build of the three-crate variant of my fixture:
+
+```text
+unit                      start    dur  frontend  codegen
+shared lib                 0.05   0.38      0.37     0.01
+part00 lib                 0.41   2.99      0.19     2.80
+part01 lib                 0.41   3.00      0.20     2.80
+part02 lib                 0.41   3.02      0.19     2.83
+app lib                    0.61   0.03      0.02     0.01
+app bin                    3.43   0.08      link        -
+```
+
+Four facts fall out of this table. The three `part` crates start at the same moment, so they run in parallel. Each of them spends about 15 times longer in codegen than in its frontend, so this is a backend problem and not a type-checking problem.
+
+The other two facts are at the ends of the schedule. The `app` library starts at 0.61 seconds, while `part02` is still in codegen until 3.43 seconds. And the last unit has no frontend or codegen section at all: that is the link step, 0.08 seconds out of a 3.51 second build.
+
+## Step 2: the fingerprint log tells me why something rebuilt
+
+`--timings` says how long a unit took. It does not say why it ran. For that, Cargo has an internal log:
+
+```bash
+CARGO_LOG=cargo::core::compiler::fingerprint=info cargo build
+```
+
+On an edit to the deepest crate of a three-crate workspace, that log prints one line per dirty unit:
+
+```text
+[core-a]: dirty: FsStatusOutdated(StaleItem(ChangedFile { ...
+             stale: "WS/core-a/src/lib.rs" ... }))
+[core-b]: dirty: FsStatusOutdated(StaleDepFingerprint { unit: UnitIndex(1) })
+[app]:    dirty: FsStatusOutdated(StaleDepFingerprint { unit: UnitIndex(1) })
+```
+
+That is the shape I expect: one crate is dirty because a file changed, and the two above it are dirty because a dependency is dirty. When the log says something else, the build is rebuilding for a reason I did not intend. The full catalogue of dirty reasons, and the six triggers I reproduced, is in "Why Did Cargo Rebuild This Crate? Reading Fingerprints and Dirty Reasons", later in this series.
+
+The width of a rebuild follows the position of the edit. Here `app` depends on `core-b`, which depends on `core-a`:
+
+| I edited | crates recompiled | wall time |
+| --- | ---: | ---: |
+| nothing | 0 | 0.02 s |
+| `app/src/main.rs` (root) | 1 | 0.06 s |
+| `core-b/src/lib.rs` (middle) | 2 | 0.09 s |
+| `core-a/src/lib.rs` (leaf) | 3 | 0.11 s |
+| cold build | 3 | 0.21 s |
+
+The workspace is tiny, so the seconds are not interesting. The counts are. An edit near the leaves costs the whole chain above it. An edit at the root costs one unit.
+
+## Step 3: `-Ztime-passes` tells me the phase inside one crate
+
+When step 1 says one crate dominates, I ask the compiler to break that crate down. This flag needs nightly:
+
+```bash
+cargo rustc --offline -p app --lib -- -Ztime-passes
+```
+
+Sorted by time, the single-crate variant of my fixture gives:
+
+```text
+time:   5.167  total
+time:   4.027  LLVM_passes
+time:   4.018  finish_ongoing_codegen
+time:   0.784  codegen_crate
+time:   0.781  codegen_to_LLVM_IR
+time:   0.304  generate_crate_metadata
+time:   0.300  monomorphization_collector_graph_walk
+time:   0.009  MIR_borrow_checking
+time:   0.008  type_check_crate
+```
+
+Type checking is 0.008 seconds of a 5.167 second compilation. LLVM is 4.027 seconds, about 78 percent. So simplifying trait bounds would not help this crate. It emits too much machine code, and the way to spend less time is to emit less.
+
+A richer version of the same breakdown comes from rustc's self-profiler, also a nightly flag, and its own topic, covered in "Reading rustc Self-Profile Data to Find a Slow Crate".
+
+## Branch: one crate dominates the wall clock
+
+If `--timings` shows one long bar and `-Ztime-passes` blames LLVM, the crate is producing too many machine-code instances. In Rust that usually means generics.
+
+A generic function is not compiled where it is written. It is compiled once per concrete type in the crate that uses it. So a small library with a large generic body is cheap to build itself and expensive for every consumer. The mechanism, and the codegen-unit partitioning that splits that work into parallel jobs, is in "Where Rust Monomorphization Happens and Why Codegen Units Matter".
+
+I confirm this branch by counting instances in the linked binary with `nm`. When the binary holds many copies of one generic body, the crate boundary is the cause, not the code inside the crate. The measured version of that comparison is in "The Unit of Rebuild When You Split a Rust Workspace", later in this series.
+
+The layer between MIR and the LLVM bitcode that these phase names describe is covered in "How a Rust Function Becomes LLVM IR Without Losing the Plot".
+
+## Branch: the graph is wide but the build is not parallel
+
+The second shape is a long chain of small units. Cargo can only start a unit once its dependencies have produced enough output, so a deep chain serialises no matter how many cores exist.
+
+Cargo softens this with pipelining. A dependent crate waits for the metadata, which the frontend produces first, not for codegen to finish. In the table above, `app lib` was type checked 2.82 seconds before `part02` finished emitting code.
+
+So the useful question is not how many crates I have, but how deep the longest chain is. A wide, shallow graph parallelises. A narrow, deep one does not. Reshaping the graph is the subject of "The Unit of Rebuild When You Split a Rust Workspace", later in this series.
+
+A lonely long bar also has a compiler-side explanation, described in "rustc's Query System: Why the Compiler Computes Facts on Demand": rustc computes facts on demand, so a crate whose queries funnel into one expensive fact cannot parallelise internally.
+
+## Branch: a build script ran again
+
+`--timings` shows build-script units separately. If a build script appears on every incremental build, the script is declaring its inputs badly, not doing too much work.
+
+I reproduced the common version by deleting a file that a build script still declared through `cargo::rerun-if-changed`. A declared input that does not exist can never be proven unchanged, so the script and everything above it recompiled on every build afterwards, quietly, because the build still succeeds.
+
+The signature is a dirty reason that repeats between two consecutive builds. A reason that appears once after an edit is normal. A reason that never goes away is a declaration bug. The rules for making a script's input boundary explicit are in "Why Cargo Build Scripts Rerun and How to Make Them Predictable".
+
+## Branch: the link step
+
+A unit in the timing report with no frontend and no codegen section is a link. In my fixture the link was 0.08 seconds of a 3.51 second build, and it stayed between 1.4 and 2.3 percent of the build across the three variants I measured.
+
+It is small because the fixture has no external dependencies and produces a tiny binary. In a real application with hundreds of crates and debug information turned on, the same unit can be the largest bar in the report. This branch is decided by the report, not by a rule of thumb.
+
+Link time is also where diagnostics from a component that is not rustc arrive. Since Rust 1.97 the linker's own stderr is forwarded through a lint, which makes it easier to tell whether a warning came from the compiler or from the system linker. That distinction is in "Rust 1.97 Linker Messages: Which Warnings Belong to rustc?".
+
+## Branch: the command changed, not the code
+
+The most confusing slow builds are the ones where nothing in the repository changed. Two shapes are worth telling apart.
+
+Changing the feature set of a command, for example `cargo build -p one-crate` after a workspace build, asks for a package compiled with different features. Changing `RUSTFLAGS` asks for every package compiled with different flags. In both cases current Cargo writes the new result beside the old one instead of replacing it, so the cost is one extra build per configuration and switching back is free.
+
+An environment variable that the source reads at compile time behaves differently. It belongs to the content of the fingerprint rather than to the name of the cache entry, so each new value replaces the previous one. In my fixture, alternating that variable recompiled all 3 crates every single time.
+
+Which shape you have decides what to do. A one-time cost per configuration needs no action. A cost on every alternation means two tools disagree about the environment, and the fix is to make them agree. Both shapes, and the log lines that tell them apart, are in "Why Did Cargo Rebuild This Crate? Reading Fingerprints and Dirty Reasons", later in this series.
+
+The feature case has a larger version at workspace scale, where a package is compiled twice because a host tool and a target build activate different features. That is explained in "Cargo Feature Unification Across Workspaces, Host Tools, and Targets". The flag case is why denying warnings through `RUSTFLAGS` is expensive on a shared cache, and why Cargo added a way to do it without changing the compilation, described in "Denying Rust Warnings Without Throwing Away the Cargo Cache".
+
+If the dependency versions themselves moved between two builds, nothing above applies and the question is a resolution question. "Cargo Resolver 3: How MSRV Changes Dependency Selection" covers when Cargo picks a different release than expected.
+
+## Branch: rustc ran but reused almost nothing
+
+Cargo freshness and rustc incremental compilation are two separate caches. Cargo decides whether to invoke rustc at all. If rustc runs, rustc decides how much of its previous work it can reuse. A build can be slow because the second cache missed while the first behaved correctly.
+
+Editing one constant in one module of the single-crate variant took 4.97 seconds, against a 5.69 second cold build. Cargo did exactly the right thing and recompiled one unit. The incremental cache inside that unit still recovered very little. What makes rustc's graph go red is covered in "What Invalidates Rust's Incremental Compilation Cache".
+
+This branch is misdiagnosed most often, because the Cargo output looks correct. One crate recompiled, which is what the graph says should happen. The cost sits one layer below.
+
+The editor has its own version of this question, since rust-analyzer maintains a separate incremental graph with different invalidation rules. That is the subject of "How rust-analyzer Recomputes Only What an Edit Invalidates".
+
+## When splitting into crates does not help
+
+The standard advice for a slow Rust build is to split the code into more crates. It is good advice for the edit-build cycle and poor advice for the full build, and the reason is the branch above: generic instances that were emitted once in one crate are emitted once per crate that uses them.
+
+I generated the same 12 modules as 1 crate, 3 crates, and 12 crates and built all three. With a single job, so parallelism could hide nothing, the twelve-crate layout took 2.5 times as long as the single crate. With 16 jobs the ordering changed but did not reverse: three crates was fastest, and twelve was still slower than three.
+
+So splitting moves work out of the edit-build cycle and into the full build. It is a good trade when I rebuild after an edit fifty times a day and build cold once. It is a loss on a two-core runner that only ever builds cold.
+
+Splitting also does nothing when it leaves the shape of the graph unchanged. A new crate that the old crate immediately depends on adds a unit without shortening the path from an edit to the binary. The full experiment, with the incremental side measured, is in "The Unit of Rebuild When You Split a Rust Workspace", later in this series.
+
+## What I check before changing a build setting
+
+1. Run `cargo build --timings` on a clean target directory. Is the report one long bar, many parallel bars, a long chain, or a large link unit?
+2. Run a no-op build twice. If the second one compiles anything, read the fingerprint log before touching anything else.
+3. Run the fingerprint log on the edit I actually make all day, not on a synthetic one.
+4. Confirm with `-Ztime-passes` that the slow unit is slow in codegen, not in the frontend.
+5. Check whether the same package appears twice in the report with different features.
+6. Check whether any build script unit appears on an incremental build.
+7. Only then change one setting, and rerun the same three commands.
+
+Steps 1 to 6 are free and reversible. Step 7 is neither. Most compile-time advice online is a list of step 7 actions with no step 1.
+
+More on this cluster: the [Rust under the hood](/blog/topics/rust-under-the-hood) topic hub, and everything tagged [compile times](/blog/tags/compile-times/page/1).
+
+## Sources
+
+- [Reporting build timings](https://doc.rust-lang.org/cargo/reference/timings.html), the Cargo book, on what each section of the `--timings` report means.
+- [Build cache](https://doc.rust-lang.org/cargo/guide/build-cache.html), the Cargo book, on the layout of `target/` and what makes a unit fresh.
+- [Profiles](https://doc.rust-lang.org/cargo/reference/profiles.html), the Cargo book, on settings that change compilation and therefore change the cache key.
+- [time-passes](https://doc.rust-lang.org/nightly/unstable-book/compiler-flags/time-passes.html), the unstable book, on the flag used in step 3 and why it is nightly only.
+- [Profiling the compiler](https://rustc-dev-guide.rust-lang.org/profiling.html), the rustc dev guide, on the self-profiler and the measureme tooling built around it.
+- [Monomorphization](https://rustc-dev-guide.rust-lang.org/backend/monomorph.html), the rustc dev guide, on where generic instances are collected and emitted.

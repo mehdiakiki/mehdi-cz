@@ -1,0 +1,103 @@
+---
+caseId: "RFA-276"
+title: "Why OpenOptions::create Still Needs Write or Append"
+date: "2026-09-06T00:56:00+01:00"
+lastmod: "2026-09-06T00:56:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "8f42115c6111f7458610f2b4efe93daa39904e2738ee2bff5386a85947844a93"
+area: "ffi-targets"
+symptom: "OpenOptions with read and create enabled fails with InvalidInput because create does not implicitly grant write or append access."
+summary: "OpenOptions flags describe separate permissions and creation behavior. create(true) may create a missing path only when write(true) or append(true) is also selected; add the access mode deliberately."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["targets implementing std::fs"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust OpenOptions create without write InvalidInput", "create true read true OpenOptions fails", "OpenOptions create requires write append Rust"]
+evidence: ["Rust 1.98.1 unique temporary path", "InvalidInput open failure", "explicit read-write creation repair"]
+sources: ["https://doc.rust-lang.org/std/fs/struct.OpenOptions.html#method.create", "https://doc.rust-lang.org/std/fs/struct.OpenOptions.html#method.write", "https://doc.rust-lang.org/std/fs/struct.OpenOptions.html#method.open"]
+---
+
+I configured `OpenOptions` with `read(true)` and `create(true)`. The name “create” made me think a missing file would appear and then open for reading. Instead, `open` returned `InvalidInput`.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-276/fail.rs) uses a unique missing path in the temporary directory. [`OpenOptions::create`](https://doc.rust-lang.org/std/fs/struct.OpenOptions.html#method.create) does not imply permission to write that file.
+
+## Creation policy and access mode are separate
+
+An `OpenOptions` builder describes several dimensions:
+
+```text
+read or write access
+append behavior
+creation of a missing path
+truncation of an existing file
+exclusive creation
+platform-specific flags
+```
+
+`create(true)` answers what may happen when the path is missing. It does not answer what access the resulting handle receives.
+
+The standard contract requires `write(true)` or `append(true)` when creation is enabled. With neither, `open` fails with `ErrorKind::InvalidInput`.
+
+## Builder calls do not grant permissions by implication
+
+This explicitness is useful. If `create` silently enabled writes, a helper that looked read-only could obtain stronger access than its caller intended.
+
+I read the final builder as a set of flags, not as a sentence where one word modifies all the others. The operating-system open mode is assembled from the whole set.
+
+Calling methods in a different order does not solve a contradictory or incomplete configuration. `create(true).read(true)` and `read(true).create(true)` mean the same flags.
+
+## Choose the smallest correct mode
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-276/fixed.rs) enables both read and write because it needs to create and then hold a readable file. If the application only appends records, append plus create may express the contract better.
+
+I avoid adding write mechanically. Access should follow actual operations:
+
+```text
+read existing only                  -> read
+create if missing, then read/write  -> read + write + create
+append or create log                -> append + create
+replace existing contents           -> write + create + truncate
+create only when absent             -> write + create_new
+```
+
+These examples are policies, not interchangeable recipes. Replacement and exclusive creation have very different data-loss and race behavior.
+
+## Opening successfully does not write content
+
+Even with write and create enabled, `open` creates an empty file when the path is missing. It does not write a header, flush application buffers, or make a multi-file operation durable.
+
+The handle's `metadata` can confirm a file exists, as the repair fixture does. Real initialization still needs write operations and explicit error handling.
+
+If readers can observe the path concurrently, creating an empty file before writing its valid content may expose a partial state. A temporary file plus durable write and rename is often a better publication protocol.
+
+## Existing paths add another branch
+
+With `create(true)`, an existing file can be opened rather than rejected. Whether its bytes remain depends on flags such as `truncate` and how later writes are positioned.
+
+If uniqueness matters, `create_new(true)` asks for an atomic failure when the target already exists. A prior `exists()` check followed by ordinary creation has a race between the two operations.
+
+I include missing and existing paths in tests because an option set can be safe in one branch and destructive in the other.
+
+## Error kind is better than error text
+
+The failing fixture's `expect` exposes the error for a human-readable proof. Production code should normally inspect [`io::Error::kind`](https://doc.rust-lang.org/std/io/struct.Error.html#method.kind) or propagate the full source error.
+
+Operating-system messages differ by platform and environment. Matching their text makes tests fragile. For this invalid option combination, the documented Rust-level kind is the stable fact to assert.
+
+Paths can fail for many other reasons after the configuration is valid: missing parents, denied permissions, read-only filesystems, exhausted descriptors, and races. Do not collapse them into “file not found.”
+
+## Temporary evidence must clean up
+
+The two fixtures use a path containing the process ID and remove it before use. The repair closes the handle and removes the created file afterward.
+
+In larger tests I prefer a dedicated temporary directory with automatic cleanup. Tests should not share a predictable filename, because parallel execution can turn a deterministic option check into a race.
+
+The evidence does not assume that opening a random path is harmless. It scopes creation to the operating system's temporary location and removes only its exact target.
+
+## What I verify
+
+My matrix covers missing and existing targets for read-only, read-write create, append-create, truncate, and exclusive create combinations used by the application. I assert open result, error kind, final bytes, and whether the path exists.
+
+For durable replacement I also inject write and sync failures and verify that the old path remains usable. `OpenOptions` selects one handle; it is only the beginning of a crash-safe storage protocol.
+
+The core principle is that capability and fallback policy are independent. `create(true)` permits a missing path to be created, but write or append access must authorize that operation. Spell out the final access mode, then test both the missing-path and existing-path branches.

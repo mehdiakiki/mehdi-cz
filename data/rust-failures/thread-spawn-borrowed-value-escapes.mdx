@@ -1,0 +1,99 @@
+---
+caseId: "RFA-089"
+title: "E0521: Why a Borrowed Value Escapes Through thread::spawn"
+date: "2026-09-05T09:09:00+01:00"
+lastmod: "2026-09-05T09:09:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "61143274430a7bae67f8d99e54c00454d2cd820c106398620f99f3e0017a633b"
+area: "async-runtime"
+symptom: "A thread spawned inside a function rejects a borrowed &str because the reference escapes and would need to be static."
+summary: "thread::spawn may outlive the function that created it, so borrowed stack data cannot enter its closure. Transfer owned data or use scoped threads when borrowing is the design."
+rustVersions: ["Rust 1.98.1"]
+targets: ["targets with std thread support"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust E0521 borrowed data escapes thread spawn",
+    "thread spawn closure requires static",
+    "move borrowed str into thread",
+  ]
+evidence: ["Rust 1.98.1 compile failure", "thread lifetime boundary", "owned-transfer repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/std/thread/fn.spawn.html",
+    "https://doc.rust-lang.org/error_codes/E0521.html",
+  ]
+---
+
+This helper tries to print a borrowed label on another thread:
+
+```rust
+fn spawn_label(label: &str) {
+    std::thread::spawn(|| println!("{label}"));
+}
+```
+
+Rust 1.98.1 reports E0521, `borrowed data escapes outside of function`, and also explains that the closure may outlive the current function. The [failing fixture](/rust-failure-atlas/evidence/RFA-089/fail.rs) reproduces both parts.
+
+The reference is valid only for the lifetime chosen by the caller. The spawned thread has an independent lifetime. It can remain alive after `spawn_label` returns and after the caller destroys the string. Rust refuses to make those two timelines agree without evidence.
+
+## spawn cannot borrow an ordinary stack frame
+
+The standard [`thread::spawn` signature](https://doc.rust-lang.org/std/thread/fn.spawn.html) requires its closure and return value to be `'static`. This does not mean every captured value must live forever. Owned values such as `String` satisfy the requirement because the closure owns them and can drop them when the thread finishes.
+
+What cannot satisfy it is a reference tied to a shorter, unknown caller lifetime. The [E0521 explanation](https://doc.rust-lang.org/error_codes/E0521.html) describes borrowed data escaping a closure or function boundary.
+
+The missing join inside the helper makes the danger obvious, but adding a join later in the function does not always help the type of `spawn`. Its API must be safe for all control paths, including panics or early returns. It cannot encode a borrow from the current stack frame.
+
+## Transfer ownership when the thread is independent
+
+The repaired helper creates owned data and moves it into the closure:
+
+```rust
+fn spawn_label(label: &str) -> std::thread::JoinHandle<()> {
+    let owned = label.to_owned();
+    std::thread::spawn(move || println!("{owned}"))
+}
+```
+
+The [fixed fixture](/rust-failure-atlas/evidence/RFA-089/fixed.rs) joins the handle and verifies the complete lifecycle. `move` alone is not enough in the failing version: moving an `&str` only copies the reference into the closure. Creating a `String` transfers ownership of the characters.
+
+This distinction matters with `&Arc<T>` too. Moving a reference to an Arc is not the same as cloning the Arc and moving the owned clone.
+
+## Scoped threads preserve a borrowing relationship
+
+If copying or allocating is unnecessary and the parent can wait, `std::thread::scope` expresses a different contract. Scoped threads must finish before the scope returns, so they may borrow data that outlives the scope.
+
+This is often the better design for parallel processing of slices. The data remains owned by the caller, workers borrow disjoint or shared portions, and the scope proves no worker escapes.
+
+I choose between ordinary and scoped threads based on lifecycle:
+
+- An independent worker receives owned state and returns a `JoinHandle` or communicates through channels.
+- A temporary parallel computation uses a scope and borrows from its parent.
+
+Trying to make one API behave like the other usually leads to unnecessary `'static` annotations.
+
+## Adding 'static to the parameter is restrictive
+
+Changing the function to accept `&'static str` compiles for string literals. It rejects dynamically created strings even when the helper could have owned a copy. This repair is correct only if the domain truly promises static data.
+
+Leaking a String to manufacture a static reference is almost never the answer. It turns a local lifetime issue into permanent memory growth.
+
+## Thread completion is part of ownership
+
+The original helper drops the JoinHandle immediately, detaching the thread. The program may exit before it prints, and failures are ignored. In the repaired example I return the handle so the caller decides when to join and how to process a panic.
+
+In service code I often prefer a long-lived worker with a channel rather than spawning one thread per item. The same ownership question remains: messages own their payload or borrow only within a structured scope.
+
+## My debugging method
+
+When E0521 mentions `'static`, I draw two endpoints: when the referenced value may be dropped, and when the task or thread is guaranteed to finish. Then I select one of three changes:
+
+1. Move owned data so the worker controls its lifetime.
+2. Introduce a scoped concurrency boundary proving the worker finishes first.
+3. Narrow the API to genuinely static data when that is the real domain contract.
+
+I do not add lifetime parameters randomly. Lifetimes describe existing relationships; they cannot make an independently scheduled thread finish sooner.
+
+The compiler error is therefore a lifecycle review. The durable repair makes thread ownership and completion visible, instead of forcing a borrowed reference through a boundary that has no reason to respect it.

@@ -1,0 +1,139 @@
+---
+caseId: "RFA-030"
+title: "spawn_blocking Work Keeps a Tokio Runtime Alive During Shutdown"
+date: "2026-09-04T21:00:00+01:00"
+lastmod: "2026-09-07T11:00:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "f904b53b13ec735f5d8b057b88c15c7299df553e30a36e30b93417cf28d7c78c"
+area: "async-runtime"
+symptom: "A Rust process finishes its async work but does not exit because dropping the Tokio runtime waits for a started spawn_blocking closure."
+summary: "Started spawn_blocking tasks cannot be aborted. This case separates an async shutdown bug from blocking work that outlives the service and shows repairs with real stop signals."
+rustVersions: ["stable Rust", "Tokio 1.x"]
+targets: ["host runtime target"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  ["tokio runtime shutdown hangs", "spawn_blocking cannot abort", "tokio process will not exit"]
+evidence: ["runtime-drop timing trace", "blocking-task lifecycle log", "cooperative stop fixture"]
+sources:
+  [
+    "https://docs.rs/tokio/latest/tokio/task/fn.spawn_blocking.html",
+    "https://docs.rs/tokio/latest/tokio/runtime/struct.Runtime.html#method.shutdown_timeout",
+  ]
+---
+
+A service receives its shutdown signal. Async workers stop, request handlers finish, and the final log line appears. Still, the process does not exit.
+
+In this case I do not start by debugging the signal handler. I first ask whether a `spawn_blocking` closure has already started and is still running. Tokio cannot cancel ordinary synchronous code in the middle. When the runtime is dropped, it waits for started blocking tasks to return, and that wait has no automatic deadline.
+
+## A minimal reproduction
+
+This program can wait forever at the end of the runtime scope:
+
+```rust
+use std::sync::{Arc, Condvar, Mutex};
+
+fn main() {
+    let parked = Arc::new((Mutex::new(false), Condvar::new()));
+    let worker_state = parked.clone();
+
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async move {
+        tokio::task::spawn_blocking(move || {
+            let (lock, wake) = &*worker_state;
+            let stopped = lock.lock().unwrap();
+            let _guard = wake.wait_while(stopped, |stop| !*stop).unwrap();
+        });
+    });
+
+    // Dropping `runtime` waits for the started blocking task.
+    drop(runtime);
+}
+```
+
+Aborting the returned `JoinHandle` is not a general solution:
+
+```rust
+let handle = tokio::task::spawn_blocking(|| blocking_operation());
+handle.abort();
+```
+
+Abort may prevent a queued blocking task from starting. Once the closure runs, abort has no effect on the synchronous instructions inside it. Rust and Tokio cannot safely tear down an arbitrary thread stack.
+
+The Atlas [failure program](/rust-failure-atlas/evidence/RFA-030/fail/src/main.rs) waits for the closure's start acknowledgment before dropping its pinned Tokio 1.53.1 runtime. Its child process must then exceed a wall-clock deadline at `drop(runtime)`. The [repaired program](/rust-failure-atlas/evidence/RFA-030/fixed/src/main.rs) sends a real stop condition, awaits the blocking task, and only then drops the runtime. The paired [lockfile](/rust-failure-atlas/evidence/RFA-030/fixed/Cargo.lock) keeps this a runtime claim rather than a moving dependency claim.
+
+## The first check: bracket runtime destruction
+
+I add two wall-clock logs around the point which owns or drops the runtime:
+
+```rust
+let before = std::time::Instant::now();
+eprintln!("dropping runtime");
+drop(runtime);
+eprintln!("runtime dropped after {:?}", before.elapsed());
+```
+
+If the second line never appears, I inspect started blocking closures before changing async cancellation code. Each closure gets a start and finish event with a stable operation name. A start without a finish is direct evidence.
+
+This also separates the case from an async task that refuses to yield. Runtime shutdown attempts to abort spawned async tasks. A started blocking closure has the different lifetime rule documented by Tokio.
+
+## `shutdown_timeout` changes the wait, not the task
+
+An owned runtime offers `shutdown_timeout`:
+
+```rust
+runtime.shutdown_timeout(std::time::Duration::from_secs(2));
+```
+
+After two seconds, the method can return even when blocking work remains. The task is not cancelled; it is allowed to continue. This can put the application into a dangerous state if the caller assumes every thread has stopped and removes files, releases a process lock, or starts a replacement instance.
+
+I use a shutdown timeout as a final containment boundary, not as proof of clean termination. The normal path must still ask blocking code to stop and observe that it did.
+
+## Build cancellation into the synchronous operation
+
+A bounded loop can check a stop flag between units of work:
+
+```rust
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+
+let stop = Arc::new(AtomicBool::new(false));
+let worker_stop = stop.clone();
+
+let worker = tokio::task::spawn_blocking(move || {
+    while !worker_stop.load(Ordering::Acquire) {
+        process_one_bounded_unit();
+    }
+});
+
+// During shutdown:
+stop.store(true, Ordering::Release);
+worker.await.unwrap();
+```
+
+The unit must really be bounded. If `process_one_bounded_unit` can block forever in a library call, the flag is never checked. For file descriptors or sockets, a close, deadline, or library-specific interrupt may be required. For a persistent worker, a dedicated `std::thread` with an explicit command channel often describes the ownership more honestly than `spawn_blocking`.
+
+Tokio positions `spawn_blocking` for non-async work that eventually finishes. It is convenient for a bounded parser or filesystem call. It is a poor hidden home for an endless consumer loop.
+
+## Limit concurrency for CPU work
+
+The blocking pool permits many threads because it also serves blocking I/O. Sending unbounded CPU-heavy work into it can create another shutdown problem: a long queue of tasks which all need to finish.
+
+I put a semaphore in front of CPU-bound submissions, or use an executor designed for CPU work. The important point is that shutdown owns both running work and queued work. Rejecting new submissions must happen before waiting for current jobs.
+
+## The shutdown sequence I want
+
+For a component with blocking workers, I make the order explicit:
+
+1. Stop accepting new units.
+2. Signal every synchronous worker through a flag, channel, close, or deadline.
+3. Await or join each worker.
+4. Record workers which miss the graceful deadline.
+5. Apply the outer runtime timeout only as containment.
+
+This sequence turns “the process sometimes hangs” into states I can observe.
+
+## The regression proof
+
+My test starts one blocking worker, waits until it confirms that it is running, sends shutdown, and requires a completion acknowledgment before a wall-clock deadline. I avoid a test that aborts immediately because it may win the race before the closure starts and hide the exact production failure.
+
+The important distinction is started versus queued. A queued closure may be prevented from starting. A started closure owns ordinary synchronous execution and must cooperate if I need it to stop.

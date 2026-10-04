@@ -1,0 +1,104 @@
+---
+caseId: "RFA-144"
+title: "Why a MutexGuard in while let Lives Through the Loop Body"
+date: "2026-09-05T14:44:00+01:00"
+lastmod: "2026-09-05T14:44:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "9e0a35023be699ee8771187832a86ddd8536992bcd7626dcabfdbd3ed9d5a201"
+area: "concurrency-memory"
+symptom: "A mutex locked only inside a while let condition is still locked in the loop body, so acquiring it again blocks or returns WouldBlock."
+summary: "The temporary scope of a pattern-matching while condition includes its consequent loop body. The unnamed MutexGuard therefore survives longer than the pop call; bind the result in a separate statement or helper so the guard drops before body work begins."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["targets with std::sync"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust while let mutex guard held through loop body", "temporary lifetime while let lock deadlock", "Mutex try_lock WouldBlock inside while let"]
+evidence: ["Rust 1.98.1 deterministic WouldBlock", "while-let temporary drop scope", "separate statement repair"]
+sources: ["https://doc.rust-lang.org/reference/destructors.html#temporary-scopes", "https://doc.rust-lang.org/std/sync/struct.Mutex.html#method.try_lock"]
+---
+
+The [failing program](/rust-failure-atlas/evidence/RFA-144/fail.rs) writes a compact worker loop:
+
+```rust
+while let Some(value) = queue.lock().unwrap().pop() {
+    // process value
+}
+```
+
+Inside the body, a non-blocking second acquisition returns `WouldBlock`. The first `MutexGuard` looks like a temporary needed only for `pop`, but its drop scope covers the body.
+
+## Temporary values still have precise scopes
+
+Rust often drops an unnamed temporary at the end of its statement. Pattern-matching control flow has more specific rules because values produced by the condition can be borrowed or moved into the consequent body.
+
+The [Reference temporary-scope section](https://doc.rust-lang.org/reference/destructors.html#temporary-scopes) states that the pattern-matching condition and loop body of `while` form a temporary scope. The guard created while evaluating the condition therefore remains alive during the matching iteration.
+
+The loop is closer to this ownership shape:
+
+```text
+create guard
+evaluate pop and match
+run body for successful match
+drop condition temporaries
+begin next condition
+```
+
+It is not equivalent to calling a helper that returns an owned `Option<T>` after dropping its guard.
+
+## The runtime symptom may be a deadlock
+
+`std::sync::Mutex` is not required to detect recursive acquisition by the same thread in a friendly way. Calling blocking `lock()` again can wait forever or have platform-dependent behaviour.
+
+The fixture uses [`try_lock`](https://doc.rust-lang.org/std/sync/struct.Mutex.html#method.try_lock), which returns immediately. It reports `WouldBlock`, making the hidden guard lifetime deterministic without hanging the evidence runner.
+
+Real code may block indirectly. The loop body can call another function, emit a callback, update a metric with the same state, or await work that later needs the mutex. The second lock site may be far from the condition that still owns the first guard.
+
+## Give the guard a smaller statement
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-144/fixed.rs) evaluates the pop in its own statement and inner block:
+
+```rust
+let next = { queue.lock().unwrap().pop() };
+let Some(value) = next else { break };
+```
+
+The guard is not stored in `next`; only the owned `Option<i32>` is. It drops at the end of the initializer statement before the body processes `value`.
+
+I like this form because the critical section is visually small. A named helper can make the contract even clearer:
+
+```rust
+fn pop_one<T>(queue: &Mutex<Vec<T>>) -> Option<T> {
+    queue.lock().unwrap().pop()
+}
+```
+
+The function return boundary ends the guard before the caller begins processing.
+
+## Rust 2024 did not shorten this while let case
+
+Rust 2024 narrowed some temporary lifetimes, notably `if let` temporaries before an `else` branch and block tail-expression temporaries. It is easy to overgeneralize that edition change and assume every pattern condition now drops early.
+
+The Reference still lists the pattern-matching `while` condition together with its consequent body. The loop may need values bound by the pattern during that body, so the scope remains different.
+
+I test the exact construct and edition rather than relying on a memory that “temporary lifetimes changed in 2024.”
+
+## Keep work outside the critical section
+
+Even when no second lock exists, holding the guard across the body can serialize expensive processing. Queue throughput falls because producers and other consumers wait while one item is handled.
+
+Popping an owned item under the lock and processing it afterward is usually the intended design. If the item borrows from protected storage, it cannot safely outlive the guard; I then redesign ownership or deliberately accept a longer critical section.
+
+For async work, I use the runtime-appropriate primitive and avoid holding a synchronous guard across `.await`. The temporary-scope lesson still applies: I make acquisition and release visible before suspension or callbacks.
+
+## My debugging sequence
+
+When a lock appears to outlive its expression, I do this:
+
+1. Identify the value that owns unlocking, normally a guard's destructor.
+2. Read the temporary scope of the complete `if let`, `while let`, or `match`, not only the method call.
+3. Reproduce with `try_lock` or a timeout instead of allowing a test to hang.
+4. Bind an owned result in a separate statement or helper.
+5. Keep callbacks, I/O, heavy computation, and awaits outside the critical section.
+6. Test the precise Rust edition when temporary-scope rules are relevant.
+
+The broad principle is that source brevity does not imply a short ownership lifetime. An unnamed RAII guard still follows formal drop scopes. Giving the protected operation its own statement makes both the lock duration and the system's concurrency behaviour easier to reason about.

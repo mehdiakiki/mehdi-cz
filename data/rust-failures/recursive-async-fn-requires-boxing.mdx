@@ -1,0 +1,123 @@
+---
+caseId: "RFA-073"
+title: "E0733: Why Direct Recursion Makes an Async Future Infinitely Sized"
+date: "2026-09-05T08:40:00+01:00"
+lastmod: "2026-09-05T08:40:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "4b916f00c0d01da9a5c67c412b9ba681c4519a6d8c51d1f942af7797720a6371"
+area: "diagnostics-macros"
+symptom: "A directly recursive async function fails with E0733 because its generated future would need to contain itself."
+summary: "Each suspended recursive call becomes state stored inside its parent future. Introduce pointer indirection with a boxed future, or rewrite the traversal iteratively when depth and allocation matter."
+rustVersions: ["Rust 1.98.1"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust E0733 recursion in async fn requires boxing",
+    "recursive async function infinitely sized future",
+    "Box pin recursive future Rust",
+  ]
+evidence: ["Rust 1.98.1 compile failure", "future-size expansion", "boxed-future repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/error_codes/E0733.html",
+    "https://doc.rust-lang.org/std/boxed/struct.Box.html#method.pin",
+  ]
+---
+
+A synchronous recursive function has a fixed stack-frame layout. An async recursive function first has to create one concrete value representing every suspended state:
+
+```rust
+async fn countdown(remaining: u32) {
+    if remaining > 0 {
+        countdown(remaining - 1).await;
+    }
+}
+```
+
+Rust 1.98.1 emits E0733: recursion in an async function requires boxing. The [failing fixture](/rust-failure-atlas/evidence/RFA-073/fail.rs) contains no runtime or executor because the failure happens while the future type is formed.
+
+## Expand one generated state
+
+An `async fn` returns an anonymous future. When it reaches an await that is not ready, the future must retain everything needed to resume. In this example that includes the child future returned by `countdown(remaining - 1)`.
+
+Without indirection, the layout equation looks like:
+
+```text
+CountdownFuture = state + CountdownFuture
+```
+
+Expanding the child gives another child forever. No finite `size_of::<CountdownFuture>()` can satisfy that recursive inline layout.
+
+A synchronous recursive call does not put the child frame inside the type of the parent frame. Runtime stack allocation provides indirection between calls. Async state machines are values, so equivalent indirection must be represented in their types.
+
+## Box the recursive future boundary
+
+One explicit repair returns a pinned trait-object future:
+
+```rust
+use std::future::Future;
+use std::pin::Pin;
+
+fn countdown(
+    remaining: u32,
+) -> Pin<Box<dyn Future<Output = ()>>> {
+    Box::pin(async move {
+        if remaining > 0 {
+            countdown(remaining - 1).await;
+        }
+    })
+}
+```
+
+Each recursive state now stores a fixed-size box pointer. The allocation behind the pointer can contain the next future without making the parent's inline size recursive. [`Box::pin`](https://doc.rust-lang.org/std/boxed/struct.Box.html#method.pin) allocates and pins the future in one operation.
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-073/fixed.rs) constructs the recursive future successfully on Rust 1.98.1. The fixture does not claim that construction alone tests an executor; it verifies the compile-time layout repair.
+
+## Borrowed input needs a lifetime on the box
+
+If the recursion borrows a tree, the returned object normally includes the borrow:
+
+```rust
+fn visit<'a>(node: &'a Node)
+    -> Pin<Box<dyn Future<Output = ()> + 'a>>
+```
+
+Without `+ 'a`, a trait-object lifetime default may imply a static requirement and produce a separate error. Boxing solves size recursion; it does not make borrowed data owned or static.
+
+Send requirements are also separate. A task-spawning API may need `+ Send`, and every value held across await must then support it.
+
+## Boxing every level has a cost
+
+The boxed version can allocate once per recursive call and dynamically dispatch polling. For a shallow control-plane traversal, that can be perfectly reasonable. For deep trees or hot parsing, I consider an explicit work stack:
+
+```rust
+let mut pending = vec![root];
+while let Some(node) = pending.pop() {
+    process(node).await;
+    pending.extend(node.children().rev());
+}
+```
+
+This uses one growable collection, makes traversal order visible, and avoids one future allocation per level. It also changes when siblings are stored and may alter cancellation points, so I test behavior rather than assuming it is mechanically equivalent.
+
+Neither version automatically protects against excessive logical depth. Boxing prevents an infinitely sized _type_, while a hostile or cyclic input can still create unbounded allocations or work at runtime. I add a depth or visited-node policy when the data is not already guaranteed to be a finite tree.
+
+Cancellation is another difference worth testing. Dropping a boxed recursive future drops the currently constructed chain of child futures. An iterative traversal may keep pending nodes in one collection instead. Cleanup and partial side effects should have an explicit invariant in both forms.
+
+## Indirect recursion can hide the cycle
+
+The cycle may pass through two functions:
+
+```text
+load_directory -> load_entry -> load_directory
+```
+
+The compiler diagnostic can point at only one await. I draw a call graph containing async edges and find a place where one edge can introduce boxing or become iterative. Boxing every function is unnecessary; one indirection in the recursive type cycle is enough.
+
+## A macro can package, not remove, the decision
+
+Helper crates and macros can transform recursive async functions into boxed futures. They reduce syntax, but the allocation, lifetime, Send bound, and cancellation behavior still exist. For a reference resource, I prefer showing the expanded signature before recommending convenience tooling.
+
+The official [E0733 page](https://doc.rust-lang.org/error_codes/E0733.html) gives the essential size explanation. My practical check is to write the future layout equation. If the anonymous state contains itself inline, introduce one deliberate pointer boundary or replace call-stack recursion with an explicit data structure.

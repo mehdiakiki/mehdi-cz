@@ -1,0 +1,73 @@
+---
+caseId: "RFA-650"
+title: "Dropping a Vec Drain Still Removes the Selected Range"
+date: "2026-09-06T08:10:00+01:00"
+lastmod: "2026-09-06T08:10:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "c33ffe20fa3fd679ea760271c4a6d4090c0c2bdae78f88b1e2168d9cbd1308f2"
+area: "concurrency-memory"
+symptom: "Creating and immediately dropping Vec::drain still removes the range, contrary to the assumption that only yielded elements are deleted."
+summary: "Drain is a mutating removal operation which also returns removed elements lazily. Treat the iterator as temporary ownership of an already selected range, and use iter for observation."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust Vec drain dropped without consume", "does Vec drain remove all elements", "Vec drain iterator side effects"]
+evidence: ["Rust 1.98.1 runtime assertion", "drain 1 through 3 dropped immediately", "vector retains only elements outside range"]
+sources: ["https://doc.rust-lang.org/std/vec/struct.Vec.html#method.drain", "https://doc.rust-lang.org/std/vec/struct.Drain.html", "https://doc.rust-lang.org/std/vec/struct.Vec.html#method.retain"]
+---
+
+`Vec::drain(range)` has two jobs: remove a range from the vector and let the caller iterate over the removed values. The removal is not conditional on consuming every value. The [failing fixture](/rust-failure-atlas/evidence/RFA-650/fail.rs) drops the drain immediately and shows that the vector still becomes `[1, 4]`.
+
+## The iterator owns the removal operation
+
+While the drain exists, it holds an exclusive borrow of the vector. The vector cannot be used directly. When the drain is consumed or dropped, the collection completes the state needed to leave the remaining elements contiguous and valid.
+
+The [`Vec::drain` documentation](https://doc.rust-lang.org/std/vec/struct.Vec.html#method.drain) explicitly says that dropping the returned iterator removes all elements in the range, including those not yet yielded. The [`Drain` type](https://doc.rust-lang.org/std/vec/struct.Drain.html) represents that temporary operation.
+
+I therefore read `drain` as mutation first and iteration second. Lazy production does not imply lazy commitment of every side effect.
+
+## Use iter or a slice for observation
+
+If I only need to inspect elements, I borrow `&values[range]` or call `iter` on a checked slice. Neither removes anything. If I need copies while preserving the vector, I collect cloned or copied values deliberately.
+
+If removal depends on a predicate, [`retain`](https://doc.rust-lang.org/std/vec/struct.Vec.html#method.retain) states that elements failing the predicate are deleted. `extract_if` can yield removed elements under its own rules. I select the operation from the mutation contract, not from the fact that all of them return or accept iterators.
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-650/fixed.rs) expects the documented post-drain vector. Another valid repair for an observational task would avoid drain entirely.
+
+## Partial consumption still removes the rest
+
+Calling `next` once gives ownership of one removed element. Dropping the iterator afterward does not preserve the unvisited part of its original range. Code that wants “remove at most one” should use `remove`, `swap_remove`, `pop`, or a narrower one-element drain according to ordering needs.
+
+This matters when mapping removed elements performs external effects. If processing fails after one item, the remaining selected values may already be gone from the vector. I separate mutation from fallible external work when recovery matters.
+
+A robust workflow might first identify keys, perform idempotent work, and then retain/delete confirmed items, or move the whole batch into a separate owned queue with explicit retry state.
+
+## Forgetting Drain is a documented hazard
+
+The standard docs warn that leaking the drain—for example with `mem::forget`—can cause the vector to lose elements outside the specified range as well. Memory safety is preserved, but unspecified loss is allowed.
+
+I do not intentionally forget library guards or iterators unless their leak behaviour is understood. RAII types often perform essential cleanup in Drop. Avoiding Drop can leak locks, file state, temporary ownership, or collection repair.
+
+Unsafe code holding vector pointers must also account for drain moving elements and changing length. Safe borrowing normally prevents simultaneous access, which is one reason to keep the operation scoped tightly.
+
+## Test post-state, not only yielded values
+
+An iterator-focused test may collect the expected removed items and never inspect the source afterward. I assert both sides: yielded sequence and remaining vector. I also test empty ranges, full ranges, range boundaries, partial consumption, and early drop.
+
+For elements with Drop, tests can count destruction or movement effects without relying on unspecified global drop order. Panic behaviour inside processing code deserves a test because unwinding drops the drain.
+
+Performance review considers shifting cost for elements after the range and allocation for any collected removed values. Drain can be efficient, but correctness comes from its state transition.
+
+## My drain checklist
+
+- Is the caller intending to mutate or only observe the vector?
+- What exact range becomes selected at drain creation?
+- Will the iterator be fully consumed, partially consumed, or dropped immediately?
+- Does failure while processing removed items need rollback or retry state?
+- Would remove, swap_remove, retain, extract_if, or a slice state intent better?
+- Are unsafe pointers invalidated by length changes or element movement?
+- Could the drain be leaked rather than dropped?
+- Do tests assert both yielded elements and final vector contents?
+
+The core principle is that an iterator can represent an in-progress mutation, not merely a view. `Vec::drain` transfers a selected range out of the collection, and Drop finishes the collection state. I choose it only when that removal is already intended.

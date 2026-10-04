@@ -1,0 +1,82 @@
+---
+caseId: "RFA-105"
+title: "Why Cargo Rejects Cyclic Package Dependencies Before Compilation"
+date: "2026-09-05T10:05:00+01:00"
+lastmod: "2026-09-05T10:05:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "53b4c5f5ed265e0ae70ebc55074b146a37d290573a3b535aa36d2b0d6fffb589"
+area: "cargo-dependencies"
+symptom: "Cargo reports that a package depends on itself through another package and stops before either crate is compiled."
+summary: "Rust modules may refer through a crate hierarchy, but Cargo packages must form an acyclic normal dependency graph. Break the cycle by moving the shared contract downward or orchestration upward."
+rustVersions: ["Rust 1.98.1", "Cargo 1.98.1"]
+targets: ["all targets"]
+profiles: ["check", "dev", "release", "test"]
+searchTerms: ["Cargo cyclic package dependency depends on itself", "Rust crates circular dependency", "break Cargo dependency cycle"]
+evidence: ["Cargo 1.98.1 resolution failure", "two-package direct cycle", "one-direction dependency repair"]
+sources: ["https://doc.rust-lang.org/cargo/reference/resolver.html", "https://doc.rust-lang.org/reference/items/modules.html"]
+---
+
+The [failing workspace](/rust-failure-atlas/evidence/RFA-105/fail/Cargo.toml) is deliberately small: package A depends on B, and package B depends on A. Cargo prints the full path and says package A depends on itself.
+
+No Rust item has been type-checked yet. The problem is not recursive function calls. It is that Cargo cannot order the compilation units as a directed acyclic dependency graph.
+
+## Package edges and code calls are different graphs
+
+Recursive code is possible. A function can call another function that later calls back, provided the runtime recursion is valid. Rust modules can also refer to sibling or parent items according to visibility and name-resolution rules described in the [module reference](https://doc.rust-lang.org/reference/items/modules.html).
+
+Crate compilation has a stricter direction. To compile A, rustc needs metadata from dependency B. To compile B, it needs metadata from dependency A. Neither metadata artifact can be produced first.
+
+The [Cargo resolver](https://doc.rust-lang.org/cargo/reference/resolver.html) builds the package graph and selects versions and features. A normal package cycle makes this graph invalid, so adding `Box`, changing lifetimes, or delaying a function call cannot help.
+
+## The cycle usually exposes confused ownership
+
+I often find a cycle after splitting one crate into several crates. A contains domain types and B contains an adapter, but A also imports B to provide a convenience function. The lower-level contract now knows the higher-level implementation.
+
+Other common shapes are:
+
+- a macro crate wants types from the consumer while the consumer uses the macro;
+- two feature modules were extracted into packages but still share concrete types;
+- a test helper becomes a normal dependency in both directions;
+- generated code imports the generator's runtime while the generator imports the schema crate.
+
+The cycle is a design signal. It says the packages do not yet have a clear dependency direction.
+
+## Move contracts downward, composition upward
+
+The [repaired workspace](/rust-failure-atlas/evidence/RFA-105/fixed/Cargo.toml) keeps B independent and lets A depend on B. This tiny example puts the base operation below the composed operation.
+
+For real systems I use one of three patterns.
+
+First, extract shared traits and data types into a small third crate. A and B depend on the contract crate, while neither depends on the other. This works when the shared material is stable and genuinely neutral.
+
+Second, move orchestration into an application crate above both libraries. A and B expose capabilities; the binary wires them together. This is often the cleanest repair because policy belongs at the top.
+
+Third, merge the crates and use modules. Separate packages have release, compilation, feature, and public API costs. If two parts must change and know each other continuously, a module boundary may be more honest.
+
+## Traits can invert the concrete dependency
+
+Suppose domain crate A wants to call a storage implementation in B. Instead of depending on B, A can define the minimal storage trait it needs. B implements that trait, and an application constructs the implementation.
+
+This is dependency inversion, but I keep it concrete. A trait created only to remove an arrow should represent a useful behavioral contract and be testable. A huge trait copying every method from B merely hides the same coupling.
+
+Callbacks, generic parameters, and trait objects choose different ownership and performance costs. The goal is not maximum abstraction. The goal is one explainable direction.
+
+## Development dependencies do not erase every concern
+
+Cargo treats some development-dependency situations differently because dev dependencies are not used when compiling a package for ordinary use. Still, relying on a test-only reverse edge needs care: features can behave differently, publishing checks may expose the graph, and examples or integration tests are separate crates.
+
+I first remove cycles from normal and build dependencies. Then I run `cargo check --workspace --all-targets` and the feature combinations that CI and publishing use.
+
+## My debugging sequence
+
+When Cargo gives a cycle path, I do not start editing manifests at random:
+
+1. Draw the exact directed edges from the error.
+2. Label what crosses each edge: types, traits, generated code, helpers, or orchestration.
+3. Decide which package owns the stable contract.
+4. Move shared contracts downward or wiring upward.
+5. Merge packages if the separation has no independent value.
+6. Check the full workspace, targets, features, and package publication boundaries.
+
+A cycle cannot be fixed by choosing which package compiles first; both demand the other's completed metadata. It is fixed by changing ownership. Once the architecture has a direction, Cargo's build order follows naturally.

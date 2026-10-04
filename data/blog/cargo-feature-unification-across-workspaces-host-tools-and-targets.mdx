@@ -1,0 +1,216 @@
+---
+title: "Cargo Feature Unification Across Workspaces, Host Tools, and Targets"
+date: "2026-09-27T17:00:00+01:00"
+tags: ["rust", "cargo", "features", "workspaces", "build systems"]
+draft: false
+reviewed: true
+reviewedHash: "b09db686d342d03129a2a98b56e38ad792c625b67e3ee1f84dafc751205e8d0d"
+cluster: "rust-under-the-hood"
+campaign: "authority-2026"
+opportunity: "RUST-015"
+summary: "A concrete Cargo dependency graph showing when features unite across workspace packages and when host, target, and platform edges stay separate."
+---
+
+Cargo features are additive, but “Cargo unifies features” is not a complete mental model.
+
+The same package version may be built with a union of features for two workspace applications. It may also be built a second time because one use belongs to a build script on the host and another belongs to the final target. A Windows-only edge may exist in `Cargo.lock` and still not activate during a Linux build.
+
+I understood this better after I stopped looking only at `Cargo.toml` and started asking two questions:
+
+1. Which packages and targets did this Cargo command select?
+2. Which dependency kind and compile target does each edge belong to?
+
+This article builds one small graph and follows the answers.
+
+## The experiment workspace
+
+I used Cargo 1.98 with resolver version 2. The same feature-unification behaviour also applies when using resolver 3; resolver 3 adds Rust-version-aware dependency selection, not a new stable feature-unification model.
+
+The workspace has three members:
+
+```toml
+# Cargo.toml
+[workspace]
+members = ["shared", "app", "cli"]
+resolver = "2"
+```
+
+The `shared` crate exposes four empty marker features:
+
+```toml
+[features]
+normal = []
+build-side = []
+cli-side = []
+windows-side = []
+```
+
+The application uses the same crate through three edges:
+
+```toml
+# app/Cargo.toml
+[dependencies]
+shared = { path = "../shared", features = ["normal"] }
+
+[build-dependencies]
+shared = { path = "../shared", features = ["build-side"] }
+
+[target.'cfg(windows)'.dependencies]
+shared = { path = "../shared", features = ["windows-side"] }
+```
+
+The CLI has one normal edge:
+
+```toml
+# cli/Cargo.toml
+[dependencies]
+shared = { path = "../shared", features = ["cli-side"] }
+```
+
+No external crates are needed, so the graph is easy to inspect.
+
+## Building one package selects one normal feature set
+
+For a Linux host, this command selects only `app`:
+
+```bash
+cargo tree -e features -p app
+```
+
+The important result is:
+
+```text
+app
+└── shared feature "normal"
+[build-dependencies]
+└── shared feature "build-side"
+```
+
+The Windows feature does not activate because Windows is not the selected target. The CLI feature does not activate because `cli` is not among the selected workspace packages.
+
+This matters during debugging. `cargo build -p app` and `cargo build --workspace` do not necessarily build the same feature graph.
+
+## Building the workspace unifies normal target edges
+
+Now I run:
+
+```bash
+cargo build --workspace -vv
+```
+
+The verbose rustc commands show two builds of `shared`:
+
+```text
+host build:
+  --cfg feature="build-side"
+
+normal target build:
+  --cfg feature="normal"
+  --cfg feature="cli-side"
+```
+
+The normal dependency from `app` and the normal dependency from `cli` are selected in one Cargo invocation, so their features are united. The build-dependency edge stays separate under resolver 2 because build scripts run in the host dependency domain.
+
+In this native build, host and target triples happen to be the same string. They are still different dependency roles. Cross-compilation makes the distinction more visible, but the resolver already knows it.
+
+## Resolver 2 separates three important cases
+
+The [Cargo resolver documentation](https://doc.rust-lang.org/cargo/reference/resolver.html#feature-resolver-version-2) defines the three separations introduced by resolver 2:
+
+- target-specific features for targets not currently built are ignored;
+- build-dependency and proc-macro features do not unite with normal dependency features;
+- dev-dependency features stay separate unless a target needing them is being built.
+
+This avoids a classic `no_std` problem. A build dependency can require `std` on the host without forcing `std` into the same crate used for an embedded target.
+
+The separation can cause the dependency to compile more than once. That extra build is the price of keeping incompatible feature contexts apart.
+
+## Selection scope still causes workspace surprises
+
+Inside one normal target domain, selected workspace members still share feature unions.
+
+Suppose `app` expects `shared` without `cli-side`, but a `cfg(feature = "cli-side")` path changes behaviour. These commands can differ:
+
+```bash
+cargo test -p app
+cargo test --workspace
+```
+
+The second command selects `cli`, so `shared` can gain the CLI feature in its normal target build. A test that passes only in the workspace-wide command may be depending accidentally on that union.
+
+If two workspace programs genuinely need separate feature sets for the same dependency, build them in separate Cargo invocations. Stable Cargo does not promise package-by-package feature isolation within one selected build.
+
+## `Cargo.lock` is wider than one compile
+
+Cargo resolves the lockfile with a graph broad enough to support features and target edges that may be selected later. It then determines the actual activated features for the current command.
+
+This explains a common confusion:
+
+```text
+dependency appears in Cargo.lock
+does not imply
+dependency is compiled for this command
+```
+
+A Windows-only optional dependency can be in the resolved graph while a Linux build does not activate its feature or compile its unit.
+
+## Default features participate in the union
+
+`default-features = false` is local to one dependency declaration. Another selected edge can enable defaults, and the union wins for that feature domain.
+
+This is unsafe reasoning:
+
+```toml
+[dependencies]
+codec = { version = "1", default-features = false }
+```
+
+It does not prove that `codec` is built without defaults. A transitive or workspace edge may enable them. The [Cargo features reference](https://doc.rust-lang.org/cargo/reference/features.html#dependency-features) explicitly warns about this.
+
+For a feature that must never coexist with another feature, I add a compile-time guard in the dependency itself:
+
+```rust
+#[cfg(all(feature = "backend-a", feature = "backend-b"))]
+compile_error!("backend-a and backend-b cannot be enabled together");
+```
+
+Features should normally be additive. If enabling a feature removes APIs or changes an existing contract, downstream unification becomes fragile.
+
+## The commands I use to investigate
+
+I begin with the exact failing command, not a generic tree:
+
+```bash
+cargo tree -e features -p app
+cargo tree -e features --workspace
+cargo tree -e features -i shared
+cargo tree -e features --target x86_64-pc-windows-msvc
+```
+
+`-e features` shows which edges enable features. `-i shared` inverts the graph around the dependency. An explicit `--target` prevents my host from silently deciding the platform view.
+
+When the tree still surprises me, `cargo build -vv` shows the actual `--cfg feature="..."` flags passed to each rustc invocation. That is the final evidence for what compiled.
+
+I also run important feature combinations explicitly in CI:
+
+```bash
+cargo check -p my-crate --no-default-features
+cargo check -p my-crate --all-features
+cargo check --workspace --all-targets
+```
+
+For libraries, I add meaningful supported combinations instead of assuming `--all-features` represents every user.
+
+## A compact prediction rule
+
+Before running Cargo, I predict feature activation in this order:
+
+1. determine selected workspace packages and targets;
+2. remove inactive target and dependency-kind edges according to the resolver;
+3. group remaining edges by package version and feature domain;
+4. take the union of requested features inside each group;
+5. expect one compilation unit per distinct target, profile, and feature set.
+
+This model is not every Cargo implementation detail, but it predicts the cases that usually hurt: workspace-wide builds, build scripts, proc macros, tests, and cross-target dependencies.
+
+Cargo does unify features. The senior-level detail is knowing **which graph is being unified for this command**.

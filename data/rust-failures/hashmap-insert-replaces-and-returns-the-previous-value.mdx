@@ -1,0 +1,75 @@
+---
+caseId: "RFA-653"
+title: "HashMap insert Replaces and Returns the Previous Value"
+date: "2026-09-06T08:13:00+01:00"
+lastmod: "2026-09-06T08:13:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "e390d96c915b2db4486befb21fe061013936915a4cd8b1ee05943330f6d9381c"
+area: "concurrency-memory"
+symptom: "Inserting running for an existing job key returns Some(queued), not None, because HashMap::insert replaces and yields the old value."
+summary: "insert is an upsert operation. Its Option reports replacement, not success. Use Entry when create-versus-update behaviour, validation, or atomic map-local decisions matter."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust HashMap insert return old value", "HashMap insert replace existing key", "Rust Entry API insert if absent"]
+evidence: ["Rust 1.98.1 runtime assertion", "second insert for job returns queued", "new value stored and previous value checked"]
+sources: ["https://doc.rust-lang.org/std/collections/hash_map/struct.HashMap.html#method.insert", "https://doc.rust-lang.org/std/collections/hash_map/enum.Entry.html", "https://doc.rust-lang.org/std/collections/hash_map/struct.HashMap.html#method.try_insert"]
+---
+
+`HashMap::insert(key, value)` always leaves the supplied value under that key. Its return is `None` when no value existed and `Some(old)` when one was replaced. The [failing fixture](/rust-failure-atlas/evidence/RFA-653/fail.rs) expects None on a repeated job key and shows the previous `queued` state instead.
+
+## The Option describes history
+
+The [`insert` documentation](https://doc.rust-lang.org/std/collections/hash_map/struct.HashMap.html#method.insert) states that the new value replaces any existing value and the old one is returned. `Some` is not an error and `None` is not a general success signal.
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-653/fixed.rs) asserts both facts: insertion returned the previous state and lookup now produces `running`.
+
+I name the return `previous`, not `result`, so reviews can read the operation without remembering a boolean convention.
+
+## Upsert may be too broad for the domain
+
+Replacing configuration, cache entries, or last-seen metadata can be correct. Replacing a user, payment attempt, or state-machine record without checking history can hide duplicate input or an invalid transition.
+
+If creation must fail when occupied, I use the [`Entry` API](https://doc.rust-lang.org/std/collections/hash_map/enum.Entry.html) and distinguish `Vacant` from `Occupied`, or an appropriate `try_insert` API when available for the toolchain. If update requires comparing the old state, `Entry` keeps lookup and mutation in one map borrow.
+
+The standard HashMap is not a cross-thread or database transaction. “One map lookup” does not make external side effects atomic. I keep that scope clear.
+
+## Key ownership has a subtle guarantee
+
+When an equal key already exists, insert updates the value but does not replace the stored key object according to the method documentation. This matters when equal keys carry non-equality metadata or allocated spelling.
+
+In well-designed maps, equality and hashing represent the complete key identity, and callers should not depend on which equal allocation remains. If canonical spelling matters, I normalise before insertion or use Entry to update key/value deliberately with supported methods.
+
+Mutating a key so its Hash or Eq changes while stored is a logic error. Safe APIs usually prevent direct key mutation, but interior mutability can still violate the contract.
+
+## Replacement drops resources
+
+If the caller ignores the returned old value, it is dropped at the end of the statement. Replacing a value can close a channel, decrement an Arc, release a file handle, or run a custom destructor immediately.
+
+I make this lifecycle explicit for registries. Sometimes the old service needs graceful shutdown before destruction. I retain the returned value and perform that sequence outside the map borrow.
+
+If constructing the new value is fallible, I finish construction before insertion so the old value remains on failure. If post-insert work can fail, I define whether rollback is possible or the map already committed.
+
+## Entry avoids repeated lookup
+
+The pattern `contains_key` followed by `insert` hashes and searches twice and can drift into inconsistent branching during refactors. `entry(key).or_insert_with(...)` computes a default only when absent. `and_modify` expresses update-then-or-insert flows.
+
+Closures passed to Entry should avoid expensive captured work unless invoked. I test occupied and vacant paths separately, including resource drops and error conversion.
+
+For concurrent maps, use the chosen crate’s documented entry and locking semantics. The standard map requires external synchronization for shared mutation.
+
+Metrics distinguish creations from replacements. A single “insert succeeded” counter hides duplicate rates and state churn, while separate occupied and vacant observations reveal retry storms or bad upstream keys. I avoid labels containing raw keys because they can leak data and create unbounded cardinality. Tests also cover replacement with an equal value: the operation still has occupied semantics even when the visible state appears unchanged.
+
+## My HashMap insertion checklist
+
+- Does the domain want insert, update, or explicit upsert?
+- Is the returned Option understood as the previous value?
+- Must duplicate creation be rejected or recorded?
+- Does a state transition need validation against the occupied value?
+- What resources are dropped when the previous value is ignored?
+- Does equal-key retention matter, and should keys be canonicalised first?
+- Would Entry avoid repeated lookup and make the branch explicit?
+- Are thread and persistence atomicity being assumed beyond one map borrow?
+
+The core principle is that insertion defines both new state and replacement history. `HashMap::insert` is an upsert returning the old value. I use its Option deliberately or choose Entry when the business operation needs separate occupied and vacant contracts.

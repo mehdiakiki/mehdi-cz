@@ -1,0 +1,75 @@
+---
+caseId: "RFA-657"
+title: "Arc make_mut Uses Clone-on-Write When Ownership Is Shared"
+date: "2026-09-06T08:17:00+01:00"
+lastmod: "2026-09-06T08:17:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "fc8132fba661a410cbc227782d9095041d9fd64d60416b470396197ba3d5298e"
+area: "concurrency-memory"
+symptom: "After Arc::make_mut changes one of two strong owners, the Arcs no longer point to the same allocation because the inner Vec was cloned."
+summary: "make_mut provides copy-on-write, not shared mutation. It mutates in place only with unique effective ownership; use synchronization when all owners must observe updates."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust Arc make_mut clones shared", "Arc copy on write ptr_eq", "Arc make_mut versus Mutex"]
+evidence: ["Rust 1.98.1 runtime assertion", "two strong owners before mutation", "owners diverge with independent vector values"]
+sources: ["https://doc.rust-lang.org/std/sync/struct.Arc.html#method.make_mut", "https://doc.rust-lang.org/std/sync/struct.Arc.html#method.get_mut", "https://doc.rust-lang.org/std/sync/struct.Mutex.html"]
+---
+
+`Arc<T>` provides shared ownership, not automatic shared mutation. `Arc::make_mut` gives mutable access by cloning the inner value when another strong owner exists. The [failing fixture](/rust-failure-atlas/evidence/RFA-657/fail.rs) assumes two Arc handles remain pointer-equal after mutation and demonstrates their divergence.
+
+## Copy-on-write separates histories
+
+The [`Arc::make_mut` documentation](https://doc.rust-lang.org/std/sync/struct.Arc.html#method.make_mut) describes clone-on-write. With no other strong references, it can expose the existing allocation mutably. With shared ownership, it creates an independent clone for the Arc being changed.
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-657/fixed.rs) asserts both branches of meaning: `left` becomes `[1, 2]`, `right` remains `[1]`, and their allocations differ.
+
+I use this for snapshots and configuration versions where readers should keep the old value while a writer prepares a new one.
+
+## It is not a Mutex replacement
+
+If every owner must observe the same mutation, copy-on-write is the wrong contract. `Arc<Mutex<T>>`, `Arc<RwLock<T>>`, atomics, a channel-owned actor, or immutable version publication may fit depending on access patterns.
+
+The standard [`Mutex`](https://doc.rust-lang.org/std/sync/struct.Mutex.html) serializes access to one shared value. It introduces blocking and poisoning considerations. Copy-on-write introduces cloning and eventual consistency between separately distributed snapshots. These are different tradeoffs.
+
+I name types accordingly: `ConfigSnapshot` suggests independent versions, while `SharedState` suggests synchronized observation.
+
+## Clone cost can appear only under load
+
+Local tests may have one owner, so make_mut updates in place and looks cheap. Production caches, tasks, or request contexts may retain many clones, causing a large T to be copied on every update.
+
+I benchmark both unique and shared cases and record inner size. Persistent data structures or an Arc around smaller immutable components can reduce copying. Sometimes rebuilding one configuration once per minute is entirely acceptable.
+
+Clone can also have semantic effects. Cloning an Arc field preserves shared sub-ownership; cloning a file handle or channel may not create an independent resource. The inner type’s Clone contract decides how separate the new version really is.
+
+## Weak references affect make_mut specially
+
+The method documentation explains behaviour in the presence of Weak references: make_mut may dissociate them when no other strong references exist rather than cloning T. Weak handles then cannot upgrade to the newly owned allocation.
+
+This matters for caches that use Weak as identity observers. A make_mut call can preserve value content while changing which allocation those observers refer to. I test strong and weak count scenarios if identity is part of the design.
+
+[`Arc::get_mut`](https://doc.rust-lang.org/std/sync/struct.Arc.html#method.get_mut) provides mutable access only under its stricter uniqueness conditions and returns None otherwise. It is useful when cloning would be an unacceptable surprise.
+
+## Pointer identity is rarely domain identity
+
+`Arc::ptr_eq` checks whether two handles share an allocation. Equal values can live in distinct allocations, especially after make_mut. I do not use pointer identity as a durable business key.
+
+For graph interning or cycle detection, allocation identity can be intentional, but clone-on-write then needs review. A stable explicit ID is normally better across serialization, processes, and rebuilt snapshots.
+
+Thread safety also depends on T. Arc provides atomic reference counting; it does not make a non-Sync inner value safe for shared access. Compiler bounds protect this when sending handles.
+
+Publishing a new snapshot is another step. After building with make_mut, I may place the new Arc behind a channel, lock, or atomic Arc-swap mechanism so future readers receive it. Existing readers intentionally keep the old version. I attach a generation number when operators need to know which configuration a request observed. This makes snapshot consistency explicit instead of expecting pointer sharing to broadcast changes.
+
+## My Arc make_mut checklist
+
+- Should existing owners observe the mutation or keep their old snapshot?
+- Are there other strong references at the mutation point?
+- What is the worst-case cost and semantic meaning of cloning T?
+- Could Weak observers be dissociated from the allocation?
+- Would get_mut make unexpected sharing fail visibly?
+- Does synchronized shared state require Mutex, RwLock, atomics, or an owner task instead?
+- Is pointer identity being confused with domain identity?
+- Do tests cover unique, shared, weak, and production-sized values?
+
+The core principle is that Arc shares ownership, while make_mut recovers exclusivity by separating versions when necessary. I use it for copy-on-write snapshots and choose synchronization when mutation must remain visible through every existing handle.

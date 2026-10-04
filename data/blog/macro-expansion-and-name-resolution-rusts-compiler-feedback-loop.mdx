@@ -1,0 +1,177 @@
+---
+title: "Macro Expansion and Name Resolution: Rust's Compiler Feedback Loop"
+date: "2026-10-05T09:00:00+01:00"
+tags: ["rust", "macros", "name resolution", "rustc", "compiler"]
+draft: false
+reviewed: true
+reviewedHash: "54c935f3d974876b539ffd3e2e518077493bacc54e2039bf1e92d8e96ebcff91"
+cluster: "rust-under-the-hood"
+campaign: "authority-2026"
+opportunity: "RUST-019"
+summary: "Rust cannot finish name resolution before expanding macros because expansion can create new names and new macros. Follow the compiler's iterative expansion loop."
+---
+
+A simple compiler diagram says parsing happens, then name resolution, then macro expansion. Rust cannot follow that straight line.
+
+A macro invocation needs its name resolved before rustc can expand it. But its expansion may define a new item, import a name, or even define another macro that must be resolved later.
+
+Rust therefore has a feedback loop between early name resolution and macro expansion.
+
+## The circular dependency is real
+
+This valid program contains the problem in miniature:
+
+```rust
+macro_rules! define_helper {
+    () => {
+        macro_rules! make_answer {
+            () => {
+                fn answer() -> u8 { 42 }
+            };
+        }
+    };
+}
+
+define_helper!();
+make_answer!();
+
+fn main() {
+    assert_eq!(answer(), 42);
+}
+```
+
+The first expansion creates `make_answer!`. The next expansion creates `answer`. Later resolution must make the function call refer to that generated item.
+
+If rustc tried to resolve every name before expanding anything, neither generated name would exist. If it expanded every invocation before resolving macro names, it would not know which macro each invocation means.
+
+## Rustc grows a partially built crate
+
+The [rustc macro expansion guide](https://rustc-dev-guide.rust-lang.org/macro-expansion.html) describes an iterative process. In simplified form:
+
+```text
+1. Resolve imports as far as possible.
+2. Collect unresolved macro invocations.
+3. Take one invocation from the queue.
+4. Try to resolve its macro name.
+5. Expand it.
+6. Parse and integrate the produced fragment.
+7. Add newly discovered invocations to the queue.
+8. Repeat until no invocations remain or no progress is possible.
+```
+
+The crate is not fully available at the start. Each successful expansion can add definitions that make a later step resolvable.
+
+This is why I find “macro expansion is text substitution” misleading. Expansion changes compiler structures and participates in naming rules. It does not paste arbitrary strings into a file.
+
+## Early resolution solves only what expansion needs
+
+Rust name resolution has multiple stages. During expansion, rustc needs enough resolution for imports and macro names. Full resolution of expressions, types, and other paths happens later when the expanded crate structure is known.
+
+The [rustc name-resolution guide](https://rustc-dev-guide.rust-lang.org/name-resolution.html) makes this split explicit: early resolution operates during macro expansion, while late resolution resolves the remaining names after expansion.
+
+For the example:
+
+```text
+early: resolve define_helper!
+expand: create make_answer!
+early: resolve make_answer!
+expand: create fn answer
+late:  resolve answer() in main
+```
+
+That sequence is much more useful for debugging than a single box labelled “resolve names.”
+
+## Indeterminate is different from wrong
+
+An unresolved macro name is not always an immediate error. A prior expansion or import may make it available in a later iteration.
+
+Conceptually, a resolution attempt can say:
+
+```text
+resolved       -> expand now
+indeterminate  -> put it back and try after more progress
+failed         -> report an error when no legal future step can resolve it
+```
+
+The compiler must eventually stop. If a pass through the pending work makes no progress, retrying forever would not create a definition. The remaining unresolved invocations become errors.
+
+## Integration is as important as expansion
+
+After a macro produces tokens, rustc parses them as the fragment expected at that location: items, expressions, patterns, types, or statements. It then integrates the result into the module and assigns compiler identities.
+
+Consider an item-producing macro:
+
+```rust
+macro_rules! endpoint {
+    ($name:ident) => {
+        fn $name() -> &'static str { "ok" }
+    };
+}
+
+endpoint!(health);
+```
+
+The useful model is:
+
+```text
+tokens from expansion
+    -> parse as item
+    -> insert function into module
+    -> collect names and nested macro calls
+    -> make item available to later compiler stages
+```
+
+This also explains why an error can point inside generated code or back to a call site. Several source spans and syntax contexts participate in the result.
+
+## Macro namespaces and textual scope are easy to confuse
+
+`macro_rules!` has scope behaviour that is not identical to ordinary functions and types. The [Rust Reference](https://doc.rust-lang.org/reference/macros-by-example.html#scoping-exporting-and-importing) distinguishes textual scope and path-based scope.
+
+For example, an unqualified invocation can depend on where a `macro_rules!` definition appears in textual order:
+
+```rust
+// helper!(); // not yet in textual scope
+
+macro_rules! helper {
+    () => { 1 };
+}
+
+const VALUE: u8 = helper!();
+```
+
+A macro imported or addressed by path follows different lookup rules. When I diagnose a surprising resolution result, I ask:
+
+- Is this a `macro_rules!`, derive, attribute, or function-like procedural macro?
+- Is the invocation qualified by a path?
+- Did an earlier expansion generate the definition or import?
+- Is the problem lookup, expansion, parsing the result, or later name resolution?
+
+These questions locate the compiler phase instead of treating every error as “the macro is broken.”
+
+## Why speculative expansion has constraints
+
+Editors and compiler diagnostics sometimes need to inspect code before every name is final. Rust's rules cannot allow a speculative choice to silently become a different meaning later.
+
+The [Rust Reference on name resolution](https://doc.rust-lang.org/reference/names/name-resolution.html) notes that speculative resolutions used during macro expansion must be stable when resolution is completed. This protects the meaning of expanded code from depending on an accidental intermediate state.
+
+In practical terms, ambiguity is not only a user-interface problem. The compiler must avoid expanding with one interpretation and later accepting another.
+
+## A debugging method that follows the loop
+
+When generated names appear missing, I reduce the case and mark each step:
+
+```text
+definition available before invocation?
+    ↓
+macro name resolves in this namespace and scope?
+    ↓
+expansion produces the expected fragment kind?
+    ↓
+generated item integrates into the expected module?
+    ↓
+late name resolution can reach the generated item?
+```
+
+I also use `cargo expand` when appropriate, but expanded text alone does not show every hygiene and resolution decision. It is an observation tool, not the language definition.
+
+The main lesson is small: Rust does not resolve a finished crate and then expand it. It repeatedly resolves enough to expand, integrates what was produced, and resolves again. Once this feedback loop is visible, many “impossible” macro name errors become ordinary phase-order problems.

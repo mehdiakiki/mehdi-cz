@@ -1,0 +1,107 @@
+---
+caseId: "RFA-182"
+title: "Why Arc::into_inner Succeeds for Exactly One Clone"
+date: "2026-09-05T17:21:00+01:00"
+lastmod: "2026-09-05T17:21:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "c9edc7b100660109990668aabce9a3b0d0247c426500a7a4193def4abd67b41b"
+area: "concurrency-memory"
+symptom: "Arc::into_inner returns None for one clone and then Some for the final clone, although code assumed all cloned attempts would fail."
+summary: "A failed into_inner consumes and drops that strong owner. If every Arc clone calls it, exactly one call is guaranteed to extract T—a stronger coordination property than try_unwrap(...).ok()."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets with atomic pointer-width operations"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust Arc into_inner exactly one Some",
+    "Arc into_inner called on every clone",
+    "difference Arc into_inner try_unwrap ok",
+  ]
+evidence:
+  ["Rust 1.98.1 two-clone fixture", "first None then final Some", "one-winner assertion repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/std/sync/struct.Arc.html#method.into_inner",
+    "https://doc.rust-lang.org/std/sync/struct.Arc.html#method.try_unwrap",
+  ]
+---
+
+One failed ownership check can change the answer to the next check. `Arc::into_inner` is a compact example because failure consumes the `Arc` instead of returning it.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-182/fail.rs) creates two strong clones. Calling `into_inner` on the first returns `None`. Calling it on the second then returns `Some("payload")`, not another `None`.
+
+## Failure drops the supplied owner
+
+[`Arc::into_inner`](https://doc.rust-lang.org/std/sync/struct.Arc.html#method.into_inner) consumes an `Arc<T>`. It returns `Some(T)` when that pointer is the sole strong reference. Otherwise it returns `None`, and the supplied strong reference is dropped.
+
+With two clones, the state transition is deterministic:
+
+```text
+before first call     strong count 2
+first result None     supplied Arc dropped, strong count 1
+second call           sole strong owner, result Some(T)
+```
+
+The first `None` does not mean extraction is impossible forever. It participates in making the next owner unique.
+
+## Calling it on every clone guarantees one winner
+
+The documentation gives a stronger concurrency guarantee: if `Arc::into_inner` is called on every clone of the same allocation, exactly one call returns the inner value. The value is not simply dropped with nobody receiving it.
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-182/fixed.rs) collects both outcomes and asserts exactly one `Some`. In multi-threaded code, I do not predict which thread wins; I design all participants to handle either result.
+
+This can support iterative destruction of recursively shared structures: one owner extracts a node while other paths release their clones.
+
+## `try_unwrap(...).ok()` is not equivalent
+
+[`Arc::try_unwrap`](https://doc.rust-lang.org/std/sync/struct.Arc.html#method.try_unwrap) returns `Err(Arc<T>)` on failure, preserving ownership. Calling `.ok()` immediately discards that returned `Arc`.
+
+In concurrent calls, several threads can each observe that another strong owner exists, all return `Err`, and then all drop their returned owners. The value is safely destroyed, but no caller receives it.
+
+`into_inner` provides the exactly-one-success guarantee across calls on every clone. Rewriting it as `try_unwrap(arc).ok()` weakens the coordination contract even though the return type looks identical.
+
+## The guarantee depends on every clone participating
+
+If one strong clone stays in a cache, global, closure, or task and never calls `into_inner`, the participating calls may all return `None`. The hidden owner eventually drops the value normally.
+
+Before relying on one winner, I establish who owns the complete clone set. `Arc::strong_count` can help debugging, but it is only a changing snapshot in concurrent code and does not prove that all future owners will participate.
+
+Ownership topology is the protocol.
+
+This is especially easy to miss when clones live in different abstraction layers. A queue may own one clone, a worker another, and shutdown code a third. Looking only at the local variable cannot establish whether the complete set will enter the terminal operation. I document the hand-off and test shutdown with every participant present, because the guarantee is global even though each call is local.
+
+## Weak pointers do not block extraction
+
+As with `try_unwrap`, outstanding `Weak` pointers do not prevent `into_inner` from succeeding. Weak observers do not keep `T` alive. After the successful extraction, they cannot upgrade.
+
+The previous Atlas case covers this rule directly. Here the new point is how several strong owners converge on one successful consumer.
+
+If weak observers must continue resolving, extracting `T` violates the application invariant even though the standard-library operation is allowed.
+
+## Result handling should make the winner visible
+
+I avoid silently ignoring `Some`. The winner normally has cleanup, persistence, or iterative-drop work to perform. A clear pattern is:
+
+```rust
+if let Some(value) = Arc::into_inner(owner) {
+    finish(value);
+}
+```
+
+Non-winners deliberately do nothing. If completion itself can fail, the system needs a way to surface the one winner's result rather than assuming another owner will retry.
+
+In concurrent tests, I collect every thread result through joins or a channel and assert one successful extraction across the set. I do not assert a particular winning thread, because scheduling is deliberately outside the guarantee. This produces a regression test for the ownership protocol without accidentally depending on one observed interleaving.
+
+## My shared-extraction checklist
+
+When an `Arc` extraction result surprises me, I ask:
+
+1. Does failure return the owner or drop it?
+2. Will every strong clone perform the same terminal operation?
+3. Is exactly one winner required, or is ordinary eventual drop sufficient?
+4. Can new strong owners be created by upgrading weak pointers?
+5. Does the winner have fallible cleanup work?
+6. Am I replacing `into_inner` with a similar-looking expression that has a weaker guarantee?
+
+The core principle is to reason about an operation's state transition, not only its return value. `None` from `Arc::into_inner` also removes one owner. Across the whole clone set, those transitions guarantee that exactly one caller receives `T`.

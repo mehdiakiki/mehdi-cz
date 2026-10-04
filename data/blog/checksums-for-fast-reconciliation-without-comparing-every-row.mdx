@@ -1,0 +1,161 @@
+---
+title: "Checksums for Fast Reconciliation Without Comparing Every Row"
+date: "2026-12-26T09:00:00+01:00"
+tags: ["checksums", "data reconciliation", "data integrity", "Merkle tree", "distributed systems"]
+draft: false
+reviewed: true
+reviewedHash: "51a2c0974380a3e3c30afe150c4c3eb8037fa3f26d31d27ecb207226c57606fc"
+cluster: "reliable-data-integrations"
+campaign: "authority-2026"
+opportunity: "DATA-088"
+summary: "Bucketed checksums can localize data drift cheaply, but only after canonical encoding, stable snapshots, deletion coverage, and collision-aware verification. A checksum narrows the search; it does not prove business equality."
+---
+
+Comparing ten million rows one by one is expensive. Trusting two row counts is cheap and weak. I use checksums between those extremes, mainly to answer: where should the reconciler look closely?
+
+The checksum is a search accelerator, not the final judge of correctness.
+
+## Equal rows need equal bytes first
+
+Hash functions compare bytes. My business contract compares meaning.
+
+These values may be semantically equal and byte-different:
+
+```text
+2026-12-26T08:00:00Z
+2026-12-26T09:00:00+01:00
+```
+
+JSON object key order, Unicode normalization, decimal scale, null versus missing, and map ordering create similar problems.
+
+Before hashing I define one canonical record representation:
+
+```text
+field list and order
+text encoding and Unicode policy
+integer/decimal representation
+timestamp instant and precision
+null/missing/default distinction
+included version and deletion state
+```
+
+[RFC 8785](https://www.rfc-editor.org/rfc/rfc8785) defines a JSON canonicalization scheme when JSON is the interchange format. I may use a simpler typed binary encoding internally, but it must be versioned and identical on both sides.
+
+## Hash records, then organize the hashes
+
+For record `r`:
+
+```text
+record_hash = SHA-256(canonical_encode(r))
+```
+
+The [Secure Hash Standard](https://csrc.nist.gov/pubs/fips/180-4/upd1/final) defines the SHA-2 family. A strong hash makes accidental collision extraordinarily unlikely, but the architecture still treats checksum equality as evidence under a chosen algorithm—not mathematical identity.
+
+I include stable record identity and version in the encoded input. Two equal payloads belonging to different entities should not cancel or masquerade as one record.
+
+## One checksum for the whole table is not enough
+
+A single mismatch tells me only that something differs. I partition records into stable buckets:
+
+```text
+bucket = first 12 bits of hash(canonical_entity_id)
+```
+
+For each bucket I store:
+
+```text
+record count
+minimum and maximum key/version
+ordered aggregate digest
+snapshot/high-water mark
+canonicalization version
+```
+
+When one bucket differs, the reconciler compares or subdivides only that bucket. A second level produces a Merkle-tree-like search: parent hashes summarize child ranges until the mismatching leaves are small enough for record comparison.
+
+The partition function must remain stable. Bucketing by database page or current row number changes when unrelated rows move.
+
+## Ordering is part of the aggregate
+
+Concatenating record hashes in query-return order is unsafe if the database does not guarantee that order.
+
+I sort by canonical entity identity and include unambiguous lengths:
+
+```text
+bucket_hash = H(
+  len(id_1) || id_1 || record_hash_1 ||
+  len(id_2) || id_2 || record_hash_2 ||
+  ...
+)
+```
+
+Length prefixes prevent ambiguous concatenation. Streaming the sorted input keeps memory bounded.
+
+Commutative aggregates such as XOR can be updated cheaply and ignore order, but duplicate equal hashes can cancel in pairs. I may use a commutative summary as a quick signal beside count and stronger ordered comparison, not as the only integrity proof.
+
+## Both sides need a comparable snapshot
+
+If the source changes while I scan, bucket 1 may represent 08:00 and bucket 4095 may represent 08:20. A target scan from another interval can differ even when synchronization is healthy.
+
+I use:
+
+- a database snapshot or repeatable-read transaction;
+- a provider snapshot/cursor guarantee;
+- a fixed event high-water mark;
+- version-bounded queries;
+- or an overlap/retry strategy when the source cannot snapshot.
+
+The checksum result records this boundary. “Calculated today” is not enough.
+
+For live systems without consistent snapshots, I compare stable older windows first and treat the moving tail separately.
+
+## Deletions and duplicates must affect the result
+
+A current-row checksum cannot explain whether a missing row was deleted correctly or never copied.
+
+Where deletion is part of the contract, I hash tombstones or compare against a complete authoritative set. Count helps catch many missing/duplicate cases but cannot explain them.
+
+I also make entity identity uniqueness an invariant before checksumming. If two rows share an identity, sorting and aggregation may produce stable but semantically invalid results.
+
+## The divide-and-verify loop
+
+My reconciliation flow is:
+
+```text
+compare root summaries
+if equal: record evidence and stop
+if different: compare stable buckets
+subdivide mismatching buckets
+fetch leaf records by identity
+compare normalized fields and versions
+classify differences
+repair according to authority
+recalculate and verify
+```
+
+This extends the [reconciliation repair loop](/blog/reconciliation-is-the-repair-loop-of-a-distributed-system). Checksums reduce how much data the comparison reads; they do not decide which side is authoritative.
+
+## Security and privacy still matter
+
+An unkeyed hash of a low-entropy value such as a country code or small customer number can be guessed. I do not publish record hashes or treat them as anonymized data.
+
+For cross-organization comparison, I define who can see identifiers, whether a keyed MAC is required, how keys rotate, and how long summaries remain. Canonical records should exclude secrets not required for equality.
+
+A malicious party may also choose input. When adversarial collision resistance matters, I use a current cryptographic construction and a reviewed protocol rather than inventing addition/XOR arithmetic.
+
+## The test fixture I trust
+
+I build two datasets that begin equal, then inject:
+
+1. One field change.
+2. One missing row.
+3. One duplicate identity.
+4. One tombstone.
+5. Same instant in another timezone representation.
+6. JSON keys in another order.
+7. A change during the scan.
+8. Two equal hashes in a deliberately weak test aggregator.
+
+The tests prove that semantic normalization ignores intended representation differences, while identity, deletion, and content changes localize to the expected bucket. The moving-scan test proves why snapshot metadata is required.
+
+I use checksums because most reconciliations find that most data is equal. A versioned, bucketed digest lets me skip the equal regions and spend expensive comparison on the small part that disagrees. Then I still inspect real records and verify the repair—because a checksum is a map to the problem, not the business truth itself.

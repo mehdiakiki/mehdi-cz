@@ -1,0 +1,91 @@
+---
+caseId: "RFA-541"
+title: "A Rust Closure Cannot Mutate While an Earlier Borrow Is Still Used"
+date: "2026-09-06T06:20:00+01:00"
+lastmod: "2026-09-06T06:20:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "3457819fa1e3504ad5892a90373e13ac4015511e6df93fe30eb82a4c3b873f44"
+area: "concurrency-memory"
+symptom: "A closure captures events mutably while an earlier reference to events[0] is still used, producing E0500 because both borrows would be live together."
+summary: "Closure creation can reserve captured access before invocation. End earlier reads before creating a mutating closure, or redesign the closure to take state as input."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust E0500 closure requires unique access already borrowed", "closure mutable capture existing immutable borrow Vec", "borrow ends before closure creation Rust"]
+evidence: ["Rust 1.98.1 E0500 compile failure", "Vec element borrow overlaps mutating closure capture", "finish read before closure construction repair"]
+sources: ["https://doc.rust-lang.org/error_codes/E0500.html", "https://doc.rust-lang.org/reference/types/closure.html#capture-modes", "https://doc.rust-lang.org/book/ch04-02-references-and-borrowing.html"]
+---
+
+The line that mutates a value may be inside a closure and run later, but the closure often borrows its environment when the closure value is created. E0500 makes this timing visible.
+
+The [failing fixture](/rust-failure-atlas/evidence/RFA-541/fail.rs) borrows `events[0]`, creates a closure that will push into the same vector, then prints the earlier reference. The immutable element borrow and the closure's required unique access overlap.
+
+## Capture happens when the closure is formed
+
+The closure body contains `events.push(...)`, so invoking it needs mutable access to `events`. Because the closure does not receive `events` as a parameter, it captures that access from the surrounding function.
+
+Rust must preserve the capture for as long as the closure may be called. It cannot wait until invocation to decide whether some other reference remained alive.
+
+The Reference explains how place expressions are borrowed or moved through [closure capture modes](https://doc.rust-lang.org/reference/types/closure.html#capture-modes). The [official E0500 page](https://doc.rust-lang.org/error_codes/E0500.html) shows the same ordering: an earlier borrow is used after a closure requiring unique access is created.
+
+## The later use keeps the earlier borrow alive
+
+Non-lexical lifetimes usually end a reference at its last use rather than the closing brace. Here the last use of `first` is the print after closure creation. The immutable borrow therefore remains relevant across that creation point.
+
+Moving the print before the closure changes the dataflow proof. The [repaired fixture](/rust-failure-atlas/evidence/RFA-541/fixed.rs) finishes using `first`, then constructs and calls the mutating closure.
+
+This is not a trick to appease the compiler. The program has a clear phase boundary: observe the old list, then mutate it.
+
+## Vec mutation makes the conflict concrete
+
+`push` may reallocate a vector. If it does, a reference into the old allocation would point at invalid memory. Even if current capacity happens to be sufficient, safe code cannot base reference validity on that incidental runtime detail.
+
+Other mutations can also change or remove the borrowed element. Rust uses one general exclusive-access rule rather than attempting to classify every vector operation dynamically.
+
+The Book's [references and borrowing chapter](https://doc.rust-lang.org/book/ch04-02-references-and-borrowing.html) states the central rule: while a mutable reference is active, no other references to the same data may be active.
+
+## Copying a small observation can separate the phases
+
+If I need the observed information after mutation, I can copy or clone only what is semantically needed:
+
+```rust
+let first_name = events[0].clone();
+events.push(new_event);
+println!("{first_name}");
+```
+
+Now `first_name` owns independent data and no longer borrows the vector. This has an allocation cost for `String`, so I do it intentionally rather than treating clone as a universal borrow-checker command.
+
+An index can also be stored and used after mutation only when the operation preserves the relevant index meaning. A push preserves existing indices, while removal or sorting may not.
+
+## Passing state into the closure reduces capture lifetime
+
+A reusable alternative is:
+
+```rust
+let append = |events: &mut Vec<String>| events.push(new_event());
+```
+
+The closure no longer captures the vector. Each call creates a short borrow through its argument. This is especially useful when the closure is stored beside other callbacks or when mutations must be interleaved.
+
+I prefer parameterisation when state ownership belongs to the caller. I prefer capture when the closure truly represents an operation bound to one environment.
+
+## Drop and scopes can document borrow endings
+
+Sometimes moving statements is awkward. A small block can keep an observation and all of its uses together, after which mutation begins. For references, an explicit `drop(reference)` is often less clear and can be misleading because dropping a `Copy` reference value is not a resource operation. The important fact is last use.
+
+I shape the code so the last use is visually close to the observation. That helps human reviewers reason in the same timeline as the compiler.
+
+## My E0500 checklist
+
+- Which earlier expression borrowed the captured place?
+- Where is that reference used for the last time?
+- What access does creating the closure capture?
+- Can I finish the observation before constructing the closure?
+- Does collection mutation risk reallocation or changing the referenced element?
+- Should I own a small snapshot instead of keeping a reference?
+- Can the closure accept mutable state as a parameter?
+- Do the final phases read clearly as observe, then mutate?
+
+The core principle is that a closure is a value carrying access to its environment. I account for that access from closure creation, not only from the line where I eventually call it.

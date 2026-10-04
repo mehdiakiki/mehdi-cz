@@ -1,0 +1,72 @@
+---
+caseId: "RFA-313"
+title: "Leaking BinaryHeap::PeekMut Can Leak Other Elements"
+date: "2026-09-06T01:33:00+01:00"
+lastmod: "2026-09-06T01:33:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "3024a1321d76c85f882ec069f8c40fac2dc90e4cc8bc282f7f28487c2b721293"
+area: "concurrency-memory"
+symptom: "After a mutably dereferenced PeekMut guard is forgotten, the heap remains valid but its visible length can lose elements besides the edited root."
+summary: "PeekMut temporarily owns heap-repair work. Rust contains the effects of leaking that safe guard by allowing some elements to leak while keeping the remaining heap valid; normal drop restores the structure."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust BinaryHeap PeekMut mem forget leaks elements", "leak PeekMut heap length", "BinaryHeap peek_mut guard must drop"]
+evidence: ["Rust 1.98.1 four-element heap", "mutably dereferenced and forgotten guard", "normal guard drop restores all elements"]
+sources: ["https://doc.rust-lang.org/std/collections/struct.BinaryHeap.html#method.peek_mut", "https://doc.rust-lang.org/std/collections/binary_heap/struct.PeekMut.html", "https://doc.rust-lang.org/std/mem/fn.forget.html"]
+---
+
+I used `peek_mut` to lower the greatest priority and assumed forgetting the guard would merely skip reordering. The heap stayed memory-safe, but several elements disappeared from its visible length on the pinned implementation.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-313/fail.rs) starts with four integers, changes the root to zero, and calls `mem::forget` on the guard. It expects length four; Rust 1.98.1 exposes only one remaining element.
+
+## The guard owns structural repair
+
+[`BinaryHeap::peek_mut`](https://doc.rust-lang.org/std/collections/struct.BinaryHeap.html#method.peek_mut) returns a guard around mutable access to the greatest item. If the value changes, dropping that guard repairs the heap invariant.
+
+The standard documentation contains an unusual warning: if the `PeekMut` value is leaked, some heap elements might be leaked with it, while the remaining elements still form a valid heap.
+
+This is a containment strategy. Safe Rust permits `mem::forget`, so a safe guard implementation cannot require its destructor to run for memory safety. It can rely on drop for ordinary semantic completion, but forgotten cleanup must not create undefined behavior.
+
+## Mutable dereference activates the expensive path
+
+Merely peeking mutably does not always require reordering. Once code obtains mutable dereference, the implementation must assume the root may have changed relative to other elements.
+
+On the pinned implementation, the guard temporarily adjusts the vector length so other elements cannot be observed through a broken heap if the guard never returns. Normal `Drop` restores the hidden region and sifts the edited value. Forgetting the guard prevents that restoration.
+
+The exact number of leaked elements is not promised. The article's fixture records one implementation and toolchain; the portable claim is only the documented possibility of losing some heap elements while validity is preserved.
+
+## Memory leak is safe, not harmless
+
+[`mem::forget`](https://doc.rust-lang.org/std/mem/fn.forget.html) is safe because Rust does not guarantee destructors always run. Reference cycles, process termination, and explicit forgetting can all prevent cleanup.
+
+“Safe” here means no undefined behavior is required. Leaked jobs, file handles, allocations, and business records can still be severe correctness or availability failures. A priority queue that silently loses pending work is not repaired by knowing the remaining allocation is valid.
+
+I reserve `forget` for ownership transfers whose receiving system truly takes the destructor obligation, and I document that transfer. It is not a way to solve borrow-checker discomfort around guards.
+
+## Drop order should be visible in code
+
+The repaired fixture places `PeekMut` in a small nested scope. At the closing brace its destructor runs, the heap reorders, and all four elements remain available.
+
+An explicit `drop(guard)` can be clearer when later code immediately needs the heap. Both forms communicate that the guard's lifecycle is a commit boundary.
+
+Calling `PeekMut::pop` is another explicit completion path when the edited root should be removed. It consumes the guard and returns the value under that method's contract.
+
+## Panic and cancellation deserve attention
+
+Normal unwinding drops local guards, so a panic after mutation usually runs heap repair. Abort, process exit, or deliberately leaked ownership does not.
+
+This distinction resembles locks and buffered I/O but with different consequences. Forgetting a `MutexGuard` can keep a lock held; forgetting `PeekMut` can leak elements. Relying on a destructor is common and correct, yet code should not deliberately suppress that destructor unless the type documents an alternative completion protocol.
+
+Async code cannot normally hold a mutable borrow of the heap across unrelated access, but cancellation still drops the future and its fields under ordinary Rust semantics. Custom unsafe containers need the same leak-aware design discipline used by the standard heap.
+
+## What I test
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-313/fixed.rs) lowers the maximum inside a scope, lets the guard drop, verifies length four, and checks the ascending sorted contents `0, 1, 2, 3`.
+
+In real priority code I test increasing and decreasing the root, leaving it unchanged, explicitly dropping the guard, popping through the guard, panicking while it is live, and types with destructor counters. I do not assert the exact leaked length from a forgotten guard as a cross-version contract.
+
+Static review also searches for `mem::forget`, `ManuallyDrop`, and intentionally leaked boxes around resource-owning values. Those sites deserve proof of who now owns cleanup.
+
+The core principle is that safe APIs must tolerate destructor suppression without becoming memory-unsafe, sometimes by sacrificing resources or semantic completeness. `PeekMut` uses drop to finish heap repair. Letting it die normally preserves the collection; leaking it accepts the documented possibility of leaking more than the one visible guard.

@@ -1,0 +1,105 @@
+---
+caseId: "RFA-178"
+title: "Why read_exact Can Modify the Buffer Before Returning an Error"
+date: "2026-09-05T17:17:00+01:00"
+lastmod: "2026-09-05T17:17:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "763ad58fba291c7671758e7122f9c336d03b1debe0b02e7280d0da5776a66a0a"
+area: "ffi-targets"
+symptom: "Read::read_exact returns UnexpectedEof after changing part of the destination buffer that application code expected to remain untouched."
+summary: "read_exact promises a full buffer only on success. On any error the buffer contents and consumed-byte count are unspecified, so transactional parsing needs separate staging or an explicitly resumable state machine."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust read_exact buffer after error unspecified",
+    "read_exact UnexpectedEof partial buffer",
+    "transactional fixed length read Rust",
+  ]
+evidence:
+  ["Rust 1.98.1 controlled short reader", "sentinel-buffer mutation", "staging-buffer repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/std/io/trait.Read.html#method.read_exact",
+    "https://doc.rust-lang.org/std/io/trait.Read.html#method.read_to_end",
+  ]
+---
+
+The name `read_exact` can sound transactional: either fill everything or change nothing. Its real promise is different. Success means the buffer is full; error does not restore the previous bytes.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-178/fail.rs) uses a controlled reader that yields one byte and then EOF. A four-byte destination starts as `[9, 9, 9, 9]`. After `UnexpectedEof`, it is `[97, 9, 9, 9]` on Rust 1.98.1.
+
+## Several reads can happen inside one call
+
+[`Read::read_exact`](https://doc.rust-lang.org/std/io/trait.Read.html#method.read_exact) keeps reading until the requested slice is full. An underlying `read` is allowed to return fewer bytes than requested without indicating an error.
+
+The sequence can therefore be:
+
+```text
+first read   -> one byte written
+second read  -> EOF
+read_exact   -> UnexpectedEof
+```
+
+The documentation states that buffer contents are unspecified after an error. It also does not promise how many bytes were consumed from the reader.
+
+The unspecified wording matters more than this observed array. Another `Read` implementation may leave the buffer unchanged, write a different prefix, or fail before any byte. My code cannot use the Rust 1.98.1 fixture's exact partial state as an API contract.
+
+## The failed buffer is not a valid frame
+
+In a fixed-length protocol, I commit the destination only after the complete read succeeds:
+
+```rust
+let mut candidate = [0_u8; FRAME_SIZE];
+reader.read_exact(&mut candidate)?;
+state.frame = candidate;
+```
+
+If `state.frame` itself were passed directly, an error could mix new prefix bytes with old suffix bytes. That hybrid may look plausible later.
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-178/fixed.rs) uses separate staging storage and validates its length before touching committed data. In real fixed-array code, a local candidate array followed by assignment is usually simpler.
+
+## Retrying the same call is not automatically correct
+
+After an error, the reader may already have consumed bytes. Calling `read_exact(&mut whole_buffer)` again can start at the middle of a frame and place later data at the beginning.
+
+A resumable reader needs to track an explicit filled length and read into the remaining suffix. The basic `read_exact` error does not tell me that length, so a custom loop around `read` is required when continuation after recoverable errors is part of the design.
+
+For EOF on a finite file or connection, retry often cannot help. The frame is incomplete and should be reported as such.
+
+## `Interrupted` is handled differently
+
+The method retries `ErrorKind::Interrupted` internally. Other errors return immediately. I do not add a blind outer retry loop without understanding whether the source position advanced and which errors are transient.
+
+For network protocols, reconnecting also creates a new stream identity. Continuing a frame across connections is valid only if the protocol provides offsets, sequence numbers, or another replay mechanism.
+
+## `Cursor` can hide the issue
+
+During construction of this case, a `Cursor<&[u8]>` happened to leave the destination sentinel unchanged on short input. That behaviour was more helpful than the general contract.
+
+I did not use it as the evidence. The fixture implements a tiny `Read` that returns one byte, then EOF. This is an important testing habit: an implementation that behaves transactionally in one setup does not strengthen a trait method's documented guarantee.
+
+Tests should exercise the latitude that an interface permits, especially at I/O boundaries.
+
+## `read_to_end` is not always the production repair
+
+[`Read::read_to_end`](https://doc.rust-lang.org/std/io/trait.Read.html#method.read_to_end) is convenient for the small finite fixture. On an untrusted or unbounded stream, reading until EOF can exhaust memory or never finish.
+
+Production parsing normally knows a maximum frame size. I use a bounded candidate buffer, validate declared lengths before allocation, and reject oversized frames before reading their bodies.
+
+Staging describes the commit rule; it does not remove the need for limits.
+
+## My fixed-size read checklist
+
+When a supposedly exact read fails, I ask:
+
+1. Could the reader have produced a short successful read first?
+2. Did it consume bytes before the error?
+3. Is the destination scratch storage or already committed state?
+4. Is retry defined by the protocol?
+5. What is the maximum accepted frame size?
+6. Do tests include one-byte progress followed by EOF and by another error?
+
+The core principle goes beyond Rust: completion guarantees are not rollback guarantees. `read_exact` defines what success means. If I need atomic state replacement or resumable progress, I build that policy around the read.

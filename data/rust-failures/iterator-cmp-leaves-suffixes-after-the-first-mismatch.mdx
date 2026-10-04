@@ -1,0 +1,92 @@
+---
+caseId: "RFA-397"
+title: "Iterator::cmp Leaves Both Suffixes After the First Mismatch"
+date: "2026-09-06T03:37:00+01:00"
+lastmod: "2026-09-06T03:37:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "dbbe90d7bc2e7fa2634aceffd2b1a352639e1f72143dc69e369ddff0434896da"
+area: "upgrades-compatibility"
+symptom: "Lexicographic comparison returns Greater after the second pair, while a sentinel third item remains available from both borrowed iterators."
+summary: "Iterator::cmp consumes equal pairs until the first unequal pair determines the result. It consumes that decisive pair but does not read irrelevant suffixes, so iterators reborrowed through by_ref can continue afterward."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust Iterator cmp stops early remainder", "iterator lexicographic comparison consumes", "Iterator cmp short circuit Rust"]
+evidence: ["Rust 1.98.1 paired iterators", "mismatch at second pair", "third values remain on both sides"]
+sources: ["https://doc.rust-lang.org/std/iter/trait.Iterator.html#method.cmp", "https://doc.rust-lang.org/std/iter/trait.Iterator.html#method.by_ref", "https://doc.rust-lang.org/std/cmp/enum.Ordering.html"]
+---
+
+Iterator comparison looks like a read-only question: is the left sequence smaller, equal, or greater? For iterators, asking the question also advances them.
+
+The detail I find most useful is where it stops. [`Iterator::cmp`](https://doc.rust-lang.org/std/iter/trait.Iterator.html#method.cmp) performs lexicographic comparison. It consumes equal pairs until one pair differs. That unequal pair decides the result, and later items are not needed.
+
+The [failing fixture](/rust-failure-atlas/evidence/RFA-397/fail.rs) wrongly expects both iterators to be exhausted. The inputs are `[1, 9, 100]` and `[1, 2, 200]`. Comparison consumes `1` against `1`, then `9` against `2`, returns `Greater`, and leaves `100` and `200` untouched.
+
+## Lexicographic comparison has a decision point
+
+The process is the same ordering used for words:
+
+1. Compare the first pair.
+2. While the pair is equal, continue.
+3. Return the ordering of the first unequal pair.
+4. If one iterator ends while all compared pairs were equal, the shorter sequence is less.
+5. If both end together, they are equal.
+
+Only the information required to decide is consumed. Reading the suffix would add work and could trigger effects from a lazy iterator without changing the answer.
+
+This short-circuit property matters with generated data, file records, parser tokens, or any adapter that does observable work in `next`.
+
+## The decisive elements are consumed too
+
+Short-circuiting does not mean the mismatch remains available. Rust had to obtain both unequal items to compare them. Those two items have already passed through `next`.
+
+After the fixture's comparison, the remaining sequences begin at `100` and `200`, not at `9` and `2`. If I need to retain the decisive values, I cannot recover them from the advanced iterators. I must peek, clone appropriate data, or design a comparison routine that returns the boundary items.
+
+This is a general streaming rule: the item that proves a boundary is often already consumed. I state that ownership decision before choosing a convenient adaptor.
+
+## by_ref makes the remaining state observable
+
+`cmp` takes ownership of its iterator receiver. Calling it directly on a named iterator would move that iterator into the method call. [`Iterator::by_ref`](https://doc.rust-lang.org/std/iter/trait.Iterator.html#method.by_ref) creates a mutable reborrow that is itself an iterator:
+
+```rust
+let mut left = [1, 9, 100].into_iter();
+let mut right = [1, 2, 200].into_iter();
+
+let order = left.by_ref().cmp(right.by_ref());
+assert_eq!(order, std::cmp::Ordering::Greater);
+assert_eq!(left.next(), Some(100));
+assert_eq!(right.next(), Some(200));
+```
+
+The temporary reborrows are consumed, then their borrows end. The original iterator variables remain usable at their new positions. `by_ref` does not clone or reset them.
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-397/fixed.rs) collects both suffixes after comparison. This proves the stopping point instead of only checking the returned `Ordering`.
+
+## Equal prefixes can consume much more
+
+If the sequences share a long prefix, `cmp` must traverse that whole prefix. If every item is equal and lengths match, it consumes both iterators completely. If one is a prefix of the other, it also needs to observe the end of the shorter side and the presence of the next item on the longer side.
+
+I therefore do not treat comparison as constant time. Its work is proportional to the prefix needed to determine ordering. In performance-sensitive code, common long prefixes can dominate.
+
+For infinite iterators that remain equal forever, comparison never returns. The types allow the operation, but the data does not provide a decision point.
+
+## Lazy iterators make consumption part of behavior
+
+An iterator may parse, allocate, read, count, or update state each time `next` runs. `cmp` is then not merely comparing values already stored somewhere. It is driving both computations in lockstep until it has enough evidence.
+
+I avoid comparing iterators with side effects unless this advancement is explicitly intended. When data must be reused independently, collecting first gives comparison ordinary owned sequences at the cost of memory. When streaming is important, I test the cursor positions.
+
+## Ordering values are clearer than numeric signs
+
+Rust returns [`Ordering`](https://doc.rust-lang.org/std/cmp/enum.Ordering.html): `Less`, `Equal`, or `Greater`. I prefer matching these variants or using `is_lt`, `is_eq`, and `is_gt` rather than converting the result into an imagined negative or positive integer.
+
+This keeps the code aligned with the trait contract and makes the decisive direction obvious during review.
+
+## My minimal regression shape
+
+To test short-circuiting, I need three regions: an equal prefix, one unequal pair, and visible suffix sentinels. A test with a mismatch at the last item cannot show whether unnecessary reads occurred. A test checking only the ordering cannot show iterator state.
+
+I assert the returned ordering and both suffixes. If the iterator drives an external source, I may also count `next` calls so the work boundary is explicit.
+
+The core principle is that consuming comparisons combine a value result with a state transition. `Iterator::cmp` returns the lexicographic answer as soon as it is known. The unequal pair is consumed; the irrelevant suffix survives. Good code accounts for both facts.

@@ -1,0 +1,98 @@
+---
+caseId: "RFA-260"
+title: "Collecting Result Stops at the First Error and Leaves a Remainder"
+date: "2026-09-06T00:40:00+01:00"
+lastmod: "2026-09-06T00:40:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "3bfd316d8e4475f2ea6fc2a97ef220e158c3f48c8d6ea9c57f6b395053e8ac0c"
+area: "concurrency-memory"
+symptom: "Collecting an iterator of Result returns the first Err while items after that error remain unvisited in the borrowed iterator."
+summary: "FromIterator for Result short-circuits at the first error. Borrow the iterator with by_ref only when preserving its remainder is intentional, and choose an explicit policy for cleanup or later processing."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust collect Result stops first error iterator remainder", "collect Result Vec short circuit Rust", "what happens to iterator after collect Err"]
+evidence: ["Rust 1.98.1 three-result iterator", "first error collection", "unvisited trailing item"]
+sources: ["https://doc.rust-lang.org/std/result/enum.Result.html#impl-FromIterator%3CResult%3CA,+E%3E%3E-for-Result%3CV,+E%3E", "https://doc.rust-lang.org/std/iter/trait.Iterator.html#method.collect", "https://doc.rust-lang.org/std/iter/trait.Iterator.html#method.by_ref"]
+---
+
+Rust makes it pleasantly concise to collect fallible work:
+
+```rust
+let values: Result<Vec<_>, _> = iterator.collect();
+```
+
+The compact line hides an important state transition. Collection stops at the first error; later iterator items are not visited.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-260/fail.rs) borrows an iterator containing `Ok(1)`, `Err("bad item")`, and `Ok(3)`. Collection returns the error, but the final item remains available.
+
+## Result collection is short-circuiting
+
+The [`FromIterator` implementation for Result](https://doc.rust-lang.org/std/result/enum.Result.html#impl-FromIterator%3CResult%3CA,+E%3E%3E-for-Result%3CV,+E%3E) builds the output collection while inputs are `Ok`. At the first `Err`, it returns that error instead of requesting more elements.
+
+This avoids unnecessary work and preserves the first failure. It also means later side effects, validation errors, or cleanup encoded in iterator advancement do not happen.
+
+The returned `Result` tells me about the collected prefix, not whether the source was exhausted.
+
+## by_ref makes the remainder observable
+
+[`Iterator::collect`](https://doc.rust-lang.org/std/iter/trait.Iterator.html#method.collect) consumes its iterator receiver. In the fixture, [`by_ref`](https://doc.rust-lang.org/std/iter/trait.Iterator.html#method.by_ref) temporarily borrows the iterator so the owner remains usable afterward.
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-260/fixed.rs) asserts that `Ok(3)` is still next. This is not a suggestion to resume blindly. It proves the exact stopping boundary.
+
+Without `by_ref`, the iterator object is moved into `collect`, and caller code cannot inspect its remaining state even though the same short-circuit mechanism occurred internally.
+
+## Unvisited is different from rolled back
+
+Items before the error were already pulled and may have performed work. Their successful values placed into the partial output are dropped when collection returns `Err`, but external side effects are not undone.
+
+Items after the error were not pulled. If advancing the iterator owns resource cleanup, acknowledgement, or cursor movement, that work remains pending.
+
+This creates three zones:
+
+```text
+visited successes | first visited error | unvisited remainder
+```
+
+I avoid describing the whole operation as atomic unless a separate transaction actually provides rollback.
+
+## First error and all errors are different products
+
+For parsing independent form fields, users often benefit from receiving every validation error. `collect::<Result<Vec<_>, _>>()` cannot provide that because it stops early.
+
+I either collect results and partition successes/errors, use a validation type designed for accumulation, or loop explicitly. That choice can require storing more data and running every validator.
+
+For a dependent pipeline, first-error behavior is usually correct. Later stages may be meaningless or unsafe after an earlier failure.
+
+## Resuming needs a protocol
+
+After a parse error, continuing at the next raw item may work for line-oriented input. In a stateful decoder, the error may leave the cursor in the middle of a frame, so the apparent remainder is not a valid restart point.
+
+I define whether errors consume one complete record, require resynchronization, or terminate the stream. Rust preserves iterator mechanics; it cannot prove the remaining items are semantically independent.
+
+For queue consumers, a first error also raises acknowledgement questions. Leaving messages unvisited in memory is not the same as leaving them unacknowledged in an external broker.
+
+## Resource cleanup should not depend only on next
+
+An iterator may own a file or temporary state whose `Drop` performs cleanup when the iterator itself is dropped. Short-circuiting still drops normal owned iterator state at the end of its lifetime.
+
+But cleanup attached to future item processing will not run. I put essential ownership cleanup in guards and destructors, while keeping fallible per-item effects explicit.
+
+This separation makes early returns and `?` safe without needing to drain arbitrary input merely for cleanup.
+
+## What I test
+
+My regression places an error in the first, middle, and last position; it also covers all-success and empty inputs. A counted source proves exactly which items were requested.
+
+If the iterator is resumable, I assert the next remaining item and the error's consumption boundary. If it is terminal, I hide the iterator behind an API that cannot accidentally continue.
+
+## Partial successes need an ownership policy
+
+The `Vec` being built before the error is not returned by ordinary `Result` collection. Its collected values are dropped during cleanup. If the application must retain successful prefix values beside the error, I use an explicit loop and return a structure containing both.
+
+That structure should say whether the failed item itself is retained, consumed, or converted into diagnostics. A tuple called `partial` is not enough when retry behavior depends on the exact boundary.
+
+For expensive values, I count destructors in tests so short-circuit cleanup does not become an invisible resource-lifetime assumption.
+
+The core principle is that short-circuiting controls both the returned value and source progress. Collecting `Result` preserves the first error by stopping immediately. That is efficient and composable, but it does not exhaust the source, accumulate failures, or roll back work already performed. Those policies remain explicit system choices.

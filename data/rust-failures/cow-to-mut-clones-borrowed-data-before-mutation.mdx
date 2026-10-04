@@ -1,0 +1,91 @@
+---
+caseId: "RFA-284"
+title: "Cow::to_mut Clones Borrowed Data Before Mutation"
+date: "2026-09-06T01:04:00+01:00"
+lastmod: "2026-09-06T01:04:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "f6c29bf30d127a5648eace0f15cc737c237fc92a56b76bd81dae76c0b0fa534c"
+area: "concurrency-memory"
+symptom: "Mutating a borrowed Cow<str> through to_mut changes a new owned String while the original borrowed String remains unchanged."
+summary: "Cow provides clone-on-write ownership. to_mut clones when the value is Borrowed and then mutates the owned copy; an already Owned value is mutated directly without another borrow-source update."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets with alloc"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust Cow to_mut clones borrowed data", "does Cow mutation change original string", "clone on write Borrowed to Owned Rust"]
+evidence: ["Rust 1.98.1 borrowed Cow str", "uppercase owned copy", "unchanged source assertion"]
+sources: ["https://doc.rust-lang.org/std/borrow/enum.Cow.html#method.to_mut", "https://doc.rust-lang.org/std/borrow/enum.Cow.html", "https://doc.rust-lang.org/std/borrow/trait.ToOwned.html"]
+---
+
+I passed a borrowed string through `Cow<str>` and later called `to_mut`. The edited Cow changed, but the original string did not. The mutation had happened on a newly owned copy.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-284/fail.rs) borrows `quiet`, uppercases through [`Cow::to_mut`](https://doc.rust-lang.org/std/borrow/enum.Cow.html#method.to_mut), and wrongly expects the source to become `QUIET`.
+
+## Cow means clone on write
+
+[`Cow`](https://doc.rust-lang.org/std/borrow/enum.Cow.html) has two states:
+
+```text
+Borrowed(&B)
+Owned(B::Owned)
+```
+
+Shared borrowed data cannot be mutated through the Cow because other code may still read it. When mutable access is requested, `to_mut` clones the borrowed form into its owned form and changes the enum to `Owned`.
+
+The returned mutable reference points into that owned value. The original borrow remains exactly as it was.
+
+## Read-only paths avoid the clone
+
+Cow is useful when most inputs can pass through unchanged and only some require normalization. Reading through dereference does not force ownership.
+
+For example, a validator can return borrowed input when it is already canonical and allocate a corrected string only when needed. This can reduce allocations without exposing two result types to callers.
+
+The optimization depends on behavior, not the type name alone. Calling `to_mut` unconditionally forces every borrowed input to allocate, even if no actual bytes are changed afterward.
+
+I put the condition before mutable access when the fast path matters.
+
+## Already owned values do not clone for this transition
+
+When the Cow is already `Owned`, `to_mut` returns a mutable reference to that existing owned value. There is no borrowed source to protect and no Borrowed-to-Owned transition.
+
+Repeated `to_mut` calls therefore do not repeatedly clone merely because they are calls to the method. Other operations on the owned type may still allocate, such as growing a `String` beyond capacity.
+
+I distinguish “Cow cloned” from “String reallocated.” They occur at different layers and need different measurement.
+
+## ToOwned defines the owned form
+
+Cow is generic over a borrowed type implementing [`ToOwned`](https://doc.rust-lang.org/std/borrow/trait.ToOwned.html). For `str`, the owned form is `String`; for `[T]`, it is commonly `Vec<T>`.
+
+The conversion may cost more than copying a small header. It can duplicate all elements and invoke their clone implementations. Custom borrowed/owned pairs can define their own cost.
+
+This is why I do not describe Cow as “zero cost.” It defers an ownership cost until mutation and can avoid it, but the expensive branch remains real.
+
+## It is not shared mutable state
+
+Cow does not provide a way to propagate edits back to every observer of the borrowed data. It deliberately chooses separation.
+
+If callers require shared mutation, they need another model such as a lock, cell, database record, or single owner passed mutably. Replacing that requirement with Cow creates snapshots, not synchronization.
+
+The compiler allows the source and Cow to coexist because the source is only immutably borrowed. Clone-on-write preserves that promise when mutation begins.
+
+## Ownership can change API behavior
+
+Matching on the Cow after `to_mut` reveals `Owned`. Code that serializes, caches, or returns it should not assume it remains borrowed.
+
+Usually consumers should use the data through `Deref` and ignore representation. Representation checks belong to optimization tests and ownership boundaries.
+
+Calling `into_owned` also guarantees an owned result, cloning if necessary. I use it when data must outlive the borrowed source, even without mutation.
+
+Lifetimes are another useful signal. A function returning a borrowed Cow can tie its result to the input lifetime, while an owned result can cross that boundary. I do not force ownership early only to simplify local code, but I also do not let a small allocation optimization make a public lifetime contract needlessly difficult.
+
+## What I test
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-284/fixed.rs) asserts three facts: the source stays lowercase, the Cow becomes uppercase, and the Cow is now `Owned`.
+
+My larger tests cover Borrowed with no mutation, Borrowed with mutation, initially Owned input, repeated mutable access, empty data, and a custom clone counter when allocation behavior is important.
+
+I verify output correctness separately from clone count. A compiler or library optimization may affect allocations, while the semantic guarantee remains that borrowed input is not modified.
+
+For request processing, I measure the proportion of values taking the owned path. Cow helps only when the workload actually has a meaningful borrowed fast path.
+
+The core principle is that mutable access requires an ownership decision. `Cow::to_mut` protects borrowed data by cloning it into an owned value before mutation. It is a strong fit for mostly-read transformations, but it does not update the source and it should not be mistaken for shared mutable state.

@@ -1,0 +1,193 @@
+---
+title: "array_windows in Rust 1.94: Const-Sized Windows and Inferred Patterns"
+date: "2026-12-25T09:00:00+01:00"
+tags: ["Rust 1.94", "array_windows", "slice", "const generics", "performance"]
+draft: false
+reviewed: true
+reviewedHash: "78bdfc050899e40f8b8fec9d2b19f2bb843da7bababfcf22246b1c45f526510c"
+cluster: "rust-under-the-hood"
+campaign: "authority-2026"
+opportunity: "RUST-068"
+summary: "Rust 1.94's slice::array_windows returns overlapping &[T; N] windows. Const-sized output enables array patterns and clearer indexing, while performance still needs measurement."
+---
+
+I use adjacent elements often: detect a transition, calculate a delta, validate sorted input, or look for three-point shapes. For years the normal Rust tool was `windows`:
+
+```rust
+for pair in values.windows(2) {
+    let delta = pair[1] - pair[0];
+    println!("{delta}");
+}
+```
+
+Rust 1.94 stabilizes `array_windows`, which makes the window size part of the returned reference type.
+
+```rust
+for &[left, right] in values.array_windows() {
+    let delta = right - left;
+    println!("{delta}");
+}
+```
+
+The second form is not only shorter indexing. The compiler and the reader both know that every item is a reference to an array of exactly two elements.
+
+## The return type is the feature
+
+For a slice `&[T]`, this call:
+
+```rust
+slice.array_windows::<3>()
+```
+
+returns an iterator whose items are `&[T; 3]`. The windows overlap:
+
+```rust
+let values = [10, 20, 30, 40];
+let windows: Vec<&[i32; 3]> = values.array_windows::<3>().collect();
+
+assert_eq!(windows, [&[10, 20, 30], &[20, 30, 40]]);
+```
+
+The official [`slice::array_windows` documentation](https://doc.rust-lang.org/stable/std/primitive.slice.html#method.array_windows) defines the const generic size and states that zero-sized windows panic.
+
+If the slice is shorter than `N`, the iterator is empty. If its length equals `N`, it yields one item.
+
+The iterator is also exact-sized and double-ended. This is useful when I need to inspect both boundaries without collecting first:
+
+```rust
+let values = [2, 4, 8, 16];
+let mut pairs = values.array_windows::<2>();
+
+assert_eq!(pairs.len(), 3);
+assert_eq!(pairs.next(), Some(&[2, 4]));
+assert_eq!(pairs.next_back(), Some(&[8, 16]));
+assert_eq!(pairs.next(), Some(&[4, 8]));
+```
+
+The references point into the original slice. No element is copied and no window allocation happens. This is especially relevant for large structs or strings: I can examine overlapping neighbourhoods without manufacturing temporary arrays. The normal borrowing rule still applies. While these windows are alive, I cannot mutate the same slice through another reference. That restriction is useful evidence that a validation pass is observing one stable view of the values.
+
+I also keep one distinction clear: `&[T; N]` is a reference to an array, not an owned array. If a downstream API requires `[T; N]`, copying is automatic only when `T: Copy`; cloning expensive elements should remain an explicit decision. The new method gives stronger shape information, but it does not change ownership.
+
+## A pattern can infer the const size
+
+In many loops I do not write `::<2>`. The array pattern supplies the expected item shape:
+
+```rust
+let values = [3, 8, 13, 21];
+
+let deltas: Vec<_> = values
+    .array_windows()
+    .map(|&[left, right]| right - left)
+    .collect();
+
+assert_eq!(deltas, [5, 5, 8]);
+```
+
+The closure pattern says two elements, allowing const-generic inference to choose `N = 2`.
+
+For a non-`Copy` element, I match references rather than trying to copy values out:
+
+```rust
+let words = [String::from("a"), String::from("bb"), String::from("ccc")];
+
+for pair in words.array_windows::<2>() {
+    let [left, right] = pair;
+    println!("{} -> {}", left.len(), right.len());
+}
+```
+
+The array shape is fixed; the elements remain borrowed.
+
+## `windows` is still the runtime-sized tool
+
+If the window size comes from configuration or user input, ordinary `windows(size)` is correct:
+
+```rust
+fn moving_groups(values: &[u32], size: usize) {
+    for group in values.windows(size) {
+        println!("{group:?}");
+    }
+}
+```
+
+A const generic cannot be filled with an arbitrary runtime variable. I do not build a large match over possible sizes only to force `array_windows` into a dynamic problem.
+
+My decision is:
+
+```text
+size known at compile time, array shape useful -> array_windows::<N>()
+size chosen at runtime                         -> windows(size)
+non-overlapping fixed groups                   -> array_chunks::<N>()
+```
+
+Overlapping versus non-overlapping is as important as array versus slice.
+
+## Zero is rejected for a reason
+
+There are `len + 1` conceptual zero-length positions around a slice, but that behaviour is rarely what a window algorithm expects. Both `windows(0)` and `array_windows::<0>()` reject the size rather than returning a surprising or infinite iterator.
+
+For a generic const `N`, I validate the assumption at the API boundary or let the documented panic represent a programmer error:
+
+```rust
+fn slopes<const N: usize>(values: &[f64]) {
+    assert!(N > 0, "slope window must contain data");
+    for _window in values.array_windows::<N>() {
+        // calculate from exactly N values
+    }
+}
+```
+
+If zero comes from user data, it should be rejected earlier as input validation rather than allowed to panic here.
+
+## What the array reference buys my code
+
+Array destructuring makes missing cases difficult to hide. With a slice window, `pair[1]` is safe because the iterator promises length two at runtime. With `&[T; 2]`, the length is also in the type and can flow into helpers:
+
+```rust
+fn transition([previous, current]: &[i64; 2]) -> i64 {
+    current - previous
+}
+
+let changes: Vec<_> = [4, 9, 15]
+    .array_windows::<2>()
+    .map(transition)
+    .collect();
+```
+
+I find this particularly readable in parsers and state-transition validation, where positions have roles rather than being arbitrary indexes.
+
+## I do not promise bounds-check elimination from syntax
+
+It is tempting to say the array form is faster because the length is statically known. The optimizer already understands many `windows(2)` loops and can remove repeated checks. Code generation depends on the surrounding function, target, and compiler.
+
+My evidence plan compares two functions with identical output:
+
+```text
+windows(2) plus indexed access
+array_windows::<2>() plus destructuring
+```
+
+I compile with release settings, inspect assembly, and benchmark realistic slice lengths. If both produce the same vectorized loop, I choose the clearer source. If they differ, I record compiler version and target before generalizing.
+
+```bash
+cargo rustc --release -- --emit=asm
+cargo bench
+```
+
+The [Rust 1.94 release notes](https://doc.rust-lang.org/releases.html#version-1940-2026-03-05) list `array_windows` among stabilized APIs. The lasting value is stronger than one benchmark: fixed-size windows can now be expressed on stable Rust without conversion boilerplate.
+
+## The cases I test
+
+For a window of three I cover:
+
+```text
+empty slice       -> zero windows
+length two        -> zero windows
+length three      -> one window
+length four       -> two overlapping windows
+zero-size request -> panic or earlier input rejection
+```
+
+I also test non-`Copy` data to ensure helpers borrow instead of cloning silently.
+
+`array_windows` is a small API that improves how an algorithm communicates. I use it when the neighbourhood size is part of the algorithm itself. The const-sized reference turns “I hope this slice has two elements” into a type the loop, pattern, and helper all agree on.

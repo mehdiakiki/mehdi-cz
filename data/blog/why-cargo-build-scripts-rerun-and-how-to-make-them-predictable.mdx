@@ -1,0 +1,212 @@
+---
+title: "Why Cargo Build Scripts Rerun and How to Make Them Predictable"
+date: "2026-09-24T17:00:00+01:00"
+tags: ["rust", "cargo", "build scripts", "build performance", "compiler tooling"]
+draft: false
+reviewed: true
+reviewedHash: "c319dcfaaa445833a073c751529817ff7baf37bbfbce1edf6640ee7f389d782a"
+cluster: "rust-under-the-hood"
+campaign: "authority-2026"
+opportunity: "RUST-013"
+summary: "Cargo build scripts are cached from declared file and environment inputs. Use rerun-if rules, verbose evidence, and a rebuild matrix to remove accidental rebuilds."
+---
+
+`build.rs` is a small Rust program with a large influence on build caching. If it reruns too often, generated files, native compilation, bindgen, and dependent crates may all become dirty.
+
+The confusing part is that Cargo cannot inspect arbitrary build-script code and discover every file, command, and environment variable it reads. The script must declare the external inputs that control its output.
+
+I use this model:
+
+> A build script is a cached function only when its input boundary is explicit.
+
+## The default is deliberately broad
+
+When a build script emits no `rerun-if` instruction, Cargo takes a conservative path: changes under the package cause the script to run again, subject to package include and exclude rules.
+
+This is safer than silently reusing stale generated output. It is also expensive in a crate containing documentation, fixtures, frontend files, or other inputs unrelated to native compilation.
+
+The fix is not to disable rebuilding blindly. The fix is to declare the real dependency set.
+
+## Two instructions define most input edges
+
+A build script prints instructions on standard output:
+
+```rust
+fn main() {
+    println!("cargo::rerun-if-changed=proto/service.proto");
+    println!("cargo::rerun-if-changed=native/wrapper.h");
+    println!("cargo::rerun-if-env-changed=MY_NATIVE_LIB_DIR");
+}
+```
+
+The meanings are different:
+
+- `cargo::rerun-if-changed=PATH` watches a file or directory path;
+- `cargo::rerun-if-env-changed=NAME` watches a variable received by Cargo from its environment.
+
+The double-colon syntax needs Rust 1.77 or newer. A crate supporting an older toolchain can print the older `cargo:KEY=VALUE` form.
+
+The [Cargo build-script reference](https://doc.rust-lang.org/cargo/reference/build-scripts.html#change-detection) is explicit that a directory path causes the directory to be scanned. I prefer individual files or a narrow generated manifest when a large tree changes frequently.
+
+## A rebuild matrix from a small experiment
+
+I tested this script with Cargo 1.98.0:
+
+```rust
+fn main() {
+    println!("cargo::rerun-if-changed=watched.txt");
+    println!("cargo::rerun-if-env-changed=DEMO_MODE");
+    println!("cargo::warning=BUILD_SCRIPT_RAN");
+}
+```
+
+The package also contained `src/lib.rs` and `ignored.txt`. I ran `cargo build -vv` after each isolated change.
+
+| Change after first build | Build script executed? | Library compiled? |
+| --- | --- | --- |
+| no change | no | no |
+| `ignored.txt` changed | no | no |
+| `watched.txt` changed | yes | yes |
+| `src/lib.rs` changed | no | yes |
+| `DEMO_MODE` changed | yes | yes |
+
+The table separates two invalidation decisions. A Rust source change can require compiling the library without requiring the build script to run. A watched build-script input normally reruns the script, and changed script output or freshness then affects the package compilation.
+
+This is the useful result of precise declarations: changing an unrelated file did no work.
+
+## A warning line does not prove the script just ran
+
+I added `cargo::warning=BUILD_SCRIPT_RAN` for visibility. On a fresh build, Cargo still displayed the cached warning even though it reported the package as `Fresh`.
+
+So this output is ambiguous:
+
+```text
+warning: demo@0.1.0: BUILD_SCRIPT_RAN
+```
+
+With `cargo build -vv`, I look for the actual `Running .../build-script-build` line and for Cargo's `Dirty` reason. Cargo also stores script output under a path similar to:
+
+```text
+target/debug/build/<package-hash>/output
+```
+
+Cached output is part of how Cargo can reuse build-script instructions. It should not be mistaken for a fresh process execution.
+
+## `build.rs` already invalidates itself
+
+Cargo rebuilds and reruns the build script when its Rust source or build dependencies change. I do not need to print `rerun-if-changed=build.rs` for that purpose.
+
+There is one special use:
+
+```rust
+fn main() {
+    println!("cargo::rerun-if-changed=build.rs");
+}
+```
+
+If the script truly has no external inputs, this single declaration prevents Cargo's broad package scan. The script itself still reruns when rebuilt.
+
+I use this only when the output depends exclusively on Cargo-provided stable inputs or constants in the script. If it calls Git, reads a configuration file, or searches a system library, the claim is false.
+
+## Generated outputs belong in `OUT_DIR`
+
+Cargo supplies `OUT_DIR` for generated files and intermediate artifacts:
+
+```rust
+use std::env;
+use std::fs;
+use std::path::PathBuf;
+
+fn main() {
+    println!("cargo::rerun-if-changed=schema.txt");
+
+    let out = PathBuf::from(env::var_os("OUT_DIR").unwrap());
+    let schema = fs::read_to_string("schema.txt").unwrap();
+    fs::write(out.join("generated.rs"), generate(&schema)).unwrap();
+}
+
+fn generate(schema: &str) -> String {
+    format!("pub const SCHEMA_LEN: usize = {};", schema.len())
+}
+```
+
+The crate can include it at compile time:
+
+```rust
+include!(concat!(env!("OUT_DIR"), "/generated.rs"));
+```
+
+Writing into `src/` from `build.rs` creates difficult feedback loops, modifies packaged source, and can make concurrent builds interfere. If generated source must be committed, I use a separate explicit generation command plus a CI check that the committed result is current.
+
+## Environment variables have three origins
+
+I distinguish these cases:
+
+1. **A variable set before Cargo starts**, such as `CC` or a custom SDK path. Use `rerun-if-env-changed` when the script reads it.
+2. **A variable supplied by Cargo to the build script**, such as `TARGET`. The change-detection instruction is not intended for these Cargo-provided values; Cargo already understands the build context.
+3. **A value embedded in Rust source with `env!` or `option_env!`**. Cargo automatically tracks those source macro reads since Rust 1.46.
+
+Over-declaring environment variables makes builds sensitive to harmless shell differences. Under-declaring them reuses stale output. I watch only variables that can change the script's result.
+
+## Host and target are easy to confuse
+
+A build script runs on the host machine, even when it helps build code for another target. Therefore this checks the wrong machine for cross-compilation:
+
+```rust
+if cfg!(target_os = "linux") {
+    // This describes the build script itself: the host.
+}
+```
+
+For the compilation target, I read Cargo's `CARGO_CFG_TARGET_OS`, `TARGET`, and related values. Native build dependencies can exist once for the host and again for the target, which is another reason build output and cache keys must keep contexts separate.
+
+## External commands need declared inputs too
+
+This script is tempting:
+
+```rust
+let revision = Command::new("git")
+    .args(["rev-parse", "HEAD"])
+    .output()?;
+```
+
+Cargo does not learn from that command which Git refs or worktree state matter. Watching the repository's `.git` internals is fragile, and embedding the current commit makes reproducible package builds harder.
+
+I first ask whether the binary needs this value. If it does, I prefer passing a release version from a controlled environment and declaring that variable. For developer-only information, a runtime command or separate packaging step is often cleaner.
+
+The same rule applies to `pkg-config`, bindgen, C compilers, and SDK discovery: list the source inputs I control, watch relevant external configuration, and avoid letting an unrecorded machine scan decide the artifact silently.
+
+## Output should be deterministic and write-on-change
+
+Even when a script reruns legitimately, it should avoid changing an output file when the generated bytes are identical.
+
+```rust
+fn write_if_changed(path: &Path, next: &[u8]) -> std::io::Result<()> {
+    if std::fs::read(path).as_deref() == Ok(next) {
+        return Ok(());
+    }
+    std::fs::write(path, next)
+}
+```
+
+This reduces downstream invalidation for generators whose output timestamp otherwise changes on every execution. I also sort discovered inputs and remove timestamps or absolute paths from generated content unless they are part of the real contract.
+
+## A review checklist
+
+For each build script, I ask:
+
+- What exact files can change its output?
+- Does any watched path name a broad directory?
+- Which caller-provided environment values matter?
+- Does it confuse host and target configuration?
+- Are all generated artifacts written under `OUT_DIR`?
+- Is output byte-for-byte deterministic for the same inputs?
+- Does it call an external program whose inputs are hidden from Cargo?
+- Can `cargo build -vv` explain every expected dirty and fresh case?
+- Does cross-compilation exercise a separate branch in CI?
+
+## Make the cache contract testable
+
+I treat rebuild behaviour as something to test, not as Cargo folklore. A small fixture package and a matrix of isolated changes are enough to expose broad watches, missing environment inputs, and misleading logs.
+
+Cargo can cache a build script well when I tell it what the script observes. Precise inputs make builds faster, but the more important result is correctness: a rebuild happens for every meaningful change and for no accidental one.

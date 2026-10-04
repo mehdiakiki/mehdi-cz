@@ -1,0 +1,94 @@
+---
+caseId: "RFA-111"
+title: "Why a Rust Channel Never Disconnects While One Sender Is Still Alive"
+date: "2026-09-05T10:11:00+01:00"
+lastmod: "2026-09-05T10:11:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "94aba335eb8c208f80ad10732f7ddf930de93ddb9fdfc00a917f16403e53ef8a"
+area: "concurrency-memory"
+symptom: "A receiver consumes all messages but waits or times out instead of observing disconnection because an original or cloned Sender still exists."
+summary: "Rust mpsc disconnection is an ownership event: every Sender must be dropped. Treat sender clones as producer capabilities, scope them deliberately, and test shutdown separately from message delivery."
+rustVersions: ["Rust 1.98.1"]
+targets: ["all targets with std"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust channel never closes sender still alive", "mpsc receiver hangs after all messages", "recv_timeout timeout instead of disconnected"]
+evidence: ["Rust 1.98.1 deterministic runtime failure", "live original Sender reproduction", "explicit sender ownership repair"]
+sources: ["https://doc.rust-lang.org/std/sync/mpsc/struct.Sender.html", "https://doc.rust-lang.org/std/sync/mpsc/struct.Receiver.html#method.recv_timeout"]
+---
+
+A channel can be empty without being disconnected. This difference explains many Rust worker loops that finish their work but never finish their shutdown.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-111/fail.rs) creates a channel, clones the sender for a worker, sends one message, and drops the clone. The receiver gets that message. Its next `recv_timeout` returns `Timeout`, not `Disconnected`, because the original sender remains alive in `main`.
+
+## Empty describes now; disconnected describes the future
+
+An empty channel says there is no queued message at this moment. A connected channel may receive another message later. The receiver is therefore correct to wait.
+
+Disconnection is stronger: no sender capability remains, so no future message can arrive. The [`Sender` documentation](https://doc.rust-lang.org/std/sync/mpsc/struct.Sender.html) explains that senders may be cloned and that send operations fail once the receiver is disconnected. On the other side, the receiver observes disconnection only after all senders are gone and buffered messages have been consumed.
+
+I use this state model:
+
+```text
+messages queued?   sender count?   receiver result
+yes                any             deliver a message
+no                 at least one    wait / Empty / Timeout
+no                 zero            Disconnected
+```
+
+The channel does not know which sender is “important.” The original handle and every clone carry equal ability to send.
+
+## A forgotten sender is a shutdown token
+
+Cloning a sender is cheap and convenient, so it can spread through structs, callbacks, or long-lived service state. Every clone silently becomes part of the shutdown protocol. One handle retained by the coordinator can keep the receiver alive after every worker exits.
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-111/fixed.rs) drops the original immediately after creating the worker sender. When the worker sender is later dropped, the receiver sees `Disconnected`.
+
+In real code I prefer a narrow ownership pattern:
+
+1. Create the channel in the coordinator.
+2. Create exactly the producer handles needed by workers.
+3. Drop the coordinator's unused sender before entering the receive loop.
+4. Let worker scope or explicit shutdown drop the final handles.
+
+This makes channel closure a natural consequence of producer lifetime.
+
+## Iteration also waits for disconnection
+
+`for message in receiver` and `receiver.iter()` are attractive because they finish when the channel disconnects. If one sender survives in the same scope, the loop does not finish after the last current message. It waits for a possible next one.
+
+I inspect the lifetime of senders before blaming scheduling. Adding sleeps may make the hang intermittent but cannot change the ownership condition.
+
+The [`recv_timeout` documentation](https://doc.rust-lang.org/std/sync/mpsc/struct.Receiver.html#method.recv_timeout) distinguishes timeout from disconnection. I keep those cases separate in error handling. A timeout can mean a slow producer; disconnection means production is impossible through this channel.
+
+## Explicit shutdown can be better than implicit closure
+
+Using sender drop as the only shutdown signal works well when all producers share one lifecycle. Long-running services can need a separate cancellation signal, because retaining a sender for future work is legitimate.
+
+I then separate two events:
+
+- stop accepting or producing work;
+- finish draining and drop the last producer.
+
+A control message, cancellation token, or scoped thread API can express the first event. Channel disconnection still expresses the second. Mixing both meanings into “receive returned nothing” makes graceful shutdown hard to reason about.
+
+## Tests must bound waiting
+
+A test that calls blocking `recv()` for the final disconnection can hang the test process forever when a sender leaks. The evidence fixture uses a short `recv_timeout` so the wrong state becomes a deterministic assertion failure.
+
+For application tests I choose a generous bound appropriate for CI and assert the exact error variant. I also join workers, because a disconnected channel with an unobserved worker panic is not a successful shutdown.
+
+I avoid tests based only on `strong_count`-style guesses. The channel API result is the behavior that matters.
+
+## My debugging sequence
+
+When a receiver does not stop, I do this:
+
+1. Confirm whether it is empty, timed out, or disconnected.
+2. Find the creation site and every `Sender::clone`.
+3. Inspect structs and callbacks retaining a sender beyond worker lifetime.
+4. Drop the coordinator copy before receiving to completion when it has no producer role.
+5. Join producers and test shutdown with a bounded timeout.
+6. Add a distinct cancellation protocol if producers intentionally remain alive.
+
+The receiver is not waiting because it missed an end marker. It is waiting because Rust ownership still proves that a future send is possible. Once sender ownership matches the intended lifecycle, disconnection becomes reliable and shutdown code becomes much smaller.

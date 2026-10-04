@@ -1,0 +1,89 @@
+---
+caseId: "RFA-134"
+title: "Why std::sync::Once Stays Poisoned After an Initializer Panic"
+date: "2026-09-05T12:34:00+01:00"
+lastmod: "2026-09-05T12:34:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "22cb9582cba1a8fac9016d91b07c69571187d50faa5e5935386fe16ee950fcd4"
+area: "concurrency-memory"
+symptom: "After a call_once initializer panics, a later ordinary call_once also panics instead of retrying because the Once records a poisoned state."
+summary: "Once treats an initializer panic as poison and propagates it through later call_once calls. Use call_once_force only with an explicit recovery policy, or choose a state representation that models retryable initialization failures directly."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["targets with std::sync"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust Once poisoned initializer panic retry", "Once instance has previously been poisoned call_once", "call_once_force recover poisoned Once"]
+evidence: ["Rust 1.98.1 deterministic poison panic", "second call_once propagates poison", "call_once_force recovery repair"]
+sources: ["https://doc.rust-lang.org/std/sync/struct.Once.html", "https://doc.rust-lang.org/std/panic/fn.catch_unwind.html"]
+---
+
+The [failing program](/rust-failure-atlas/evidence/RFA-134/fail.rs) calls a `Once` initializer that panics. It catches the first unwind so execution can continue, then calls `call_once` again. The second call panics with “Once instance has previously been poisoned” instead of executing the new closure.
+
+The surprise comes from treating `Once` as a boolean that says only “finished” or “not finished.” Its state also remembers failed initialization.
+
+## Once coordinates a one-time transition
+
+The [`Once` documentation](https://doc.rust-lang.org/std/sync/struct.Once.html) defines a synchronization primitive for running initialization exactly once. Successful completion establishes synchronization with later callers.
+
+An initializer panic creates a difficult state. Other threads cannot assume initialization completed, but blindly rerunning arbitrary partial initialization may also be unsafe. The primitive marks itself poisoned and ordinary `call_once` calls propagate that failure.
+
+I model the states like this:
+
+```text
+new -> running -> complete
+          |
+          +---- panic -> poisoned
+```
+
+Poisoned is not the same as new. It records that code entered the transition and did not finish normally.
+
+## catch_unwind catches the panic, not the poison
+
+The fixture uses [`catch_unwind`](https://doc.rust-lang.org/std/panic/fn.catch_unwind.html) around the first call. This catches unwinding at that boundary so the demonstration can continue. It does not roll back changes made by the closure, and it does not reset the `Once` state.
+
+This distinction matters in services that catch panics around jobs or plugin code. Catching an unwind is a control-flow decision. It is not transactional recovery for memory, files, processes, global state, or synchronization primitives.
+
+I avoid broad `catch_unwind` as a way to make initialization retryable. The initializer may have published partial external effects even if Rust memory remains safe.
+
+## call_once_force is an explicit recovery path
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-134/fixed.rs) calls `call_once_force`. Its closure receives a state value and verifies that the previous attempt was poisoned. If this forced closure returns normally, the `Once` becomes complete and later ordinary calls do not execute.
+
+I use this only after defining what recovery means. A good forced initializer should either reconstruct all state from a known base or validate and complete the partial state left by the first attempt.
+
+Simply rerunning the same side effects can duplicate registrations, truncate a file twice, leak handles, or leave two background workers. The primitive permits recovery; it cannot prove the recovery procedure is correct.
+
+## Retryable failure may need a different model
+
+Some initialization is naturally fallible: a network dependency is unavailable, credentials have not arrived, or a configuration file is temporarily incomplete. A panic plus poisoning is often the wrong representation for this expected failure.
+
+I prefer an API that returns `Result` and a state machine that states whether retry is allowed. A mutex-protected enum can represent `Uninitialized`, `Initializing`, `Ready`, and `Failed { retry_at, cause }`. More specialized cell types can fit simple one-value cases, but their exact panic and retry semantics must be checked rather than assumed.
+
+The extra state is worthwhile when operations teams need error context, backoff, cancellation, or a manual reset. `Once` is strongest when initialization should either complete exactly once or reveal a programmer-level failure.
+
+## Partial publication is the real risk
+
+Before choosing forced recovery, I list what the initializer can change:
+
+- memory reachable by other threads,
+- files or sockets,
+- process-global libraries,
+- metrics and registrations,
+- spawned threads or tasks.
+
+If other code can observe a partially initialized resource before the panic, the problem is larger than poison. I build the state privately, validate it, and publish one ready handle only at the end. This reduces the recovery surface.
+
+Idempotent setup also helps, but I define idempotency for each side effect. “Calling twice did not panic in a test” is not sufficient proof.
+
+## My debugging sequence
+
+When a second `call_once` unexpectedly panics, I do this:
+
+1. Find the first initializer panic, including one caught elsewhere.
+2. Record every side effect completed before that panic.
+3. Decide whether failure is exceptional poison or an expected retryable result.
+4. Use `call_once_force` only with a tested reconstruction or completion procedure.
+5. Replace `Once` with explicit state when retries, backoff, or error reporting are product requirements.
+6. Test concurrent callers, a panic at each initialization step, and the post-recovery state.
+
+The core principle is that once-only initialization is a state transition, not merely a closure call. A panic leaves history. Good recovery makes that history and its partial effects explicit instead of assuming a caught unwind returned the world to its starting point.

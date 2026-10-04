@@ -1,0 +1,92 @@
+---
+caseId: "RFA-101"
+title: "Why Two Versions of the Same Rust Crate Produce Different Types"
+date: "2026-09-05T10:01:00+01:00"
+lastmod: "2026-09-05T10:01:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "1daeaecfa030554b12dcb84871808614da44cc05ded615ceb593d20eff11b218"
+area: "cargo-dependencies"
+symptom: "Rust reports that a type does not match an apparently identical type because the dependency graph contains two versions of the crate that defines it."
+summary: "A Rust type includes the identity of its defining crate, not only its printed path and fields. Use Cargo's inverse tree to find the two versions, then align the dependency boundary instead of converting blindly."
+rustVersions: ["Rust 1.98.1", "Cargo 1.98.1"]
+targets: ["all targets"]
+profiles: ["check", "dev", "release", "test"]
+searchTerms: ["Rust multiple versions same crate mismatched types", "expected type found different same type Rust", "cargo tree duplicate crate versions"]
+evidence: ["Cargo 1.98.1 workspace failure", "two local versions with identical type names", "single-version graph repair"]
+sources: ["https://doc.rust-lang.org/cargo/commands/cargo-tree.html", "https://doc.rust-lang.org/cargo/reference/resolver.html"]
+---
+
+This error looks impossible the first time. Rust can print something close to this:
+
+```text
+expected `rfa_model::UserId`, found a different `rfa_model::UserId`
+```
+
+The names are equal. The fields may also be equal. Still, the types are not equal. In the [failing workspace](/rust-failure-atlas/evidence/RFA-101/fail/Cargo.toml), one side comes from version 0.1.0 and the other from version 0.2.0 of the same package. Cargo can build both versions together, but rustc gives each compiled crate its own identity.
+
+I think about the full name as `(crate instance, module path, type name)`. The error normally prints only the last parts. This is why reading the line without reading the dependency graph wastes time.
+
+## Same source shape does not create type compatibility
+
+Rust is nominal here. Two public structs do not become interchangeable because both contain one `u64`:
+
+```rust
+pub struct UserId(pub u64);
+```
+
+The defining crate is part of the type. This is important for coherence, trait implementations, layout changes, and API safety. Version 0.2 may look equal today and gain a different invariant tomorrow. Rust does not guess that the packages intended a shared contract.
+
+The [Cargo resolver documentation](https://doc.rust-lang.org/cargo/reference/resolver.html) explains that the graph can contain multiple compatible or incompatible package versions. Resolution answers which packages must be built. It does not merge their Rust types after resolution.
+
+## I inspect the inverse graph first
+
+The useful command is usually:
+
+```bash
+cargo tree -d
+cargo tree -i package-name@0.1.0
+cargo tree -i package-name@0.2.0
+```
+
+`cargo tree -d` shows packages present at several versions. The inverse form shows who pulled each version into the graph. The [cargo tree documentation](https://doc.rust-lang.org/cargo/commands/cargo-tree.html) also documents feature and edge views, which matter when a target or optional feature introduces the second copy.
+
+I record the exact package version, source, and target. A registry release, Git revision, and local path package with similar names are not necessarily one crate instance. In a workspace, I also check renamed dependencies because aliases can hide the shared package name in source.
+
+## The repair belongs at the dependency boundary
+
+The [repaired workspace](/rust-failure-atlas/evidence/RFA-101/fixed/Cargo.toml) makes the application and producer use one model package. This is the clean repair when the type represents the same domain concept.
+
+Real graphs are not always so easy. A direct dependency may accept only version 1 while a transitive dependency accepts only version 2. Then I have four possible decisions:
+
+1. Upgrade or downgrade one dependent crate so both accept a common version.
+2. Change a version requirement if I own the crate and its actual API is compatible.
+3. Keep both versions but translate through my own stable type at the boundary.
+4. Remove the dependency from a public API so its concrete types do not leak between subsystems.
+
+I do not use `transmute`, pointer casts, or serialization as a casual conversion. Matching fields do not prove matching validity rules. Serialization can be a legitimate boundary, but then it should be explicit, validated, and treated as data conversion rather than a compiler workaround.
+
+## Public dependency types make upgrades harder
+
+If a library returns `dependency_v1::UserId`, every consumer becomes coupled to that exact dependency identity. A second library accepting `dependency_v2::UserId` cannot receive it. This is sometimes correct, but for a central domain identifier I prefer a type owned by the public crate or a dependency version intentionally shared across the workspace.
+
+Traits have the same issue. An implementation of a trait from version 1 is not an implementation of the visually equal trait from version 2. Error messages around `Serialize`, database traits, or plugin interfaces can therefore look like a missing implementation even when source search finds it.
+
+## Lockfile edits are not the first move
+
+Deleting `Cargo.lock` may select another graph, but it does not explain why two requirements were incompatible. It can also update unrelated packages and make the investigation larger. I first use the existing lockfile as evidence, inspect inverse edges, and make one controlled dependency change.
+
+For an application I normally commit the lockfile. For a library, I test supported dependency ranges and sometimes test minimum versions separately. The exact policy changes, but the type-identity rule does not.
+
+## My debugging sequence
+
+When Rust says one type differs from itself, I follow this order:
+
+1. Read every note under the main error; rustc often says that multiple versions exist.
+2. Run `cargo tree -d` and inverse trees for both versions.
+3. Check registry, Git, and path sources, not only version numbers.
+4. Find where the dependency type crosses a public or subsystem boundary.
+5. Align versions when it is truly one concept; otherwise write an explicit conversion.
+6. Run tests at the boundary, including validation and trait behavior.
+
+The compiler message is strange only because the displayed type name is abbreviated. The actual failure is precise: two crate instances define two nominal types. Once I make the dependency graph visible, the repair becomes an architecture choice instead of trial and error.

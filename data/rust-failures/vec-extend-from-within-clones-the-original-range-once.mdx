@@ -1,0 +1,84 @@
+---
+caseId: "RFA-391"
+title: "Vec::extend_from_within Clones the Original Range Once"
+date: "2026-09-06T03:31:00+01:00"
+lastmod: "2026-09-06T03:31:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "c6927e76a3b528f017e6d9af9aa4aa33ee33554f5fe034006af7dafb46eb43cc"
+area: "concurrency-memory"
+symptom: "Vec::extend_from_within appends one clone of the selected range and does not recursively include elements appended during the operation."
+summary: "extend_from_within resolves a source range against the existing vector, clones those elements, and appends one suffix. The range cannot grow recursively as appends occur, and each clone follows T::clone semantics."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust Vec extend_from_within source range", "extend_from_within recursive append", "clone Vec range to end Rust"]
+evidence: ["Rust 1.98.1 three-element Vec", "source range zero through two", "single two-element cloned suffix"]
+sources: ["https://doc.rust-lang.org/std/vec/struct.Vec.html#method.extend_from_within", "https://doc.rust-lang.org/std/clone/trait.Clone.html", "https://doc.rust-lang.org/std/vec/struct.Vec.html#method.extend_from_slice"]
+---
+
+I used `extend_from_within` while expanding a repeating prefix and briefly pictured the range growing while new elements were appended. That would have made the operation recursive. Rust instead selects one range from the current vector and clones it once.
+
+The [failing fixture](/rust-failure-atlas/evidence/RFA-391/fail.rs) extends `['a', 'b', 'c']` from range `0..2`. The result contains five values: `a, b, c, a, b`. The newly appended `a` does not re-enter the source and append again.
+
+## The range describes the pre-extension vector
+
+[`Vec::extend_from_within`](https://doc.rust-lang.org/std/vec/struct.Vec.html#method.extend_from_within) clones elements from a range inside the vector and appends them to its end. The source is a bounded logical selection, not a live iterator whose end tracks length changes.
+
+This makes the final length predictable:
+
+```text
+final length = original length + source range length
+```
+
+For `0..2`, the range length is two. Capacity may grow to accommodate those values, but reallocation does not change which logical elements were selected.
+
+## Each element is cloned
+
+The method requires `T: Clone`, not `T: Copy`. The appended suffix follows the element's [`Clone`](https://doc.rust-lang.org/std/clone/trait.Clone.html) implementation.
+
+For `String`, this normally produces distinct owned string buffers. For `Rc<T>` or `Arc<T>`, cloning increases a reference count and shares the same allocation. For a custom type, cloning can copy an identifier, allocate new state, or perform other documented work.
+
+I therefore do not describe the operation as “deep copy” without knowing `T`. If each appended element needs fresh domain identity, I use explicit generation rather than relying on Clone.
+
+## Invalid ranges panic before a useful result
+
+Like slice indexing, the source must have ordered bounds inside the vector's original length. An out-of-bounds or inverted range panics. If bounds come from a message or user input, I validate them and return a domain error.
+
+This method returns `()`, not a partial extension result. I do not use panic catching as ordinary range validation.
+
+For trusted internal indices, the panic usefully reveals an invariant failure close to the mutation.
+
+## One call is not a general repetition operator
+
+To repeat a pattern several times, I calculate the desired count and use an explicit loop whose source stays clear. Calling `extend_from_within` repeatedly can be efficient, but the range used by each call is evaluated against the vector state at that call.
+
+For example, doubling a complete vector repeatedly is different from appending the first two original items repeatedly. I name the original pattern length so later growth does not silently change the selected range.
+
+For very large output, I check length arithmetic and allocation failure concerns before starting. Cloning can also be expensive or observable.
+
+## It differs from extend_from_slice in ownership access
+
+[`extend_from_slice`](https://doc.rust-lang.org/std/vec/struct.Vec.html#method.extend_from_slice) accepts a separate borrowed slice. Borrowing a slice from the same vector and mutably extending that vector conflicts in safe code because reallocation could invalidate the borrow.
+
+`extend_from_within` provides the internal operation safely. The method controls selection, possible reallocation, and cloning without exposing a stale reference.
+
+I use the separate-slice method when data comes from another collection and the within method when duplication is intentionally from the same vector.
+
+## Panic during Clone leaves a valid but partial story
+
+A custom `Clone` implementation can panic. Rust maintains memory safety and drops initialized values correctly, but application-level side effects from earlier clones may already have happened. I avoid clone implementations with external side effects where possible.
+
+For fallible duplication, `Clone` cannot return `Result`. I build a temporary vector with a fallible mapping, then extend only after every new value succeeds. That offers an application-level all-or-nothing boundary, subject to external effects inside the constructor.
+
+## My tests make identity visible
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-391/fixed.rs) uses owned strings and asserts the final sequence. For reference-counted or custom values, I also test pointer identity or generated IDs according to the intended clone contract.
+
+I check empty ranges, full ranges, and a middle range. I assert final length separately so an accidental recursive loop is immediately visible.
+
+The core principle is that mutation does not make the source specification self-expanding. `extend_from_within` resolves one original range, clones each selected element once, and appends that finite result. Repetition beyond that belongs in explicit application logic.
+
+## The invariant I leave beside production code
+
+For non-obvious uses I record three values in a test: the original length, the resolved source range, and the final length. The expected relation is `final = original + source_len`. This catches accidental range changes during refactoring and documents that the appended suffix is not reconsidered as input. If cloning has business meaning—duplicating queued work, retry records, or owned handles—I also prefer a named helper so reviewers see that cloning is intentional and can inspect whether every element's `Clone` behavior is acceptable.

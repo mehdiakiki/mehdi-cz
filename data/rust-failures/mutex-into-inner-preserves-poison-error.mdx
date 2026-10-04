@@ -1,0 +1,84 @@
+---
+caseId: "RFA-329"
+title: "Mutex::into_inner Still Reports Poison"
+date: "2026-09-06T01:49:00+01:00"
+lastmod: "2026-09-06T01:49:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "9541eabb4f422da00eab993066d41a4dcba8bcc1a71577be22cd15dfc248c093"
+area: "concurrency-memory"
+symptom: "Consuming a Mutex does not bypass an earlier poison event: into_inner returns PoisonError even though no future lock acquisition is needed."
+summary: "Mutex::into_inner removes synchronization ownership but retains the consistency warning created by a panic under the guard. The error owns the protected value, which can be validated and recovered explicitly."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["targets with std::sync::Mutex"]
+profiles: ["dev", "release with panic=unwind", "test"]
+searchTerms: ["Rust Mutex into_inner PoisonError", "recover owned value poisoned Mutex", "does into_inner ignore mutex poison"]
+evidence: ["Rust 1.98.1 worker panic", "consumed uniquely owned Mutex", "owned value recovered from PoisonError"]
+sources: ["https://doc.rust-lang.org/std/sync/struct.Mutex.html#method.into_inner", "https://doc.rust-lang.org/std/sync/struct.PoisonError.html#method.into_inner", "https://doc.rust-lang.org/std/sync/struct.Mutex.html#poisoning"]
+---
+
+I once assumed consuming a `Mutex` would make poison irrelevant. There would be no competing thread and no future call to `lock`, so I expected `into_inner()` to return `T` directly. Rust keeps the warning.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-329/fail.rs) lets a worker mutate an integer and panic while holding the guard. After reclaiming sole ownership of the mutex, `into_inner()` returns an error.
+
+## Synchronization ownership and data health are separate
+
+[`Mutex::into_inner`](https://doc.rust-lang.org/std/sync/struct.Mutex.html#method.into_inner) consumes the mutex and returns a `LockResult<T>`. It can fail with poison even though consuming ownership means no lock needs to be acquired afterward.
+
+This makes sense when poison is read as a consistency signal rather than a locking failure. Removing the synchronization wrapper does not prove that the earlier interrupted mutation left `T` valid.
+
+The caller now owns the recovery decision, but the event has not stopped mattering.
+
+## The error owns the value
+
+[`PoisonError::into_inner`](https://doc.rust-lang.org/std/sync/struct.PoisonError.html#method.into_inner) returns the protected data carried by the error. For `Mutex::into_inner`, that is the owned `T`, not a guard.
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-329/fixed.rs) deliberately recovers the integer and verifies the mutation that occurred before panic.
+
+Using `unwrap_or_else(|error| error.into_inner())` is mechanically simple. The semantic work is deciding whether that value is acceptable. In the tiny fixture the invariant is trivial. In a real cache, graph, ledger, or state machine, I validate or reconstruct before using it.
+
+## Poison does not roll back mutation
+
+The [`Mutex` poisoning documentation](https://doc.rust-lang.org/std/sync/struct.Mutex.html#poisoning) describes poison as advisory. Rust cannot reverse assignments made through the guard. It also cannot know whether the panic occurred before mutation, after a complete valid update, or between several related changes.
+
+The fixture writes `2` and then panics. Recovering `1` would require an application-level snapshot or transaction; the mutex never promised one.
+
+External side effects may have happened as well. Consuming the in-memory wrapper cannot compensate for a message already sent or a file partially written.
+
+## Unique Arc ownership is another independent condition
+
+The example first uses `Arc<Mutex<i32>>` to share the mutex with a worker. Before calling `into_inner`, it uses `Arc::try_unwrap` to prove that only one strong owner remains.
+
+`Arc::try_unwrap` failure would mean shared ownership still exists. `Mutex::into_inner` poison means an interrupted guarded operation was recorded. These are different failures and deserve different handling.
+
+I avoid collapsing both into `unwrap()`, especially in shutdown code where lingering worker ownership is valuable diagnostic information.
+
+## Shutdown and extraction paths need failure tests
+
+Consuming synchronization wrappers often occurs during shutdown, snapshotting, test cleanup, or conversion from a builder phase into an immutable phase. These paths receive less testing than ordinary lock acquisition.
+
+A worker panic can make the final extraction fail exactly when the system is already handling another error. If cleanup calls `unwrap`, the secondary panic can hide the original worker failure.
+
+I preserve the join error and the poison state separately, then decide whether a best-effort snapshot is safe.
+
+## Recovery policy belongs near the invariant
+
+A library that owns `T` can offer a method such as `validate_and_finish(self) -> Result<Output, FinishError>`. It can inspect poisoned data using domain knowledge and report what was repaired.
+
+Exposing only `Mutex<T>` pushes every caller toward generic poison handling. Exposing only `T` after silently ignoring poison hides evidence. A domain wrapper can make the safe path the easy one.
+
+For rebuildable caches, the policy may discard recovered state and recompute it. For durable financial state, the policy may terminate and replay a journal. The synchronization primitive cannot choose between them.
+
+## Panic strategy changes whether extraction runs
+
+RFA-329 uses unwinding so the worker releases its guard, the join returns an error, and the parent continues. With `panic=abort`, the process terminates before `Arc::try_unwrap` or `into_inner` executes.
+
+I test the configured panic strategy and do not describe in-memory poison recovery as a universal crash-recovery mechanism. Process death requires durable evidence outside the mutex.
+
+## What I verify
+
+My tests distinguish a healthy consumed mutex, a poisoned consumed mutex with valid recoverable data, a value that fails domain validation, and a mutex whose `Arc` still has another owner. They retain the original worker result so recovery does not erase why poison exists.
+
+I also test that normal successful mutation and extraction do not take the error path. Recovery code should be unusual and observable.
+
+The core principle is that removing a coordination mechanism does not erase the history of the data it guarded. `Mutex::into_inner` gives up the lock because ownership is unique, but it preserves poison because consistency is still a question. I retrieve the value explicitly and let the domain, not the absence of competitors, decide whether it is safe.

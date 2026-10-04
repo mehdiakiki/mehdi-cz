@@ -1,0 +1,107 @@
+---
+caseId: "RFA-092"
+title: "E0596: Why Arc Does Not Give Mutable Access"
+date: "2026-09-05T09:12:00+01:00"
+lastmod: "2026-09-05T09:12:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "52ed221e1124e7dd92234379edb3fd4cf3ee3e3abda5020c705ab6c3d5c8935c"
+area: "concurrency-memory"
+symptom: "Calling a mutating Vec method through Arc<Vec<T>> fails because Arc does not provide mutable access."
+summary: "Arc shares ownership, not &mut access. Decide whether mutation happens before sharing, through copy-on-write, or under synchronization rather than wrapping types until the compiler accepts them."
+rustVersions: ["Rust 1.98.1"]
+targets: ["targets with atomic pointer support"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  ["Rust cannot borrow data in Arc as mutable E0596", "Arc Vec push mutation", "Arc Mutex Vec"]
+evidence: ["Rust 1.98.1 compile failure", "ownership-versus-mutation matrix", "Arc Mutex repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/std/sync/struct.Arc.html",
+    "https://doc.rust-lang.org/std/sync/struct.Mutex.html",
+  ]
+---
+
+Wrapping a vector in `Arc` makes it shareable, but not directly mutable:
+
+```rust
+use std::sync::Arc;
+
+fn main() {
+    let values = Arc::new(vec![1, 2]);
+    values.push(3);
+}
+```
+
+Rust 1.98.1 reports E0596: it cannot borrow data in an Arc as mutable. `Vec::push` needs `&mut Vec<T>`, while `Arc<Vec<T>>` can normally expose only shared access to the vector. The [failing fixture](/rust-failure-atlas/evidence/RFA-092/fail.rs) pins this exact case.
+
+The word “atomic” in Arc refers to reference-count ownership bookkeeping. It does not turn every operation on `T` into an atomic or synchronized operation.
+
+## Shared ownership removes ordinary uniqueness
+
+An `&mut T` is exclusive: while it exists, no other reference may access the same value in conflicting ways. An Arc is designed to have several owners. If each owner could obtain `&mut T`, those mutable references could overlap.
+
+The standard-library [`Arc` documentation](https://doc.rust-lang.org/std/sync/struct.Arc.html) says shared references do not generally permit mutation and points to atomics or locks for shared mutation. [`Mutex`](https://doc.rust-lang.org/std/sync/struct.Mutex.html) supplies interior mutability by granting one guarded mutable access at a time.
+
+These are separate properties:
+
+- Arc decides how many owners may keep the allocation alive.
+- A mutex or atomic decides how concurrent operations coordinate.
+- The inner type defines what state changes mean.
+
+## Mutate before sharing when possible
+
+The cheapest repair may be changing initialization order:
+
+```rust
+let mut values = vec![1, 2];
+values.push(3);
+let values = Arc::new(values);
+```
+
+Once published to other owners, the data becomes immutable. This is a strong architecture for configuration, routing tables, schemas, and snapshots. Readers need no lock and the ownership transition is obvious.
+
+If the Arc is still uniquely owned, `Arc::get_mut` can return mutable access. It returns `None` when another strong or relevant weak owner exists. I use it during controlled construction, not as a runtime synchronization strategy.
+
+## Copy-on-write is another ownership model
+
+`Arc::make_mut` clones the inner value when the allocation is shared and returns mutable access to a unique copy. This works well for data read frequently and modified rarely when diverging snapshots are acceptable.
+
+It does not update every existing owner. A caller expecting one shared live vector would introduce a subtle logical bug by using copy-on-write. The method compiles because it changes the ownership semantics, not because it adds synchronization to one shared state.
+
+## Use a lock for genuinely shared mutation
+
+The [verified repair](/rust-failure-atlas/evidence/RFA-092/fixed.rs) uses `Arc<Mutex<Vec<_>>>`:
+
+```rust
+let values = Arc::new(Mutex::new(vec![1, 2]));
+values.lock().unwrap().push(3);
+```
+
+Every participant must take the same lock before accessing the mutable vector. The guard creates temporary exclusive access.
+
+This representation still needs an operational policy: keep guard lifetimes short, decide how to handle poisoning, avoid holding the guard across await, and avoid returning references that outlive it.
+
+For read-heavy access, `RwLock` may allow concurrent readers. It also adds fairness and starvation questions. I measure the workload before assuming it is faster.
+
+## Atomics work only for atomic-shaped state
+
+If the shared value is a counter or flag, an atomic type may remove the lock. A Vec update is not one atomic machine operation. Replacing the data model with several atomics can make consistency harder than a mutex-protected struct.
+
+Message passing is another option: one task owns the vector and receives update commands. This removes shared mutation but introduces queueing, backpressure, and shutdown responsibilities.
+
+## A nested wrapper should tell a story
+
+Types such as `Arc<Mutex<Option<Vec<T>>>>` are not automatically wrong, but every layer should have a named role. Arc owns process-wide lifetime, Mutex serializes changes, Option represents presence, and Vec stores order. If I cannot explain each layer, the design probably grew by reacting to compiler errors.
+
+## My repair decision
+
+For E0596 through Arc, I ask:
+
+1. Can all mutation finish before the first clone?
+2. Should different owners see independent snapshots?
+3. Must every owner observe one changing state?
+4. Is the update a true atomic value or a multi-step invariant?
+5. Could one owner task process commands instead?
+
+Then I choose construction-time mutation, `get_mut`, `make_mut`, a lock, an atomic, or message passing. The compiler is not saying Arc is incomplete. It is asking the program to specify a mutation protocol that shared ownership alone cannot provide.

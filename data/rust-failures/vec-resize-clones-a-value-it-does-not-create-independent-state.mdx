@@ -1,0 +1,70 @@
+---
+caseId: "RFA-660"
+title: "Vec::resize Clones a Value; It Does Not Create Independent State"
+date: "2026-09-06T08:20:00+01:00"
+lastmod: "2026-09-06T08:20:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "a9112fbdd35ff9be1126cab22e48a3c48dcb136d66676d3ba86fbe53d280e6c8"
+area: "concurrency-memory"
+symptom: "Growing a vector with Vec::resize creates several Arc values, but changing one element appears to change every element."
+summary: "resize follows Clone semantics for its fill value. A cloned handle can still point to shared state; use resize_with when every slot needs a fresh value."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust Vec resize clone shared Arc", "Vec resize independent values", "resize_with versus resize Rust"]
+evidence: ["Rust 1.98.1 runtime assertion", "Arc fill values share one atomic allocation", "resize_with constructs independent allocations"]
+sources: ["https://doc.rust-lang.org/std/vec/struct.Vec.html#method.resize", "https://doc.rust-lang.org/std/vec/struct.Vec.html#method.resize_with", "https://doc.rust-lang.org/std/clone/trait.Clone.html"]
+---
+
+`Vec::resize(new_len, value)` grows a vector by cloning `value`. This sentence looks simple, but it hides an important distinction: cloning a value is not the same operation as creating independent state. The [failing fixture](/rust-failure-atlas/evidence/RFA-660/fail.rs) fills three positions with clones of one `Arc<AtomicU8>`. Updating the atomic through the first position is visible through the second one.
+
+## Clone decides what duplication means
+
+The [`Vec::resize` contract](https://doc.rust-lang.org/std/vec/struct.Vec.html#method.resize) says new elements are filled by cloning the supplied value. `Vec` does not know whether `T::clone` duplicates bytes, increments a reference count, copies a file descriptor abstraction, or performs a domain-specific operation.
+
+For `String`, a clone owns another string buffer with the same text. For `Arc<T>`, a clone creates another strong handle to the same allocation. For a custom type, the implementation of [`Clone`](https://doc.rust-lang.org/std/clone/trait.Clone.html) defines the result. The method name cannot promise more than that trait contract.
+
+I therefore avoid reading `resize(10, x)` as “make ten fresh x values.” I read it literally as “extend this vector using Clone on this particular x.” That small change in language catches the failure early.
+
+## The vector elements are separate, the inner object is shared
+
+After resizing, every slot in the failing fixture contains a distinct `Arc` value. The handles occupy separate vector elements and can be replaced separately. However, all handles identify the same atomic allocation. This is normal shared ownership, not aliasing corruption.
+
+The distinction matters in worker state, request limits, caches, test fixtures, and per-connection counters. If every slot is supposed to own an independent counter, cloning an `Arc` silently changes the model into one global counter with many handles. The types remain memory-safe while the application invariant is wrong.
+
+The same pattern occurs with `Rc<RefCell<T>>`, reference-counted strings, cloneable clients backed by a shared connection pool, and custom handles. A cheap clone often intentionally shares expensive resources. It should not be used as a generic factory.
+
+## Use resize_with for construction
+
+[`Vec::resize_with`](https://doc.rust-lang.org/std/vec/struct.Vec.html#method.resize_with) calls a closure for each new element. The [repaired fixture](/rust-failure-atlas/evidence/RFA-660/fixed.rs) creates a new `Arc` and a new atomic in that closure. A write through one slot then remains local to that slot.
+
+This also makes intent visible in review. `resize_with(count, Default::default)` says that every missing position is independently default-constructed. `resize(count, shared.clone())` says that positions follow the value's clone behaviour. Neither method is generally better; they encode different ownership models.
+
+When construction needs an index, I may use an iterator such as `(old_len..new_len).map(make_slot)` and extend the vector. The important part is not the syntax. It is deciding whether repeated positions are replicas, handles, or newly constructed identities.
+
+## Do not depend on an exact clone count
+
+I test the observable ownership result instead of counting calls to `clone`. An implementation may move the supplied value into one position and clone it for others while still satisfying the API. Code with side effects inside `Clone` is already difficult to reason about.
+
+The useful assertion is that slots either share or do not share state according to the design. For `Arc`, `Arc::ptr_eq` can test allocation identity. For domain objects, modifying one element and checking another often expresses the invariant more clearly.
+
+If cloning can fail conceptually, `Clone` is also the wrong abstraction because it cannot return `Result`. A fallible factory loop can stop cleanly, report which slot failed, and leave rollback policy explicit.
+
+## Capacity is a different question
+
+`resize` changes length and may trigger allocation when capacity is insufficient. That allocation moves the vector's elements, but it does not change whether their inner state is shared. I keep storage capacity, element ownership, and inner resource identity as three separate questions.
+
+Shrinking with `resize` truncates and drops removed elements. Growing again constructs or clones new elements; it does not restore the old ones. Systems that use a vector as a reusable slot table should define how removed resources are closed and how new slot identities are assigned.
+
+## My review checklist
+
+- What exactly does `T::clone` do for the fill value?
+- Should each new position have independent identity or shared ownership?
+- Would `resize_with` communicate the intended construction better?
+- Am I testing observable sharing instead of implementation clone counts?
+- Can construction fail and therefore require an explicit loop returning `Result`?
+- Is vector capacity being confused with the identity of stored resources?
+- Does shrinking have a deliberate drop and cleanup policy?
+
+The core principle goes beyond vectors: generic cloning preserves the type's own duplication contract. It never upgrades a shared handle into independent state. I choose a clone when sharing or value duplication is intended, and I choose a factory when each position must begin a new lifetime.

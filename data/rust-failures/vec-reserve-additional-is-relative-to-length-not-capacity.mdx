@@ -1,0 +1,103 @@
+---
+caseId: "RFA-405"
+title: "Vec::reserve Measures Additional Space from Length, Not Capacity"
+date: "2026-09-06T03:45:00+01:00"
+lastmod: "2026-09-06T03:45:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "a6c0db4c1880a99a9322b847d829da57efa2c0b45239cabf520e8fa69ee8656b"
+area: "concurrency-memory"
+symptom: "reserve(9) reallocates a Vec whose length is two and capacity is ten because the request means room for eleven total elements."
+summary: "Vec::reserve(additional) guarantees capacity for len + additional elements. It does not request a total capacity or compare additional directly with existing spare capacity; calculate the postcondition from current length."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets with an allocator"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust Vec reserve additional relative to length", "Vec reserve reallocates despite spare capacity", "reserve argument capacity or length Rust"]
+evidence: ["Rust 1.98.1 length-two capacity-ten Vec", "nine additional elements request", "capacity at least eleven assertion"]
+sources: ["https://doc.rust-lang.org/std/vec/struct.Vec.html#method.reserve", "https://doc.rust-lang.org/std/vec/struct.Vec.html#method.reserve_exact", "https://doc.rust-lang.org/std/vec/struct.Vec.html#method.capacity"]
+---
+
+I had a vector with capacity ten and called `reserve(9)`. I expected no allocation because nine was smaller than ten. The mistake was comparing the argument with capacity instead of reading it as additional elements after the current length.
+
+The [failing fixture](/rust-failure-atlas/evidence/RFA-405/fail.rs) starts with length two and capacity ten. `reserve(9)` must prepare space for at least eleven total elements, so the existing allocation is insufficient.
+
+## The postcondition is len plus additional
+
+[`Vec::reserve`](https://doc.rust-lang.org/std/vec/struct.Vec.html#method.reserve) guarantees capacity for at least `self.len() + additional` elements after it returns successfully.
+
+For the fixture:
+
+```text
+len         = 2
+capacity    = 10
+additional  = 9
+required    = 2 + 9 = 11
+```
+
+There are only eight spare slots. The request needs nine spare slots. Reallocation is therefore allowed and necessary.
+
+I name the argument `additional` in wrappers and compute `required_total` in tests. Naming it `capacity` or `size` invites exactly this confusion.
+
+## It is not a requested total capacity
+
+If I know a final target length of nine and the vector already contains two items, the additional request is seven:
+
+```rust
+let target_len = 9;
+let additional = target_len.saturating_sub(values.len());
+values.reserve(additional);
+```
+
+Calling `reserve(target_len)` would ask for room for the current length plus nine more. That can over-allocate relative to the intended workload.
+
+When the final operation already knows its iterator length, `extend` may reserve appropriately itself. I add manual reservation only when it expresses a useful workload fact or measurement shows repeated growth.
+
+## Capacity can exceed the guarantee
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-405/fixed.rs) asserts `capacity >= len + additional`, not equality. `reserve` may allocate more than the minimum to support amortized growth.
+
+The exact growth factor is not a stable API contract. Tests expecting the fixture's observed capacity of twenty would encode one implementation choice and could fail after a legitimate allocator or standard-library change.
+
+[`Vec::capacity`](https://doc.rust-lang.org/std/vec/struct.Vec.html#method.capacity) reports how many elements the vector can hold without reallocating at that moment. It does not predict the next allocation size.
+
+## reserve_exact still does not promise allocator exactness
+
+[`reserve_exact`](https://doc.rust-lang.org/std/vec/struct.Vec.html#method.reserve_exact) asks Vec not to deliberately over-allocate for speculative future growth. Its postcondition is still based on `len + additional`.
+
+The allocator may provide more usable storage than requested, so I still avoid asserting exact capacity. “Exact” distinguishes the vector's reservation strategy, not a universal byte-for-byte allocator guarantee.
+
+For repeated incremental pushes, ordinary `reserve` is usually appropriate. For a one-shot fixed bound where spare memory matters, `reserve_exact` may fit. Measurement decides whether the difference matters.
+
+## Elements and bytes are different units
+
+The argument counts elements of `T`, not bytes. Reserving 1,000 `u8` elements and 1,000 large records has very different memory cost.
+
+For zero-sized types, Vec has special capacity behavior and no ordinary element allocation. I do not turn element counts into bytes without checking `size_of::<T>()`, overflow, allocator overhead, and whether the workload bound itself is trusted.
+
+Untrusted lengths need explicit limits before reservation. A syntactically valid `usize` from a file or network does not mean the process should attempt that allocation.
+
+## Reallocation invalidates allocation-dependent observations
+
+When reserve grows storage, element addresses and raw pointers into the old allocation may become invalid. Safe Rust references cannot normally survive a mutable reserve call, but stored raw pointers, foreign handles, and copied addresses can.
+
+I reserve before exposing such handles, or redesign the API so external code uses stable IDs rather than vector addresses. Existing spare capacity reduces the chance of movement but is not a lifetime proof for future unknown mutations.
+
+## try_reserve is about allocation failure
+
+For fallible resource handling, `try_reserve` and `try_reserve_exact` return an error rather than panicking for capacity overflow or allocator failure. They use the same additional-from-length meaning.
+
+The application still needs a policy for oversized input. Attempting an absurd allocation and catching failure can consume time and memory pressure before the error. I validate domain limits first and use the fallible API as the lower-level safety layer.
+
+## My reservation test
+
+I record:
+
+- current length;
+- current capacity;
+- requested additional elements;
+- required total as checked `len + additional`;
+- capacity after the call as a lower-bound assertion.
+
+If pointer stability is relevant, I also compare allocation addresses only in a controlled diagnostic test, never as a promise that reserve must move or must not move when the contract permits either.
+
+The core principle is that capacity APIs express a postcondition, not an allocation prediction. `reserve(n)` means “I may add `n` elements to what is already initialized.” Reading it from length makes the reallocation in this case obvious and keeps tests independent from growth heuristics.

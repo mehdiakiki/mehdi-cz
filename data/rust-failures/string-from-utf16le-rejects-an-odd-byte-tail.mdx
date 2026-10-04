@@ -1,0 +1,95 @@
+---
+caseId: "RFA-702"
+title: "String::from_utf16le Rejects an Odd Byte Tail"
+date: "2026-09-07T09:33:00+01:00"
+lastmod: "2026-09-07T09:33:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "45dec268ef71d1ba66461db85327a581b7771bea53dd7173897bd5ca179362ab"
+area: "upgrades-compatibility"
+symptom: "String::from_utf16le returns FromUtf16Error with OddBytes when a byte stream ends halfway through one UTF-16 code unit."
+summary: "The Rust 1.98 endian-aware UTF-16 decoder first needs complete two-byte code units. An odd byte count is truncated framing, separate from invalid surrogate data."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust from_utf16le OddBytes error", "UTF-16LE odd byte length String 1.98", "truncated UTF16 byte stream Rust decoder"]
+evidence: ["Rust 1.98.1 runtime error", "one trailing byte produces OddBytes", "complete little-endian code units decode to AB"]
+sources: ["https://doc.rust-lang.org/std/string/struct.String.html#method.from_utf16le", "https://doc.rust-lang.org/std/string/struct.String.html#method.from_utf16le_lossy", "https://doc.rust-lang.org/releases.html#version-1980-2026-08-20"]
+---
+
+Rust 1.98 stabilized direct conversion from little-endian and big-endian UTF-16 byte slices. This removes some hand-written byte pairing, but it does not remove the framing problem. UTF-16 code units are two bytes wide, so a stream containing an odd number of bytes is incomplete before Unicode surrogate validation even begins.
+
+The [failing fixture](/rust-failure-atlas/evidence/RFA-702/fail.rs) contains one byte:
+
+```rust
+let bytes = [0x41_u8];
+let decoded = String::from_utf16le(&bytes).unwrap();
+```
+
+On Rust 1.98.1 the error debug output identifies `OddBytes`. The byte looks familiar—`0x41` is part of the encoding of `A`—but the decoder still needs the second byte of that little-endian `u16`.
+
+## Framing fails before character decoding
+
+There are two useful failure levels:
+
+1. The byte sequence may not contain a whole number of 16-bit code units.
+2. Complete code units may contain an unpaired UTF-16 surrogate.
+
+Both make strict conversion return `FromUtf16Error`, but they point to different upstream defects. An odd tail often means a partial read, an incorrect length field, or a chunk boundary treated as an end-of-message. An unpaired surrogate can mean corrupt or invalid text inside an otherwise complete frame.
+
+I record the byte length before decoding. That simple evidence keeps a transport truncation from being investigated as a Unicode character problem.
+
+## Network reads do not preserve code-unit boundaries
+
+A call to `read` may return any positive prefix that currently fits. Even if the sender writes UTF-16 in complete code units, one receiver chunk can end after the first byte of a unit.
+
+I do not decode every chunk independently. I preserve at most one trailing byte and prepend it to the next chunk, or I assemble the complete length-delimited field first. End of stream with a saved byte becomes a clear truncation error.
+
+A small streaming state looks like this:
+
+```text
+complete pairs -> decoder input
+one trailing byte -> carry to next read
+end of message with carry -> truncated UTF-16 error
+```
+
+This same principle appears in UTF-8, binary integers, and compressed blocks. Transport chunks are delivery units, not semantic units.
+
+## Endianness must come from the protocol
+
+`from_utf16le` reads each pair as little-endian regardless of the host CPU. `from_utf16be` does the opposite. This is good: a file or wire format should define byte order explicitly.
+
+I do not select the method with `cfg!(target_endian)`. That would make the same external bytes decode differently on another target. I select it from the format specification or a validated byte-order marker.
+
+For a byte-order mark, I consume the marker deliberately and then use the matching decoder. I also define what happens when the marker is missing, duplicated, or contradicts an outer protocol field.
+
+## Strict and lossy are product policies
+
+The strict methods return `Result`. The lossy variants replace invalid data with the Unicode replacement character. Lossy conversion is not a universal repair for `OddBytes`; it can hide that a message was cut in transit.
+
+For display of damaged logs, replacement may be the right policy. For identifiers, paths, signatures, medical data, or protocol control fields, silently changing text may be unacceptable. I make that decision at the boundary and report whether replacement occurred when observability matters.
+
+Calling `.unwrap()` is appropriate only when an earlier invariant proves validity. The [repaired fixture](/rust-failure-atlas/evidence/RFA-702/fixed.rs) supplies complete code units and still handles the result:
+
+```rust
+let bytes = [0x41_u8, 0x00, 0x42, 0x00];
+let decoded = String::from_utf16le(&bytes).expect("valid UTF-16LE");
+assert_eq!(decoded, "AB");
+```
+
+In an input parser, I return a typed error instead of `expect`.
+
+## Tests need damaged boundaries
+
+Happy-path multilingual text is necessary but insufficient. I test:
+
+- zero bytes and one byte;
+- an odd tail after valid code units;
+- one unpaired high and low surrogate;
+- a valid surrogate pair split across transport chunks;
+- the same known text in little-endian and big-endian form;
+- the strict and lossy policy chosen by the caller.
+
+The useful Rust 1.98 improvement is that endian conversion and Unicode validation now live in one standard operation. The system still owns framing. When `OddBytes` appears, I begin one layer earlier: where was the missing half of the code unit supposed to arrive?
+
+At an API boundary I preserve that distinction in my own error type, even if I do not expose the standard error's debug representation. Callers can then count truncation separately from invalid text and decide whether a retry can help.

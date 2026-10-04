@@ -1,0 +1,78 @@
+---
+caseId: "RFA-314"
+title: "Reducing Vec Length with set_len Does Not Drop Elements"
+date: "2026-09-06T01:34:00+01:00"
+lastmod: "2026-09-06T01:34:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "d6eea61fbd0d5a7899fa08143b815fa7a322d0990b0f983589c9208cb5619afe"
+area: "concurrency-memory"
+symptom: "After unsafe set_len reduces a vector length, destructor counters show that hidden tail elements are never dropped."
+summary: "Vec::set_len changes only the logical initialized boundary. Lowering it abandons destructor obligations for the removed tail; truncate or clear performs safe removal and drops values."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust Vec set_len smaller does not drop", "set_len memory leak Drop elements", "Vec truncate versus unsafe set_len"]
+evidence: ["Rust 1.98.1 two drop-counted values", "unsafe length reduction to one", "truncate executes both destructors"]
+sources: ["https://doc.rust-lang.org/std/vec/struct.Vec.html#method.set_len", "https://doc.rust-lang.org/std/vec/struct.Vec.html#method.truncate", "https://doc.rust-lang.org/std/vec/struct.Vec.html#method.clear"]
+---
+
+I reviewed an FFI buffer helper that used `set_len(0)` as a fast clear. The allocation was reusable, but values formerly in the vector owned resources. Their destructors never ran.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-314/fail.rs) creates two drop-counted values, unsafely changes length to one, and drops the vector. Only the first visible element is destroyed; the hidden tail value is leaked.
+
+## set_len changes a boundary, not a sequence
+
+[`Vec::set_len`](https://doc.rust-lang.org/std/vec/struct.Vec.html#method.set_len) directly sets the vector's logical length. It does not initialize new elements when length grows and does not drop old elements when length shrinks.
+
+That is why the method is unsafe. When growing, the caller must prove every newly exposed element is initialized and valid. The new length must also stay within capacity. When shrinking, memory safety can still hold, but the caller becomes responsible for destructor obligations no longer reachable through the vector.
+
+The standard documentation shows that reducing a vector of inner vectors to length zero is sound yet leaks their allocations.
+
+## truncate expresses ordinary removal
+
+[`Vec::truncate`](https://doc.rust-lang.org/std/vec/struct.Vec.html#method.truncate) shortens to at most the requested length and drops removed elements. It does nothing when the requested length is greater than the current length.
+
+For clearing every item, [`Vec::clear`](https://doc.rust-lang.org/std/vec/struct.Vec.html#method.clear) drops them while retaining the vector allocation for reuse.
+
+These safe methods describe application intent and preserve RAII. I do not replace them with `set_len` for an imagined speed gain. Destructor work is part of correctness, and the standard implementations already handle panic safety and vector invariants.
+
+## Deallocation is not the same as dropping values
+
+When the shortened vector is later dropped, its backing allocation is freed. That does not cause Rust to revisit elements beyond `len` and run their individual destructors.
+
+For `u8`, this distinction has no resource effect because bytes need no drop glue. For `String`, `Vec`, file handles, reference-counted owners, or custom guards, it can leak allocations and resources. Generic unsafe code must not infer “T is probably plain data.”
+
+`needs_drop::<T>()` can help an optimization choose a path, but it does not repair invalid initialization or replace the safety proof. The simple safe operation is preferable unless profiling proves a specialized path matters.
+
+## FFI is the legitimate but sharp use case
+
+A common correct pattern allocates spare capacity, lets a foreign function initialize some number of elements, validates the returned count, and then calls `set_len(initialized)`.
+
+The proof must cover:
+
+- the returned length does not exceed capacity;
+- every newly exposed element is fully initialized;
+- the bytes represent valid values of `T`;
+- failure paths drop any already initialized resource-owning elements;
+- the foreign side does not retain invalid pointers after reallocation or drop.
+
+For raw byte output, `Vec<MaybeUninit<u8>>` or `spare_capacity_mut` can make the uninitialized region explicit before the final length update.
+
+## Lowering length can be correct after manual drop
+
+Low-level code may manually drop a tail range and then lower length so the vector does not drop those values twice. Order and unwind behavior matter. If manual destruction panics partway, the vector length must accurately describe which elements remain owned.
+
+This is container implementation work, not a routine application shortcut. I keep the unsafe block small and place a safety comment beside every precondition, including destructor ownership.
+
+Writing only “new length is within capacity” is incomplete when the method participates in initialization or manual drop.
+
+## What I test
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-314/fixed.rs) uses `truncate(1)`. One destructor runs during truncation and the remaining one runs when the vector is dropped, producing an exact count of two.
+
+For unsafe vector adapters I test zero, partial, and full initialization; failure after each initialized item; ZSTs; types that panic in controlled test destructors; and reported lengths at capacity boundaries. Miri and sanitizers can assist, but they do not prove foreign contracts that a fixture fails to exercise.
+
+I also assert resource counts, not only final vector values. A vector can look empty and still have leaked everything it used to own.
+
+The core principle is that `len` is Rust's ownership boundary for initialized vector elements. `set_len` moves that boundary without doing element lifecycle work. Growing requires proof of initialization; shrinking requires a plan for drop. Safe removal methods encode both responsibilities for ordinary code.

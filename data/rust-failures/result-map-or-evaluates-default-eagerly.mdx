@@ -1,0 +1,87 @@
+---
+caseId: "RFA-245"
+title: "Why Result::map_or Evaluates the Default on Ok"
+date: "2026-09-06T00:25:00+01:00"
+lastmod: "2026-09-06T00:25:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "ec5ceaa3a1cf086c061bceea06b662e2451a1a020f6c78eca74ae02caa9136d0"
+area: "diagnostics-macros"
+symptom: "Result::map_or calls an expensive or state-changing default expression even when the Result is Ok and the default value is discarded."
+summary: "Rust evaluates ordinary function arguments before entering map_or. Pass a closure to map_or_else when fallback work should happen only for Err, and decide whether the error must remain available."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust Result map_or evaluates default eagerly", "map_or vs map_or_else Result", "lazy fallback for Result Rust"]
+evidence: ["Rust 1.98.1 Ok result", "atomic fallback call count", "map_or_else repair"]
+sources: ["https://doc.rust-lang.org/std/result/enum.Result.html#method.map_or", "https://doc.rust-lang.org/std/result/enum.Result.html#method.map_or_else", "https://doc.rust-lang.org/reference/expressions/call-expr.html"]
+---
+
+The result of this expression can be correct while its execution is still wrong:
+
+```rust
+result.map_or(load_fallback(), |value| value)
+```
+
+When `result` is `Ok`, the returned value comes from the closure as expected. But `load_fallback()` has already run.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-245/fail.rs) counts fallback calls with an atomic. The `Result` is `Ok(7)`, the final number is seven, and the fallback count is one. [`Result::map_or`](https://doc.rust-lang.org/std/result/enum.Result.html#method.map_or) receives a value, not deferred work.
+
+## The eagerness comes from call evaluation
+
+Rust evaluates a call's operand expressions before the call takes place. The default expression must produce the `U` value passed into `map_or`, so it runs before the method can inspect whether the `Result` is `Ok` or `Err`.
+
+`map_or` cannot undo a database query, allocation, log record, random-number draw, or state update that occurred while calculating that argument. It can only discard the already-created value.
+
+This behavior is not special to `Result`. Any ordinary eager argument has the same evaluation model. Method names that read like English conditionals can hide this fact during review.
+
+## map_or_else accepts deferred work
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-245/fixed.rs) uses [`map_or_else`](https://doc.rust-lang.org/std/result/enum.Result.html#method.map_or_else). Its first argument is a closure receiving the error. Rust constructs the closure value eagerly, but its body runs only for `Err`.
+
+```rust
+result.map_or_else(
+    |error| fallback_for(error),
+    |value| transform(value),
+)
+```
+
+This also exposes useful information that `map_or` ignores: the fallback can inspect the actual error. If every error should map to the same cheap constant, eager `map_or(0, ...)` is perfectly reasonable.
+
+## Cheap and pure defaults are different
+
+A fallback can be computationally cheap but semantically important. Incrementing a counter, consuming an iterator item, advancing a clock abstraction, or emitting a warning changes observable state even if it takes nanoseconds.
+
+Conversely, constructing a small constant can be pure and cheap enough that laziness adds visual noise with no benefit. I choose between the methods based on both cost and side effects.
+
+The test should measure what matters. A timing-only test for eagerness is fragile. The Atlas fixture uses an exact call count, which directly proves evaluation.
+
+## Ownership can make the eager form expensive
+
+Suppose the default is an owned `String`. `map_or(existing_string, ...)` moves that string into the call even when the `Ok` branch wins, then drops it unused. A cloned default also allocates before the branch.
+
+`map_or_else` can move captured state into the fallback closure and consume it only if called. The closure itself may still capture and move ownership at construction, so I inspect whether merely creating the closure changes later availability.
+
+If both branches only need a reference, mapping `as_ref()` first may avoid ownership entirely. Laziness and borrowing are related performance tools but solve different problems.
+
+## Flattening a Result discards error structure
+
+Both methods turn `Result<T, E>` into one `U`. Afterward, the caller cannot distinguish success from fallback unless `U` encodes that distinction.
+
+For operational failures I often prefer `?`, `unwrap_or_else` with explicit logging, or returning the `Result` upward. A convenient fallback can hide an outage as valid-looking data.
+
+When fallback is a product requirement, I add metrics labelled by error class. The lazy closure is a good place to record that the fallback genuinely happened, because it is called only on the error path.
+
+## Similar pairs deserve the same review question
+
+Rust APIs often offer an eager value and a lazy closure variant: `unwrap_or` and `unwrap_or_else`, `Option::map_or` and `Option::map_or_else`, `HashMap::or_insert` and `or_insert_with`, or boolean `then_some` and `then`.
+
+I do not memorise every pair in isolation. During review I ask: “Am I passing the result of work, or the work itself?” Parentheses after the fallback name are an immediate clue.
+
+## What I test
+
+The regression covers `Ok` and `Err`, verifies the selected output, and counts both transformation and fallback calls. It adds a captured owned value when ownership matters and verifies error-specific fallback behavior.
+
+For production code I also test that fallback errors are not swallowed. A cache lookup followed by a database fallback can itself fail; forcing both outcomes into a plain value may be too weak.
+
+The core principle is that control-flow-looking methods still follow Rust's expression evaluation rules. `map_or` chooses between values after its default exists. `map_or_else` chooses which closure body to execute. Making that distinction explicit prevents invisible work while preserving the simple eager form for constants that really are harmless.

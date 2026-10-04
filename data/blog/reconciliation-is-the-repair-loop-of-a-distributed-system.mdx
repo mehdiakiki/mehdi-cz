@@ -1,0 +1,187 @@
+---
+title: "Reconciliation Is the Repair Loop of a Distributed System"
+date: "2026-12-11T09:00:00+01:00"
+tags: ["reconciliation", "distributed systems", "data synchronization", "repair loop", "reliability"]
+draft: false
+reviewed: true
+reviewedHash: "1088a463c49d741f723d7ea03547900a8aff9bace87b9e0d986fe6134b99cbe7"
+cluster: "reliable-data-integrations"
+campaign: "authority-2026"
+opportunity: "DATA-081"
+summary: "Retries handle known failed attempts; reconciliation finds the differences the system no longer knows about. I build the loop around authority, comparison, repair, verification, and evidence."
+---
+
+While building synchronization systems, I stopped believing that a successful event path could keep two systems equal forever.
+
+Webhooks are delayed. Workers die after external effects. Operators repair rows manually. A provider changes old data without sending an event. Retention expires. Even a well-designed retry loop only retries failures it knows about.
+
+Reconciliation is the second path: periodically compare what should be true with what is observed, then repair the difference safely.
+
+## Retry and reconciliation solve different uncertainty
+
+A retry begins from a known attempted operation:
+
+```text
+attempt failed -> policy allows another attempt
+```
+
+A reconciler begins from state:
+
+```text
+desired/authoritative state
+observed state
+diff
+classification
+repair
+verification
+```
+
+It can find a record whose event was never produced, an effect whose acknowledgement was lost, or drift created outside the normal path.
+
+Kubernetes controllers are a visible example of this pattern: the [controller documentation](https://kubernetes.io/docs/concepts/architecture/controller/) describes control loops that move current state toward desired state. Business data has different semantics, but the loop shape is useful.
+
+## First I choose authority per field
+
+“Make both sides equal” is not a specification. If both changed, which one wins?
+
+I write ownership before comparison:
+
+| Field | Authority | Repair direction |
+| --- | --- | --- |
+| provider payment state | provider | provider to internal |
+| internal display label | product | internal to provider if supported |
+| external identifier | identity map | never inferred from label |
+| computed search projection | canonical store | rebuild projection |
+| deletion | explicit lifecycle rule | tombstone or restore |
+
+For bidirectional synchronization, authority may depend on state and operation, not only field. My [field-ownership article](/blog/define-field-ownership-before-you-build-bidirectional-sync) develops that table further.
+
+Without authority, a repair loop can become a corruption loop.
+
+## The reference loop I use
+
+The core can be expressed without infrastructure jargon:
+
+```text
+for each stable partition:
+    resume from durable scan cursor
+    read authoritative records in a bounded page
+    load corresponding observed records
+    compare normalized meaning
+    classify each difference
+    enqueue an idempotent repair or a review case
+    verify completed repairs
+    advance cursor with evidence
+```
+
+I separate scanning from repairing. The scanner should not stop for twenty minutes because one provider update is slow. It emits bounded repair work with stable identity.
+
+A repair identity can be:
+
+```text
+(reconciliation_run, entity_id, authority_version, repair_kind)
+```
+
+If the same work is delivered twice, the executor can recognize it. If authority changed after the diff was calculated, the executor rejects the stale repair and asks for a new comparison.
+
+## Compare meaning, not noisy representation
+
+Two records can differ in harmless ways:
+
+```text
+"2026-12-11T08:00:00Z"
+"2026-12-11T09:00:00+01:00"
+```
+
+They describe the same instant. JSON object order, insignificant decimal formatting, and provider-generated update timestamps can also create false drift.
+
+I normalize only according to the contract. Over-normalization is dangerous: lowercasing a case-sensitive identifier or treating null as missing can hide a real difference.
+
+My comparison result is structured:
+
+```json
+{
+  "entity": "account/a-19",
+  "kind": "VALUE_MISMATCH",
+  "field": "lifecycle",
+  "expected_version": 81,
+  "observed_version": 78,
+  "repair": "UPDATE_PROJECTION"
+}
+```
+
+This becomes evidence and a metric, not a line of prose buried in logs.
+
+## Deletes need a deliberate rule
+
+If an entity is missing on one side, several stories are possible:
+
+- it was deleted authoritatively;
+- it was never copied;
+- the list API is incomplete;
+- permissions hide it;
+- the current page moved during pagination;
+- the observed side deleted it incorrectly.
+
+I do not turn absence directly into deletion. I require a complete-list guarantee, explicit tombstone, or a confirmation step. Destructive repairs often go through a longer observation window or human review.
+
+## Full scans and incremental scans work together
+
+An incremental loop using `updated_at` or a cursor is efficient but inherits the source's change-tracking guarantees. A periodic full or partitioned comparison catches assumptions that the incremental path missed.
+
+I mix:
+
+```text
+continuous incremental reconciliation
+daily high-risk partitions
+weekly rotating full coverage
+on-demand entity repair after support or alerts
+```
+
+The schedule is based on consequence and source capacity. I use rate budgets so repair traffic cannot starve live product calls.
+
+For very large datasets, counts and checksums can narrow the search before record-level comparison. They are locators, not final proof; equal weak aggregates can hide different records.
+
+## Verification closes the loop
+
+Sending a repair command is not success. After the effect settles, I read the relevant state again and compare it with the intended version.
+
+Possible outcomes are:
+
+```text
+repaired and verified
+already correct
+authority changed; recalculate
+transient failure; retry within budget
+permanent incompatibility; review
+outcome unknown; query by operation identity
+```
+
+Every repair queue needs an exit. Infinite retries hide a permanent semantic disagreement and consume capacity.
+
+## Evidence I keep
+
+For each run I want:
+
+```text
+scope and partitions
+authority snapshot or high-water mark
+comparison/mapping version
+scan cursor
+differences by class
+repairs attempted and verified
+unresolved cases
+rate and completion estimate
+```
+
+I avoid full sensitive payloads. Entity identity, safe hashes, versions, reason codes, and controlled snapshots are usually enough for investigation.
+
+The dashboard I care about shows drift age, not only job status. A green process that has not reduced a week-old difference is not healthy.
+
+## Reconciliation changes the architecture
+
+Once I know a repair loop exists, the live path can be simpler and more honest. It still aims for immediate correctness, but it does not pretend every network outcome can be known synchronously.
+
+This does not excuse weak design. Idempotency, durable cursors, constraints, and transactional boundaries remain necessary. Reconciliation catches the residual failures and changes that escape them.
+
+I think of it as maintenance built into the system. Distributed state will drift eventually. Senior engineering is not promising that it never does; it is defining who is authoritative, how drift becomes visible, how repair stays safe, and how I prove the two sides converged again.

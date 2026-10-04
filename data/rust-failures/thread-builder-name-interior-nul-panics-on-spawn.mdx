@@ -1,0 +1,94 @@
+---
+caseId: "RFA-356"
+title: "Thread Builder Names With Interior NUL Panic at spawn"
+date: "2026-09-06T02:16:00+01:00"
+lastmod: "2026-09-06T02:16:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "d3713a87a8568cdc40c7e52d5337d3b42dfb7b6f3d0cd9aefe2afd2a8584e0c1"
+area: "concurrency-memory"
+symptom: "Builder::spawn panics for a configured thread name containing an interior NUL instead of returning an io::Error."
+summary: "Thread creation can return io::Result for operating-system failures, but invalid NUL-containing names are a documented panic precondition. Validate untrusted names before Builder::name when panic is not an acceptable error channel."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust thread name null byte panic", "Builder spawn NUL thread name", "thread Builder spawn io Result still panics"]
+evidence: ["Rust 1.98.1 named thread Builder", "interior NUL accepted by String", "spawn panic separated from OS io::Result"]
+sources: ["https://doc.rust-lang.org/std/thread/struct.Builder.html#method.name", "https://doc.rust-lang.org/std/thread/struct.Builder.html#method.spawn", "https://doc.rust-lang.org/std/thread/struct.Thread.html#method.name"]
+---
+
+I saw [`thread::Builder::spawn`](https://doc.rust-lang.org/std/thread/struct.Builder.html#method.spawn) return `io::Result`, so I assumed every thread-creation problem would arrive as `Err`. A name containing `\0` takes another path: `spawn` panics before it can return an operating-system creation error.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-356/fail.rs) places `worker\0hidden` in a normal Rust `String`. `Builder::name` accepts the string, but `spawn` panics. An outer `catch_unwind` observes the panic, and the final assertion makes the evidence program fail with a precise explanation.
+
+## Rust String can contain NUL
+
+A Rust `String` is valid UTF-8. The zero scalar U+0000 is valid UTF-8, represented by the zero byte. Rust strings do not use NUL as their own terminator, so text after it remains part of the string.
+
+Many operating-system interfaces historically use NUL-terminated strings. At such a boundary, an interior zero could make the native side see only a prefix or make the value impossible to pass without ambiguity.
+
+The standard thread API therefore requires that a configured name contain no null bytes. This is an interface constraint, not a general Rust string constraint.
+
+## Builder::name records configuration
+
+[`Builder::name`](https://doc.rust-lang.org/std/thread/struct.Builder.html#method.name) consumes the builder, stores the supplied `String`, and returns the builder. Its signature has no `Result`, and it does not report the invalid-name condition there.
+
+The constraint is enforced when a spawn method tries to create the named thread. The documentation for `spawn` explicitly lists a panic when the configured name contains null bytes.
+
+This timing can surprise code that builds configuration in one function and starts workers much later. The invalid data crosses several layers before becoming visible.
+
+## Result does not mean “this function cannot panic”
+
+`spawn` returns `io::Result<JoinHandle<T>>` so it can report failures to create a thread at the operating-system level. Resource exhaustion or an OS rejection belongs in this recoverable channel.
+
+Rust functions returning `Result` may still have documented panic preconditions. Indexing can panic while surrounding code returns a result. Allocation may abort or panic depending on context. User callbacks can panic. A return type describes represented outcomes, not every possible way execution can stop.
+
+I read both the Errors and Panics sections of system-facing APIs. Looking only at the signature misses this distinction.
+
+## Validate at the trust boundary
+
+If the thread name is a source-code literal that I control, an interior NUL is normally a programming bug, and the panic makes it loud. If the name comes from configuration, tenant data, a job label, or generated text, I do not let invalid input become a process-level surprise.
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-356/fixed.rs) checks `name.contains('\0')` before building the thread. It returns a domain error for the invalid name, then starts a valid `worker-7` and joins it.
+
+A real API would use a structured error enum rather than `&'static str`. I keep invalid configuration, OS creation failure, and worker panic as separate variants because callers may respond differently to each.
+
+## Sanitizing is a policy, not always a repair
+
+Replacing NUL with an underscore may seem convenient, but it can create identity collisions. `worker\0admin` and `worker_admin` could become the same displayed name. Truncating at NUL is worse because it recreates the native-string ambiguity.
+
+For diagnostic-only names, I may escape or replace forbidden characters while preserving the original identifier in structured data. For names used in monitoring or correlation, I prefer rejection or a reversible encoding with length limits.
+
+The standard library notes that thread names are currently used for identification in panic messages. Platform debuggers and tooling may impose further truncation. I do not treat the displayed name as a secure or globally unique identity.
+
+## The worker may fail through a third channel
+
+Successful `spawn` returns a `JoinHandle`. The closure can later panic, and `join()` then returns an error carrying the panic payload. This is distinct from an invalid builder name and from an OS failure during creation.
+
+My worker startup flow therefore has three stages:
+
+1. validate configuration before the builder,
+2. handle `io::Result` from spawning,
+3. handle the join result from executing the worker.
+
+Collapsing them into one string loses useful operational evidence. A retry might help transient OS exhaustion, but retrying an invalid NUL-containing name will only repeat the panic.
+
+## Catching unwind is evidence, not the normal validator
+
+The failing fixture uses `catch_unwind` so it can prove exactly where the panic occurs. I do not use panic catching as routine input validation. Panic hooks still run, not every panic is guaranteed to unwind, and recovery boundaries need careful invariant analysis.
+
+Checking the string is simpler and makes the accepted language explicit. It also works in builds where panic behavior is configured to abort, where `catch_unwind` cannot recover the process.
+
+## Tests should preserve the hidden suffix
+
+A test with a name ending at NUL does not show why native boundaries are dangerous as clearly. The fixture keeps `hidden` after the zero, proving that the Rust string has more content even though the boundary rejects it.
+
+I test an ordinary ASCII name, Unicode, empty names if my application permits them, interior NUL at different positions, and application length limits. I also run target-specific integration checks when external monitoring depends on platform-visible names.
+
+[`Thread::name`](https://doc.rust-lang.org/std/thread/struct.Thread.html#method.name) returns an optional borrowed name for a running thread, but it does not turn that diagnostic label into an application identity.
+
+## The core principle is to separate language-valid data from boundary-valid data
+
+Rust safely represents more values than many operating-system interfaces accept. UTF-8 validity is only the first layer. A thread name must also satisfy the no-NUL precondition, and my application may add uniqueness, length, or privacy rules.
+
+I validate each rule before crossing its boundary. Then `spawn`'s `io::Result` can keep its intended meaning: whether the system managed to create a validly configured thread.

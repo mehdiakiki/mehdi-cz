@@ -1,0 +1,81 @@
+---
+caseId: "RFA-659"
+title: "A Poisoned Mutex Reports a Panic; It Does Not Make the Data Unreachable"
+date: "2026-09-06T08:19:00+01:00"
+lastmod: "2026-09-06T08:19:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "6db61b5041fbf6c5b52e749fc59874281df4356d9889a088c557feebe351777f"
+area: "concurrency-memory"
+symptom: "Unwrapping a mutex lock panics after another thread panicked while holding the guard because the mutex is marked poisoned."
+summary: "Poisoning is advisory evidence that protected invariants may be broken. Propagate, recover and validate, or replace state deliberately; never unwrap without choosing a policy."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust Mutex poison recover into_inner", "lock unwrap PoisonError Rust", "mutex poisoned after thread panic"]
+evidence: ["Rust 1.98.1 runtime panic", "worker panics while mutex guard is live", "PoisonError into_inner recovery"]
+sources: ["https://doc.rust-lang.org/std/sync/struct.Mutex.html#poisoning", "https://doc.rust-lang.org/std/sync/struct.PoisonError.html#method.into_inner", "https://doc.rust-lang.org/std/sync/struct.Mutex.html#method.clear_poison"]
+---
+
+Rust’s standard Mutex becomes poisoned when a thread panics while holding its guard in the usual detected case. Future `lock` calls still acquire the lock but return `Err(PoisonError<Guard>)`. The [failing fixture](/rust-failure-atlas/evidence/RFA-659/fail.rs) unwraps that result and produces a second panic.
+
+## Poisoning is an invariant warning
+
+The standard [`Mutex` poisoning documentation](https://doc.rust-lang.org/std/sync/struct.Mutex.html#poisoning) describes the advisory mechanism. The mutex memory is not permanently inaccessible. The error contains the guard so code can inspect or repair the protected value.
+
+The original panic might have happened halfway through a multi-field update. Even though memory safety remains, an application invariant such as “balance equals sum of entries” may no longer hold.
+
+I do not globally replace `lock().unwrap()` with silent recovery. I decide the protected state’s recovery contract.
+
+## Three policies are common
+
+For critical invariant-bearing state, propagating or aborting can be safest. Continuing with inconsistent authorization, accounting, or allocator metadata may cause worse damage.
+
+For reconstructible caches and metrics, I can take the guard, validate or reset state, and continue. [`PoisonError::into_inner`](https://doc.rust-lang.org/std/sync/struct.PoisonError.html#method.into_inner) returns the guard. The [repaired fixture](/rust-failure-atlas/evidence/RFA-659/fixed.rs) uses it and confirms the value written before panic.
+
+For durable state, recovery may reload from a transactional source. I keep the mutex unavailable to normal operations until reconstruction completes.
+
+## The contained value is not automatically correct
+
+Seeing `1` in the repaired fixture proves the write occurred, not that it represents a committed domain transition. A panic can happen before or after any statement and destructors run during unwinding.
+
+I design updates so invariants are restored before code that can panic where practical. Preparing fallible work outside the lock, replacing state atomically under the guard, and using transaction objects can reduce inconsistent windows.
+
+Panics from user callbacks while holding locks deserve special attention. I avoid invoking arbitrary code inside critical sections or define how poison and rollback work.
+
+## clear_poison records a completed repair
+
+After validated repair or replacement, [`Mutex::clear_poison`](https://doc.rust-lang.org/std/sync/struct.Mutex.html#method.clear_poison) can clear the marker. I call it only after establishing the invariant, not immediately after catching the error.
+
+Other waiting threads need a consistent policy. One recovering thread may rebuild state while others also observe poison. The mutex serializes guard access, but surrounding readiness or service health may need another state machine.
+
+Logging includes the original panic context where available and one recovery decision. Repeatedly logging poison on every request can flood the actual cause.
+
+## Poisoning is not guaranteed in every panic scenario
+
+The standard docs warn that detection is not complete in some nested panic, hook, or foreign-exception situations. Unsafe code cannot rely on poisoning as its only safety mechanism.
+
+Memory safety invariants must remain protected even if poison is missed. Poison is for application consistency guidance. A custom unsafe data structure needs transactional state or guards whose Drop restores safety unconditionally.
+
+Alternative synchronization primitives may use different poisoning policies. I read the chosen type’s docs rather than generalising from std Mutex.
+
+## Async mutexes have another failure model
+
+Holding a synchronous Mutex across await can block executor progress and retain a guard through cancellation points. Async mutex implementations may not poison and have runtime-specific fairness.
+
+I keep critical sections small, avoid await under a std guard, and use message ownership when operations span external I/O. Cancellation can leave domain work partial even without a thread panic, so explicit transaction state remains necessary.
+
+Tests force a panic under the guard, join the worker, assert poison, run the selected repair, and verify subsequent locks. Critical services also test recovery failure and shutdown behaviour.
+
+## My mutex poison checklist
+
+- What invariant might the panicking thread have left incomplete?
+- Should this state propagate failure, reset, reload, or validate and recover?
+- Is into_inner being treated as evidence of correctness rather than access?
+- Can fallible or user-controlled work move outside the critical section?
+- When is it honest to call clear_poison?
+- Could several threads attempt recovery and how are they coordinated?
+- Does unsafe code incorrectly depend on guaranteed poison detection?
+- Are synchronous locks held across async suspension or cancellation?
+
+The core principle is that poisoning carries evidence about interrupted mutation, not a verdict about every byte. I treat PoisonError as a recovery decision point, restore or reject the domain state, and clear the marker only after the invariant is proven again.

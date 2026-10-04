@@ -1,0 +1,168 @@
+---
+title: "Why updated_at Is a Dangerous Synchronization Cursor"
+date: "2026-09-18T17:00:00+01:00"
+tags: ["updated_at cursor", "incremental synchronization", "clock skew", "change data capture", "data engineering"]
+draft: false
+reviewed: true
+reviewedHash: "3900627a744ca4ca98e41a4f4f3578d07d9833f304567d8e1354469fb9a6e8b3"
+cluster: "reliable-data-integrations"
+campaign: "authority-2026"
+opportunity: "DATA-020"
+summary: "Concrete simulations of the records a timestamp cursor can miss, plus safer tuple cursors, overlap windows, change logs, and reconciliation."
+---
+
+The first incremental synchronization query often looks reasonable:
+
+```sql
+SELECT *
+FROM records
+WHERE updated_at > :last_seen
+ORDER BY updated_at;
+```
+
+After a successful run, the worker saves the largest `updated_at`. The next run continues after it.
+
+I do not consider this a reliable cursor unless the source explicitly guarantees unique, immutable and commit-ordered timestamps with a stable pagination contract. Most application `updated_at` columns do not provide these guarantees.
+
+The problem is not only clock skew. Ties, transaction visibility, mutable sort keys, backfills and deletion can each create a permanent gap.
+
+## Failure 1: equal timestamps
+
+Suppose the source stores milliseconds and 500 records are updated in one millisecond. The API returns 100 per page.
+
+```text
+page 1: rows 001..100, all at 10:00:00.123
+saved cursor:                  10:00:00.123
+next query: updated_at >       10:00:00.123
+```
+
+Rows 101..500 are skipped. Ordering by timestamp does not make a timestamp unique.
+
+The minimum repair is a total tuple:
+
+```sql
+WHERE (updated_at, id) > (:last_time, :last_id)
+ORDER BY updated_at, id
+```
+
+This works only if `id` is stable and the source implements the tuple comparison consistently. Pagination and checkpointing must both use the same ordering.
+
+## Failure 2: a late commit carries an older timestamp
+
+Two transactions begin in this order:
+
+| Real event | Transaction A | Transaction B |
+| --- | --- | --- |
+| 10:00:00 | starts, sets `updated_at=10:00:00` | — |
+| 10:00:01 | still working | starts, sets `updated_at=10:00:01` |
+| 10:00:02 | still working | commits |
+| 10:00:03 | sync reads B and saves `10:00:01` | — |
+| 10:00:04 | commits | already visible |
+
+The next strict query asks for values greater than `10:00:01`. Transaction A is newly visible but has `updated_at=10:00:00`, so it is never read.
+
+Application time and commit order are different facts. PostgreSQL documents that [`transaction_timestamp()`](https://www.postgresql.org/docs/current/functions-datetime.html) is fixed at transaction start, while `statement_timestamp()` and `clock_timestamp()` have different meanings. A timestamp selected inside a transaction does not automatically become a commit-sequence cursor.
+
+## Failure 3: producer clocks disagree
+
+Consider two writers:
+
+```text
+worker east clock: correct time + 40 seconds
+worker west clock: correct time - 25 seconds
+```
+
+At real time 12:00:10, east writes a row stamped 12:00:50. The sync advances to that value. At real time 12:00:20, west writes a new row stamped 11:59:55. A strict cursor will not see west's row until time catches up; if the cursor continues advancing, it may never see it.
+
+Even synchronized clocks have resolution, adjustment and uncertainty. If the source lets clients provide the value, the risk is larger.
+
+## Failure 4: the ordering key changes
+
+When a row's `updated_at` changes, it moves in the ordered result set while pagination is in progress. A row can move behind the cursor after being edited, or move ahead and appear twice.
+
+This resembles the issue in [pagination under concurrent writes](/blog/what-happens-when-api-data-changes-while-you-paginate): a cursor is safe only relative to the ordering guarantees of the changing dataset.
+
+The usual response is idempotent upsert for duplicates and a source-supported snapshot or change sequence for omissions. Deduplication fixes repeated observations; it cannot recover an unseen record.
+
+## Failure 5: backfills and imports preserve old time
+
+A source may import historical records today while retaining their original business timestamp. It may repair `updated_at`, restore a backup, or copy rows between regions. The record is new to the reader but old according to the cursor.
+
+I distinguish at least:
+
+```text
+event time:      when the business event happened
+source edit time: when the producer says the row changed
+commit/log order: where the durable change entered source history
+observed time:    when my worker received it
+```
+
+One field cannot safely stand in for all four.
+
+## Failure 6: deletion leaves no row to query
+
+Hard-deleting a row removes both its data and its `updated_at`. No later `WHERE updated_at > ...` query can discover the absence reliably.
+
+The source needs a deletion feed, tombstone, audit/change log, or a periodic full comparison. The [tombstone design](/blog/tombstones-deleting-across-systems) explains why the deletion marker must outlive the slowest legitimate reader.
+
+## Better cursor choices, in order
+
+I choose the strongest source primitive available.
+
+### 1. Opaque provider cursor or change token
+
+This is best when its contract promises an ordered change feed, deletion visibility and a documented expiry/recovery path. I store the token without trying to interpret it.
+
+### 2. Database log position or source sequence
+
+Change data capture follows durable change order rather than an application clock. CDC systems expose transaction and log metadata because this ordering matters. It still needs retention handling, snapshot handoff and idempotent consumers.
+
+### 3. Immutable monotonic revision
+
+A source-assigned sequence that increases with each committed change can be a good cursor. I verify scope: global, per tenant, per partition or per entity are different contracts.
+
+### 4. Timestamp plus stable tie-breaker and overlap
+
+When a timestamp API is the only option, I use `(updated_at, stable_id)`, reread an overlap window, upsert idempotently and run reconciliation. The overlap reduces bounded lateness; it does not prove no record can arrive arbitrarily late.
+
+## The clock-skew simulation I run
+
+Before trusting a timestamp endpoint, I simulate:
+
+```text
+same timestamp on more records than one page
+writer clock ahead and behind
+long transaction committing after the cursor advances
+record updated during pagination
+historical backfill with an old timestamp
+timestamp precision truncated by serialization
+hard delete between scans
+retry after the final page but before checkpoint commit
+```
+
+For each case I assert that every expected identity is eventually observed and that duplicates do not repeat effects. A row-count comparison is not enough because one missing row and one duplicate can cancel each other.
+
+The checkpoint itself must commit after durable application of all records before it. [A durable cursor](/blog/a-durable-cursor-for-incremental-api-synchronization) covers the crash boundary.
+
+## Ask the source contract directly
+
+I do not infer cursor safety from a column name. I ask:
+
+- Who sets the timestamp: database, application, client or provider?
+- What is its precision and can values tie?
+- Is it transaction-start, statement, wall-clock or commit time?
+- Can it move backward?
+- Is the field present for every material change?
+- How are deletions represented?
+- Does pagination see a snapshot?
+- How long can a change become visible after its timestamp?
+- Is there a stable secondary key?
+- What recovery exists after cursor expiry or uncertainty?
+
+If these answers are absent, the sync design includes an uncertainty budget and repair loop.
+
+## My practical rule
+
+`updated_at` is useful evidence and a weak default cursor. I never assume it proves total order or complete change capture.
+
+I prefer an opaque change token, log position or source revision. When I must use time, I add a stable tie-breaker, overlap, idempotency and reconciliation, then test clock and commit-order failures. The goal is not a clever query. It is proving that a record cannot fall permanently between two runs.

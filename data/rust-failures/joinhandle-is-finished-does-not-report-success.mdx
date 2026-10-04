@@ -1,0 +1,77 @@
+---
+caseId: "RFA-235"
+title: "JoinHandle::is_finished Does Not Tell You Whether the Thread Succeeded"
+date: "2026-09-06T00:15:00+01:00"
+lastmod: "2026-09-06T00:15:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "891bbee50b084e17286608d8eca73b66cf2e78a98e40dba3d5698fe8a896308a"
+area: "concurrency-memory"
+symptom: "JoinHandle::is_finished becomes true for a worker that panicked, so completion is mistaken for success."
+summary: "is_finished is a nonblocking completion hint and cannot return the thread value or panic payload. Join the handle to establish completion ordering and inspect the result; do not detach failures accidentally."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets with std threads"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust JoinHandle is_finished thread panicked", "is_finished versus join Rust", "check thread completed successfully without blocking"]
+evidence: ["Rust 1.98.1 panicking worker", "true completion state", "join-result repair"]
+sources: ["https://doc.rust-lang.org/std/thread/struct.JoinHandle.html#method.is_finished", "https://doc.rust-lang.org/std/thread/struct.JoinHandle.html#method.join", "https://doc.rust-lang.org/std/thread/fn.spawn.html"]
+---
+
+I polled `JoinHandle::is_finished` and treated `true` as worker success. A panicking worker becomes finished too. The boolean says that execution reached completion, not how it completed.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-235/fail.rs) spawns a thread that panics, waits until `is_finished` is true, then joins. The join result is an error.
+
+## Completion is a one-bit observation
+
+[`JoinHandle::is_finished`](https://doc.rust-lang.org/std/thread/struct.JoinHandle.html#method.is_finished) checks whether the associated thread has finished running its main function. It is nonblocking and supports a poll-before-join pattern.
+
+The method cannot contain the thread's return value, panic payload, or application status. All those outcomes share the same finished state.
+
+Rust also documents a small interval where `is_finished` can be true after the thread's main function returns but before the thread itself has completely stopped. Once true, `join` is expected to return quickly, but the boolean is not a substitute for joining.
+
+## `join` provides the outcome and ordering boundary
+
+[`JoinHandle::join`](https://doc.rust-lang.org/std/thread/struct.JoinHandle.html#method.join) returns `Ok(T)` for a normal return and `Err` for a Rust panic reaching the thread root. It also establishes that the thread's operations happen before operations after the successful join call returns.
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-235/fixed.rs) demonstrates both paths: a worker returning `42` and a worker whose expected panic becomes an error result.
+
+I do not discard that result with `let _ = handle.join()`. Doing so waits for completion but erases failure evidence. At a service boundary I translate worker failure into shutdown, retry, degraded state, or a recorded incident according to ownership.
+
+## Polling can still be useful
+
+A coordinator may need to remain responsive while workers finish. It can check `is_finished`, continue other work, and call `join` once the handle reports ready. The key is that the final join remains mandatory.
+
+For many workers, repeatedly scanning every handle can become inefficient. A completion channel, scoped-thread design, or task executor may expose a better notification primitive. The right design depends on whether results must be collected in spawn order, completion order, or by stable job ID.
+
+`is_finished` is a readiness hint, not a result transport.
+
+## Dropping the handle detaches the thread
+
+The `JoinHandle` documentation explains that dropping it detaches the associated thread. The thread may continue, but there is no longer a way to join through that handle.
+
+This is easy to do accidentally when handles are stored in a vector and an early return drops the vector. Background failures then become panic-hook output without a structured owner. The process may also end before detached work completes.
+
+I make thread ownership visible in a coordinator type and define shutdown behaviour for every handle. Fire-and-forget is a real policy, but I name it and give failures another reporting path.
+
+## A panic is not the only application failure
+
+A thread can return normally with `Result::Err`, a partial count, or a cancellation state. Then `join` returns `Ok(Err(...))` or another domain value. There are two layers:
+
+```text
+join failure:   the thread panicked
+worker failure: the thread returned a domain error
+```
+
+Flattening or unwrapping these layers without context can make diagnostics confusing. I usually handle the join error first and then the worker result, attaching the worker name and job identity.
+
+Foreign unwinding has platform and runtime caveats described by the standard library, so I do not claim every non-Rust exception becomes the same recoverable payload.
+
+## My regression forces both terminal paths
+
+A test containing only a successful worker allows the mistaken `is_finished == success` model to survive. The fixture intentionally panics one worker and asserts the join error.
+
+Application tests cover a returned domain error, a panic, cancellation, normal success, and coordinator shutdown while work is unfinished. I avoid sleep-based completion checks: polling uses `yield_now` only in the tiny evidence case, while larger tests use controlled synchronization.
+
+In metrics I keep “running,” “finished,” “joined,” and “succeeded” as separate counters. A growing gap between finished and joined handles then exposes a lifecycle leak that one success percentage would hide.
+
+The core principle is that readiness, completion, and success are separate states. `is_finished` answers only completion readiness. `join` transfers the result and establishes the lifecycle boundary. I retain the handle until its owner has observed and handled both thread-level and domain-level outcomes.

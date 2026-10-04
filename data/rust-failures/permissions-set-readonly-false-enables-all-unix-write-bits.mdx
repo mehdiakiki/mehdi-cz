@@ -1,0 +1,76 @@
+---
+caseId: "RFA-316"
+title: "set_readonly(false) Enables Every Unix Write Bit"
+date: "2026-09-06T01:36:00+01:00"
+lastmod: "2026-09-06T01:36:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "1ddf02aedc4e975e98dcaa1b554d0513dbc6d9d39b82e355db9bc46b59eb2630"
+area: "ffi-targets"
+symptom: "Making a Unix file non-readonly through Permissions changes mode 0444 to 0666 rather than restoring only owner write permission."
+summary: "The portable readonly Boolean maps to all three Unix write bits. Clearing it is equivalent to adding write permission for owner, group, and others; use PermissionsExt when an exact Unix mode is required."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["Unix"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust set_readonly false world writable Unix", "Permissions set_readonly chmod a+w", "restore owner writable Rust permissions"]
+evidence: ["Rust 1.98.1 Unix mode fixture", "0444 starting permissions", "0666 Boolean result versus explicit 0644 repair"]
+sources: ["https://doc.rust-lang.org/std/fs/struct.Permissions.html#method.set_readonly", "https://doc.rust-lang.org/std/os/unix/fs/trait.PermissionsExt.html", "https://doc.rust-lang.org/std/fs/fn.set_permissions.html"]
+---
+
+I made a generated file temporarily read-only, then called `set_readonly(false)` to make it editable again. On Unix, its mode became `0666`. I intended the familiar `0644`: writable only by the owner.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-316/fail.rs) starts from exact mode `0444`, clears the readonly flag, applies the permissions, and observes write bits for owner, group, and others.
+
+## One portable Boolean maps to several Unix bits
+
+[`Permissions::set_readonly`](https://doc.rust-lang.org/std/fs/struct.Permissions.html#method.set_readonly) exposes a cross-platform Boolean view. On Unix, setting readonly removes all write bits. Clearing readonly adds all write bits, equivalent to `chmod a+w`.
+
+Rust's documentation warns plainly that `set_readonly(false)` makes a Unix file world-writable. The method cannot guess whether the desired writable mode is `0600`, `0640`, `0644`, `0660`, or something shaped by an ACL.
+
+The name means “make this Permissions value not readonly under the portable view,” not “restore whatever write policy existed earlier.”
+
+## Permission mutation happens in two steps
+
+Calling `permissions.set_readonly(false)` mutates an in-memory `Permissions` value. It does not change the filesystem by itself. [`fs::set_permissions`](https://doc.rust-lang.org/std/fs/fn.set_permissions.html) applies that value to the path.
+
+The two-step design allows inspection and modification before the system call, but also creates room for stale metadata and path replacement. In security-sensitive writable directories, another actor may replace the path between metadata retrieval and permission update.
+
+I avoid describing this read-modify-write sequence as atomic. Handle-based platform operations can be more appropriate when the threat model includes races.
+
+## PermissionsExt expresses an exact Unix policy
+
+[`PermissionsExt`](https://doc.rust-lang.org/std/os/unix/fs/trait.PermissionsExt.html) exposes Unix mode bits. The repaired fixture applies `0644` explicitly rather than translating through the readonly Boolean.
+
+For secret material I may choose `0600`; for shared group workflows, perhaps `0660`. The important part is that the mode comes from a documented application policy and not from an assumption about the previous state.
+
+I mask observed mode with `0o777` in the fixture because metadata mode can include file-type and special bits. Production policy may also need set-user-ID, set-group-ID, or sticky-bit handling rather than silently discarding them.
+
+## Umask does not repair this chmod-style change
+
+A process umask influences permissions when creating files. It is not a general safety filter applied to every later permission change. Starting securely and then calling `set_readonly(false)` can still broaden write access.
+
+I set restrictive creation options where available and explicitly apply final permissions before exposing sensitive content. Temporary-file creation also needs safe naming and exclusive creation; mode alone does not prevent path substitution.
+
+Restoring a prior policy requires storing the prior permissions and deciding whether they are still trustworthy, not toggling a Boolean twice.
+
+## ACLs and effective access are more complex
+
+Unix mode bits do not describe every access-control mechanism. ACLs, ownership, group membership, capabilities, mount options, and privileged processes affect effective access. The readonly getter checks write permission bits, not whether the current process can actually modify a file in every circumstance.
+
+On Windows the portable API maps to a readonly attribute with different semantics. A cross-platform tool should specify the security outcome it needs per platform instead of assuming one Boolean means one access matrix.
+
+I keep the RFA-316 case scoped to Unix because its exact mode result and repair use Unix extensions.
+
+## Directories are another trap
+
+Directory write permission interacts with creating, removing, and renaming entries, while file write permission governs file contents. A readonly attribute or mode change on a directory does not translate directly into “nothing below this path can change.”
+
+I test files and directories separately and include parent-directory permissions in threat reviews. Protecting a file's bytes may still allow the file entry to be replaced when the containing directory is writable.
+
+## What I test
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-316/fixed.rs) begins with `0444`, sets exact `0644` through `PermissionsExt`, reads the applied mode, and removes the temporary file.
+
+My platform suite tests intended modes under several umasks, owner and group identities where the environment allows it, existing ACLs, read-only transitions, directories, replacement races, and failures from unsupported filesystems. Tests run in an isolated directory and restore or remove artifacts.
+
+The core principle is that portable abstractions compress platform state. Rust's readonly flag maps several Unix write bits into one Boolean, so reversing it cannot reconstruct the desired policy. When Unix permissions carry security meaning, I specify the complete mode or use a higher-level access policy designed for that deployment.

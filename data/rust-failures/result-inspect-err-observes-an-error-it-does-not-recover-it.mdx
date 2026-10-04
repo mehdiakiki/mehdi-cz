@@ -1,0 +1,85 @@
+---
+caseId: "RFA-671"
+title: "Result::inspect_err Observes an Error; It Does Not Recover It"
+date: "2026-09-06T08:31:00+01:00"
+lastmod: "2026-09-06T08:31:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "07be0504ff6937cc115ca597ac87ba92e5f950b6f715fe0c3a9a9707332eb32b"
+area: "diagnostics-macros"
+symptom: "A Result remains Err after inspect_err logs the error, so a later success assertion or question-mark return still fails."
+summary: "inspect_err is a pass-through observation hook. Use or_else, unwrap_or_else, map_err, or matching when the error value or control flow must change."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust inspect_err does not handle error", "Result inspect_err versus or_else", "log and recover Result Rust"]
+evidence: ["Rust 1.98.1 runtime assertion", "error logging closure executes", "unwrap_or supplies explicit fallback"]
+sources: ["https://doc.rust-lang.org/std/result/enum.Result.html#method.inspect_err", "https://doc.rust-lang.org/std/result/enum.Result.html#method.or_else", "https://doc.rust-lang.org/std/result/enum.Result.html#method.map_err"]
+---
+
+`Result::inspect_err` calls a closure with a reference to the error and then returns the original result unchanged. It is useful for observation inside a chain, not for recovery. The [failing fixture](/rust-failure-atlas/evidence/RFA-671/fail.rs) logs `offline` and still holds `Err("offline")`.
+
+## Inspect means pass-through observation
+
+The [`inspect_err` contract](https://doc.rust-lang.org/std/result/enum.Result.html#method.inspect_err) mirrors `inspect` on the success side. The closure receives `&E`, so it cannot take ownership of or replace the error. After it runs, the same `Result<T, E>` continues.
+
+This makes the method useful for tracing, metrics, and debugging:
+
+```rust
+operation().inspect_err(|error| tracing::warn!(%error))?
+```
+
+The question-mark still propagates the error. A log line is evidence that failure occurred, not evidence that it was handled.
+
+## Recovery changes the result shape or branch
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-671/fixed.rs) uses `unwrap_or(0)` after observation because zero is its explicit fallback. In reusable code, [`or_else`](https://doc.rust-lang.org/std/result/enum.Result.html#method.or_else) can compute another result, including another fallible attempt.
+
+[`map_err`](https://doc.rust-lang.org/std/result/enum.Result.html#method.map_err) transforms the error type but does not recover into success. Matching gives full control when both value and effects matter. Each API tells a different story:
+
+- inspect: observe without changing outcome;
+- map: transform one branch's value;
+- or_else: choose another result after error;
+- unwrap_or_else: leave Result and produce a fallback value;
+- `?`: return the residual error to the caller.
+
+I choose by control-flow contract, not by how fluent the chain looks.
+
+## Logging every layer creates noise
+
+If a low-level function, service layer, request handler, and runtime boundary all call `inspect_err`, one failure may create four nearly identical messages. It becomes hard to identify the owning context.
+
+I normally attach structured context as errors move upward and log once at a boundary that knows request identity and final disposition. An inner `inspect_err` is useful for a metric or a rare diagnostic, but it should have a reason beyond “errors must be logged somewhere.”
+
+Sensitive data also matters. Debug formatting an error can include paths, query fragments, identifiers, or payload details. Observation hooks follow the same redaction policy as normal logs.
+
+## Side effects should tolerate retries
+
+An inspection closure can perform arbitrary side effects even though it borrows the error. If surrounding code retries, the hook can increment a counter or emit an alert several times for one logical operation.
+
+Metrics distinguish attempt failures from final request failures. Alerts normally belong after retry exhaustion. I name and place hooks according to that level.
+
+The closure itself should not panic. Turning one expected I/O error into a process panic because logging failed loses the original control flow. Observability infrastructure must degrade safely.
+
+## inspect_err consumes and returns Result
+
+The method takes `self` by value and returns it. That supports chaining without cloning `T` or `E`. It also means a named result is moved unless the returned result is assigned or immediately chained.
+
+Because the closure sees a reference, it can extract display information but cannot retain that reference beyond the call. Owned diagnostic data must be cloned or converted intentionally, with cost and redaction understood.
+
+Tests assert both that the hook ran for `Err` and did not run for `Ok`, and that the original outcome stayed identical. Recovery tests then cover the separate fallback or retry operation.
+
+In asynchronous pipelines, the closure itself is synchronous; it cannot be awaited. If recording evidence requires asynchronous I/O, I normally carry context to an async boundary or send a bounded event to an observability worker. Blocking inside an inspection hook can turn an error path into a latency and backpressure problem.
+
+## My Result observation checklist
+
+- Is the closure only observing, or is recovery expected?
+- Which combinator states the required control-flow change?
+- Will this error also be logged at a higher boundary?
+- Does the diagnostic expose sensitive information?
+- Are metrics counting attempts or final failed operations?
+- Can the observation backend panic or block critical work?
+- Is the returned Result still chained or accidentally discarded?
+- Do tests assert the unchanged outcome as well as the side effect?
+
+The core principle is that seeing an error is not handling it. `inspect_err` is intentionally transparent to the result pipeline. I use it to gather evidence and keep recovery, transformation, and propagation as explicit separate choices.

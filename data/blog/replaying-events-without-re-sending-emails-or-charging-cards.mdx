@@ -1,0 +1,209 @@
+---
+title: "Replaying Events Without Re-Sending Emails or Charging Cards"
+date: "2026-10-23T09:00:00+01:00"
+tags: ["event replay", "side effects", "idempotency", "event sourcing", "distributed systems"]
+draft: false
+reviewed: true
+reviewedHash: "37906e6fcce5ce0a2a81a3b9402b03b8babe0f19e69f7b4846aab6de68a3d3e9"
+cluster: "reliable-data-integrations"
+campaign: "authority-2026"
+opportunity: "DATA-051"
+summary: "Historical replay should rebuild state without repeating real-world effects. Separate projections from effectors and give every intended notification, payment, or command a durable identity."
+---
+
+Replaying an event log is useful for rebuilding a projection, repairing a bug, or creating a new read model. It becomes dangerous when the same consumer also sends email, charges cards, opens tickets, or calls another production system.
+
+An event can be safe to read twice while its side effect is not safe to perform twice.
+
+## Projection and effect are different responsibilities
+
+Consider one handler:
+
+```text
+on OrderPaid:
+  update paid_orders projection
+  send receipt email
+  award loyalty points
+```
+
+A replay intended to rebuild `paid_orders` now sends old receipts and awards points again.
+
+I split the work:
+
+```text
+OrderPaid -> paid_orders_projection
+OrderPaid -> receipt_effector
+OrderPaid -> loyalty_effector
+```
+
+The projection can be rebuilt into a fresh table or version. Each effector owns a real-world operation and a durable effect ledger.
+
+This separation is not only code organisation. It gives replay policy a concrete boundary.
+
+## Give every intended effect an identity
+
+For a receipt, the identity can be:
+
+```text
+effect key = order_id + "initial-payment-receipt"
+```
+
+For a payment capture:
+
+```text
+effect key = payment_intent_id + "capture-v1"
+```
+
+The ledger records:
+
+```sql
+create table effect_ledger (
+  effector text not null,
+  effect_key text not null,
+  source_event_id text not null,
+  source_position text not null,
+  status text not null,
+  external_reference text,
+  first_requested_at timestamptz,
+  confirmed_at timestamptz,
+  primary key (effector, effect_key)
+);
+```
+
+If the historical event appears again, the effector finds the same key. It does not invent a new payment or message because the delivery came from a replay job.
+
+## A replay flag is useful but insufficient
+
+A common guard is:
+
+```ts
+if (!context.isReplay) {
+  await sendEmail(event);
+}
+```
+
+This reduces accidents, but it trusts every replay entry path to set one boolean. A manual offset rewind, broker redrive, restored backup, or duplicate delivery may not carry it.
+
+I use two layers:
+
+```text
+replay policy: says which effectors the job is allowed to invoke
+effect identity: prevents an already intended effect from happening twice
+```
+
+The policy controls deliberate historical work. Idempotency protects unexpected re-observation.
+
+## Rebuild into a new projection generation
+
+Updating the live table in place makes partial replay visible. I prefer:
+
+```text
+paid_orders_v41  <- current live projection
+paid_orders_v42  <- replay target
+```
+
+The replay writes only `v42`, verifies counts and checksums, catches up to a recorded live position, then switches a pointer or view.
+
+```text
+build -> validate -> catch up -> cut over -> retain old version for rollback
+```
+
+The generation belongs to derived state, not to external effects. Creating projection generation 42 must not create “receipt generation 42.”
+
+## Some effects should be recomputed, not suppressed
+
+Not every downstream action is irreversible. A search index, cache, or materialized feature can be rebuilt safely when it has a separate target generation or monotonic version.
+
+I classify consumers:
+
+| Consumer | Replay mode |
+| --- | --- |
+| pure projection | rebuild into isolated generation |
+| idempotent derived store | apply with source position/version |
+| external notification | suppress unless an explicit campaign is approved |
+| payment or entitlement | effect ledger plus business reconciliation |
+| audit log | preserve original observation and replay metadata separately |
+
+“Disable all side effects” is too broad when the replay's purpose is to repair a derived system. The allowlist is explicit per consumer.
+
+## Make replay capability explicit at startup
+
+I prefer the replay runner to register only consumers allowed for that job. This is stronger than delivering every event to every consumer and asking each handler to notice a flag correctly.
+
+```text
+normal runtime: projection + receipt + loyalty consumers
+replay runtime: paid_orders_v42 projection only
+```
+
+The job manifest records the selected handlers, code revision, source range, target generation, and operator approval. A consumer with an external capability is absent unless the replay purpose explicitly requires it.
+
+This gives defence in depth. Registration prevents an accidental call path; the effect ledger still protects against a duplicate reaching an effector through another path. I also fail startup when a replay target points at the live projection name, because a typo should not turn an isolated rebuild into an in-place rewrite.
+
+## Event time does not prove an effect already happened
+
+It is tempting to suppress events older than today. This fails for a genuine delayed event that should trigger an effect, and it can allow a recent replay to repeat one.
+
+```text
+old event + never processed   -> effect may still be required
+recent event + already done   -> effect must not repeat
+```
+
+Only durable effect identity and outcome evidence answer the question.
+
+## Preserve source and replay identities
+
+I give the replay its own metadata without changing the original event identity:
+
+```json
+{
+  "source_event_id": "evt_819",
+  "source_position": "orders/12/417",
+  "delivery": {
+    "kind": "historical_replay",
+    "replay_id": "replay_2026_10_23",
+    "target_generation": "paid_orders_v42"
+  }
+}
+```
+
+If a tool replaces the original event ID with a new replay ID, normal inbox deduplication cannot recognise that it is the same event.
+
+The replay ID identifies the job and audit trail. The source event ID still identifies the fact.
+
+## Ambiguous historical effects need reconciliation
+
+An old ledger row may say `requested` without `confirmed` because the original worker crashed. Replay is not permission to call again blindly.
+
+I reconcile using the stable key or external reference:
+
+```text
+confirmed -> suppress and continue
+not found at provider -> execute according to current policy
+found -> record confirmation and continue
+provider cannot answer -> manual or explicitly accepted risk
+```
+
+Retention matters. If the effect ledger expires before the event can be replayed, the guarantee expires with it. [How Long Must a Consumer Remember Duplicate Messages?](/blog/how-long-must-a-consumer-remember-duplicate-messages) derives that window.
+
+## Test replay as a production operation
+
+My test fixture contains:
+
+```text
+one event with confirmed email
+one event whose email was never requested
+one event with ambiguous payment request
+one duplicate source event
+one event that arrived late but is not a replay
+```
+
+I run the same range twice and assert:
+
+- the new projection matches expected state;
+- confirmed external effects remain one;
+- suppressed effects are counted by reason;
+- genuinely missing allowed effects follow policy;
+- the second replay creates no new business effects;
+- cutover happens only after catch-up and verification.
+
+A replay is a new computation over old facts. It should create a new derived view when that is the goal, not repeat the world's irreversible reaction to those facts.

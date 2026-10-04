@@ -1,0 +1,267 @@
+---
+title: "Rust Enum Niches: How Option<T> Can Cost No Extra Byte"
+date: "2026-09-13T19:00:00+01:00"
+tags: ["rust", "enum", "memory layout", "option", "unsafe rust"]
+draft: false
+reviewed: true
+reviewedHash: "db353cb54271e220853132b364656ef5ed10f88b0161a1f952fb966277656b5c"
+cluster: "rust-under-the-hood"
+campaign: "authority-2026"
+opportunity: "RUST-048"
+summary: "Measured Rust enum layouts showing how invalid payload values encode Option discriminants, which optimizations are guaranteed, and what repr changes."
+---
+
+When I inspect memory-heavy Rust code, I do not assume that an enum always stores a separate tag. `Option<&T>` normally has the same size as `&T`: there is no extra boolean beside the pointer. Rust can represent `None` with the null bit pattern because a valid reference is never null.
+
+This is often called the null-pointer optimisation. The more general mechanism is a **niche**: a bit pattern that is invalid for a type and can therefore encode something else.
+
+The interesting part is not only how Rust saves a word. It is knowing which layouts are guaranteed, which are compiler choices, and where `repr` can remove the optimisation we expected.
+
+## A discriminant does not always need a field
+
+Start with an ordinary enum:
+
+```rust
+enum State<T> {
+    Empty,
+    Full(T),
+}
+```
+
+Conceptually, Rust must distinguish `Empty` from `Full`. We call this information the discriminant. A naive representation stores a tag plus enough space for `T`:
+
+```text
+[ tag ][ padding ][ payload ]
+```
+
+But if `T` has an impossible bit pattern, the compiler may use that pattern as the tag:
+
+```text
+[ payload-or-impossible-value ]
+```
+
+The enum still has a discriminant at the language level. It simply does not require a separate byte or word in the chosen representation.
+
+## `NonZeroUsize` gives Rust one impossible value
+
+Every bit pattern is a valid `usize`. `0` through `usize::MAX` all mean something. So `Option<usize>` needs another representation for `None`.
+
+`NonZeroUsize` excludes zero:
+
+```rust
+use std::num::NonZeroUsize;
+
+let id = NonZeroUsize::new(7).unwrap();
+let present = Some(id);
+let absent: Option<NonZeroUsize> = None;
+
+assert_eq!(present.unwrap().get(), 7);
+assert!(absent.is_none());
+```
+
+Now zero is available as a niche. Rust guarantees that `Option<NonZeroUsize>` has the same size, alignment, and function-call ABI as `NonZeroUsize`.
+
+On a common 64-bit target, this comparison normally prints:
+
+```rust
+use std::mem::size_of;
+use std::num::NonZeroUsize;
+
+fn main() {
+    println!("usize:                  {}", size_of::<usize>());
+    println!("Option<usize>:          {}", size_of::<Option<usize>>());
+    println!("NonZeroUsize:           {}", size_of::<NonZeroUsize>());
+    println!(
+        "Option<NonZeroUsize>:   {}",
+        size_of::<Option<NonZeroUsize>>()
+    );
+}
+```
+
+I ran these measurements with Rust 1.95.0-nightly on `x86_64-unknown-linux-gnu`:
+
+| Type | Size | Alignment |
+| --- | ---: | ---: |
+| `usize` | 8 | 8 |
+| `Option<usize>` | 16 | 8 |
+| `NonZeroUsize` | 8 | 8 |
+| `Option<NonZeroUsize>` | 8 | 8 |
+| `&u8` | 8 | 8 |
+| `Option<&u8>` | 8 | 8 |
+| `*const u8` | 8 | 8 |
+| `Option<*const u8>` | 16 | 8 |
+| `NonZeroU8` | 1 | 1 |
+| `Option<NonZeroU8>` | 1 | 1 |
+
+These are evidence for this compiler and target, not a cross-platform size table. The equalities guaranteed by the documented `Option` representation are the portable facts.
+
+## References have a null niche
+
+Safe Rust references must point to a valid, properly aligned value and cannot be null. This leaves the null pointer bit pattern available for `None`:
+
+```rust
+use std::mem::size_of;
+
+fn main() {
+    assert_eq!(size_of::<&u8>(), size_of::<Option<&u8>>());
+    assert_eq!(size_of::<&mut u8>(), size_of::<Option<&mut u8>>());
+}
+```
+
+The standard library guarantees this representation for references to sized types, `Box<U, Global>` with sized `U`, `NonNull<U>` with sized `U`, function pointers, the integer `NonZero*` types, and qualifying transparent wrappers.
+
+This is stronger than "rustc happens to optimise it today." Unsafe and FFI code may rely on the cases explicitly documented by `Option`.
+
+## A raw pointer is different
+
+A raw pointer may be null, so null is not an invalid bit pattern for `*const T` or `*mut T`.
+
+```rust
+use std::mem::size_of;
+
+fn main() {
+    println!("*const u8:         {}", size_of::<*const u8>());
+    println!(
+        "Option<*const u8>: {}",
+        size_of::<Option<*const u8>>()
+    );
+}
+```
+
+On current common targets, the option may be larger because every pointer value, including null, is already valid as a raw pointer. More importantly, the standard `Option` guarantee does not list raw pointers.
+
+If an API means "a pointer that is non-null when present," `Option<NonNull<T>>` expresses exactly that and receives the documented niche optimisation:
+
+```rust
+use std::ptr::NonNull;
+
+struct Link<T> {
+    next: Option<NonNull<T>>,
+}
+```
+
+This does not make dereferencing safe. Lifetime, aliasing, and ownership invariants still belong to the data structure.
+
+## Niches are not padding bytes
+
+Padding is space inserted to satisfy alignment. A niche is an invalid representation of a type.
+
+These concepts can interact in compiler layout work, but they are not synonyms. It is especially dangerous for unsafe code to treat padding as stable spare storage. Rust may leave padding uninitialised, typed copies may not preserve its bytes, and default `repr(Rust)` field layout is not a public contract.
+
+A good example of a true niche is `NonZeroU8`: the complete one-byte pattern `0x00` is invalid for the type. This is a semantic invariant, not accidental padding between fields.
+
+## More invalid values can encode more states
+
+`bool` has only two valid values even though one byte contains 256 bit patterns. References exclude null and may have alignment constraints. Small fieldless enums can leave many integer representations unused.
+
+In principle, a compiler can use these invalid patterns for enum variants and sometimes optimise nested enums or results.
+
+But this is where we must slow down: Rust does not promise every niche optimisation that rustc currently performs. Unless the Reference or a type's documentation gives a layout guarantee, observed sizes are performance facts for that build, not a serialization or FFI specification.
+
+This assertion can be a useful regression test in a closed application:
+
+```rust
+assert_eq!(
+    std::mem::size_of::<MyInternalEnum>(),
+    expected_for_this_target,
+);
+```
+
+It does not create a language guarantee for downstream crates or future compiler versions.
+
+## `repr(C)` can require an explicit tag
+
+Rust's default enum layout has freedom to use niches. An explicit representation can trade that freedom for a defined layout.
+
+```rust
+enum Compact<T> {
+    None,
+    Some(T),
+}
+
+#[repr(C)]
+enum CLayout<T> {
+    None,
+    Some(T),
+}
+```
+
+For data-carrying enums, applying `repr(C)` or an explicit integer representation defines a tag-and-payload style layout and suppresses the usual null-pointer optimisation.
+
+This is not a compiler failure. We requested a representation suitable for a particular low-level contract. Layout predictability and maximum compactness are different goals.
+
+Do not add `repr(C)` as a general performance annotation. Use it when C interoperability or a documented layout protocol requires it.
+
+## `repr(transparent)` can preserve an inner guarantee
+
+A transparent wrapper has the layout and ABI of its one non-zero-sized field:
+
+```rust
+use std::num::NonZeroU32;
+
+#[repr(transparent)]
+struct UserId(NonZeroU32);
+```
+
+The `Option` documentation guarantees the null-pointer optimisation for a qualifying `repr(transparent)` wrapper around one of its listed types, recursively under the documented conditions. This lets an API create a strong domain type without paying a separate tag for `Option<UserId>`.
+
+The wrapper still has to preserve the inner validity invariant. Safe constructors should reject zero.
+
+## FFI: use only the guaranteed subset
+
+For an FFI callback, a nullable function pointer is a useful case:
+
+```rust
+type Callback = extern "C" fn(i32) -> i32;
+
+#[repr(C)]
+struct Configuration {
+    callback: Option<Callback>,
+}
+```
+
+Rust documents `Option<extern "C" fn(...) -> ...>` as having the same layout and ABI as the non-null function pointer, with `None` representing null.
+
+Do not generalise this to every `Option<MyType>` whose measured size looks convenient. For FFI, network formats, shared memory, or files, use only explicit representation guarantees and specify every field.
+
+## Transmute requires a documented validity guarantee
+
+Equal size is not enough to make `transmute` sound. The destination type must accept the produced bit pattern, alignment and validity must hold, and layout must be guaranteed for the conversion.
+
+The `Option` module documents a narrow set of sound conversions for its guaranteed niche types. For example, converting a valid `T` from that list to `Some::<T>` and back is guaranteed under the stated conditions. Transmuting `None::<T>` into `T` is undefined behavior because it creates the invalid niche value as a valid `T`.
+
+Most code should use `Some`, pattern matching, and normal constructors. They communicate the same operation without asking a reviewer to re-prove a representation contract.
+
+## Niche optimisation and API design
+
+Niche-aware types can make a real difference in dense structures:
+
+- millions of optional IDs;
+- tree nodes with optional non-null links;
+- state-machine variants stored per connection;
+- compact handles in embedded systems.
+
+Still, I use this order:
+
+1. Choose the type that expresses the invariant, such as `NonZeroU32` or `NonNull<T>`.
+2. Measure the containing structure on the real targets.
+3. Check whether the required layout is guaranteed or only observed.
+4. Add a size regression test if application performance depends on it.
+5. Keep external formats independent from default Rust layout.
+
+This produces better APIs even before considering bytes. In my own code, I prefer `NonZeroU32` because it tells readers that zero is invalid. The compact `Option` is then a valuable consequence rather than a clever representation trick driving the domain model.
+
+## Measure, then check the promise
+
+A niche is a representation that a type promises never to use. Rust can borrow it to encode an enum variant without storing a separate tag.
+
+Some `Option<T>` layouts are guaranteed and safe to design around. Many other clever layouts are intentionally unspecified. Measure all you want, but keep a clear line between "this compiler produced" and "the language promises."
+
+That line is where compact Rust stays sound Rust.
+
+## Further reading
+
+- [`Option` representation guarantees](https://doc.rust-lang.org/std/option/index.html#representation)
+- [Type layout in the Rust Reference](https://doc.rust-lang.org/reference/type-layout.html)
+- [`repr(Rust)` and the null-pointer optimisation](https://doc.rust-lang.org/nomicon/repr-rust.html)
+- [Alternative representations in the Rustonomicon](https://doc.rust-lang.org/nomicon/other-reprs.html)

@@ -1,0 +1,72 @@
+---
+caseId: "RFA-317"
+title: "DirEntry::metadata Does Not Follow the Final Symlink"
+date: "2026-09-06T01:37:00+01:00"
+lastmod: "2026-09-06T01:37:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "fe8db24bc4fabc2d5324194d1a0d273481cf95d5f6f8b7069d7545a5243e102f"
+area: "ffi-targets"
+symptom: "Metadata obtained from a read_dir entry reports a symbolic link while fs::metadata on the entry path reports the regular target file."
+summary: "Despite its similar name, DirEntry::metadata follows symlink_metadata semantics for the final entry. Use fs::metadata when the destination object is required, and keep race limits visible."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["Unix"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust DirEntry metadata follows symlink", "read_dir entry metadata is symlink", "DirEntry metadata versus fs metadata"]
+evidence: ["Rust 1.98.1 Unix directory", "DirEntry for relative symlink", "entry and destination metadata comparison"]
+sources: ["https://doc.rust-lang.org/std/fs/struct.DirEntry.html#method.metadata", "https://doc.rust-lang.org/std/fs/struct.DirEntry.html#method.file_type", "https://doc.rust-lang.org/std/fs/fn.metadata.html"]
+---
+
+I changed a directory walker from `fs::metadata(entry.path())` to `entry.metadata()` because the shorter form looked equivalent. Symbolic links changed classification. The entry method reported the link itself, while the free function had reported the target.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-317/fail.rs) creates a link to a regular file, finds its `DirEntry`, and expects `entry.metadata().is_file()` to be true. The metadata file type is symlink instead.
+
+## Similar method names carry different follow policies
+
+[`DirEntry::metadata`](https://doc.rust-lang.org/std/fs/struct.DirEntry.html#method.metadata) does not traverse a final symbolic link. On Unix it is equivalent in this respect to calling `symlink_metadata` on the path.
+
+[`fs::metadata`](https://doc.rust-lang.org/std/fs/fn.metadata.html) follows symbolic links. Applied to the same entry path, it describes the destination regular file.
+
+RFA-305 compares `fs::metadata` with `fs::symlink_metadata`. This case adds the less obvious fact that `DirEntry::metadata` belongs to the no-follow side despite sharing the shorter `metadata` name.
+
+## Directory walking must choose what it visits
+
+A walker has at least two decisions: how to classify an entry and whether to recurse through a directory symlink. Accidentally following links can escape the intended root, revisit the same directory through cycles, or scan a much larger tree.
+
+Accidentally not following them can omit data that the product considers part of the logical tree. Neither policy is universally correct.
+
+I store entry type and resolved target type separately when policy needs both. A Boolean `is_dir` cannot explain whether a path is a direct directory, a link to one, a broken link, or an inaccessible target.
+
+## file_type can be cheaper and clearer
+
+[`DirEntry::file_type`](https://doc.rust-lang.org/std/fs/struct.DirEntry.html#method.file_type) also does not traverse symlinks. When I only need to distinguish file, directory, and link, it states the question directly and may avoid extra system calls on supported platforms.
+
+Full metadata is appropriate for size, timestamps, permissions, and other fields. I do not request it only to inspect a type if directory entry data already carries that fact.
+
+Platform cost differs: the standard documentation explains that metadata and file-type queries can require different calls depending on Unix, Windows, and filesystem support. I benchmark a real deployment rather than assuming every entry already contains every field.
+
+## Stored entry information can become stale
+
+A `DirEntry` is not a stable capability to one immutable object. The filesystem can change after `read_dir` produced it. Calling `entry.path()` and then another metadata function can observe a replacement.
+
+For backup, cleanup, or sandbox boundaries, I consider handle-relative traversal, device and inode identity where appropriate, and platform no-follow options. A string path plus earlier classification is not proof that a later open reaches the same object.
+
+The exact defenses depend on the operating system. The Rust standard methods give useful building blocks but do not turn multi-step path traversal into an atomic security boundary.
+
+## Relative symlink targets add another coordinate
+
+The fixture stores `target.txt` in the link. That text is resolved relative to the directory containing the link. `entry.path()` returns the path of the link entry, while `read_link` would return its stored target text. Followed metadata resolves that text to an object.
+
+I keep these three concepts distinct in logs: encountered entry path, stored link target, and resolved destination. Printing only one “path” makes debugging cycles and escapes unnecessarily difficult.
+
+Canonicalization can provide a resolved absolute path for some workflows, but it requires existence, follows links, and introduces its own race between resolution and later action.
+
+## What I test
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-317/fixed.rs) asks both questions. Entry metadata identifies the link; free-function metadata identifies its file destination. Cleanup happens after both observations.
+
+My walker tests direct files and directories, links to each, dangling links, relative and absolute targets, cycles, permission errors, disappearing entries, and links that point outside the root. I run platform-specific expectations instead of pretending Unix setup applies everywhere.
+
+I also test the follow policy at the operation that matters, such as open or recursion, not only at the metadata display layer.
+
+The core principle is that filesystem APIs encode a link-follow boundary in each operation. Names alone are not enough: `DirEntry::metadata` does not follow the final symlink, while `fs::metadata` does. A robust walker makes entry identity and destination identity separate, reviewable states.

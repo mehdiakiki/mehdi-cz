@@ -1,0 +1,188 @@
+---
+title: "Rust 1.97 Linker Messages: Which Warnings Belong to rustc?"
+date: "2026-09-30T09:00:00+01:00"
+tags: ["rust", "rustc", "linker", "warnings", "rust 1.97"]
+draft: false
+reviewed: true
+reviewedHash: "bd774a11d930e6ce3ef0e7ac1e0f61f1ac467c9aa7211c031812ac9cd8d4e003"
+cluster: "rust-under-the-hood"
+campaign: "authority-2026"
+opportunity: "RUST-017"
+summary: "Rust 1.97 forwards successful linker output through a special lint. Learn who produced the message, why -D warnings ignores it, and how to investigate it."
+---
+
+Rust 1.97 made some successful builds noisier on purpose. When the linker writes a message but still exits successfully, rustc can now show that output as a warning instead of hiding it.
+
+This creates an important diagnostic question: is rustc warning about Rust code, or is it forwarding text from an external linker?
+
+The visual format looks like a Rust warning, but the ownership is different. Rustc controls the lint envelope. The linker controls the original message and whether it appears on one platform only.
+
+## What changed in Rust 1.97
+
+Before 1.97, rustc normally silenced linker output when linking succeeded. This avoided noise, but it could also hide useful notices about deprecated flags, duplicate libraries, architecture mismatches, or future linker changes.
+
+The [Rust 1.97 announcement](https://blog.rust-lang.org/2026/07/09/Rust-1.97.0/#linker-output-no-longer-hidden-by-default) says successful linker messages are now enabled by default and common known false positives are filtered.
+
+A forwarded diagnostic looks like:
+
+```text
+warning: linker stderr: ...message produced by the linker...
+  |
+  = note: `#[warn(linker_messages)]` on by default
+```
+
+The build can succeed because the linker returned success. Text written to stderr is not the same thing as a non-zero exit status.
+
+## A controlled noisy-linker experiment
+
+To see the boundary, I wrapped the system C linker with a script that writes one line to stderr and then executes the real linker:
+
+```sh
+#!/bin/sh
+echo "synthetic linker notice: using compatibility path" >&2
+exec cc "$@"
+```
+
+Then I compiled a small program with stable Rust 1.98:
+
+```bash
+rustc main.rs \
+  -C linker=./noisy-linker.sh \
+  -D warnings
+```
+
+The program linked successfully, and rustc printed:
+
+```text
+warning: linker stderr: synthetic linker notice: using compatibility path
+  = note: `#[warn(linker_messages)]` on by default
+  = note: the `linker_messages` lint ignores `-D warnings`
+```
+
+This result is subtle. Blanket `-D warnings` does not deny this special lint.
+
+When I changed the command to:
+
+```bash
+rustc main.rs -C linker=./noisy-linker.sh -D linker-messages
+```
+
+rustc reported the forwarded message as an error and aborted after linking.
+
+## Why the lint ignores the warnings group
+
+Normal rustc lints are meant to behave consistently for the same Rust program and compiler configuration. External linker output depends on more variables:
+
+- operating system and target triple;
+- linker family and version;
+- system libraries and SDK version;
+- native dependencies and their flags;
+- environment-specific search paths;
+- whether a compiler driver such as `cc` sits in front of the linker.
+
+If `-D warnings` included every successful linker notice, a workspace could pass on Linux and fail on one macOS SDK revision without any Rust source change. Rust 1.97 therefore keeps `linker_messages` outside the ordinary warnings group.
+
+This also means `CARGO_BUILD_WARNINGS=deny` does not automatically deny it. That Cargo setting changes adjustable local-package warnings, while this lint has special behaviour. See [Denying Rust Warnings Without Throwing Away the Cargo Cache](/blog/denying-rust-warnings-without-throwing-away-the-cargo-cache) for the cache distinction.
+
+## Identify the producer before fixing the text
+
+I investigate in this order.
+
+First, record the target and linker:
+
+```bash
+rustc -vV
+cargo build -vv
+```
+
+The verbose Cargo output shows the rustc invocation and often the selected linker flags. For a cross build, I record the explicit `--target` value as part of the reproduction.
+
+Second, copy the exact text after `linker stderr:`. Prefixes often reveal the producer:
+
+```text
+ld: ...
+ld.lld: ...
+link.exe: ...
+clang: ...
+collect2: ...
+```
+
+Third, determine which crate reaches the final link and which native library or build script added the relevant flag. `cargo tree` explains Rust dependencies, while `cargo build -vv` exposes `-L`, `-l`, and `-C link-arg` inputs.
+
+Fourth, reproduce on the affected target image. A message that exists only with one linker version is not disproved by a clean build elsewhere.
+
+## Which component owns the fix?
+
+I use this routing table:
+
+| Evidence | Likely owner |
+| --- | --- |
+| my `.cargo/config.toml` adds the bad link argument | application or build configuration |
+| my `build.rs` prints a wrong `cargo::rustc-link-*` directive | my crate's build script |
+| a `-sys` crate discovers an obsolete native path | that crate or its configuration |
+| rustc passes a surprising default flag for the target | rustc target specification |
+| linker reports a deprecated platform SDK behaviour | toolchain/image owner, sometimes upstream linker |
+| harmless message is forwarded inconsistently | possible rustc filter issue |
+
+The wrapper belongs to rustc, but that does not make every enclosed message a rustc defect.
+
+## Do not suppress before reading
+
+A successful linker warning can still predict a future failure. Examples include ignored incompatible libraries, deprecated flags, duplicate symbol selection, or architecture fallback.
+
+I check:
+
+1. Did the produced binary contain the expected architecture and symbols?
+2. Is the message new after a Rust, linker, SDK, or native dependency update?
+3. Does it appear on every clean build or only an old cached environment?
+4. Can I remove the responsible link argument or duplicate library?
+5. Does the linker documentation classify it as informational?
+
+Only after this do I allow the lint.
+
+## Scoped suppression
+
+For a repository-wide decision, Cargo can configure the Rust lint:
+
+```toml
+[lints.rust]
+linker_messages = "allow"
+```
+
+I prefer a target-specific CI decision when the noise belongs to one platform. A global allow can hide a useful new message on every other linker.
+
+I also record the exact accepted message, linker version, affected target, and upstream issue. Suppression without an expiry becomes permanent blindness.
+
+The Rust compiler's lint list on current stable also contains `linker_info`, an allow-by-default category for linker output known to be informational. This reflects the filtering problem: not every linker line has the same meaning. I rely on the compiler version's own classification instead of assuming the names never evolve.
+
+## CI policy that remains portable
+
+My CI separates these decisions:
+
+```text
+Rust lints:
+  deny ordinary warnings for local packages
+
+Linker messages:
+  collect on every supported target
+  fail only on reviewed target-specific patterns or explicit lint policy
+
+Link failure:
+  always fail because the linker returned non-zero
+```
+
+A text allowlist is fragile, so I keep it small. When possible, I fix the flag or dependency that causes the message.
+
+## The mental model
+
+There are three layers:
+
+```text
+native linker produces text and exit status
+rustc classifies and renders that text as a lint diagnostic
+Cargo selects lint policy and presents the build result
+```
+
+Rust 1.97 made the first layer more visible through the second. That is valuable because a successful link can still carry useful evidence.
+
+The right response is neither “all warnings must fail” nor “linker noise does not matter.” Identify who produced the message, test the actual target, fix the responsible input, and suppress only a reviewed informational case.

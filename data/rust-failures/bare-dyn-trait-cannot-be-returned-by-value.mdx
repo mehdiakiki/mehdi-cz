@@ -1,0 +1,92 @@
+---
+caseId: "RFA-426"
+title: "Why Rust Cannot Return a Bare dyn Trait by Value"
+date: "2026-09-06T04:16:00+01:00"
+lastmod: "2026-09-06T04:16:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "9db2327d48a367ad6102b1e43cc629b916c65e4c121ebf1d41f100c7fe44cb48"
+area: "diagnostics-macros"
+symptom: "A function returning dyn Label fails with E0746 because the trait object's concrete value has no statically known size or inline return layout."
+summary: "dyn Trait is a dynamically sized erased type and must be used behind pointer indirection. Return impl Trait for one hidden concrete type, Box<dyn Trait> for runtime-varying implementations, or an enum for a closed set."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust E0746 return type cannot be trait object without pointer indirection", "cannot return dyn Trait by value", "impl Trait versus Box dyn Trait return"]
+evidence: ["Rust 1.98.1 E0746 compile failure", "bare dyn Label return type", "single concrete impl Trait repair"]
+sources: ["https://doc.rust-lang.org/error_codes/E0746.html", "https://doc.rust-lang.org/reference/types/trait-object.html", "https://doc.rust-lang.org/reference/types/impl-trait.html#abstract-return-types"]
+---
+
+I wanted a function to hide its concrete return type, so I wrote `fn make() -> dyn Label`. Rust rejected it with E0746 because a bare trait object cannot be returned by value.
+
+The [failing fixture](/rust-failure-atlas/evidence/RFA-426/fail.rs) returns a small `Name` value that implements `Label`. The body looks unambiguous, but the declared return type is dynamically sized.
+
+## A return place needs a layout
+
+Ordinary by-value calling conventions need to know how much space the return value occupies and how to move or destroy it. Different implementations of one trait can have different sizes and alignments.
+
+The [`dyn Trait` type](https://doc.rust-lang.org/reference/types/trait-object.html) erases that concrete type. Trait objects are dynamically sized types, so they live behind pointers such as `&dyn Trait`, `Box<dyn Trait>`, `Rc<dyn Trait>`, or `Arc<dyn Trait>`.
+
+A pointer has a known outer layout and carries metadata needed for dynamic dispatch. A bare `dyn Label` has no such sized container.
+
+## Use impl Trait for one hidden concrete type
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-426/fixed.rs) returns `impl Label`. The function body always returns `Name`, so the compiler knows the concrete layout while callers only rely on the trait interface.
+
+This uses static dispatch. It does not allocate merely because the concrete type is hidden.
+
+The important restriction is that all normal return paths must resolve to the same concrete type. Two unrelated types that both implement `Label` do not become one opaque return type.
+
+## Use `Box<dyn Trait>` for runtime variation
+
+When configuration selects among unrelated implementations, a boxed trait object is often direct:
+
+```rust
+fn make(remote: bool) -> Box<dyn Label> {
+    if remote {
+        Box::new(RemoteName)
+    } else {
+        Box::new(LocalName)
+    }
+}
+```
+
+The box provides stable pointer size and ownership, while its metadata selects the correct method implementations. This normally adds heap allocation and dynamic dispatch. Sometimes those costs are irrelevant beside I/O; sometimes a hot inner loop should avoid them.
+
+Lifetimes must also be stated when the object borrows data, for example `Box<dyn Label + 'a>`. Omitting this design step can accidentally demand `'static` data.
+
+## Use an enum for a closed set
+
+If the implementation set is known, an enum stores each variant inline and can implement the trait by matching internally. Its size is the largest variant plus discriminant and padding.
+
+Enums preserve exhaustive matching and can avoid allocation and virtual dispatch. They couple the caller or wrapper to the known variants, which may be unsuitable for plugin-style extension.
+
+I choose an enum when the domain is closed, not only because benchmarks prefer it.
+
+## A borrowed trait object has another ownership story
+
+Returning `&dyn Label` is possible only when the function can return a reference tied to data that outlives the call. It does not manufacture ownership.
+
+A reference to a local variable would fail borrow checking because the local is destroyed on return. Static registries, fields borrowed from an input, or caller-owned objects can support borrowed trait-object returns with explicit lifetimes.
+
+## dyn compatibility remains required
+
+Putting the object behind a box fixes the size problem, but the trait must also be dyn-compatible. Generic methods, some uses of `Self`, associated constants, and other features can prevent object dispatch.
+
+The Atlas contains separate cases for those failures. E0746 specifically means the return position lacks pointer indirection; after adding a box, another diagnostic may reveal a trait-definition issue.
+
+## Performance is more than one indirect call
+
+The [E0746 explanation](https://doc.rust-lang.org/error_codes/E0746.html) presents `impl Trait`, boxed trait objects, and enums as distinct repairs. I assess allocation, cache locality, code size from monomorphisation, branch predictability, and extension needs together.
+
+For a factory called once during startup, clarity usually dominates. For millions of small operations, representation can matter. I measure the actual workload.
+
+## My choice table
+
+- One concrete type, hidden from callers: `impl Trait`.
+- Several runtime-selected open implementations: `Box<dyn Trait>` or another owning pointer.
+- Borrowed existing implementation: `&dyn Trait` with a correct lifetime.
+- Closed known alternatives: enum.
+- Caller chooses implementation: generic type parameter.
+
+The core principle is that abstraction does not remove representation. `impl Trait` hides a concrete sized type statically. `dyn Trait` erases the type dynamically and therefore needs a pointer carrying location and metadata. I choose the form that matches who selects the implementation and who owns its storage.

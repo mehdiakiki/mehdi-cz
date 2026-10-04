@@ -1,0 +1,82 @@
+---
+caseId: "RFA-246"
+title: "Why Vec::truncate Does Nothing When the New Length Is Larger"
+date: "2026-09-06T00:26:00+01:00"
+lastmod: "2026-09-06T00:26:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "21be035313c38fbbc5750ea9c64a851db378901a688efd09b7b2032a679e79b6"
+area: "concurrency-memory"
+symptom: "Vec::truncate(3) leaves a one-element vector unchanged instead of extending its length to three."
+summary: "truncate only shortens logical length and drops the removed suffix. Use resize, resize_with, or extend for growth, and remember that truncation does not promise to release capacity."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets with alloc"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust Vec truncate larger length does nothing", "set vector length and fill Rust", "Vec truncate versus resize"]
+evidence: ["Rust 1.98.1 one-element vector", "larger truncate no-op", "resize growth repair"]
+sources: ["https://doc.rust-lang.org/std/vec/struct.Vec.html#method.truncate", "https://doc.rust-lang.org/std/vec/struct.Vec.html#method.resize", "https://doc.rust-lang.org/std/vec/struct.Vec.html#method.resize_with"]
+---
+
+The name `truncate` can be misread as “set the length to this boundary.” In Rust it has one direction: shorten if necessary.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-246/fail.rs) starts with `[1]` and calls `truncate(3)`. [`Vec::truncate`](https://doc.rust-lang.org/std/vec/struct.Vec.html#method.truncate) leaves the vector at length one. There are no values Rust could safely invent for the missing positions.
+
+## Length is not only a number
+
+For a `Vec<T>`, every position below `len` must hold a valid, initialized `T`. Increasing length from one to three therefore requires constructing two values.
+
+`truncate` receives only an integer. It has no default value, closure, or `Default` bound, so it cannot define how new elements should be initialized. Its contract is to keep the first `len` elements when the vector is longer and drop the suffix. If the vector is already shorter, the operation is a no-op.
+
+This is a semantic safety rule, not a missing optimization.
+
+## resize expresses the growth policy
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-246/fixed.rs) wants zero-filled growth and uses [`Vec::resize`](https://doc.rust-lang.org/std/vec/struct.Vec.html#method.resize):
+
+```rust
+values.resize(3, 0);
+```
+
+If growth occurs, `resize` clones the supplied value into new positions. If shortening occurs, it drops the suffix much like `truncate`.
+
+For values that should be constructed independently, [`resize_with`](https://doc.rust-lang.org/std/vec/struct.Vec.html#method.resize_with) accepts a closure. This matters when cloned values would share internal reference-counted state or when each item needs a unique identifier.
+
+`extend` is clearer when I already have the missing elements. The right method states where the new valid values come from.
+
+## Capacity remains a different dimension
+
+Truncating changes logical length but does not promise to reduce allocated capacity. A vector can become empty while retaining a large buffer for future reuse.
+
+This is usually an advantage in a repeated workload. It can be surprising in a cache or long-lived service that expects memory to return after clearing data. `shrink_to_fit`, replacing the vector, or changing ownership can express a release policy, subject to allocator behavior.
+
+I record `len` and `capacity` separately in diagnostics. Saying “the vector is still large” is ambiguous between live elements and reserved storage.
+
+## Removed elements are dropped
+
+When truncation shortens a vector, each removed element is dropped. That can close handles, decrement reference counts, release locks embedded in values, or run other destructor logic.
+
+Code must not assume truncation is only pointer arithmetic. If destructor order or latency matters, I test it or drain elements into an explicit processing path. Panicking destructors are especially dangerous and should not be used as ordinary control flow.
+
+For plain bytes the drop cost is trivial, which can hide the more general contract in early tests.
+
+## Do not use unsafe set_len as a shortcut
+
+`Vec::set_len` can change the logical length without constructing elements, but it is unsafe precisely because the caller must prove every newly exposed position is initialized. Calling it after `reserve` alone is unsound: capacity is storage, not initialized `T` values.
+
+Low-level code may write through `spare_capacity_mut` and set the length after successful initialization. That proof must handle partial failure and drop exactly the initialized prefix. For ordinary application vectors, `resize`, `extend`, and collection are safer and clearer.
+
+## Protocol padding needs an explicit byte value
+
+In packet construction, growing to a required width often means zero padding. In text, it may mean spaces. In a table, missing entries might be invalid rather than defaultable.
+
+Treating these as the same “length adjustment” loses domain meaning. I name helpers `pad_with_zeroes`, `reject_wrong_width`, or `drop_after_limit` instead of hiding all policies behind one integer.
+
+## What I test
+
+The regression checks a requested length smaller than, equal to, and greater than current length. It verifies retained prefix values, dropped-element effects, fill behavior for growth, and capacity only when capacity is truly part of the contract.
+
+For `resize_with`, I count closure calls. The closure should run once for every new element and not at all during shortening.
+
+I include a value with a visible `Drop` implementation when lifecycle matters. That reveals whether the removed suffix is destroyed immediately and prevents a refactor from changing cleanup timing unnoticed. The test records events rather than depending on allocator memory statistics, which are a different and less deterministic signal.
+
+The core principle is that collection length represents initialized values, not available slots. `truncate` can safely remove initialized values using only a boundary. Growth needs a source of new values, which is why it belongs to `resize`, `resize_with`, or `extend`. Choosing the verb according to direction makes both ownership and performance easier to reason about.

@@ -1,0 +1,105 @@
+---
+caseId: "RFA-207"
+title: "HashMap::drain Empties the Map but Keeps Its Capacity"
+date: "2026-09-05T17:46:00+01:00"
+lastmod: "2026-09-05T17:46:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "2db76d1e15c8c803fc30ee7a3104eb8b34e95f21c11634f1e705cf632b5c858f"
+area: "concurrency-memory"
+symptom: "HashMap::drain removes every entry but the empty map still reports a large capacity and keeps its previous allocation."
+summary: "HashMap::drain clears logical entries while retaining allocated storage for reuse. Use mem::take, shrink_to_fit, or an ownership redesign when releasing capacity is the actual requirement."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets with alloc"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust HashMap drain keeps capacity",
+    "HashMap drain release memory Rust",
+    "empty HashMap still allocated after drain",
+  ]
+evidence: ["Rust 1.98.1 reserved map", "retained empty capacity", "mem::take ownership repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/std/collections/struct.HashMap.html#method.drain",
+    "https://doc.rust-lang.org/std/collections/struct.HashMap.html#method.capacity",
+    "https://doc.rust-lang.org/std/mem/fn.take.html",
+  ]
+---
+
+I drained a large temporary map and saw its length return to zero. I expected its storage to disappear too. The process kept the capacity because those are two separate properties.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-207/fail.rs) creates a map with capacity for many entries, drains its two sample entries, and checks for zero capacity. The length is zero, but the allocation is retained.
+
+Empty does not mean unallocated.
+
+## `drain` is designed for reuse
+
+[`HashMap::drain`](https://doc.rust-lang.org/std/collections/struct.HashMap.html#method.drain) clears the map and returns an iterator over owned key-value pairs. Its documentation explicitly says allocated memory is kept for reuse.
+
+This is valuable in a loop:
+
+```text
+fill batch map
+drain and process
+fill next batch without reallocating the table
+```
+
+The map has no logical entries after the drain, yet [`capacity`](https://doc.rust-lang.org/std/collections/struct.HashMap.html#method.capacity) still describes how many elements it can hold without reallocating.
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-207/fixed.rs) uses [`mem::take`](https://doc.rust-lang.org/std/mem/fn.take.html) when the intention is to move out the complete allocated map and leave a new empty default map behind.
+
+## Dropping the drain early still clears the map
+
+The draining iterator owns the removed entries as it yields them. If I stop consuming it and drop it, remaining entries are dropped, and the map is empty. The allocation remains with the map.
+
+This is different from filtering iterators such as `extract_if`, where unvisited entries may stay in the collection. “Drain” and “extract conditionally” have different destructor contracts.
+
+I use a small scope around a drain because it keeps a mutable borrow of the map until the iterator is dropped. Trying to reuse the map while the drain is alive is correctly rejected by the borrow checker.
+
+## `clear` has the same storage intention
+
+`clear` removes entries without yielding them and also preserves capacity for reuse. If I do not need ownership of the removed pairs, `clear` communicates the intention more directly than `drain().for_each(drop)`.
+
+If I do need the pairs, `drain` avoids cloning and allows them to move into another structure. Neither operation is a request to return memory to the allocator.
+
+This separation helps API review:
+
+```text
+clear      -> discard entries, keep storage
+drain      -> yield entries, keep storage
+take       -> move the complete map, replace with default
+shrink     -> ask to reduce spare storage
+```
+
+## `shrink_to_fit` is a request with collection rules
+
+After clearing or draining, I can call `shrink_to_fit`. The map reduces capacity as much as its implementation allows, while internal sizing rules may still matter. I avoid tests that assume an exact nonzero capacity for arbitrary populated maps.
+
+For an empty default `HashMap`, capacity is documented as zero until insertion. That makes `mem::take` a strong way to leave the owner with no current allocation while the old allocation travels with the returned value and is eventually dropped.
+
+Which repair is right depends on ownership. If another stage needs the entries, taking the map may be excellent. If the same map will refill next millisecond, retaining capacity is faster and avoids allocator churn.
+
+## Memory use is more than `capacity * size_of`
+
+`HashMap::capacity` is an element-capacity contract, not a byte measurement of resident memory. Buckets, control bytes, allocator rounding, keys, values, and heap allocations owned by keys or values all affect actual usage.
+
+Draining drops or transfers the entries, so heap memory owned by removed `String` or `Vec` values may disappear even while the table allocation stays. Looking only at process RSS can also mislead because an allocator may keep freed memory for later allocations.
+
+I use capacity to explain collection behaviour and a memory profiler to answer process-memory questions. They are related evidence, not interchangeable evidence.
+
+## High-water marks need policy
+
+A long-lived service may receive one unusually large batch, grow a map, and then keep that capacity for months. Reuse is efficient for recurring peaks but wasteful for rare spikes.
+
+I often add a threshold policy: retain normal capacity, but replace or shrink the map after an exceptional batch. The threshold comes from measured workloads, not from calling `shrink_to_fit` after every request.
+
+Repeated shrinking and regrowing can cost more CPU and fragment allocation patterns. The right objective is stable service behaviour, not the smallest capacity after every operation.
+
+## My regression checks length and capacity separately
+
+The fixture drains every entry, asserts the number yielded, and then inspects capacity. This isolates storage retention from partial iteration or forgotten entries.
+
+In production tests I also refill the map to confirm whether allocation reuse was the reason for keeping it. For release-memory paths I keep the old map alive long enough to ensure ownership is where I expect, then drop it at the intended boundary.
+
+The core principle is that logical state and storage state are different. `HashMap::drain` empties the logical map while retaining its table. I choose drain for ownership plus reuse, and I replace or shrink the collection only when releasing the high-water allocation is part of the requirement.

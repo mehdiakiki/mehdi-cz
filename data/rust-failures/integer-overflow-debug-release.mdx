@@ -1,0 +1,156 @@
+---
+caseId: "RFA-037"
+title: "Why Integer Overflow Behaves Differently in Rust Debug and Release Builds"
+date: "2026-09-04T21:00:00+01:00"
+lastmod: "2026-09-07T10:20:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "34e207855c719285874e7850091217289f7633f60bf1830a236ab1b3b03fc486"
+area: "upgrades-compatibility"
+symptom: "Integer arithmetic panics in a debug build but wraps or produces a different result in a release build."
+summary: "Cargo enables overflow checks in dev and disables them in release by default. Choose checked, wrapping, saturating, or overflowing arithmetic explicitly when behavior matters."
+rustVersions: ["stable Rust", "Cargo stable"]
+targets: ["all targets; integer width remains target-specific for usize/isize"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust overflow debug release different",
+    "integer overflow checks Cargo profile",
+    "Rust release build wraps overflow",
+  ]
+evidence: ["profile-paired fixture", "effective profile configuration", "boundary-value table"]
+sources:
+  [
+    "https://doc.rust-lang.org/reference/expressions/operator-expr.html#overflow",
+    "https://doc.rust-lang.org/cargo/reference/profiles.html#overflow-checks",
+  ]
+---
+
+This difference is real and intentional:
+
+```rust
+fn main() {
+    let value = std::hint::black_box(u8::MAX);
+    println!("{}", value + 1);
+}
+```
+
+With Cargo's default development profile, the addition is checked and panics at runtime. The default release profile disables overflow checks, so ordinary unsigned addition wraps to zero when the overflow is not rejected earlier as a compile-time constant.
+
+The same source can therefore have different observable behavior under different profiles.
+
+## First reproduce the effective profiles
+
+I run the smallest non-constant input both ways:
+
+```bash
+cargo run
+cargo run --release
+```
+
+Then I inspect the workspace root manifest and Cargo configuration. Profile settings inside dependencies are ignored; profiles are controlled from the workspace root and can also be overridden by configuration or environment variables.
+
+The built-in defaults include:
+
+```toml
+[profile.dev]
+overflow-checks = true
+
+[profile.release]
+overflow-checks = false
+```
+
+The `test` profile inherits from `dev`, while `bench` inherits from `release`. Custom profiles can choose differently.
+
+I do not use “debug” and “release” as vague synonyms for slow and fast. I record the exact Cargo profile and effective overflow setting.
+
+The [profile-paired failure](/rust-failure-atlas/evidence/RFA-037/fail/src/main.rs) is run from one manifest and one source file: the development process must panic while the release process must print `0`. The [repaired source](/rust-failure-atlas/evidence/RFA-037/fixed/src/main.rs) uses `wrapping_add`, and the verifier accepts it only when both profiles finish successfully with the same output. This tests the cross-profile claim rather than testing two unrelated examples.
+
+## Choose the arithmetic contract in source
+
+Primitive integers provide several families:
+
+```rust
+let value = u8::MAX;
+
+assert_eq!(value.checked_add(1), None);
+assert_eq!(value.wrapping_add(1), 0);
+assert_eq!(value.saturating_add(1), u8::MAX);
+assert_eq!(value.overflowing_add(1), (0, true));
+```
+
+These names express four different domain rules:
+
+- `checked_*` makes overflow part of control flow.
+- `wrapping_*` performs modular arithmetic.
+- `saturating_*` clamps at the numeric boundary.
+- `overflowing_*` returns both the wrapped value and an overflow flag.
+
+If correctness depends on one of these behaviors, I put that behavior in source rather than relying on the profile.
+
+Counters used only for diagnostics may reasonably wrap. Financial amounts usually need checked operations and a typed error. Pixel operations may saturate. Cryptographic code often requires deliberate modular arithmetic. There is no universal repair.
+
+## Signed overflow needs the same care
+
+Two's-complement hardware does not make ordinary signed overflow a good implicit contract. Methods such as `wrapping_add` state intent and stay consistent across profiles.
+
+Division also has special boundaries. Dividing a signed minimum by `-1` overflows, and division by zero panics. Shifts with an excessive right-hand value have their own overflow behavior. I include these in the boundary table when the code accepts untrusted counts or divisors.
+
+For `usize` and `isize`, the width depends on the target. An input which fits on a 64-bit host can overflow on a 32-bit target. Cross-target tests matter even when profiles match.
+
+## Enabling release checks is a valid safety policy
+
+A workspace can require checked ordinary arithmetic in release:
+
+```toml
+[profile.release]
+overflow-checks = true
+```
+
+This makes accidental operator overflow panic rather than wrap. It can be a good containment policy, but it does not replace explicit error handling. A panic may still be the wrong response in a server or library, and callers cannot see the overflow in the function type.
+
+I prefer both layers for sensitive code: explicit checked arithmetic in the domain operation and release overflow checks as a broad backstop.
+
+## Avoid false tests
+
+This can fail during compilation rather than showing a profile difference:
+
+```rust
+let value = 255_u8 + 1;
+```
+
+The compiler can evaluate constants and reject unconditional overflow. `black_box`, input parsing, or a function parameter makes a runtime fixture honest.
+
+I also avoid changing optimization and overflow checks together when diagnosing. A custom profile can keep `opt-level = 3` and toggle only `overflow-checks`. That isolates the mechanism.
+
+## The repair workflow
+
+1. Reduce the operation and exact input.
+2. Run it under profiles differing only in overflow checks.
+3. Decide the domain's overflow meaning.
+4. Replace ordinary operators with the matching explicit method where behavior matters.
+5. Decide whether release checks should remain enabled as defense in depth.
+6. Test target-width boundaries when `usize` or `isize` is involved.
+
+## Conversion can hide the earlier overflow
+
+I also check where the value changes integer type. A cast with `as` can truncate or wrap according
+to Rust's cast rules before the later calculation begins. The final addition may be perfectly in
+range while its input was already narrowed incorrectly.
+
+For fallible narrowing, I prefer `TryFrom`:
+
+```rust
+let count = u32::try_from(external_count)
+    .map_err(|_| Error::CountTooLarge(external_count))?;
+```
+
+This makes the boundary visible and keeps the rejected value available for diagnostics. I test the
+conversion and arithmetic as two separate steps. Otherwise enabling overflow checks can appear not
+to work because the information was lost in a cast which happened earlier.
+
+## The regression proof
+
+My test table includes the maximum, one below maximum, zero, signed minimum, negative inputs when relevant, and values derived from parsing. I run the same semantic assertions in dev and release.
+
+The goal is not to make both profiles coincidentally print the same value. The goal is to make the source declare what overflow means, so profile configuration no longer chooses the business result.

@@ -1,0 +1,116 @@
+---
+caseId: "RFA-160"
+title: "Why an Atomic Load Cannot Use Ordering::Release"
+date: "2026-09-05T16:50:00+01:00"
+lastmod: "2026-09-05T16:50:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "55d7667600ce73e0562a9ced92423f3fe6fd92622af790f197a6f79c4c3a80b4"
+area: "concurrency-memory"
+symptom: "AtomicUsize::load with Ordering::Release fails the invalid_atomic_ordering lint even though Release is a normal atomic Ordering variant."
+summary: "Atomic orderings describe different directions of synchronization. Release applies to publishing through a store, while a pure load can use Relaxed, Acquire, or SeqCst. Choose the protocol before the enum variant."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["targets supporting AtomicUsize"]
+profiles: ["check", "dev", "release", "test"]
+searchTerms: ["Rust atomic loads cannot have Release ordering", "invalid_atomic_ordering AtomicUsize load", "Ordering Release not valid for load"]
+evidence: ["Rust 1.98.1 invalid_atomic_ordering", "pure-load operation", "Acquire load repair"]
+sources: ["https://doc.rust-lang.org/std/sync/atomic/struct.Atomic.html#method.load", "https://doc.rust-lang.org/std/sync/atomic/enum.Ordering.html", "https://doc.rust-lang.org/nomicon/atomics.html"]
+---
+
+All variants live in one `Ordering` enum, but they are not valid for every atomic operation. The operation gives the ordering its direction.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-160/fail.rs) loads an `AtomicUsize` with `Ordering::Release`. Rust 1.98.1 rejects it through the deny-by-default `invalid_atomic_ordering` lint:
+
+```text
+atomic loads cannot have `Release` or `AcqRel` ordering
+```
+
+The compiler suggests `Acquire`, `SeqCst`, or `Relaxed`. Choosing among them still needs a synchronization argument.
+
+## Release publishes from a write
+
+[`Ordering::Release`](https://doc.rust-lang.org/std/sync/atomic/enum.Ordering.html#variant.Release) is applicable to operations that can perform a store. It prevents earlier operations in the publishing thread from moving after that atomic write in the relevant memory model.
+
+A corresponding Acquire load in another thread can observe the released value and establish a happens-before relation for earlier data.
+
+The familiar message-passing shape is:
+
+```text
+producer: write ordinary data -> Release store ready=true
+consumer: Acquire load ready -> read ordinary data
+```
+
+Release belongs to the publication edge. A pure load writes nothing, so it has no store through which to release earlier work.
+
+This is why “Release is strong” is not a sufficient reason. It is strong in a direction that a load does not have.
+
+## Acquire receives through a read
+
+[`Atomic::load`](https://doc.rust-lang.org/std/sync/atomic/struct.Atomic.html#method.load) accepts:
+
+- `Relaxed` for atomicity without cross-location ordering;
+- `Acquire` to receive synchronization from a release operation whose value is observed;
+- `SeqCst` to add the sequentially consistent global-order guarantee.
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-160/fixed.rs) uses `Acquire`. In the tiny fixture there is no second thread or ordinary data, so `Relaxed` would also return the number correctly. `Acquire` is used to demonstrate the valid receiving counterpart, not because every load should be Acquire.
+
+I do not upgrade atomics until a test passes. Memory-ordering bugs often do not reproduce reliably, and unnecessarily strong orderings can hide an absent protocol without explaining it.
+
+## Start with the communication story
+
+Before writing the ordering, I describe:
+
+1. which thread or operation publishes data;
+2. which atomic value carries the observation;
+3. which reader must see which earlier writes;
+4. whether the reader actually observes the value from the release sequence;
+5. whether one global order among several atomics is required.
+
+Then the operation and ordering usually become clear.
+
+If the atomic is only a statistics counter and no ordinary memory visibility depends on it, Relaxed may be enough. If a ready flag guards initialized data, a Release store and matching Acquire load are common. If correctness depends on ordering several atomic observations globally, SeqCst may be justified, though I still write the invariant.
+
+## AcqRel also does not fit a pure load
+
+`AcqRel` combines Acquire semantics for the read part and Release semantics for the write part. It applies to read-modify-write operations such as a successful compare-exchange or fetch operation.
+
+A load has no write part, so `AcqRel` is invalid for the same reason as Release. Using Acquire expresses the part that a load can perform.
+
+Conversely, a pure atomic store cannot use Acquire or AcqRel. Its valid non-SeqCst directional ordering is Release. I classify the operation first:
+
+```text
+load              -> read direction
+store             -> write direction
+read-modify-write -> both directions, depending on ordering and outcome
+```
+
+This table is more useful than ranking enum variants from weak to strong.
+
+## The lint protects a semantic mismatch
+
+The invalid ordering is documented to panic at the atomic API level, and rustc can reject a statically visible invalid combination through `invalid_atomic_ordering`. The fixture captures the compile-time path on Rust 1.98.1.
+
+If an ordering arrives through more complex generic or dynamic code, I do not rely only on the lint to design correctness. I constrain the API so callers choose among meaningful operations, or I expose domain methods such as `publish` and `is_ready` rather than raw ordering arguments.
+
+That prevents a caller from selecting a syntactically available but meaningless variant.
+
+## What Acquire does not guarantee
+
+An Acquire load does not make all writes from all threads visible by magic. It synchronizes when it reads a value connected to a compatible Release operation. Reading an older value may not establish the edge the algorithm expects.
+
+It also does not make non-atomic concurrent access legal without a proven synchronization relationship. The [Rustonomicon atomics chapter](https://doc.rust-lang.org/nomicon/atomics.html) is useful here because it frames atomics inside the memory model rather than as faster locks.
+
+For unsafe lock-free structures, I validate the full algorithm with established patterns and appropriate model testing. A locally valid ordering is only one piece.
+
+## My diagnostic sequence
+
+When rustc rejects an ordering, I do not substitute the first suggestion blindly:
+
+1. Identify whether the operation reads, writes, or does both.
+2. Remove orderings structurally impossible for that operation.
+3. State the cross-thread data that must become visible.
+4. Identify the matching atomic operation on the other side.
+5. Choose the weakest ordering that proves that relation.
+6. Document the proof beside non-obvious code.
+
+The core principle is that ordering variants are not universal strength levels. Release sends prior effects through a write; Acquire receives them through a read. A load cannot release because it publishes no new atomic value. Once I reason in operations and directions, the compiler error becomes a useful protocol check rather than an arbitrary restriction.

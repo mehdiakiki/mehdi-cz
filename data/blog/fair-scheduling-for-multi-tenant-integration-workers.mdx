@@ -1,0 +1,209 @@
+---
+title: "Fair Scheduling for Multi-Tenant Integration Workers"
+date: "2026-09-22T09:00:00+01:00"
+tags: ["multi tenancy", "job scheduling", "data integration", "fairness", "distributed systems"]
+draft: false
+reviewed: true
+reviewedHash: "2f102a5a813ca39fdeebbe3687711316a115a79f8092138be00efc9115acdbf0"
+cluster: "reliable-data-integrations"
+campaign: "authority-2026"
+opportunity: "DATA-023"
+summary: "A shared FIFO queue lets one large customer delay everyone else. Schedule integration work by tenant, cost, and age while preserving useful spare capacity."
+---
+
+A shared integration worker usually begins with one queue. Every synchronization page, webhook repair, and backfill becomes another message. Workers take messages in arrival order.
+
+This works until one customer imports ten million records. Their messages fill the queue. A second customer with twelve urgent updates waits behind work that may take hours.
+
+Nothing is technically broken. The queue is processing at full speed. The system is still unfair.
+
+I use this principle:
+
+> Queue order is part of the multi-tenant product contract.
+
+Fair scheduling is not the same as giving every tenant identical throughput. It means one workload cannot consume a shared bottleneck without an intentional limit.
+
+## Why one FIFO queue creates a noisy neighbour
+
+Assume two tenants arrive at the same time:
+
+| Tenant | Queued jobs | Cost per job |
+| --- | ---: | ---: |
+| A | 10,000 | 1 second |
+| B | 10 | 1 second |
+
+With one FIFO queue ordered by arrival, tenant B can wait almost three hours if A's batch was inserted first. Adding more workers reduces the absolute delay but does not fix the policy. A can still occupy every worker.
+
+The problem becomes worse when jobs have different costs. A “page” from one API may contain 20 records; another may contain 2,000. Counting messages is not counting resource use.
+
+## Separate admission from scheduling
+
+I split the problem into two decisions:
+
+```text
+admission: may this tenant add more work now?
+scheduling: which admitted work runs next?
+```
+
+Admission protects queue size and downstream services. Scheduling allocates the capacity that is already available.
+
+A per-tenant queue limit can stop one runaway producer from filling storage. It still does not decide whether premium work, interactive work, backfills, and retries should receive the same service. That is the scheduler's job.
+
+## Queue by tenant, then choose between tenants
+
+The simplest useful change is a logical queue per tenant:
+
+```text
+tenant A: [A1, A2, A3, ...]
+tenant B: [B1, B2]
+tenant C: [C1, C2, C3]
+```
+
+A round-robin scheduler visits A, B, C, then repeats. If a tenant has no work, it is skipped. The physical storage can remain one database table or broker topic as long as the scheduler can select by tenant without scanning everything.
+
+For equal-cost jobs, this already prevents starvation.
+
+| First six starts | FIFO | Tenant round robin |
+| --- | --- | --- |
+| order | A1 A2 A3 A4 A5 A6 | A1 B1 C1 A2 B2 C2 |
+
+Tenant B begins after one competing job instead of after A's complete backlog.
+
+## Count cost, not only jobs
+
+Round robin becomes unfair when A's job takes 50 milliseconds and B's takes 30 seconds.
+
+I assign an estimated cost unit to each job. The estimate can use:
+
+- records expected in a page;
+- endpoint class;
+- historical runtime percentile;
+- bytes transferred;
+- downstream write count;
+- provider quota units.
+
+The estimate does not need to be perfect. It needs to be better than pretending every message costs one.
+
+A practical scheduler is deficit round robin. Each active tenant receives a quantum of credits on every round. A job runs when the tenant has enough credit for its estimated cost. Unused credit carries into the next round, so a large legitimate job eventually runs instead of starving forever.
+
+```ts
+type TenantQueue = {
+  tenantId: string;
+  weight: number;
+  deficit: number;
+  jobs: Array<{ id: string; estimatedCost: number }>;
+};
+
+function choose(queues: TenantQueue[], baseQuantum: number) {
+  for (const queue of queues) {
+    queue.deficit += baseQuantum * queue.weight;
+    const job = queue.jobs[0];
+    if (job && job.estimatedCost <= queue.deficit) {
+      queue.deficit -= job.estimatedCost;
+      return queue.jobs.shift();
+    }
+  }
+  return undefined;
+}
+```
+
+Production code also needs atomic claims, leases, crash recovery, and a rotating cursor so the scan does not always begin with the same tenant. The example shows the policy, not a complete queue.
+
+## Weights should express a contract
+
+A weight of two can give one tenant roughly twice the service under contention. I only introduce weights when there is a product reason:
+
+- paid service tier;
+- reserved capacity;
+- interactive work versus background backfill;
+- an explicit recovery objective.
+
+Weights should not become secret compensation for a slow customer. If one tenant's jobs are inefficient, improving cost estimation and isolating the bottleneck is clearer.
+
+The [AWS guidance on fairness in multi-tenant systems](https://builder.aws.com/content/3Eupj3d2bo4fEvlzYbICMZNhQ3B/fairness-in-multi-tenant-systems) frames fairness as protecting a single-tenant-like experience while still allowing workloads to use spare capacity. This is the property I want: boundaries during congestion, work conservation when the system is quiet.
+
+## Do not reserve idle workers unnecessarily
+
+Hard partitioning ten workers into two workers per tenant wastes capacity when four tenants are idle.
+
+I prefer a work-conserving scheduler:
+
+1. enforce a maximum number of concurrent jobs per tenant;
+2. choose work fairly among active tenants;
+3. let active tenants borrow otherwise idle capacity;
+4. reclaim that capacity when another tenant becomes active.
+
+This is different from permanent reservation. It gives isolation at the bottleneck without making every customer pay for a private worker pool.
+
+Dedicated pools still make sense for strict regulatory isolation, very large tenants, or workloads whose resource profile cannot coexist safely. Fair scheduling is not a reason to pool everything.
+
+## Retries need their own fairness rule
+
+A failing provider can create unlimited retries for one tenant. If retries return to the main queue at high priority, that tenant can occupy the system while making no progress.
+
+I keep retry state explicit:
+
+```text
+ready → running → succeeded
+             └──> retry_wait(until, attempt, reason)
+             └──> terminal_failure
+```
+
+Only due retries become schedulable. They still consume the tenant's concurrency and cost budget. A global retry budget can further protect the provider and worker fleet during an outage.
+
+The scheduler must also distinguish provider-wide throttling from tenant-specific throttling. If all tenants share one provider account, a global `Retry-After` can pause that provider lane. If only one customer's credential is limited, pausing everyone is unnecessary.
+
+## Prevent starvation without destroying priority
+
+Strict priority queues can starve low-priority work forever. Pure fairness can delay an urgent repair behind ordinary imports.
+
+I combine priority with age:
+
+```text
+effective_priority = base_priority + waiting_time_bonus
+```
+
+The waiting bonus is capped and easy to inspect. Old background work gradually becomes eligible, while fresh urgent work still starts quickly. Another valid design is to reserve a small percentage of starts for the oldest eligible jobs.
+
+## Measure the experience per tenant
+
+Fleet averages hide noisy neighbours. I keep tenant-aware metrics:
+
+- queue age at start, by tenant and work class;
+- time to first job after enqueue;
+- completed cost units per minute;
+- active and waiting jobs;
+- retry share;
+- per-tenant concurrency;
+- scheduler skips caused by missing credit;
+- oldest eligible job age.
+
+I also load-test the system with asymmetric traffic: one huge backfill, many small tenants, slow jobs, failing jobs, and a tenant that continuously enqueues. The [AWS SaaS Lens](https://docs.aws.amazon.com/wellarchitected/latest/saas-lens/foundations.html) explicitly recommends concentrated multi-tenant load and throttling tests because average load does not reveal isolation failures.
+
+## A queue schema that keeps the policy visible
+
+One possible relational shape is:
+
+```sql
+create table integration_jobs (
+  id uuid primary key,
+  tenant_id uuid not null,
+  work_class text not null,
+  state text not null,
+  available_at timestamptz not null,
+  estimated_cost integer not null,
+  base_priority integer not null,
+  enqueued_at timestamptz not null,
+  lease_until timestamptz
+);
+```
+
+Indexes and claim queries depend on the database and volume. The important fields are tenant identity, availability, cost, priority, age, and lease state. If tenant identity exists only inside an opaque payload, fair scheduling becomes expensive to add later.
+
+## What I learned from integration workloads
+
+An integration fleet does not process an abstract global backlog. It serves customers who each expect progress, even while another customer imports a large history or retries a broken endpoint.
+
+I make tenant identity part of queue control, estimate cost, cap concurrency, schedule active tenants fairly, and let unused capacity remain useful. Then I test the system under deliberately unequal load.
+
+That is the difference between a queue that is busy and a service that is fair.

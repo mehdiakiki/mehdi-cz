@@ -1,0 +1,112 @@
+---
+caseId: "RFA-175"
+title: "Why Arc::try_unwrap Ignores Weak Pointers"
+date: "2026-09-05T17:14:00+01:00"
+lastmod: "2026-09-05T17:14:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "23fa6a61a62f1c34f4d460b69330c8e2a4179597936ff74f7ef13884011c9c72"
+area: "concurrency-memory"
+symptom: "Arc::try_unwrap succeeds while a Weak pointer exists, then that observer can no longer upgrade after the final strong owner is consumed."
+summary: "Arc::try_unwrap requires one strong owner, not an empty weak count. Weak pointers keep allocation metadata available but do not keep T alive, so successful extraction makes every existing Weak unable to upgrade."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets with atomic pointer-width operations"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust Arc try_unwrap succeeds with Weak pointer",
+    "Arc try_unwrap ignores weak count",
+    "Weak upgrade None after try_unwrap",
+  ]
+evidence: ["Rust 1.98.1 runtime assertion", "one strong plus one weak", "clone-with-owner repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/std/sync/struct.Arc.html#method.try_unwrap",
+    "https://doc.rust-lang.org/std/sync/struct.Weak.html#method.upgrade",
+    "https://doc.rust-lang.org/std/sync/struct.Arc.html#method.strong_count",
+  ]
+---
+
+I once grouped every pointer connected to an `Arc` allocation under the word “reference.” That shortcut is too vague for ownership decisions. Strong and weak pointers have deliberately different effects on the lifetime of `T`.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-175/fail.rs) creates one `Arc<String>` and one `Weak<String>`. It expects `Arc::try_unwrap` to fail because another pointer still exists. Extraction succeeds. Afterwards, the weak pointer cannot upgrade.
+
+## Extraction depends on strong ownership
+
+[`Arc::try_unwrap`](https://doc.rust-lang.org/std/sync/struct.Arc.html#method.try_unwrap) returns the inner value when the supplied `Arc` is the only strong reference. The documentation states that outstanding weak references do not affect this result.
+
+This matches the basic contract of `Weak`: it does not keep the inner value alive. A weak pointer can observe that a value still has a strong owner, but it is not itself an owner of `T`.
+
+The state before extraction is:
+
+```text
+strong count: 1
+weak count:   1
+T:            alive
+```
+
+Successful `try_unwrap` consumes the last strong pointer and moves `T` out. Allocation bookkeeping may remain until weak pointers are dropped, but there is no `T` left for them to recover.
+
+## `Weak::upgrade` is the lifetime test
+
+[`Weak::upgrade`](https://doc.rust-lang.org/std/sync/struct.Weak.html#method.upgrade) returns an optional strong pointer. It returns `Some` only while the allocation still has a live value.
+
+After successful extraction, `upgrade()` returns `None`. This is not a race in the fixture. It is the ownership consequence of consuming the final strong reference.
+
+If my design says that weak observers must continue to resolve, then moving the value out is not an allowed operation at that moment. The API can succeed, but the application invariant forbids using that success.
+
+## Weak references are observers, not vetoes
+
+It may feel attractive for every `Weak` handle to prevent extraction. That would make weak caches, parent links, and cycle-breaking references secretly own the value. It would defeat the reason weak pointers exist.
+
+I now phrase the distinction like this:
+
+```text
+Arc<T>   participates in keeping T alive
+Weak<T>  may discover whether T is still alive
+```
+
+An observer can become an owner by upgrading while a strong owner exists. It cannot demand that the final owner remain.
+
+## Keep an owner when identity must survive
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-175/fixed.rs) keeps the original strong owner and clones the inner `String` for an independent value. The weak pointer can still upgrade because the `Arc` remains alive.
+
+Cloning `T` is not always cheap or even available. Other choices include:
+
+- postpone extraction until observers may expire;
+- return an `Arc<T>` from the boundary instead of returning `T`;
+- redesign weak handles to point at a stable registry entry;
+- move only selected owned data while retaining the shared identity;
+- make observer invalidation an explicit event in the protocol.
+
+The correct repair depends on whether I need the data, the allocation identity, or continued discoverability.
+
+## Counts are diagnostic snapshots
+
+[`Arc::strong_count`](https://doc.rust-lang.org/std/sync/struct.Arc.html#method.strong_count) helps demonstrate the fixture, but in concurrent code a count can change immediately after I read it. It is not normally a safe permission check followed by a separate action.
+
+`try_unwrap` performs the ownership decision as part of consuming the `Arc`. I use counts for diagnostics and tests with controlled ownership, not as a homemade synchronisation protocol.
+
+The same warning applies to weak counts. An implicit internal weak reference and concurrent changes can make raw numbers less intuitive than expected. The semantic question—can a weak pointer upgrade, and is there one strong owner?—is more useful than treating counts as a business invariant.
+
+## Do not replace it with `into_inner` blindly
+
+`Arc::into_inner` and `Arc::try_unwrap` have related but different return shapes and guarantees for concurrent patterns. Changing methods to make code shorter can change which competing caller receives the value.
+
+I start from the ownership protocol I need, then choose the operation whose documented guarantee matches it. In ordinary single-owner extraction, `try_unwrap` makes failure retain the `Arc`, which is often exactly what I want.
+
+## My `Arc` review checklist
+
+When extraction or mutation behaves unexpectedly, I check:
+
+1. How many strong owners exist at the operation itself?
+2. Are weak observers expected to remain usable afterwards?
+3. Does the code need `T`, a clone of `T`, or the shared allocation identity?
+4. Am I treating a diagnostic count as a synchronisation guarantee?
+5. Can another thread upgrade a weak pointer during the operation?
+6. What should observers experience when the last owner disappears?
+
+I also compare the operation with nearby but different rules. `Arc::get_mut` is conservative in the presence of weak pointers, while `Arc::make_mut` may dissociate them. Those differences are API contracts, not one universal definition of “unique.”
+
+The core principle is that ownership must be classified by capability. A weak pointer can observe and attempt to upgrade, but it does not keep `T` alive. `try_unwrap` follows strong ownership, so existing weak pointers do not block extraction and cannot recover the value afterwards.

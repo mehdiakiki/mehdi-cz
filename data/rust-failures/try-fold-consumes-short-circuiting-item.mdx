@@ -1,0 +1,82 @@
+---
+caseId: "RFA-311"
+title: "try_fold Consumes the Item That Short-Circuits"
+date: "2026-09-06T01:31:00+01:00"
+lastmod: "2026-09-06T01:31:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "1d90be2078ffb777b12d888475f4230fe20657a4a2bafdf14d9d53c8de6b6546"
+area: "upgrades-compatibility"
+symptom: "After try_fold returns an error for one item, continuing the iterator starts with the following item rather than returning the rejected item again."
+summary: "try_fold leaves an iterator usable after short-circuiting, but the closure already owned the item that produced the residual. Preserve that item inside the error when recovery needs it."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust try_fold iterator after error", "try_fold consumes failing item", "continue iterator after try_fold short circuit"]
+evidence: ["Rust 1.98.1 four-item range", "error on third item", "fourth item remains after short-circuit"]
+sources: ["https://doc.rust-lang.org/std/iter/trait.Iterator.html#method.try_fold", "https://doc.rust-lang.org/std/iter/trait.Iterator.html#method.try_for_each", "https://doc.rust-lang.org/std/ops/enum.ControlFlow.html"]
+---
+
+I used `try_fold` to parse records until one failed, then tried to hand the remaining iterator to a recovery path. I expected the invalid record to be the first remaining item. Recovery began with the record after it.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-311/fail.rs) rejects value three. `try_fold` returns the expected error, but the next value from the iterator is four, not three.
+
+## The closure receives ownership before it can fail
+
+[`Iterator::try_fold`](https://doc.rust-lang.org/std/iter/trait.Iterator.html#method.try_fold) pulls an item and passes it to the closure together with the accumulator. Only then can the closure return success or a short-circuiting residual such as `Err`.
+
+At that moment the item is already consumed from the iterator. Returning an error does not push it back. The iterator remains positioned after the rejected item.
+
+The lifecycle is:
+
+```text
+next -> item 3
+closure receives item 3
+closure returns Err
+try_fold returns Err
+next -> item 4
+```
+
+“The iterator remains usable” means later unvisited items remain available. It does not mean the whole failing step is transactional.
+
+## Put the rejected value in the error
+
+If recovery needs the item, the closure owns exactly the place where it can preserve it. I return an error containing the rejected value and any partial state required by the caller.
+
+The repaired fixture uses a `Rejected` structure with `value` and `partial_sum`. This is more useful than a string because recovery can inspect the exact item without reconstructing it or rewinding an input that may not support rewinding.
+
+For large records I move the owned record into the error. For borrowed iteration I can preserve a reference under the iterator's lifetime. The error type should reflect ownership honestly.
+
+## The accumulator also needs a recovery policy
+
+When the closure returns an error, the accumulator passed into that invocation has also moved into the closure. A simple error discards it. If partial progress matters, I include it in the error or keep state outside the fold with a clearly documented mutation policy.
+
+This matters for batches. Suppose two records were accepted and a third failed. A caller may need the accepted batch, the rejected record, and the untouched remainder. `Result<Accumulator, String>` cannot express all three unless the string is hiding structured state.
+
+I use a named outcome that makes retry and commit boundaries clear. If accepted items already caused external side effects, recovering an accumulator alone does not undo them.
+
+## Short-circuiting is not rollback
+
+`try_fold` stops calling the closure after the residual. It cannot reverse writes, counter increments, file operations, or mutations completed for earlier items. It also cannot reverse mutations performed during the failing closure before the error was returned.
+
+I keep fallible validation ahead of irreversible effects where possible. For database or remote operations, I use the transaction or idempotency mechanism belonging to that system rather than reading “try” as an atomic promise.
+
+[`try_for_each`](https://doc.rust-lang.org/std/iter/trait.Iterator.html#method.try_for_each) has the same ownership frontier without an accumulator. The item that makes its closure fail has been visited.
+
+## ControlFlow can name an intentional break
+
+Not every short circuit is an error. [`ControlFlow`](https://doc.rust-lang.org/std/ops/enum.ControlFlow.html) can return a meaningful break value from `try_fold` without pretending a domain decision is a failure.
+
+The same consumption rule applies. A closure returning `Break(item)` can preserve the triggering item directly. This is useful for searches that need partial aggregate state together with the first boundary item.
+
+I choose `Result` when propagation represents failure and `ControlFlow` when early completion is ordinary control flow.
+
+## What I test
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-311/fixed.rs) rejects three, stores it with partial sum three, and then asserts that four is the first untouched remainder.
+
+My production tests cover failure on the first, middle, and final items; complete success; empty input; partial accumulator recovery; and dropping the remainder. I use drop counters when items own resources so error paths prove which values are returned, retained, or destroyed.
+
+For a parser over bytes, I also preserve byte offsets independently. Iterator position in logical records is not always enough to resume the underlying stream safely.
+
+The core principle is that short-circuiting defines a visitation boundary, not a rewind. `try_fold` stops after the closure returns a residual, but the triggering item has already moved into that closure. Preserve it in the result when the recovery contract needs more than the untouched suffix.

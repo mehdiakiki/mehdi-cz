@@ -1,0 +1,111 @@
+---
+caseId: "RFA-205"
+title: "Option::insert Replaces Some; It Is Not get_or_insert"
+date: "2026-09-05T17:44:00+01:00"
+lastmod: "2026-09-05T17:44:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "0a85919204995c39155c506b4a88b4a86e106b6d81324d9d308266ed077c8df1"
+area: "concurrency-memory"
+symptom: "Option::insert replaces an already configured value with a fallback although the caller intended to insert only when the Option was None."
+summary: "Option::insert always stores the new value and drops old Some contents. Use get_or_insert or get_or_insert_with when an existing value must win, and choose the lazy closure when constructing the fallback has cost or side effects."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust Option insert replaces existing value",
+    "Option insert versus get_or_insert_with",
+    "insert Option only if None Rust",
+  ]
+evidence: ["Rust 1.98.1 occupied Option", "unconditional replacement", "lazy fallback repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/std/option/enum.Option.html#method.insert",
+    "https://doc.rust-lang.org/std/option/enum.Option.html#method.get_or_insert_with",
+    "https://doc.rust-lang.org/std/option/enum.Option.html#method.replace",
+  ]
+---
+
+I read `insert` as “put this here if the slot needs it.” That interpretation was wrong for `Option`. An existing configured value disappeared and the fallback became active.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-205/fail.rs) starts with `Some("configured")` and calls `insert("fallback")`. The returned mutable reference points to `fallback`, and the option now contains `fallback`.
+
+`insert` is unconditional replacement.
+
+## The old value is dropped
+
+[`Option::insert`](https://doc.rust-lang.org/std/option/enum.Option.html#method.insert) inserts the supplied value and returns `&mut T` to the value now stored. If the option was already `Some`, its old contents are dropped.
+
+The two starting states become:
+
+```text
+None      + insert(new) -> Some(new)
+Some(old) + insert(new) -> drop(old), Some(new)
+```
+
+The method is useful when the new value must win and I want to mutate it afterward. The surprise comes from using it as a defaulting operation.
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-205/fixed.rs) uses [`get_or_insert_with`](https://doc.rust-lang.org/std/option/enum.Option.html#method.get_or_insert_with). The existing configured value stays, and the fallback closure is not called.
+
+## `get_or_insert` preserves Some but builds its argument
+
+`get_or_insert(value)` does not replace an existing `Some`. However, `value` is an ordinary function argument, so it is evaluated before Rust knows whether the option is empty.
+
+This difference matters when the default is expensive or observable:
+
+```rust
+slot.get_or_insert(load_configuration());
+slot.get_or_insert_with(load_configuration);
+```
+
+The first line calls `load_configuration` every time it reaches the method. If `slot` is occupied, the new result is dropped. The second calls it only for `None`.
+
+For a cheap integer or static string, eager construction is often simpler. For network handles, allocated buffers, counters, logs, or generated identifiers, I prefer the closure form when the value is truly a fallback.
+
+## Dropping can be the real bug
+
+Replacing a `String` is usually harmless. Replacing a guard, temporary directory, sender, file, or last reference-counted handle can trigger meaningful cleanup immediately.
+
+The call site may look like a small assignment while `Drop` closes a channel, removes a file, releases a lock, or decrements ownership. Rust keeps memory safe, but it cannot tell whether that lifecycle transition was intended.
+
+When replacement has consequences, I use [`Option::replace`](https://doc.rust-lang.org/std/option/enum.Option.html#method.replace) if I need the old value back. Its return type `Option<T>` forces the code to acknowledge what was displaced. I can inspect, close, migrate, or restore it deliberately.
+
+If I need to remove the value without inserting another one, `take` states that intent more directly.
+
+## A mutable reference extends the operation
+
+All the insertion methods return a mutable reference to the contained value. That lets me initialize and then update without a second lookup:
+
+```rust
+let state = slot.get_or_insert_with(State::new);
+state.mark_ready();
+```
+
+The borrow lasts as long as `state` is used. During that time I cannot independently borrow `slot` in conflicting ways. Sometimes a compact method chain hides this lifetime; a small scope or separate statement makes the ownership boundary clearer.
+
+The reference is not proof of whether insertion happened. If I need that information for metrics or side effects, I inspect `is_none()` before the operation or match on the option explicitly.
+
+## Defaults are policy, not only values
+
+In configuration systems I distinguish three operations:
+
+```text
+override:     incoming always replaces configured
+default:      configured wins; use incoming only when absent
+merge:        combine both according to domain rules
+```
+
+`insert` implements override. `get_or_insert_with` implements default. Neither implements merge.
+
+This naming matters when configuration has several layers such as built-in defaults, a file, environment variables, and request overrides. A single wrong method can reverse precedence without producing a compiler error.
+
+I write precedence tests with distinct values at every layer. Equal example values can make incorrect replacement invisible.
+
+## My regression test observes construction
+
+Testing only the final value is enough to detect replacement in the Atlas fixture. In application code I also count calls to the fallback factory and, when important, drops of the old value.
+
+I test both `None` and `Some`, because each exercises a different branch. For a fallible fallback I avoid hiding error handling in a closure that cannot return the needed type; an explicit match is often clearer.
+
+The core principle is to name who wins before selecting the API. `Option::insert` says the new value wins. `get_or_insert_with` says the existing value wins and construction happens only when missing. That small semantic choice can control a much larger resource lifecycle.

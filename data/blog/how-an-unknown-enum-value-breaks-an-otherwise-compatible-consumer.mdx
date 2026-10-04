@@ -1,0 +1,225 @@
+---
+title: "How an Unknown Enum Value Breaks an Otherwise Compatible Consumer"
+date: "2026-11-20T09:00:00+01:00"
+tags: ["enum", "schema evolution", "Protocol Buffers", "API compatibility", "data contracts"]
+draft: false
+reviewed: true
+reviewedHash: "3560f6ac4f69bea407674d4403dd97ef5597915034076fd3c4b905c9afddca84"
+cluster: "reliable-data-integrations"
+campaign: "authority-2026"
+opportunity: "DATA-067"
+summary: "Adding an enum value may be wire-compatible while an older consumer rejects, crashes, or chooses a dangerous default. Preserve the raw value and make unsupported behaviour explicit."
+---
+
+Adding one enum value looks like a safe, additive schema change.
+
+```text
+PENDING
+APPROVED
+REJECTED
++ NEEDS_REVIEW
+```
+
+The message may still parse. The transport may preserve the value. An older application can still fail because its business logic believed the set was closed.
+
+I test enum evolution at three layers: wire representation, generated API, and domain decision.
+
+## The structural schema can be stricter than the wire
+
+In JSON Schema, `enum` restricts a value to the listed set. An older schema rejects the new string:
+
+```json
+{
+  "type": "string",
+  "enum": ["pending", "approved", "rejected"]
+}
+```
+
+The JSON is syntactically valid, but `"needs_review"` fails the old validator. The [JSON Schema enum reference](https://json-schema.org/understanding-json-schema/reference/enum) makes the closed set explicit.
+
+With Protocol Buffers, enums have numeric wire values. Some generated APIs for open enums retain an unrecognized number even when the symbolic name is absent. The Protobuf [enum guidance](https://protobuf.dev/programming-guides/editions/#enum) documents this behaviour and also explains that language/runtime handling differs.
+
+Preserved bytes do not mean understood meaning.
+
+## The dangerous line is usually after parsing
+
+An old consumer may contain:
+
+```rust
+match status {
+    Status::Pending => wait(),
+    Status::Approved => release(),
+    Status::Rejected => stop(),
+}
+```
+
+If generated code exposes an unknown integer, an adapter may force it into a known enum:
+
+```rust
+let status = Status::try_from(raw.status).unwrap_or(Status::Approved);
+```
+
+Now the new `NEEDS_REVIEW` state releases something the producer intended to hold.
+
+A safe fallback is not always `Unknown`. It depends on the action. For this workflow, fail-closed behaviour may be:
+
+```text
+preserve raw value
+do not release
+surface unsupported state
+alert or send to review
+retry after consumer upgrade only if bounded
+```
+
+## I keep the raw value at open boundaries
+
+Inside a closed domain module, exhaustive enums are very useful. At an independently evolving integration boundary, I wrap them:
+
+```rust
+enum ExternalStatus {
+    Known(Status),
+    Unknown(i32),
+}
+
+fn decode_status(raw: i32) -> ExternalStatus {
+    match Status::try_from(raw) {
+        Ok(value) => ExternalStatus::Known(value),
+        Err(_) => ExternalStatus::Unknown(raw),
+    }
+}
+```
+
+For string formats:
+
+```rust
+enum ExternalStatus {
+    Known(Status),
+    Unknown(String),
+}
+```
+
+I do not discard the raw value. It is needed for logging safe metadata, forwarding, later replay, and distinguishing several future alternatives.
+
+## `UNKNOWN = 0` does not catch every future value
+
+Protobuf commonly uses a zero-valued enumerator such as:
+
+```proto
+enum Status {
+  STATUS_UNSPECIFIED = 0;
+  STATUS_PENDING = 1;
+  STATUS_APPROVED = 2;
+}
+```
+
+`STATUS_UNSPECIFIED` represents an explicit or default zero according to the contract. It does not guarantee that every unrecognized numeric value is converted to zero by every runtime.
+
+Conflating these loses evidence:
+
+```text
+0: producer did not specify or explicitly sent zero
+7: producer sent a real alternative unknown to this consumer
+```
+
+Those states may require different metrics and rollout actions.
+
+## Forwarding can succeed while business behaviour fails
+
+An old Protobuf intermediary may preserve an unknown enum number and reserialize it. This is useful for transparent relays.
+
+But if the intermediary also performs a side effect before forwarding, its logic still sees an unsupported state. Wire preservation cannot repair a wrong decision already made.
+
+The related article [Unknown Fields Are the Quiet Engine of Protobuf Evolution](/blog/unknown-fields-are-the-quiet-engine-of-protobuf-evolution) explains the same boundary for new field numbers. Enum evolution is different: the field is known, but its value is not.
+
+## Versioned consumer tests expose the real contract
+
+I compile or run both old and new schema bindings. The fixture matrix is:
+
+| Producer | Value | Consumer | Expected result |
+| --- | --- | --- | --- |
+| V1 | known old | V1 | normal decision |
+| V1 | known old | V2 | same decision |
+| V2 | new value | V2 | new decision |
+| V2 | new value | V1 | preserved unsupported state or explicit rejection |
+
+Then I include the real path:
+
+```text
+V2 producer
+-> broker or JSON bridge
+-> V1 consumer domain adapter
+-> persistence
+-> reserialization
+-> V2 reader
+```
+
+I check both bytes and effect. An old consumer returning HTTP 200 after dropping the event is not compatible.
+
+## Choose the evolution policy by domain
+
+There are several honest strategies.
+
+### Tolerant reader
+
+The consumer preserves unknown values and applies a conservative default action. This works when new states can safely wait or remain visible without interpretation.
+
+### Capability or version negotiation
+
+The producer sends a new value only to consumers that advertise support. This fits direct APIs better than broadcast events.
+
+### New message or field
+
+A new alternative changes the workflow so much that older logic must not see it. A new versioned topic, endpoint, or field can make the break explicit.
+
+### Coordinated rollout
+
+Readers deploy before writers. This helps when every active reader can be enumerated, but replays and offline consumers still extend the compatibility window.
+
+No strategy is universally correct. “Enum additions are safe” is not a strategy.
+
+## Unknown must not create an infinite retry
+
+If an old consumer treats every unsupported value as transient, it may retry the same event forever.
+
+I separate:
+
+```text
+temporarily unsupported: newer deployment is expected soon
+permanently invalid: producer violated contract
+unknown but safely retainable: store and continue with limited behaviour
+security-sensitive unknown: quarantine and alert
+```
+
+The dead-letter or review record includes message identity, schema identity, raw enum number or bounded string, and first/last observation. It does not need the full private payload in logs.
+
+## Observe new values before they become incidents
+
+I record:
+
+- unknown value count by producer and consumer version;
+- raw numeric or bounded string value when safe;
+- decisions taken for unsupported values;
+- retries and quarantine age;
+- schema version mismatch;
+- first-seen time;
+- forwarding preservation test status.
+
+An alert on first-seen can reveal a writer enabled too early. A rate alert catches a producer bug that emits random values.
+
+## My change checklist
+
+Before adding an enum value, I ask:
+
+```text
+Will the old wire parser retain it, reject it, or map it?
+What does each generated language API expose?
+Does an adapter preserve the raw value?
+What action will old business logic take?
+Can older validators accept the payload?
+Do intermediaries retain the value through round trips?
+Can readers deploy before writers and replays?
+Does unsupported mean hold, reject, quarantine, or continue?
+How do we observe the first unknown value?
+```
+
+An enum is closed in one source file and often open in a distributed system. Compatibility comes from designing the unknown case before the producer uses it, not from hoping an additive schema diff is harmless.

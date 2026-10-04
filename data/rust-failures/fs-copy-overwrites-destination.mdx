@@ -1,0 +1,99 @@
+---
+caseId: "RFA-219"
+title: "std::fs::copy Overwrites an Existing Destination"
+date: "2026-09-05T17:58:00+01:00"
+lastmod: "2026-09-05T17:58:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "34f268f752feaa1e447e806ad1490b02acdc53a77536cea2b93b36ef1083115d"
+area: "ffi-targets"
+symptom: "fs::copy succeeds when the destination already exists and replaces its old bytes instead of returning AlreadyExists."
+summary: "std::fs::copy has an overwrite contract. For no-clobber creation, open the destination atomically with create_new and stream into that owned handle instead of checking existence first."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets with filesystem support; metadata behaviour is platform-specific"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust fs copy overwrites destination",
+    "copy file without overwrite Rust",
+    "fs copy AlreadyExists create_new",
+  ]
+evidence: ["Rust 1.98.1 temporary files", "existing bytes replaced", "exclusive-create copy repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/std/fs/fn.copy.html",
+    "https://doc.rust-lang.org/std/fs/struct.OpenOptions.html#method.create_new",
+    "https://doc.rust-lang.org/std/io/fn.copy.html",
+  ]
+---
+
+I treated `fs::copy` as a create operation and expected an existing destination to cause `AlreadyExists`. Instead, the call succeeded and replaced the old contents.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-219/fail.rs) copies a file containing `new` onto one containing `old`. The final destination contains `new`.
+
+The path-level copy API is overwrite-by-default.
+
+## Overwrite is part of the documented contract
+
+[`std::fs::copy`](https://doc.rust-lang.org/std/fs/fn.copy.html) copies one file's contents to another path and explicitly overwrites the destination contents. It also copies permission bits according to its platform behaviour.
+
+On success, the returned byte count equals the resulting destination file length reported through metadata. That count proves how many bytes were copied, not whether an older file existed.
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-219/fixed.rs) implements no-clobber creation by opening the destination with `create_new(true)`. An existing path returns `AlreadyExists` and keeps its old bytes.
+
+## Check-then-copy has a race
+
+This pattern is not a safe repair:
+
+```text
+if destination does not exist
+    fs::copy(source, destination)
+```
+
+Another process can create or replace the destination between the check and the copy. The final copy still has overwrite semantics.
+
+[`OpenOptions::create_new`](https://doc.rust-lang.org/std/fs/struct.OpenOptions.html#method.create_new) requests atomic creation that fails when a path already exists, including a dangling symlink at that location. The decision and creation happen in one filesystem operation.
+
+After obtaining the new destination handle, the fixture uses [`io::copy`](https://doc.rust-lang.org/std/io/fn.copy.html) to stream bytes into the file.
+
+## A partial destination can remain after failure
+
+Exclusive creation prevents clobbering, but it does not make the following data transfer atomic. If reading or writing fails after the new file is created, a partial destination may remain.
+
+I define cleanup and recovery. For publication-style writes, a common structure is to create a temporary file in the correct filesystem, write and flush it, synchronize if durability requires it, and rename or link it into place using platform-appropriate semantics.
+
+The exact atomic replacement and no-replace operations vary across operating systems. I do not claim that one portable sequence provides every durability guarantee.
+
+## Source and destination can name the same file
+
+The `fs::copy` documentation warns that if both paths refer to the same file, the file will likely be truncated. Textual path inequality does not prove different underlying files because hard links, symbolic links, relative paths, and case rules can alias.
+
+For a destructive-sensitive tool, I resolve identity with platform-appropriate metadata and design a safe staging path. A string comparison is only an early sanity check.
+
+This is another reason a high-level copy action needs an explicit overwrite policy and an audit record.
+
+## Metadata copying is platform-dependent
+
+The function copies permission bits, but other metadata behaviour varies. Ownership, extended attributes, timestamps, sparse layout, access-control lists, and alternate streams cannot be assumed from the word “copy.”
+
+If the product promises a faithful backup, I enumerate the required metadata and test each target. If it promises only byte contents, I say so and apply destination permissions deliberately.
+
+Copying permission bits can itself surprise code that created a destination with a secure mode and expected that mode to remain.
+
+## Existing directories and special files need boundaries
+
+`fs::copy` is a file-copy operation, not recursive directory copy. Errors for directories, permissions, links, and special files depend on platform behaviour.
+
+I reject unsupported file types before entering the copy protocol, while remembering that a separate check can race. For strong security boundaries I use directory handles and platform APIs that constrain path resolution, or a well-reviewed library implementing them.
+
+The small fixture stays with regular files because it proves the overwrite rule without platform noise.
+
+## Error kind is part of the no-clobber test
+
+The repaired fixture asserts `AlreadyExists` and verifies the old bytes remain. Either assertion alone is weaker: the right error could arrive after damage from another bug, or unchanged bytes could result from an unrelated early failure.
+
+It also proves the successful branch with a second fresh destination. This prevents a no-clobber implementation that simply refuses every copy from appearing correct.
+
+In application tests I add empty and large files, injected mid-stream failures, existing symlinks, permissions, and concurrent creators according to supported targets.
+
+The core principle is that a friendly function name does not imply a conservative conflict policy. `fs::copy` overwrites. When existing data must win, I acquire a destination atomically with create-new semantics and design cleanup for every later failure point.

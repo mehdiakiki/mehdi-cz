@@ -1,0 +1,86 @@
+---
+caseId: "RFA-112"
+title: "Why try_send Is Full on a Zero-Capacity Rust sync_channel"
+date: "2026-09-05T10:12:00+01:00"
+lastmod: "2026-09-05T10:12:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "0b50441ecceb0db543beed8144cad8d530f9b6a77054fd258e589f3ef8a917d7"
+area: "concurrency-memory"
+symptom: "try_send on sync_channel(0) returns Full even though the channel contains no buffered messages."
+summary: "A zero-capacity synchronous channel is a rendezvous, not an empty queue with room. Nonblocking try_send succeeds only when a receiver is already waiting; use blocking handoff or choose actual buffering."
+rustVersions: ["Rust 1.98.1"]
+targets: ["all targets with std"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust sync_channel zero try_send Full", "zero capacity channel no room rendezvous", "TrySendError Full sync_channel 0"]
+evidence: ["Rust 1.98.1 deterministic runtime failure", "zero-capacity try_send reproduction", "blocking rendezvous repair"]
+sources: ["https://doc.rust-lang.org/std/sync/mpsc/fn.sync_channel.html", "https://doc.rust-lang.org/std/sync/mpsc/struct.SyncSender.html#method.try_send"]
+---
+
+“Full” sounds like stored messages occupy a buffer. For `sync_channel(0)`, there is no buffer to occupy. The channel is a rendezvous: a send and a receive must meet.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-112/fail.rs) creates a zero-capacity channel and immediately calls `try_send`. The receiver exists as a value, but no thread is waiting in `recv`. `try_send` returns `TrySendError::Full`, and the assertion fails.
+
+## Capacity zero means no storage slot
+
+The [`sync_channel` documentation](https://doc.rust-lang.org/std/sync/mpsc/fn.sync_channel.html) describes a bounded synchronous channel. Positive bounds provide that many buffered message slots. A bound of zero creates a rendezvous channel where each sender synchronizes with a receiver.
+
+I use a small picture:
+
+```text
+capacity 2: sender -> [ message ][ free ] -> receiver
+capacity 0: sender -------- handshake -------- receiver
+```
+
+An idle receiver handle is not the same as a receiver actively waiting. Without a waiting receive operation, the nonblocking send cannot complete the handshake.
+
+## try_send promises not to wait
+
+The [`SyncSender::try_send` documentation](https://doc.rust-lang.org/std/sync/mpsc/struct.SyncSender.html#method.try_send) says the operation returns immediately. It reports `Full` if the channel's buffer is full or no receiver is waiting for a zero-capacity channel. It reports `Disconnected` when the receiver is gone.
+
+This result is a snapshot, not a prediction. A receiver may begin waiting one instruction later. Retrying in a busy loop can waste a core and still provide poor fairness.
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-112/fixed.rs) starts a consumer and uses blocking `send`. The send returns only after the receiver accepts the value. This matches the intended handoff contract.
+
+## Choose rendezvous for a reason
+
+A zero-capacity channel provides strong backpressure. A producer cannot get ahead of a consumer by even one queued item. This can be valuable for work handoff, tests of coordination, or controlling resource ownership.
+
+It also couples their schedules. A stalled receiver stalls a blocking sender. In a thread pool or shutdown path, that coupling can create deadlock if the receiver needs a lock held by the sender or both run on a resource with no spare worker.
+
+I choose capacity from the system contract:
+
+- zero for a deliberate synchronous handoff;
+- small positive capacity to absorb limited bursts;
+- unbounded only when another mechanism truly bounds production and memory.
+
+The number is not a performance tuning detail alone. It decides where waiting and queued memory live.
+
+## Nonblocking policy must handle the returned value
+
+If the caller cannot block, `try_send` is appropriate, but `Full` needs a policy. Possible policies include returning backpressure upstream, dropping a replaceable update, recording a metric, or scheduling a bounded retry.
+
+I do not silently loop until success. That turns a nonblocking API into unbounded CPU waiting. I also keep ownership of the returned message: `TrySendError<T>` gives the unsent value back so the caller can decide.
+
+For a zero-capacity channel, a nonblocking design is particularly sensitive to timing. If the application requires eventual delivery, an actual buffer or a different coordination primitive may be more honest.
+
+## Why tests become flaky
+
+A tempting test spawns a receiver thread, sleeps briefly, then asserts `try_send` succeeds. The sleep does not prove the receiver reached `recv`. Under CI scheduling, the sender can still arrive first and get `Full`.
+
+I synchronize the test with a separate barrier or use blocking `send` when the behavior under test is the rendezvous itself. Deterministic tests establish ordering through synchronization, not elapsed time.
+
+If I specifically test `try_send`, I assert both allowed timing outcomes or create a protocol proving the receiver is waiting. Proving a thread was spawned is not enough.
+
+## My debugging sequence
+
+When `try_send` reports `Full` unexpectedly, I check:
+
+1. Whether the sender came from `channel` or `sync_channel`.
+2. The configured capacity, including zero.
+3. Whether a receiver is actively waiting or merely exists.
+4. Whether the caller may block and what backpressure policy is intended.
+5. Locks and worker resources held across a blocking send.
+6. Tests for sleep-based scheduling assumptions.
+
+There is no contradiction in an empty zero-capacity channel being full. Empty says it stores no message; full says it has no storage slot. Delivery requires a receiver to meet the sender, and the API makes that coordination choice explicit.

@@ -1,0 +1,241 @@
+---
+title: "A Durable Cursor for Incremental API Synchronization"
+date: "2026-09-10T14:00:00+01:00"
+tags: ["incremental sync", "API cursor", "checkpoints", "data integration", "reliability"]
+draft: false
+reviewed: true
+reviewedHash: "d1d9c4b9f2a6e9614d16a5324474eb6f09c10d50747402795da8aeb4cad87bfe"
+cluster: "reliable-data-integrations"
+campaign: "authority-2026"
+opportunity: "DATA-007"
+summary: "A crash-safe checkpoint design for incremental API synchronization, including atomic progress, cursor invalidation, poison records, leases, and full-sync recovery."
+---
+
+An incremental sync cursor looks like a string. In a reliable integration, it is closer to a commit position.
+
+I have seen the same failure in different forms: a worker downloads a page, saves the next cursor, and crashes before all records are durable. When it restarts, it continues after the page. The missing records may never appear again.
+
+The opposite order also has a cost. If the worker applies the page and crashes before saving the cursor, it reads the page again. This is normally acceptable if application of every record is idempotent.
+
+So my core rule is simple:
+
+> I advance the durable cursor only after every effect covered by that cursor is durable.
+
+This article explains what “durable” requires in practice.
+
+## A cursor is bound to a query
+
+I never store only this:
+
+```text
+cursor = "Ci0KHj..."
+```
+
+A provider cursor may be valid only for one account, endpoint, filter set, API version, or page size. Reusing it after configuration changes can skip data or produce an invalid request.
+
+My checkpoint record normally contains:
+
+```text
+tenant
+provider
+provider account
+resource type
+normalized filter hash
+cursor or sync token
+high-water mark, when available
+generation
+lease version
+status
+updated at
+```
+
+The cursor is opaque. I do not parse it or compare two cursor strings unless the provider explicitly documents that behaviour.
+
+The filter hash is especially valuable. If someone adds `status=active` or changes a date range, the previous cursor no longer silently represents a different query.
+
+## The checkpoint transaction
+
+The ideal case is when the local effects and checkpoint share one database. I process one source page in a transaction:
+
+```text
+begin
+  lock checkpoint generation G
+  apply every record idempotently
+  store page audit metadata
+  replace cursor C0 with C1
+commit
+```
+
+If the process crashes before commit, neither the effects nor C1 become visible. The page is fetched again. If it crashes after commit, both are already durable.
+
+This does not create exactly-once delivery across the external API and our database. It creates an atomic local commit plus safe replay. That is the guarantee I can explain and test.
+
+When applying one whole page in a transaction is too large, I store an item ledger or stage the page first. The important invariant remains: the checkpoint cannot move beyond unfinished items.
+
+## Page staging for expensive effects
+
+Some records trigger calls to other services or large processing that cannot join a database transaction. I use two stages:
+
+```text
+fetch page C0 → C1
+        ↓
+store page and item identities durably
+        ↓
+process each item with idempotency
+        ↓
+mark page complete
+        ↓
+commit checkpoint C1
+```
+
+After a crash, the worker reloads the staged page and continues unfinished items. It does not need the provider to preserve the exact page forever.
+
+The page state includes the input cursor and returned cursor. This allows an operator to see why the sync cannot advance.
+
+I use retention so staging does not become a permanent duplicate of provider data. Once processing and audit needs are satisfied, I can keep item IDs and hashes while removing sensitive payloads.
+
+## One bad record must not disappear
+
+A poison record creates an uncomfortable choice. If I skip it and commit the cursor, I create a permanent hole. If I refuse to advance forever, every later change waits behind it.
+
+I make the policy explicit:
+
+1. retry transient failures with a bounded budget;
+2. classify deterministic validation or mapping failures;
+3. store the failed record identity, error, source version, and safe diagnostic context;
+4. decide whether this resource permits quarantine;
+5. advance only if the quarantine is itself durable and visible;
+6. replay quarantined records after the code or data is repaired.
+
+For security-critical or accounting data, I may block the checkpoint instead. For a large catalogue, durable quarantine may be a better availability trade-off. “Log and continue” is not enough because logs expire and are difficult to replay.
+
+## More than one worker needs a fence
+
+A lease prevents two workers from intentionally processing the same account, but leases expire. A paused worker can wake after another worker has acquired the lease.
+
+I add a monotonically increasing lease generation, sometimes called a fencing token:
+
+```text
+worker A holds lease version 12
+lease expires
+worker B acquires version 13
+worker A tries to commit cursor
+database rejects version 12
+```
+
+The checkpoint update includes a condition such as:
+
+```sql
+where sync_id = $1 and lease_version = $2 and cursor = $3
+```
+
+This compare-and-swap protects progress even when the old worker does not know it lost ownership.
+
+Parallelizing pages from one cursor chain is usually unsafe unless the provider documents independent partitions. I prefer parallel work across accounts or partitions and ordered checkpoint commits inside each one.
+
+## Cursor invalidation is a normal state transition
+
+Change history is not always retained forever. A provider may reject an old token after a long outage or when the underlying query changes.
+
+Google Calendar documents a clear contract: save the `nextSyncToken` from a complete synchronization, use it for the next incremental request, and perform a new full synchronization when the server returns HTTP 410 for an invalid token. The official [incremental synchronization guide](https://developers.google.com/workspace/calendar/api/guides/sync) is a good example.
+
+I represent recovery as a new generation:
+
+```text
+incremental(G7, C42)
+    ↓ invalid token
+full_sync(G8, started_at=T)
+    ↓ complete and reconciled
+incremental(G8, new_cursor=C0)
+```
+
+The new generation prevents pages and absence decisions from two incompatible views being mixed together.
+
+During the full sync, live changes can continue. I therefore need either a provider snapshot boundary, a buffered change stream, or version-aware overlapping reads. The cursor alone does not solve the race between a baseline snapshot and continuing deltas.
+
+## Updated timestamps need a compound checkpoint
+
+Some APIs do not provide opaque tokens. They allow a query such as `updated_after=...` sorted by update time.
+
+Saving only a timestamp can skip records:
+
+```text
+A updated at 10:00:00
+B updated at 10:00:00
+page ends after A
+next query asks strictly after 10:00:00
+B is lost
+```
+
+When supported, I use a stable tie-breaker:
+
+```text
+(updated_at, stable_id)
+```
+
+The next predicate becomes:
+
+```text
+updated_at > last_time
+OR (updated_at = last_time AND id > last_id)
+```
+
+I also use an overlap window when clocks, commits, or indexing can be delayed. Overlap intentionally produces duplicates, so idempotent application and source versions are mandatory.
+
+If records can change their sorting timestamp while I paginate, I establish a high-water mark at the start and restrict the scan to it when the API permits. Otherwise even a compound key has mutation edge cases.
+
+## A checkpoint is not proof of correctness
+
+The cursor proves where the provider believes the consumer is in a change sequence. It does not prove that:
+
+- every endpoint emits every kind of change;
+- deletes appear in the feed;
+- our transformation preserved all fields;
+- old application bugs did not acknowledge bad data;
+- an administrator did not reset state incorrectly.
+
+I combine cursor processing with periodic reconciliation. A checkpoint gives efficient forward progress; reconciliation checks whether the resulting state converged.
+
+## The failure tests I run
+
+I place crash points around every state change.
+
+### Crash before applying any item
+
+Assert the checkpoint stays on C0 and the page can be retried.
+
+### Crash after half the items
+
+Assert completed effects are idempotent, unfinished effects resume, and C1 remains uncommitted.
+
+### Crash after effects but before checkpoint commit
+
+Fetch the page again and assert no duplicate external effect occurs.
+
+### Two lease holders
+
+Let worker A pause, allow B to acquire the next lease generation, then resume A. Assert A cannot commit.
+
+### Poison item
+
+Exhaust its retry budget. Assert either the whole sync visibly blocks or a durable quarantine entry exists before the cursor advances.
+
+### Invalid token
+
+Return the provider's expiration response. Assert a new full-sync generation begins and that the old cursor is never reused.
+
+### Changed filter
+
+Modify the synchronized scope. Assert its filter hash mismatch forces an intentional restart.
+
+These tests give me more confidence than a successful long-running demo because they target the exact moments where progress and effects can disagree.
+
+## My durable-cursor rule
+
+I treat an incremental cursor as a promise: everything before this position has been applied or placed into a durable, repairable state.
+
+That promise needs atomic checkpointing, idempotent effects, a query identity, fenced workers, visible poison-record handling, and an invalidation path. A string in a settings table is only one small piece.
+
+Kubernetes exposes a related list/watch model: clients list a consistent resource version, watch forward from it, and recover when an old resource version is no longer available. Its [API concepts documentation](https://kubernetes.io/docs/reference/using-api/api-concepts/) is worth reading because it makes consistency, continuation tokens, and expired history explicit.
+
+With this checkpoint in place, webhooks can remain the fast signal while the cursor-driven reader becomes the dependable recovery path described in [Webhooks, Polling, or Both?](/blog/webhooks-polling-or-both-a-recovery-first-integration-design).

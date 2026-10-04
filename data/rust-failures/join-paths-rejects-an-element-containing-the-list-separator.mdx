@@ -1,0 +1,76 @@
+---
+caseId: "RFA-379"
+title: "env::join_paths Rejects a Path Containing the List Separator"
+date: "2026-09-06T03:19:00+01:00"
+lastmod: "2026-09-06T03:19:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "d71555ec45cf05278713c90975197b6775198e29cf6f800ffdc51e10687e533d"
+area: "ffi-targets"
+symptom: "env::join_paths returns JoinPathsError when one Unix path contains a colon instead of escaping the colon."
+summary: "PATH is a platform-specific flat list without a universal escaping layer. join_paths rejects an element containing colon on Unix, quote on Windows, or semicolon on UEFI; keep paths structured until this boundary."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["Unix evidence; separators differ on Windows, UEFI, and targets without PATH-like variables"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust join_paths colon JoinPathsError", "env join_paths path separator error", "Rust PATH element contains colon"]
+evidence: ["Rust 1.98.1 Unix env path list", "colon inside one element", "split_paths round-trip repair"]
+sources: ["https://doc.rust-lang.org/std/env/fn.join_paths.html", "https://doc.rust-lang.org/std/env/fn.split_paths.html", "https://doc.rust-lang.org/std/env/struct.JoinPathsError.html"]
+---
+
+I used to think joining search paths was the same as joining ordinary strings with a platform separator. Then one Unix directory name contained a colon. [`env::join_paths`](https://doc.rust-lang.org/std/env/fn.join_paths.html) returned `JoinPathsError` instead of escaping it.
+
+The [failing fixture](/rust-failure-atlas/evidence/RFA-379/fail.rs) tries to combine `/srv/bin` with `/tmp/has:colon`. The call fails before any environment variable is changed.
+
+## A PATH value is one flat platform string
+
+Application code naturally holds search directories as a list of `PathBuf` values. At the process boundary, `PATH` and similar variables encode that list inside one `OsString` using platform conventions.
+
+On Unix the separator is colon. If a directory element itself contains a colon, a reader cannot tell whether it is part of the name or a boundary between two elements. The format used by this API has no extra quoting convention that can represent every possible Unix path losslessly.
+
+Rust rejects the conversion rather than generating an ambiguous string. That error protects a round-trip property: splitting the joined result should recover the intended elements.
+
+## The invalid character is platform-specific
+
+The documentation lists colon on Unix, a double quote on Windows, and semicolon on UEFI. Some targets, such as WASI, may not have a PATH-like variable and can also return an error.
+
+This means validation copied from one target is not portable. I do not hard-code `':'` in cross-platform application logic and assume the problem is solved. I call `join_paths` at the target boundary and handle its result.
+
+The evidence case is labelled Unix because its exact colon input depends on that contract. A Windows fixture should test the Windows-invalid representation described by its API, not pretend colon has the same role there.
+
+## Keep the list structured as long as possible
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-379/fixed.rs) stores two `PathBuf` elements, joins them only at the environment boundary, and uses [`split_paths`](https://doc.rust-lang.org/std/env/fn.split_paths.html) to prove the round trip.
+
+Inside configuration and business logic, I keep `Vec<PathBuf>`. This avoids repeated splitting, preserves element identity, and makes append or deduplication operate on paths rather than substrings.
+
+Only the code that launches a child or updates an environment variable needs the platform encoding. That small boundary is also the correct place to report which element could not be represented.
+
+## String concatenation hides ambiguity
+
+Manually formatting `format!("{}:{}", first, second)` on Unix produces a string even when an element contains a colon. Success of string construction says nothing about whether another process will parse the intended list.
+
+It also loses non-Unicode paths if code converts them with `to_string_lossy`. `join_paths` accepts path-like values and returns `OsString`, so it preserves the operating system's native string representation where the PATH format permits it.
+
+I use `display()` only for human diagnostics. I do not round-trip a displayed path back into process configuration.
+
+## An error needs a product policy
+
+When a user selects a directory containing the list separator, the program has several honest choices: reject it with a clear message, avoid representing the directory through PATH, or pass the location through another argument or environment variable that contains one path rather than a list.
+
+Silently dropping the element can run the wrong executable. Replacing the separator changes the directory name. Inventing a quoting syntax helps only if every consumer understands the same syntax, which ordinary PATH parsing does not guarantee.
+
+For a child process I often set an explicit executable path with `Command::new` instead of editing PATH when one known tool is required. This removes search ambiguity and is usually easier to audit.
+
+## Appending to inherited PATH is fallible too
+
+A common sequence is `var_os("PATH")`, `split_paths`, push one directory, then `join_paths`. The final step remains fallible. The inherited variable may contain data that splits into elements Rust later refuses to join under the documented rules, or the new element may be invalid.
+
+I keep the original `OsString` until the replacement has been built successfully. Then an error cannot leave process configuration partially updated. In Rust 2024, environment mutation also has safety constraints in multithreaded processes, so I prefer setting environment on a `Command` for a child rather than mutating the parent globally.
+
+## Tests should assert round trips, not visual strings
+
+Except in a target-specific fixture, I avoid asserting that the joined value contains a particular separator. I assert that `split_paths(join_paths(paths)?)` yields the original sequence.
+
+I add a target-specific rejection test for the known invalid character and keep it behind the relevant `cfg`. Tests involving non-Unicode paths use `OsString` rather than UTF-8 assumptions.
+
+The core principle is that serialization can fail even when every input is individually a valid path. The destination format may not represent its separator inside an element. `join_paths` makes that limitation explicit, and keeping paths structured prevents the ambiguity from spreading through the rest of the program.

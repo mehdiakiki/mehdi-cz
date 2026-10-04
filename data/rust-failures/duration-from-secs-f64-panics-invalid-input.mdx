@@ -1,0 +1,80 @@
+---
+caseId: "RFA-233"
+title: "Duration::from_secs_f64 Panics on Negative and Non-Finite Input"
+date: "2026-09-06T00:13:00+01:00"
+lastmod: "2026-09-06T00:13:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "d591e1a7a38c636ce60286222bfac79c6b273bbdfbdf5a95290b21db80822f98"
+area: "concurrency-memory"
+symptom: "Constructing Duration from negative floating-point seconds panics instead of returning a value or Result."
+summary: "Duration is non-negative, and from_secs_f64 is a panicking convenience constructor for invalid, non-finite, or overflowing input. Use try_from_secs_f64 at untrusted boundaries and decide how rounding enters the contract."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust Duration from_secs_f64 negative panic", "convert float seconds to Duration without panic", "Duration try_from_secs_f64 NaN"]
+evidence: ["Rust 1.98.1 negative float", "captured constructor panic", "fallible conversion repair"]
+sources: ["https://doc.rust-lang.org/std/time/struct.Duration.html#method.from_secs_f64", "https://doc.rust-lang.org/std/time/struct.Duration.html#method.try_from_secs_f64", "https://doc.rust-lang.org/std/time/struct.TryFromFloatSecsError.html"]
+---
+
+I converted a floating-point timeout with `Duration::from_secs_f64`. It worked for normal configuration, then a negative value from a calculation panicked the process.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-233/fail.rs) catches the constructor panic for `-0.5` and emits a stable Atlas assertion. The same constructor also panics for NaN, infinity, and values outside `Duration`'s range.
+
+## Duration cannot represent negative time
+
+`Duration` is a non-negative span. [`Duration::from_secs_f64`](https://doc.rust-lang.org/std/time/struct.Duration.html#method.from_secs_f64) is a convenience constructor returning `Duration` directly, so invalid input is reported by panic.
+
+The method is suitable when the caller has already established its preconditions, for example a positive literal or a value produced by a trusted invariant. A user-controlled string, telemetry calculation, or external API value has not earned that trust.
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-233/fixed.rs) uses [`try_from_secs_f64`](https://doc.rust-lang.org/std/time/struct.Duration.html#method.try_from_secs_f64). Negative and NaN inputs return `TryFromFloatSecsError`; `0.5` becomes 500 milliseconds.
+
+## NaN defeats ordinary range checks
+
+This validation is incomplete:
+
+```rust
+if seconds < 0.0 {
+    return Err(...);
+}
+```
+
+For NaN, comparisons such as `<`, `>=`, and equality behave differently from ordinary numbers. NaN passes through many intuitive range conditions and reaches the panicking constructor.
+
+I either use the fallible conversion as the validator or explicitly require `seconds.is_finite()` plus the domain bounds. Duplicating the standard conversion's range logic is rarely useful.
+
+Infinity is easier to recognize but can emerge from division by a tiny value or parsing special float text. Overflow is not limited to infinity; a finite float can still exceed the maximum duration.
+
+## A negative result may reveal a direction bug
+
+Clamping every negative duration to zero is not always a repair. The value may result from subtracting timestamps in the wrong order, mixing units, or applying clock skew incorrectly.
+
+I preserve the signed quantity until the domain decides what it means. A scheduled deadline in the future and an elapsed age use opposite directions. Converting too early to non-negative `Duration` erases that distinction.
+
+If zero-clamping is a product rule, I name it and emit a metric for how often it occurs. Unexpected negative time should not become invisible.
+
+## Floating conversion includes rounding
+
+The constructor rounds to nanosecond precision. Very small positive values can become zero or one nanosecond according to the documented conversion. Large values cannot preserve every nanosecond because `f64` has limited precision.
+
+For protocol fields already expressed as integer nanoseconds or milliseconds, I keep integer representation and use the matching constructor. Going through `f64` adds a rounding policy the protocol did not request.
+
+When float seconds are the actual input contract, I test values around half-nanosecond boundaries and document whether exact reproducibility matters.
+
+## Catching the panic is weaker than fallible construction
+
+The fixture uses `catch_unwind` only to turn a built-in panic into a predictable demonstration. I do not normally wrap the constructor in `catch_unwind` as input validation.
+
+Panics can run destructors, interact with poison state, and may abort under the configured panic strategy. A direct `Result` keeps expected bad input in the ordinary control flow and gives callers a specific [`TryFromFloatSecsError`](https://doc.rust-lang.org/std/time/struct.TryFromFloatSecsError.html).
+
+At an HTTP or configuration boundary, I translate that error into a field-level message such as “timeout must be finite and non-negative.” Internal code can preserve the source error for diagnostics.
+
+## My regression covers all invalid classes
+
+The repaired fixture checks a negative value, NaN, and a successful fractional value. Application tests add positive and negative infinity, zero, a sub-nanosecond value, a very large finite value, and the maximum accepted business timeout.
+
+I test the boundary parser rather than only the standard method. This proves that malformed external input becomes a controlled error and never reaches a panic path.
+
+For observability, I record the rejected field and error class without logging a whole configuration document. Separate counters for negative, non-finite, and above-policy values help distinguish bad callers from unit mistakes during rollout.
+
+The core principle is that constructors returning plain values often assume their preconditions. `from_secs_f64` is explicit about panicking outside its domain. At uncertain boundaries I use the fallible twin, preserve signed meaning until policy is known, and treat float rounding as part of the data contract.

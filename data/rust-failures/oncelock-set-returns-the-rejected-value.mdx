@@ -1,0 +1,84 @@
+---
+caseId: "RFA-357"
+title: "OnceLock::set Returns the Rejected Owned Value"
+date: "2026-09-06T02:17:00+01:00"
+lastmod: "2026-09-06T02:17:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "8abca08dcbb77dc886ab5386fe65a639548b218f190981868367e27920bb2253"
+area: "concurrency-memory"
+symptom: "A second OnceLock::set call returns Err with the supplied value while the first initialized value remains stored."
+summary: "set guarantees the cell is initialized when it returns, but not necessarily with the caller's candidate. On collision it preserves ownership by returning Err(candidate), enabling recovery or explicit discard."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust OnceLock set returns Err value", "OnceLock second set recover candidate", "OnceLock set already initialized semantics"]
+evidence: ["Rust 1.98.1 local OnceLock", "first value retained", "second String recovered from Err"]
+sources: ["https://doc.rust-lang.org/std/sync/struct.OnceLock.html#method.set", "https://doc.rust-lang.org/std/sync/struct.OnceLock.html#method.get", "https://doc.rust-lang.org/std/sync/struct.OnceLock.html#method.get_or_init"]
+---
+
+I once treated `OnceLock::set` like an assignment that would either replace the value or lose my candidate. It does neither on a second call. The first value remains, and the second owned value comes back inside `Err`.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-357/fail.rs) stores `first`, then expects storing `second` to succeed. The actual result is `Err("second")`.
+
+## Set races for one initialization slot
+
+[`OnceLock::set`](https://doc.rust-lang.org/std/sync/struct.OnceLock.html#method.set) initializes an empty cell. It returns `Ok(())` when this call supplied the stored value, and `Err(value)` when the cell was already initialized.
+
+Under concurrency it may wait while another thread initializes. When it returns, the cell is guaranteed to contain a value, but the documentation carefully says it may not be the value this caller provided.
+
+That distinction prevents a winner/loser race from being mistaken for ordinary mutation.
+
+## Ownership is preserved on rejection
+
+The value parameter is taken by value. If another initialization won, silently dropping the candidate would impose a resource policy the caller did not request. Returning `Err(T)` gives ownership back.
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-357/fixed.rs) recovers the rejected `String`, verifies it is `second`, and checks that [`get`](https://doc.rust-lang.org/std/sync/struct.OnceLock.html#method.get) still exposes `first`.
+
+The caller may reuse, compare, log safe metadata about, send elsewhere, or deliberately drop the losing value. For expensive resources, this recovery is important.
+
+## Err does not mean the cell is empty
+
+Many `Result` APIs use `Err` to report that an operation left its target unchanged or unavailable. Here `Err(candidate)` means the cell is already successfully initialized.
+
+Code that retries `set` in a loop on `Err` will not make progress. The state is permanent unless exclusive mutable ownership later uses APIs designed to take or change it.
+
+I match the error as an initialization collision, not as transient failure.
+
+## get_or_init has a different candidate lifecycle
+
+[`get_or_init`](https://doc.rust-lang.org/std/sync/struct.OnceLock.html#method.get_or_init) accepts a closure and returns a reference to the stored value. The closure is evaluated only if initialization is needed under its contract.
+
+This can avoid constructing an expensive candidate that loses immediately. `set` is useful when I already own the value or need the rejected value back. The choice is about resource creation and collision behavior, not style alone.
+
+If initialization itself can fail, I use a fallible design appropriate to the stable APIs and desired retry policy rather than hiding failure inside a supposedly infallible singleton.
+
+## OnceLock is not a compare-and-swap variable
+
+After initialization, shared callers cannot replace the value through `set`. This immutability is the point: readers can obtain a stable shared reference without locking around later assignments.
+
+For configuration reloads, cache refreshes, or rotating credentials, another synchronization primitive and versioning strategy is needed. Wrapping a changing resource in `OnceLock<Mutex<T>>` moves mutation into the mutex; it does not make `OnceLock` itself replaceable.
+
+I choose it only when “initialized at most once” is a truthful lifetime contract.
+
+## Panic behavior differs from LazyLock poison
+
+If a `get_or_init` initializer panics, `OnceLock` remains uninitialized under its documentation and may be initialized by a later attempt. This differs from the unrecoverable poisoning behavior of `LazyLock` covered elsewhere in the Atlas.
+
+I do not generalize one “lazy initialization” rule across types. The exact cell, closure ownership, and panic contract matter.
+
+`set` itself receives an already constructed value and does not run user initialization code inside the cell operation.
+
+## Tests should model winners and returned resources
+
+The minimal deterministic test performs two sequential sets. A concurrency test can start several threads with distinct candidates and assert exactly one `Ok`, every loser recovers its candidate, and the cell equals the winner.
+
+I avoid asserting which thread wins unless synchronization deliberately chooses it. Scheduling is not part of `OnceLock` identity.
+
+For resource values I include a drop counter to verify losers are neither leaked nor accidentally destroyed before the caller handles them.
+
+## The general principle is rejected ownership
+
+Rust APIs often return an owned input when a state transition cannot accept it: channel sends, collection insertion variants, conversion errors, and one-time initialization. This turns a failed operation into a recoverable ownership path.
+
+I inspect the error payload before writing `_ = cell.set(value)`. Ignoring the result may be fine when losing candidates should be dropped, but that is then an explicit policy. `OnceLock::set` preserves both facts: initialization already happened, and my unused value is still mine.

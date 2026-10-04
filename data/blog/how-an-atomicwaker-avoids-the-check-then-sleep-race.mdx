@@ -1,0 +1,210 @@
+---
+title: "How an AtomicWaker Avoids the Check-Then-Sleep Race"
+date: "2026-11-02T09:00:00+01:00"
+tags: ["rust", "AtomicWaker", "async", "futures", "concurrency"]
+draft: false
+reviewed: true
+reviewedHash: "49f5ab857919a00e7dc04ab0a8f3a917fb919a3a6b6f4a4bfea5c3945a8f6ebe"
+cluster: "rust-under-the-hood"
+campaign: "authority-2026"
+opportunity: "RUST-040"
+summary: "A future can miss a wake between checking readiness and storing its Waker. Register first, recheck state, and let AtomicWaker coordinate concurrent registration with wake calls."
+---
+
+An async future must not return `Poll::Pending` unless something can wake it after progress becomes possible. The difficult part is the few instructions between checking state and registering the current task's `Waker`.
+
+If a producer changes the state in that gap, the future can sleep forever.
+
+## The broken check-then-register order
+
+Imagine a one-value channel:
+
+```rust
+fn poll_recv(&self, cx: &mut Context<'_>) -> Poll<Value> {
+    if let Some(value) = self.try_take() {
+        return Poll::Ready(value);
+    }
+
+    self.waker.register(cx.waker());
+    Poll::Pending
+}
+```
+
+This timeline loses the notification:
+
+```text
+consumer: checks slot, sees empty
+producer: stores value
+producer: calls wake, but no Waker is registered
+consumer: registers Waker
+consumer: returns Pending
+```
+
+The value is ready, but nobody is required to poll the future again.
+
+This race is the async form of checking a condition and then going to sleep without coordinating with the notifier.
+
+## Register, then check again
+
+The usual shape is:
+
+```rust
+fn poll_recv(&self, cx: &mut Context<'_>) -> Poll<Value> {
+    self.waker.register(cx.waker());
+
+    if let Some(value) = self.try_take() {
+        Poll::Ready(value)
+    } else {
+        Poll::Pending
+    }
+}
+```
+
+Now there are two useful cases.
+
+If the producer stores before registration finishes, the subsequent state check sees the value. The consumer returns `Ready` and does not need the earlier wake.
+
+If the producer stores after registration, its `wake` observes a registered task and schedules another poll.
+
+```text
+store before registration -> second check catches state
+store after registration  -> registered Waker catches notification
+```
+
+The state is the truth. A wake is only a hint that polling may now make progress.
+
+## AtomicWaker coordinates the Waker slot
+
+The `futures` crate provides `AtomicWaker` for a pattern with one logical registered task and concurrent wake calls.
+
+```rust
+use futures::task::AtomicWaker;
+
+struct Shared {
+    ready: AtomicBool,
+    waker: AtomicWaker,
+}
+```
+
+The producer publishes readiness and wakes:
+
+```rust
+self.ready.store(true, Ordering::Release);
+self.waker.wake();
+```
+
+The future registers and rechecks:
+
+```rust
+self.waker.register(cx.waker());
+
+if self.ready.load(Ordering::Acquire) {
+    Poll::Ready(())
+} else {
+    Poll::Pending
+}
+```
+
+The [`AtomicWaker` documentation](https://docs.rs/futures/latest/futures/task/struct.AtomicWaker.html) explicitly recommends registering before checking the condition and documents the synchronization guarantee between `register` and concurrent `wake` calls.
+
+## Notification does not contain the data
+
+`AtomicWaker` stores task notification capability. It does not store the channel value, completion result, or closed state.
+
+I keep those in separate shared state with its own atomic or lock protocol:
+
+```text
+shared state: empty | value | closed
+AtomicWaker: task to notify when shared state may have changed
+```
+
+`wake()` can happen more than once, be coalesced by an executor, or arrive when the task is already scheduled. The future must always re-read state when polled.
+
+Using wake count as a message count is wrong.
+
+## Waking before registration is not automatically remembered
+
+`AtomicWaker` is not a durable event log. If `wake` runs before any Waker exists, the authoritative readiness state must still let a later poll return `Ready`. This is another reason for the second check.
+
+I never design the protocol as “one call to wake corresponds to one future poll.” Executors may combine notifications, and a task can be polled for reasons unrelated to this primitive. Level-triggered state such as `ready == true`, `slot contains value`, or `closed == true` makes progress recoverable even when notification timing changes. The Waker makes the executor look again; the shared state explains what happened.
+
+## Registration can replace an older Waker
+
+Executors may poll the same future with a Waker that is not equivalent to the previous one. A correct implementation updates registration rather than keeping the first Waker forever.
+
+`AtomicWaker::register` handles replacement for the intended single-consumer pattern. It is not a broadcast list of arbitrary waiters.
+
+If several independent consumers call `register` concurrently, one registration can replace another. A multi-consumer primitive needs a queue or collection of waiters with clear removal and cancellation semantics.
+
+The ownership assumption belongs in the type's documentation.
+
+## Ready paths may leave a stale registration
+
+After registering, the second check may return `Ready`. A Waker can remain stored and receive a later extra notification.
+
+Extra wakeups are normally allowed: polling a completed future again is controlled by the future's contract and executor usage. For reusable primitives, I consider whether stale Wakers retain task resources or notify a future generation incorrectly.
+
+Some designs use a generation counter or clear registration when ownership changes. The right cleanup depends on whether the object is one-shot, a stream, or a reusable event.
+
+## Closing is also a state change
+
+A receiver waiting on an empty channel must wake when all senders close:
+
+```text
+value stored -> wake receiver
+last sender dropped -> mark closed, wake receiver
+```
+
+The poll path checks both:
+
+```rust
+register current Waker
+
+if value exists {
+    Ready(Some(value))
+} else if closed {
+    Ready(None)
+} else {
+    Pending
+}
+```
+
+If closure changes state without calling wake, the receiver can remain pending forever even though no future value is possible.
+
+## Memory ordering still needs a proof
+
+The Waker race and data-publication race are related but not identical.
+
+The producer must publish the value or completion state before the consumer acts on readiness. The Acquire/Release relation normally travels through the atomic state or lock guarding the value. I do not assume that calling `wake()` alone safely publishes arbitrary non-atomic memory.
+
+The proof names:
+
+```text
+which operation stores the payload
+which Release publishes readiness
+which Acquire observes readiness
+when wake is called
+which second check prevents the missed notification
+```
+
+## Test the narrow race
+
+Normal runtime tests rarely stop in the dangerous gap. I use a small model and force orderings:
+
+```text
+producer acts before register
+producer acts during register
+producer acts after register but before recheck
+producer acts after Pending
+close races with registration
+Waker changes between polls
+spurious or repeated wake occurs
+```
+
+With Loom or another controlled concurrency harness, the final assertion is not “wake was called.” It is:
+
+```text
+If state is ready or closed, the future cannot remain permanently asleep.
+```
+
+`AtomicWaker` solves the synchronization around storing and taking one Waker. The future still needs the correct protocol: register first, recheck authoritative state, publish data with valid memory ordering, and wake for every transition that can make progress possible.

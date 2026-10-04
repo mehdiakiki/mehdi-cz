@@ -1,0 +1,74 @@
+---
+caseId: "RFA-341"
+title: "Iterator::fuse Makes the First None Permanent"
+date: "2026-09-06T02:01:00+01:00"
+lastmod: "2026-09-06T02:01:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "f5e5f06bcafb25f1b64940d2b1d018203fe3b3442b7f5bdf016b99c592323705"
+area: "upgrades-compatibility"
+symptom: "A custom iterator can produce a value after None, but the same iterator wrapped in fuse never exposes that later value."
+summary: "Iterator permits a source to resume after None unless it implements FusedIterator. The fuse adaptor deliberately turns the first None into permanent termination, so temporary absence must be represented as an item state instead."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust iterator Some after None fuse", "Iterator fuse loses later values", "FusedIterator first None permanent"]
+evidence: ["Rust 1.98.1 custom resumable iterator", "Some None Some source sequence", "explicit Pending item repair"]
+sources: ["https://doc.rust-lang.org/std/iter/trait.Iterator.html#method.fuse", "https://doc.rust-lang.org/std/iter/struct.Fuse.html", "https://doc.rust-lang.org/std/iter/trait.FusedIterator.html"]
+---
+
+I used to read `None` as a universal statement: this iterator is finished forever. That is the normal convention, but the base `Iterator` trait does not require it. A custom iterator may return `Some` on a later call. Adding `fuse` is the operation that makes termination permanent.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-341/fail.rs) defines a tiny source with the sequence `Some(1)`, `None`, `Some(2)`. Once wrapped in `fuse`, the final value cannot be observed.
+
+## Iterator has a deliberately small contract
+
+The required `next` method returns an `Option<Item>`. `Some` carries the next item, and `None` says that this call has no next item. The [`Iterator::fuse`](https://doc.rust-lang.org/std/iter/trait.Iterator.html#method.fuse) documentation calls out the non-obvious part: `Iterator` alone does not guarantee that future calls after `None` also return `None`.
+
+Most standard finite iterators behave permanently finished. Many consumers also stop on the first `None`; a `for` loop cannot wait and try again. A resumable iterator is consequently legal but surprising.
+
+This is why I do not use `None` to mean “temporarily unavailable” in a public iterator design. Legal behavior is not automatically composable behavior.
+
+## fuse changes observable semantics
+
+[`Fuse`](https://doc.rust-lang.org/std/iter/struct.Fuse.html) remembers whether its source has returned `None`. Before that event it forwards calls. Afterwards it returns `None` without allowing a later source value through.
+
+It does not repair or poll a resumable source. It chooses permanent termination on the caller's behalf. That is valuable when an algorithm wants stable end-of-input semantics, but destructive if `None` was secretly being used as a temporary pause.
+
+The name can mislead readers into thinking this is only a marker or optimization. It is an adaptor with observable behavior for iterators that may resume.
+
+## Represent temporary absence as data
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-341/fixed.rs) uses an item enum with `Value` and `Pending`. The iterator returns `Some(Pending)` during temporary absence. Only final exhaustion returns `None`.
+
+Now ordinary iterator consumers do not silently stop at the pause. A caller can match the state, wait, retry elsewhere, or collect the events for a test. The outer `Option` keeps one meaning: whether iteration itself is over.
+
+For truly asynchronous availability I use a stream abstraction whose polling contract includes `Pending`, not a synchronous `Iterator` that invents time-dependent meanings for `None`. The type should expose the state machine it actually implements.
+
+## FusedIterator records the stronger promise
+
+The [`FusedIterator`](https://doc.rust-lang.org/std/iter/trait.FusedIterator.html) marker says that once `next` returns `None`, every future call will also return `None`. `Fuse<I>` provides this promise even when `I` did not.
+
+The marker can help generic code reason about repeated termination, but consumers should still avoid unnecessary calls after exhaustion. Some adaptors have special implementation details, and the basic control flow is clearer when it stops once.
+
+I also do not implement `FusedIterator` manually for a source that may resume. A marker trait is part of the semantic contract even though it has no method body.
+
+## Why common tests miss this boundary
+
+Calling `collect` on the raw source stops at the first `None`, so it produces `[1]` and never reveals the later two. Comparing `collect` before and after `fuse` therefore says they are equal. That test cannot detect the changed post-termination behavior.
+
+My fixture calls `next` explicitly three times. When testing a custom iterator, I include calls immediately after its first `None`, repeated calls after completion, empty input, and any transient state the source claims to support.
+
+If the iterator must be fused, I test the stronger rule. If it must resume, I test that a normal consumer has a way to observe the pause without interpreting it as completion.
+
+## Iterator adaptors assume meanings, not only types
+
+Many iterator mistakes come from looking only at `Item`. The termination channel is also part of the protocol. `peekable`, `flatten`, `map_while`, and `fuse` each add state and decide what calls mean around a boundary.
+
+I document the sequence model before stacking adaptors. Is the source finite? Can it resume? Does an error terminate it? Is a missing value an item or the end? These questions are more useful than starting from a clever method chain.
+
+## The general systems lesson
+
+A sentinel cannot safely carry two meanings when generic machinery owns the control flow. End-of-stream, temporary unavailability, filtered item, and recoverable error need distinct states if callers must react differently.
+
+In Rust the type system gives me inexpensive vocabulary for this. I keep `None` for the end, put temporary state in an enum or polling protocol, and use `fuse` only when permanent termination is the exact contract I want.

@@ -1,0 +1,86 @@
+---
+caseId: "RFA-542"
+title: "A Mutable Rust Closure Capture Reserves Access Until the Closure Is Finished"
+date: "2026-09-06T06:21:00+01:00"
+lastmod: "2026-09-06T06:21:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "6cfc68f9612d5556165063f465b52bedd29b93a17a9b27396662b021710ab0eb"
+area: "concurrency-memory"
+symptom: "Using events directly after a closure has captured it for mutation fails with E0501 because the closure is called later and still owns the unique borrow."
+summary: "A stored closure can extend a mutable borrow across surrounding statements. Passing the state as an argument creates shorter call-scoped borrows."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust E0501 previous closure requires unique access", "mutable variable already captured by closure", "closure parameter instead of mutable capture Rust"]
+evidence: ["Rust 1.98.1 E0501 compile failure", "captured Vec used directly before later closure call", "non-capturing closure parameter repair"]
+sources: ["https://doc.rust-lang.org/error_codes/E0501.html", "https://doc.rust-lang.org/reference/types/closure.html", "https://doc.rust-lang.org/stable/rust-by-example/fn/closures/capture.html"]
+---
+
+E0501 often appears when the direct mutation looks harmless because the closure has not run yet. The missing detail is that the closure already captured the exclusive access it will need later.
+
+The [failing fixture](/rust-failure-atlas/evidence/RFA-542/fail.rs) creates `add_from_callback`, which pushes into `events`. It then pushes directly into `events` before calling the closure. Since the closure remains live and will be used later, its mutable capture spans the direct push.
+
+## The closure value contains the borrow
+
+A closure is compiled to an anonymous value with fields representing captures. When the body mutates `events`, the environment effectively contains mutable access to that vector.
+
+As long as the closure may still be invoked, Rust must preserve its access. Directly borrowing `events` again would create two live unique paths to the same value.
+
+The [official E0501 explanation](https://doc.rust-lang.org/error_codes/E0501.html) describes a mutable variable used while already captured. The Reference's [closure type section](https://doc.rust-lang.org/reference/types/closure.html) explains capture and call traits in more general terms.
+
+## Last use controls when the capture can end
+
+If I call the closure first and never use it again, non-lexical lifetime analysis can often end the capture afterward. If I need direct access first, I can define the closure after that direct operation.
+
+These order changes are valid when operations have the same intended semantics. They are not safe mechanical rewrites when ordering affects results, I/O, or error handling.
+
+In the fixture the order is intentionally direct then callback. I therefore change the closure shape rather than reorder the operations.
+
+## A parameter creates a borrow per invocation
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-542/fixed.rs) defines a closure that accepts `&mut Vec<_>`. It captures no `events` reference. The direct push completes, and the later call borrows the vector only for that call.
+
+This design makes ownership choreography explicit:
+
+```text
+caller owns events
+direct operation borrows it briefly
+closure call borrows it briefly
+caller regains access
+```
+
+It is a useful pattern for local strategies, test callbacks, and synchronous pipelines that operate on caller-owned state.
+
+## Dropping the closure is appropriate when it is finished
+
+If the closure has served its purpose, ending its scope or calling `drop(closure)` releases the captured environment before later direct access. This communicates that the callback cannot be called again.
+
+I use a block when possible because the lifetime is visible structurally. Explicit drop is useful when a larger scope is necessary and the closure owns other resources. Neither option helps if code must invoke the closure again afterward, as in the failing fixture.
+
+## Interior mutability changes the rules and the failure mode
+
+`RefCell` can allow several closures to own shared handles and request mutable access at runtime. `Mutex` can coordinate shared access across threads. These types do not remove exclusivity; they enforce it through runtime borrowing or locking.
+
+I do not introduce them merely because E0501 appears. Parameterising a synchronous callback is cheaper and easier when calls do not overlap. Interior mutability belongs to architectures where ownership really is shared.
+
+Rust By Example illustrates [closure capture modes](https://doc.rust-lang.org/stable/rust-by-example/fn/closures/capture.html), including borrow and move behaviour. I use that model before reaching for a container.
+
+## Move does not necessarily solve a mutable-capture conflict
+
+Adding `move` transfers captured variables or references into the closure environment. If the captured value is `&mut Vec<_>`, moving that reference into the closure still makes it unavailable for direct use. If the closure takes ownership of the vector, the surrounding function loses it entirely.
+
+`move` answers where the environment is owned, not whether two paths may mutate the same value. I use it for ownership and lifetime needs such as spawning tasks, not as a generic borrow fix.
+
+## My E0501 checklist
+
+- Which closure captured the variable mutably?
+- Will that closure be called again after the conflicting direct access?
+- Can operations be reordered without changing semantics?
+- Can the closure be defined later or end earlier?
+- Can mutable state become an explicit closure parameter?
+- Would dropping the closure accurately end its useful life?
+- Is shared interior mutability truly required by the architecture?
+- Am I expecting `move` to remove an exclusive-access rule it cannot remove?
+
+The core principle is that stored behaviour may also store access rights. I shorten those rights with call parameters whenever the caller, rather than the closure, should remain the clear owner of mutable state.

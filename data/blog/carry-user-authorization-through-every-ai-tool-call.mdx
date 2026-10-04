@@ -1,0 +1,192 @@
+---
+title: "Carry User Authorization Through Every AI Tool Call"
+date: "2026-09-08T14:00:00+01:00"
+tags: ["AI agents", "authorization", "OAuth", "security", "system design"]
+draft: false
+reviewed: true
+reviewedHash: "bbc434a40586d02787d73661e5b818238dce000e6dcdca34ff77392d6b3ce741"
+cluster: "reliable-ai-systems"
+campaign: "authority-2026"
+opportunity: "AI-016"
+summary: "A reference flow for keeping user identity, tenant, audience, and allowed actions attached to every AI tool call without trusting the model to enforce permissions."
+---
+
+While building systems that connect data and tools, I have learned one security rule that becomes even more important with AI: **the model can suggest an action, but it cannot grant permission for that action**.
+
+This sounds obvious. Still, it is easy to lose the rule inside an agent loop. A user asks a question, the model chooses a tool, and the tool runs with a server credential. The first demo works. Later, the same credential can read every tenant or perform an action the user was never allowed to perform.
+
+The mistake is not really about prompting. It is an authorization design mistake. User authority entered at the HTTP request and disappeared before the tool call.
+
+I prefer to carry a small, verified authorization context through the complete execution path. Every boundary checks it again. The model receives only the tools and arguments it may propose; the tool gateway remains responsible for what may actually happen.
+
+## The reference flow
+
+This is the flow I use as a starting point:
+
+```text
+user request
+    ↓ authenticate
+application session
+    ↓ derive subject, tenant and policy
+agent run
+    ↓ propose tool + arguments
+tool gateway
+    ↓ validate authorization, audience and input
+downstream service
+    ↓ perform effect
+audit record
+```
+
+There are two decisions in this flow, and I keep them separate:
+
+1. The model decides which action may help answer the request.
+2. Trusted application code decides whether this user may perform that action on this resource now.
+
+If the model writes `tenant_id: "another-tenant"` in its arguments, this must not change the authorization context. Tenant identity comes from the verified session or delegated token, not from generated text.
+
+## What I carry with the tool call
+
+The exact representation depends on the architecture. It can be a signed token, an internal object, or a capability created for one execution. The important part is the meaning:
+
+```ts
+type ToolAuthorization = {
+  subject: string
+  tenant: string
+  audience: string
+  allowedActions: string[]
+  resourceConstraints: Record<string, string>
+  expiresAt: string
+  requestId: string
+}
+```
+
+I do not let the model create or edit this object. Trusted code creates it after authentication and policy evaluation.
+
+Each field protects a different boundary:
+
+- `subject` identifies the person or workload behind the request;
+- `tenant` prevents data from crossing customer boundaries;
+- `audience` limits which service should accept the authority;
+- `allowedActions` limits capabilities such as `invoice.read` or `ticket.create`;
+- `resourceConstraints` narrows an action to a project, account, or record;
+- `expiresAt` prevents a delayed agent run from keeping old authority;
+- `requestId` connects the decision, effect, and audit trail.
+
+This is one place where a schema is useful. It makes missing authority visible during review and testing.
+
+## A service token is not the user's permission
+
+Many integrations need a service credential to call an external API. That credential answers, “Can our application connect?” It does not always answer, “Can this user read this record?”
+
+I treat these as separate layers:
+
+```text
+application credential: may call the provider
+user authorization: may perform this operation on this resource
+```
+
+Sometimes the downstream service supports OAuth delegation or token exchange, which allows us to send a narrowly scoped token representing the user. Sometimes it does not. In that case, the tool gateway must enforce the user policy before using the broader service credential.
+
+What I avoid is token passthrough without validation. A token issued for one audience should not be accepted by another service simply because it looks valid. OAuth security guidance recommends restricting privileges and binding access tokens to their intended resource servers. The [OAuth 2.0 Security Best Current Practice](https://www.rfc-editor.org/rfc/rfc9700.html) explains these audience and least-privilege requirements; [OAuth token exchange](https://www.rfc-editor.org/rfc/rfc8693.html) describes explicit impersonation and delegation when they are needed.
+
+## Authorize the resolved resource, not only the arguments
+
+Suppose a model calls:
+
+```text
+send_invoice(customer="Acme", invoice="latest")
+```
+
+Checking that the user may call `send_invoice` is not enough. Trusted code must resolve “Acme” and “latest,” then confirm that the resolved invoice belongs to the permitted tenant and that the user may send it.
+
+This closes a common confused-deputy path: the agent is allowed to use a powerful tool, so an untrusted instruction tries to make the tool access another resource.
+
+My order is:
+
+1. validate the generated argument shape;
+2. resolve names to canonical internal identifiers;
+3. load the current resource state;
+4. authorize the subject, action, and resolved resource;
+5. perform the effect with an idempotency key;
+6. record the decision and result.
+
+Authorization immediately before the effect also reduces time-of-check/time-of-use problems. An approval or membership may have changed while a long agent run was reasoning.
+
+## Read and write tools need different treatment
+
+I do not expose a generic `run_sql` or `call_api` tool and hope the model stays inside a policy described in the prompt. I expose narrow operations with server-side rules.
+
+A read tool may still leak sensitive data into a later answer, so it needs row and field restrictions. A write tool needs stronger controls:
+
+- an explicit action name;
+- narrow resource scope;
+- idempotency for retries;
+- current-state validation;
+- a human confirmation for high-impact or surprising effects;
+- an audit record that does not store secrets.
+
+Human confirmation is not a replacement for authorization. A confirmation screen can be manipulated or misunderstood. I first prove that the user is allowed to act, then ask them to confirm when the consequence deserves it.
+
+## Do not make prompt injection an authorization problem
+
+Indirect prompt injection is possible when an agent reads untrusted documents, web pages, tickets, or emails. The content may tell the model to call a tool or reveal data.
+
+I assume this can influence the proposal. I design the execution boundary so it still cannot increase authority.
+
+For example, a document saying “export all customers” may cause a proposed export call. The tool gateway still applies the authenticated tenant, action policy, export limits, and confirmation rule. Instructions inside data never become capabilities.
+
+This separation is useful beyond AI. It is the same principle used for browsers, database clients, and integration workers: parse untrusted input, but make authorization decisions from trusted identity and policy.
+
+## The tests I consider essential
+
+Happy-path tests prove very little here. I test attempts to cross the boundary:
+
+### Generated tenant replacement
+
+Give the tool arguments another tenant ID. Assert that the gateway ignores or rejects it and never queries that tenant.
+
+### Allowed tool, forbidden resource
+
+Let the user call `document.read`, but request a document outside their project. Assert a denial after resource resolution.
+
+### Expired authority during a long run
+
+Create the agent run, let its authorization expire, then attempt the write. Assert that the effect requires fresh authorization.
+
+### Wrong audience
+
+Present a token intended for service A to service B. Assert that B rejects it even when the signature is valid.
+
+### Approval revoked before execution
+
+Approve an action, change the underlying role or resource, then execute. Assert that the final authorization check uses current state.
+
+### Tool retry
+
+Deliver the same authorized write twice. Assert one durable effect and two traceable attempts.
+
+These are integration tests around the tool gateway, not model-quality tests. I want them to pass even if the model behaves badly.
+
+## What I log
+
+For each attempted effect, I want to reconstruct:
+
+```text
+who requested it
+which tenant and resource were resolved
+which policy allowed or denied it
+which tool version executed
+whether a human confirmed it
+which idempotency key protected it
+what result category was returned
+```
+
+I avoid logging access tokens, raw secrets, or complete sensitive payloads. Auditability should not create a second data leak.
+
+## The practical rule
+
+An AI tool call is still an API call made on somebody's behalf. I carry that somebody's authority to the last trusted boundary, narrow it to the required audience and action, and check it against the resolved resource at execution time.
+
+The model is useful for choosing and composing actions. The application remains responsible for identity, authorization, validation, and effects. This division lets me use AI without pretending that generated instructions are a security control.
+
+The current Model Context Protocol authorization specification also requires protected resources to validate tokens and forbids token passthrough; its [authorization guidance](https://modelcontextprotocol.io/specification/2025-06-18/basic/authorization) is a helpful protocol-level reference. For the surrounding threat model, see [How to Build a Secure Internal AI Tool](/blog/how-to-build-secure-internal-ai-tool).

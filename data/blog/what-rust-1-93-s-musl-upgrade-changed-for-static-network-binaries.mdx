@@ -1,0 +1,129 @@
+---
+title: "What Rust 1.93's musl Upgrade Changed for Static Network Binaries"
+date: "2026-12-30T09:00:00+01:00"
+tags: ["Rust 1.93", "musl", "static linking", "DNS", "Linux"]
+draft: false
+reviewed: true
+reviewedHash: "746147459bbcc586779929a086ade21aae7559e1b18a9548c2df14092053aa22"
+cluster: "rust-under-the-hood"
+campaign: "authority-2026"
+opportunity: "RUST-070"
+summary: "Rust 1.93 updates bundled musl targets to 1.2.5, bringing DNS resolver improvements and exposing old dependencies that still reference removed compatibility symbols such as open64."
+---
+
+I like static Rust binaries because deployment can be simple. I also avoid saying “static means independent of the environment”, especially for a program that resolves names and opens network connections.
+
+Rust 1.93 is a good example. It updates the bundled musl used by Rust's Linux musl targets to version 1.2.5. The binary still depends at runtime on DNS configuration, network behaviour, certificates, clocks, and kernel interfaces. The libc implementation inside it has changed too.
+
+## The main benefit is DNS resolver behaviour
+
+The Rust project's [official musl 1.2.5 migration post](https://blog.rust-lang.org/2025/12/05/Updating-musl-1.2.5/) says the main ecosystem motivation is the major DNS resolver improvements introduced in musl 1.2.4 and fixed further in 1.2.5.
+
+For statically linked networking binaries, this should improve reliability with large DNS records and recursive nameservers. Large answers may require TCP after a truncated UDP response; resolver edge cases are exactly where a small container works in one environment and fails in another.
+
+I describe this as “better resolver support”, not “DNS is solved”. Search domains, multiple nameservers, IPv4/IPv6, timeouts, and the surrounding network still need testing.
+
+## Which Rust targets changed
+
+Rust 1.93 makes musl 1.2.5 the bundled/minimum version across Rust musl targets. The most direct change applies to three Tier 2 targets that had been pinned to 1.2.3:
+
+```text
+x86_64-unknown-linux-musl
+aarch64-unknown-linux-musl
+powerpc64le-unknown-linux-musl
+```
+
+Some other target definitions had already picked up newer musl through their build configuration. The official post documents this history and the move to an intentional consistent minimum.
+
+The [Rust 1.93 release notes](https://doc.rust-lang.org/releases.html#version-1930-2026-01-22) list the bundled musl update as a compatibility note. I check the exact target rather than assuming every musl build changed from the same old version.
+
+## The expected breakage is an old dependency, not DNS
+
+Musl 1.2.4 removed several legacy compatibility symbols. Rust ecosystem crates had used some of them. The `libc` crate shipped its fix in version 0.2.146, long before Rust 1.93, but an old lockfile can still select an affected version.
+
+A typical link failure mentions an undefined reference to `open64`, sometimes through an old `getrandom` dependency.
+
+```text
+undefined reference to `open64`
+some extern functions couldn't be found
+```
+
+The first useful commands are:
+
+```bash
+cargo tree -i libc
+cargo tree -i getrandom
+cargo update -p libc
+```
+
+The exact update command depends on the lockfile and dependency constraints. I do not blindly update the whole graph during a release incident. I identify which package holds the old version, update the narrow dependency, run target tests, and review the lockfile diff.
+
+If a direct or transitive dependency constrains `libc` below the fixed version, that dependency needs an update or patch.
+
+## Build success is only half the migration
+
+After resolving link compatibility, I test the resulting artifact in a minimal environment:
+
+```bash
+cargo +1.93.0 build --release --target x86_64-unknown-linux-musl
+file target/x86_64-unknown-linux-musl/release/my-service
+```
+
+Then I run networking scenarios against controlled DNS:
+
+1. Small A and AAAA answers.
+2. Large answer that triggers truncation/TCP fallback.
+3. Multiple configured nameservers.
+4. Search-domain behavior if the deployment uses it.
+5. NXDOMAIN and temporary resolver failure.
+6. IPv4-only and IPv6-capable environments.
+7. Slow DNS followed by connection deadline.
+
+I record resolver configuration inside the test container. A successful lookup on the host proves little about a minimal production image.
+
+## Static linking does not bundle configuration
+
+The libc code is inside the binary. `/etc/resolv.conf` and `/etc/hosts` are not magically embedded. CA certificates are separate. Timezone data may be separate. User/group lookup behaviour differs across libc and deployment choices.
+
+For a network client I inventory:
+
+```text
+DNS configuration and search policy
+certificate roots
+proxy environment
+IPv6 availability
+clock/timeouts
+service discovery mechanism
+```
+
+This avoids attributing every failure to Rust or musl merely because the binary is statically linked.
+
+## I compare old and new under the same network
+
+For a compatibility-sensitive service, I build the same source with the old and new Rust toolchains and run both in the same container/network harness.
+
+I capture:
+
+```text
+lookup result and address order
+UDP/TCP DNS traffic
+timeout and error category
+binary/toolchain/dependency identity
+connection result after resolution
+```
+
+Packet capture is controlled and contains test names only. The goal is not a synthetic benchmark score; it is evidence for resolver cases the service relies on.
+
+## What I expect during upgrade review
+
+My checklist is:
+
+1. Confirm which musl target and old bundled version apply.
+2. Inspect `libc` and related transitive versions before building.
+3. Fix `open64`-style compatibility through dependency updates, not linker suppression.
+4. Build the real release artifact.
+5. Test DNS truncation, fallback, negative answers, and deadlines.
+6. Run in the same minimal filesystem assumptions as production.
+7. Canary network error rates and resolver latency.
+
+Rust 1.93's musl update is mostly good news for portable networking binaries. The senior lesson I take from it is broader: a static artifact still includes a versioned libc and still participates in a live network. I upgrade both as operational dependencies, with lockfile evidence at build time and resolver evidence at runtime.

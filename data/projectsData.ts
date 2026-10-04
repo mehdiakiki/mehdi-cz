@@ -10,9 +10,9 @@ interface Project {
 export const projectsData: Project[] = [
   {
     title: "MonitorMe",
-    subtitle: "Founding Software Engineer",
+    subtitle: "Founder",
     description:
-      "Built and led MonitorMe, an open-source, full-stack observability framework designed for distributed microservices. Architected the system end-to-end: from data ingestion pipelines and metric aggregation to the real-time dashboard UI. MonitorMe gives engineering teams deep visibility into their infrastructure without the overhead of heavyweight commercial solutions.",
+      "Founded MonitorMe as an open-source observability framework and startup product. Designed the system across telemetry ingestion, backend services, dashboards, and browser session replay, then installed and configured it for several client environments through consulting engagements.",
     imgSrc: "/static/images/monitorme.png",
     href: "https://github.com/mehdiakiki/monitorme",
     type: "personal",
@@ -21,7 +21,7 @@ export const projectsData: Project[] = [
     title: "Rust Programming Language",
     subtitle: "Open Source Contributor",
     description:
-      "Contributed directly to the Rust compiler and its tooling ecosystem. Work included sharpening borrow-checker diagnostics to surface clearer, more actionable error messages and improving compilation performance where it matters most. Contributing to Rust means navigating one of the most rigorous codebases in the industry, where correctness is non-negotiable.",
+      "Contributed ten merged changes to the Rust compiler across linker and crate metadata, language behavior, parser checks, diagnostics, and compiler tooling.",
     imgSrc: "/static/images/rust.png",
     href: "https://github.com/rust-lang/rust",
     type: "opensource",
@@ -30,7 +30,7 @@ export const projectsData: Project[] = [
     title: "Deno",
     subtitle: "Open Source Contributor",
     description:
-      "Contributed to Deno, a secure-by-default JavaScript and TypeScript runtime built in Rust. Deno rethinks what a modern runtime should look like: native ES modules, top-level await, and a built-in suite of tooling (formatter, linter, test runner) with no configuration required. Working on Deno means reasoning about security boundaries, runtime internals, and the sharp edges of the JS spec.",
+      "Contributed two merged changes to Deno: a fast path for non-streaming TextDecoder calls and the userAgent property on Navigator's prototype.",
     imgSrc: "/static/images/deno.png",
     href: "https://github.com/denoland/deno",
     type: "opensource",
@@ -39,8 +39,8 @@ export const projectsData: Project[] = [
     title: "Rust Analyzer",
     subtitle: "Open Source Contributor",
     description:
-      "Contributed to Rust Analyzer, the modular compiler frontend that powers the Rust developer experience across every major editor. Features like instant diagnostics, intelligent code completion, go-to-definition, and automated refactoring all flow through this codebase. It's infrastructure that thousands of Rust developers depend on daily, and getting anything merged requires understanding the compiler's internal architecture in depth.",
-    imgSrc: "/static/images/rust_analyzer.png",
+      "Contributed three merged changes to rust-analyzer covering editor behavior and internal naming consistency.",
+    imgSrc: "/static/images/rust_analyzer.webp",
     href: "https://github.com/rust-lang/rust-analyzer",
     type: "opensource",
   },
@@ -49,7 +49,7 @@ export const projectsData: Project[] = [
     subtitle: "Project",
     description:
       "Built an interactive, browser-based DICOM image viewer using React and Cornerstone3D. The viewer supports full slice navigation, zoom and pan, and window-level adjustments — the core interactions radiologists and medical engineers need when working with diagnostic imaging data. No plugins, no server round-trips: everything runs client-side.",
-    imgSrc: "/static/images/dicom_viewer.png",
+    imgSrc: "/static/images/dicom_viewer.webp",
     href: "https://github.com/mehdiakiki/dicomviewer",
     type: "personal",
   },
@@ -67,6 +67,6 @@ export const projectsData: Project[] = [
 export const mainProjectData: Project = {
   title: "What is MonitorMe?",
   description: `MonitorMe is an integrated observability platform using OpenTelemetry to monitor backend performance and replay frontend events for rapid error detection. Its intuitive UI delivers near real-time insights.`,
-  imgSrc: "/static/images/new-application.png",
-  href: "/blog/the-time-machine",
+  imgSrc: "/static/images/new-application.webp",
+  href: "/work/monitorme",
 };

@@ -1,0 +1,130 @@
+---
+title: "Two Ways to Make a Type Disappear: Erasure and Monomorphization"
+date: "2026-09-11T06:40:00+01:00"
+lastmod: "2026-09-11T06:40:00+01:00"
+tags: ["types", "rust", "typescript", "generics", "monomorphization", "types under the hood"]
+draft: false
+reviewed: true
+reviewedHash: "713deb3e50c7c18ceabc9562340d28abe592aef8d979e03f0432a4a5f0faedc0"
+cluster: "rust-under-the-hood"
+campaign: "editorial"
+summary: "One generic function used with three types produced three copies in the Rust binary and one function in the JavaScript output. I counted the symbols, found the vtable jump, and argue that monomorphization is a trade most code makes without measuring it."
+---
+
+There are two ways to make a generic type disappear, and the difference decides how big your binary is and how long your build takes. Erasure throws the type away and keeps one copy of the code. Monomorphization keeps the type, compiles one copy of the code per type, and then throws the type away. I counted the copies in both.
+
+This is a spoke of [What Is a Type?](/blog/what-is-a-type-a-set-of-values-a-promise-about-operations-or-both). My opinion here is that Rust picked the right default and that most Rust code takes it too far, because the cost is invisible at the place where the choice is made.
+
+The programs and a script that reproduces every output are in the `types-under-the-hood` fixture of the site repository. I used rustc 1.95 nightly and TypeScript 5.9 on x86-64 Linux.
+
+## Monomorphization: one copy per type
+
+The function is as small as a generic function gets:
+
+```rust
+#[inline(never)]
+pub fn first<T: Copy>(xs: &[T]) -> T { xs[0] }
+```
+
+I called it with a slice of `u8`, a slice of `u64`, and a slice of `f64`, then listed the symbols in the compiled library. I replaced the crate hash with dots and put the lines in the order I called them, rather than the order the tool printed:
+
+```text
+_RINvCs..._11erasure_lib5firsthEB2_
+_RINvCs..._11erasure_lib5firstyEB2_
+_RINvCs..._11erasure_lib5firstdEB2_
+```
+
+Three symbols for one function. The letters near the end are the type: `h` is `u8`, `y` is `u64`, `d` is `f64`. The compiler wrote one machine-code version of `first` per concrete type I used it with, which is what monomorphization means.
+
+A trait bound behaves the same way. This function, with two implementations, produced two symbols:
+
+```rust
+#[inline(never)]
+pub fn speak_static<S: Speak>(s: &S) -> u64 { s.speak() }
+```
+
+```text
+_RINvCs..._11erasure_lib12speak_staticNtB2_3DogEB2_
+_RINvCs..._11erasure_lib12speak_staticNtB2_3CatEB2_
+```
+
+One for `Dog`, one for `Cat`. Each copy knows its exact type, so the call inside can be inlined and optimized as if the generic had never been written. That is where the speed comes from, and it is real.
+
+## Erasure: one copy for everything
+
+The same two ideas in TypeScript compile to this:
+
+I cut the two class declarations and the two `console.log` lines from the output:
+
+```js
+function first(xs) {
+    return xs[0];
+}
+function speak(s) {
+    return s.speak();
+}
+```
+
+One `first`. No type parameter, no second copy, nothing that remembers I called it with numbers and with strings. The interface `Speak` produced nothing at all. This is erasure: the type is used to check the program and then deleted, and one piece of code serves every type.
+
+Java does nearly the same thing with generics, for the same historical reason: the runtime already existed and could not be changed. Some traces do survive in the class file, such as generic signatures and bridge methods. The trade is the opposite of Rust's. The binary stays small and compiles fast, and every call pays for not knowing the type.
+
+## The third way: the vtable, and what it costs
+
+Rust has an erasure-like option too, and it is `dyn`:
+
+```rust
+#[inline(never)]
+pub fn speak_dyn(s: &dyn Speak) -> u64 { s.speak() }
+```
+
+```text
+_RNvCs..._11erasure_lib9speak_dyn
+```
+
+One symbol, whatever the concrete type is. And the whole body of that function is one instruction, with the mangled label shortened here:
+
+```asm
+speak_dyn:
+    jmpq    *24(%rsi)
+```
+
+There is no `retq` because this is a tail call: the function jumps straight into the method and lets it return to the original caller.
+
+The reference arrived as two registers, because a `&dyn Speak` is 16 bytes rather than 8, which I measured in [Behavior Without Shape](/blog/behavior-without-shape-traits-interfaces-and-types-that-own-no-bytes) and promised to come back to here. The second register points to the vtable, and offset 24 is where the first method sits, after three words that hold the destructor, the size, and the alignment. That is what rustc does today, not something the language promises.
+
+That is the shape of the trade in one line of assembly. Static dispatch gives the optimizer a known function to inline. Dynamic dispatch gives it an address it will not know until the program runs.
+
+## The opinion: the copies are not free, and nobody sees them
+
+Three copies of a five-character function is nothing. The problem is that the copies multiply, quietly, in a place that is invisible when you write the code.
+
+A generic function that calls two other generic functions gets instantiated for every type, and so do they. A generic type with three type parameters used with four types in each position is up to 64 versions of every method. Add a derive macro that generates code per type, and the compiler is now typechecking, optimizing, and emitting machine code for a number of functions nobody wrote. This is a large part of why Rust builds are slow, and I measured the same effect from the other direction in [The Unit of Rebuild When You Split a Rust Workspace](/blog/the-unit-of-rebuild-when-you-split-a-rust-workspace), where twelve crates instantiating the same generic produced 2.6 times as many instances of one function body as a single crate.
+
+The place I see this most is generic code over a trait where dispatch cost does not matter at all. A configuration loader, a command line parser, a setup routine that runs once. If a function runs one time per process and takes a microsecond, an indirect jump costs nothing measurable, and writing it as `&dyn Trait` instead of `<T: Trait>` removes every copy but one.
+
+The standard library agrees with this more than most user code does. `std::fmt` passes each argument as a data pointer plus a function pointer rather than instantiating the formatting machinery per type, so `println!` with ten different types produces ten small shims and one copy of the machinery.
+
+So my rule is not "avoid generics". It is: use a generic when the call is hot or when the types must be distinct, and reach for `dyn` when the call happens rarely and the only thing the generic buys is elegance. The cost of getting this wrong is usually not a slow program, it is a slow build, and I pay that one every time I recompile.
+
+## The model I take from this
+
+1. Erasure keeps one copy of the code and forgets the type. Monomorphization keeps one copy per type and then forgets the type.
+2. Monomorphization is why Rust generics are as fast as hand-written code, because each copy is compiled with the concrete type visible.
+3. The cost is code the compiler must produce for every instantiation, which shows up as build time and binary size, not as a slow program.
+4. `dyn` is Rust's erasure. It costs a 16 byte reference and an indirect jump through a vtable, and it costs one copy of the function instead of many.
+5. The type is gone in all three cases. What differs is how many copies of the code remain and whether the call target is known when the compiler emits it.
+
+## What I check before making a function generic
+
+- How often does this run? If it is once per process, the generic is buying nothing.
+- How many types will actually instantiate it? Two is fine. A generic inside a generic inside a derive is where the count stops being visible.
+- Does the body use the concrete type for anything, or does it only call trait methods? The second case is what `dyn` is for.
+- Is this on the edge of a crate that everything depends on? Then every instantiation is also a rebuild trigger.
+
+## Sources
+
+- [rustc dev guide: monomorphization](https://rustc-dev-guide.rust-lang.org/backend/monomorph.html)
+- [The Rust Programming Language: generic data types and performance](https://doc.rust-lang.org/book/ch10-01-syntax.html)
+- [The Rust Reference: trait objects](https://doc.rust-lang.org/reference/types/trait-object.html)
+- [TypeScript handbook: generics](https://www.typescriptlang.org/docs/handbook/2/generics.html)

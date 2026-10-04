@@ -1,0 +1,81 @@
+---
+caseId: "RFA-382"
+title: "A Trait Method Returning impl Trait Is Not dyn-Compatible"
+date: "2026-09-06T03:22:00+01:00"
+lastmod: "2026-09-06T03:22:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "8e87796949442301c54b22dab1814a47365f743e53d7ff7b807805553aa2644d"
+area: "diagnostics-macros"
+symptom: "A trait method returning impl Iterator works generically but makes the trait unavailable as dyn Trait."
+summary: "Return-position impl Trait lets each implementation choose an opaque concrete return type. A trait object cannot expose that per-implementation opaque layout; use a boxed iterator, static associated type, or concrete representation."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust impl Trait return method not dyn compatible", "E0038 RPITIT trait object", "trait method impl Iterator Box dyn Iterator"]
+evidence: ["Rust 1.98.1 E0038 compile failure", "receiver method returning impl Iterator", "boxed iterator repair"]
+sources: ["https://doc.rust-lang.org/reference/items/traits.html#dyn-compatibility", "https://doc.rust-lang.org/reference/types/impl-trait.html#return-position-impl-trait-in-traits-and-trait-implementations", "https://doc.rust-lang.org/reference/types/trait-object.html"]
+---
+
+I like returning `impl Iterator` because it hides a long adapter type without paying for dynamic dispatch. The same syntax inside a trait method has a boundary: the trait can work with generic callers, but it cannot automatically become `dyn Trait`.
+
+The [failing fixture](/rust-failure-atlas/evidence/RFA-382/fail.rs) defines `fn values(&self) -> impl Iterator<Item = u8>`. `&dyn Numbers` produces E0038 because the method references an `impl Trait` return.
+
+## Each implementation chooses a hidden concrete result
+
+Return-position `impl Trait` does not mean “any iterator value.” It introduces an opaque type with declared capabilities and one concrete hidden representation in the relevant definition.
+
+For a trait method, different implementations can supply different hidden iterator types. One may return a range, another a slice iterator, and another a chain of filters. Generic code knows the implementing `T`, so the compiler can select and monomorphize the corresponding hidden result.
+
+A trait object erases that `T`. Its method call needs one ABI-level return representation known to the caller. An arbitrary implementation-selected iterator layout does not provide one.
+
+The [dyn-compatibility Reference](https://doc.rust-lang.org/reference/items/traits.html#dyn-compatibility) lists opaque return types, including return-position `impl Trait` and `async fn`, as incompatible for dispatchable methods.
+
+## Box the returned interface for dynamic use
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-382/fixed.rs) returns `Box<dyn Iterator<Item = u8> + '_>`. Every call now returns the known box representation. The iterator inside may still vary by implementation.
+
+The `'_` lifetime matters. It permits the iterator to borrow from `self` rather than defaulting accidentally to a longer object lifetime. In the tiny range example no borrow occurs, but the signature remains useful for implementations iterating their own fields.
+
+This repair chooses allocation and indirect `next` calls. For configuration paths that cost is often irrelevant. For a hot scanner loop, I measure and may keep a static design.
+
+## Associated types preserve static dispatch
+
+Another design is:
+
+```rust
+trait Numbers {
+    type Iter<'a>: Iterator<Item = u8> where Self: 'a;
+    fn values(&self) -> Self::Iter<'_>;
+}
+```
+
+This exposes a relationship between each implementer and its iterator type without allocation. Generic callers work well. A trait object still needs associated-type choices that can be named and compatible with dyn rules; a generic associated type is not a shortcut to universal erasure.
+
+I use associated types when performance and static composition matter, and a boxed iterator when heterogeneous runtime selection is the actual feature.
+
+## Exclude the method if dynamic callers do not need it
+
+Adding `where Self: Sized` to the opaque-return method removes it from the dynamic surface, allowing other compatible methods to remain on `dyn Numbers`. Concrete and generic code can still use it.
+
+This is suitable for a convenience iterator while the trait object's core operations are something else. It is not suitable if iterating values is the reason the object exists.
+
+The decision should be visible in API documentation because users can see the method on the trait but cannot call it through a trait object.
+
+## async fn has the same structural issue
+
+An async function returns a hidden future type. Different implementations generate different future state machines, so a dispatchable async trait method meets the same opaque-return constraint.
+
+Boxed futures are one dynamic repair, with lifetime, `Send`, allocation, and cancellation semantics that should be explicit. The important lesson is not “box all opaque returns.” It is to choose where static identity ends and runtime erasure begins.
+
+## Avoid accidental double erasure
+
+If the service is already behind `dyn Numbers`, returning another boxed trait object creates two dispatch boundaries. This can be entirely reasonable, but I count them. Sometimes returning a concrete `Vec<u8>` is simpler when result sets are small and ownership is useful.
+
+An enum can unify a closed set of iterator shapes without heap allocation. A callback-style method can also push values to a consumer, though it changes control flow and error handling.
+
+## My design check starts from callers
+
+I list whether callers are generic or dynamic, whether the iterator borrows, whether implementations are open-ended, and whether allocation is acceptable. Then I select opaque return, associated type, enum, concrete collection, or boxed iterator.
+
+The core principle is that hiding a type statically is not the same as erasing it dynamically. `impl Trait` lets a compiler know one concrete type while callers do not name it. `dyn Trait` needs a common runtime representation. A method combining both abstractions needs an explicit bridge rather than assuming one kind of hiding supplies the other.

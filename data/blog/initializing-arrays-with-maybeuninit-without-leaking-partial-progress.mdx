@@ -1,0 +1,199 @@
+---
+title: "Initializing Arrays With MaybeUninit Without Leaking Partial Progress"
+date: "2026-11-30T09:00:00+01:00"
+tags: ["rust", "MaybeUninit", "unsafe Rust", "array initialization", "panic safety"]
+draft: false
+reviewed: true
+reviewedHash: "98a6a34effd6bcc87fe1104764ed2c5ca0a3e1ff9575447a000422c5a40ee282"
+cluster: "rust-under-the-hood"
+campaign: "authority-2026"
+opportunity: "RUST-059"
+summary: "Element-wise MaybeUninit array construction needs an initialized-prefix guard. On error or unwind it drops exactly the completed elements; only the fully initialized array crosses the unsafe boundary."
+---
+
+`MaybeUninit<T>` lets Rust code reserve storage before a valid `T` exists. It does not remember which array elements I initialized, and dropping `MaybeUninit<T>` does not run `T`'s destructor.
+
+If construction returns an error or panics after element four, the first four values leak unless I track and clean the initialized prefix.
+
+A small guard makes this unsafe pattern auditable.
+
+## Why an ordinary `[T; N]` cannot be half valid
+
+Rust assumes every ordinary `T` value satisfies its initialization and validity rules. Creating an uninitialized reference, `bool`, `Vec`, or most other types is not a temporary harmless state.
+
+The standard [`MaybeUninit` documentation](https://doc.rust-lang.org/std/mem/union.MaybeUninit.html) provides the wrapper specifically so the compiler knows the contained bytes may not hold a valid `T` yet.
+
+```rust
+let mut data: [MaybeUninit<String>; 8] =
+    [const { MaybeUninit::uninit() }; 8];
+```
+
+The outer array is fully initialized: every element is a valid `MaybeUninit<String>`. None contains a valid `String` yet.
+
+## The leaking first attempt
+
+```rust
+for (index, slot) in data.iter_mut().enumerate() {
+    slot.write(build_string(index)?);
+}
+```
+
+If `build_string(4)` returns `Err`, elements 0–3 contain valid allocated strings. The function drops the `MaybeUninit` array, which intentionally does nothing to those strings. Memory safety is preserved, but their allocations leak.
+
+On a one-time CLI exit this may be small. In a retrying server path it can be unbounded.
+
+## Track exactly one initialized prefix
+
+```rust
+use std::mem::MaybeUninit;
+
+struct InitGuard<'a, T> {
+    slots: &'a mut [MaybeUninit<T>],
+    initialized: usize,
+}
+
+impl<T> Drop for InitGuard<'_, T> {
+    fn drop(&mut self) {
+        for slot in &mut self.slots[..self.initialized] {
+            // SAFETY: only the initialized prefix is visited, once.
+            unsafe { slot.assume_init_drop() };
+        }
+    }
+}
+```
+
+The guard's invariant is:
+
+```text
+slots[0..initialized] contain valid T values
+slots[initialized..] may be uninitialized
+the guard exclusively owns cleanup responsibility for the prefix
+```
+
+Every write advances the count only after success.
+
+## A complete fallible constructor
+
+```rust
+use std::mem::MaybeUninit;
+
+fn try_build_array<T, E, F, const N: usize>(mut build: F) -> Result<[T; N], E>
+where
+    F: FnMut(usize) -> Result<T, E>,
+{
+    let mut data: [MaybeUninit<T>; N] =
+        [const { MaybeUninit::uninit() }; N];
+
+    let mut guard = InitGuard {
+        slots: &mut data,
+        initialized: 0,
+    };
+
+    for index in 0..N {
+        let value = build(index)?;
+        guard.slots[index].write(value);
+        guard.initialized += 1;
+    }
+
+    // All elements are initialized. Disarm prefix cleanup.
+    guard.initialized = 0;
+    drop(guard);
+
+    // SAFETY: every element contains one valid T; reading moves the array out.
+    // Dropping the old MaybeUninit containers does not drop their contents.
+    let initialized = unsafe {
+        (&data as *const [MaybeUninit<T>; N])
+            .cast::<[T; N]>()
+            .read()
+    };
+
+    Ok(initialized)
+}
+```
+
+The unsafe conversion is isolated after the loop. There is no error path between proving all `N` writes and moving out the array.
+
+## Panic follows the same guard path
+
+If `build(index)` panics and the program unwinds, Rust drops local variables. The guard drops the completed prefix.
+
+If the binary uses `panic = "abort"`, destructors do not run because the process terminates. Panic safety under unwinding and cleanup after process abort are different requirements.
+
+The guard also protects an early `return` or `?`, which is the more common production path.
+
+## Increment after the write
+
+This order is required:
+
+```rust
+let value = build(index)?;
+guard.slots[index].write(value);
+guard.initialized += 1;
+```
+
+Incrementing first tells `Drop` that an uninitialized slot is valid. If construction then fails, `assume_init_drop` on that slot causes undefined behaviour.
+
+The counter is part of the safety proof, not ordinary bookkeeping.
+
+## Never create a reference to uninitialized `T`
+
+I operate through `MaybeUninit::write` or raw pointers. I do not cast the array to `&mut [T]` during construction.
+
+A reference asserts that its target is a valid value for its lifetime. Even if I promise not to read the uninitialized elements, constructing such a reference is already wrong.
+
+The [Rustonomicon uninitialized-memory chapter](https://doc.rust-lang.org/nomicon/unchecked-uninit.html) explains this distinction and the need for raw pointers during field-wise initialization.
+
+## Test drop counts, not only returned values
+
+I use a type with an atomic live counter:
+
+```text
+construct -> live += 1
+drop      -> live -= 1
+```
+
+For every failure index from 0 through N, I make the builder return `Err` and assert the live count returns to zero. Then I panic at each index under `catch_unwind` and make the same assertion.
+
+For success I assert:
+
+```text
+N values returned
+all values correct
+live count is N before result drops
+live count returns to zero after result drops
+```
+
+Miri is valuable for finding invalid reads and double drops, but a clean Miri run does not replace writing down the invariant.
+
+## Zero-length arrays and zero-sized values still use the proof
+
+When `N` is zero, the loop performs no writes, the initialized prefix is empty, and the final conversion returns a valid empty array. The code should not special-case it through invalid pointer arithmetic.
+
+For a zero-sized `T`, several elements may share an address, but they remain distinct logical values with distinct destructor calls. The counter tracks initialized elements, not unique addresses or allocated bytes. I test a zero-sized type implementing `Drop` because byte-oriented reasoning can otherwise hide a missed or duplicate destructor.
+
+The same point applies to capacity: reserving zero bytes does not remove the requirement to create and destroy the correct number of values.
+
+## Prefer a safe constructor when it fits
+
+Standard-library and crate APIs can provide safe array initialization for many cases. I use them when available for the project's Rust version and required error type.
+
+I reach for `MaybeUninit` when implementing a low-level container, FFI output buffer, performance-sensitive primitive, or compatibility layer that cannot use a safe helper.
+
+The unsafe code should remain smaller than the test explaining it.
+
+## My review checklist
+
+I verify:
+
+- storage is `[MaybeUninit<T>; N]`, never uninitialized `[T; N]`;
+- initialized count starts at zero;
+- each slot is written once before count increments;
+- error and unwind drop exactly the prefix;
+- cleanup never sees an uninitialized slot;
+- success disarms the guard exactly once;
+- conversion happens only after all elements are valid;
+- no reference to uninitialized `T` is created;
+- zero-length arrays work;
+- tests cover every failure position and drop count.
+
+`MaybeUninit` removes automatic destruction because automatic destruction cannot know what is valid. The prefix guard restores that knowledge explicitly, making partial progress safe on every exit path.

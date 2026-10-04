@@ -1,0 +1,237 @@
+---
+title: "AI-Resistant Rust Interview Problems: Reasoning Beyond Syntax"
+date: "2026-09-05T09:00:00+01:00"
+tags: ["rust", "interviews", "ownership", "async rust", "concurrency", "ai-resistant interviews"]
+draft: true
+reviewed: false
+summary: "Five Rust interview problems that test ownership, aliasing, async state, and memory ordering through explanation and changing constraints—not syntax recall."
+---
+
+Most Rust interview questions are easy to search. Many are also easy to answer without understanding Rust.
+
+"What is ownership?" invites a definition. "What is `Send`?" invites another definition. A candidate, or an AI tool, can produce acceptable words while missing the behaviour that matters in a real program.
+
+I prefer a different kind of problem. Start with small code. Ask for a prediction. Then change one condition and ask which part of the explanation must change.
+
+I call these **AI-resistant** because they resist answer matching. The name is not a promise that an AI cannot solve them. No public question stays secret, and using AI is not itself a problem. The useful signal is whether an engineer can inspect an answer, find the weak assumption, and verify it.
+
+This first set has five problems. Each one includes the answer because this is a study resource, not a hidden employer question bank.
+
+## How to use these problems
+
+For a candidate, stop before each explanation and write down four things:
+
+1. Does the program compile?
+2. Which language rule decides the result?
+3. What would become unsafe or ambiguous without that rule?
+4. What is the smallest repair that preserves the intended behaviour?
+
+For an interviewer, do not grade the first prediction too heavily. The useful part starts when the constraint changes. Ask the candidate to disprove their own model with a compiler, Miri, a test, or a smaller example.
+
+## Problem 1: the mutable borrow that waits
+
+Does this compile?
+
+```rust
+fn main() {
+    let mut numbers = vec![10, 20, 30];
+    numbers.push(numbers.len());
+}
+```
+
+It does.
+
+The method call needs a mutable reference to `numbers`, but the argument calls `numbers.len()` through a shared reference. At first sight, these borrows overlap.
+
+Rust accepts this specific shape using a **two-phase borrow**. The compiler reserves the mutable borrow for the method receiver, evaluates the arguments, and activates the mutable borrow when the call happens. During the reservation phase, the shared borrow needed by `len()` is permitted.
+
+Now make the receiver borrow explicit:
+
+```rust
+fn main() {
+    let mut numbers = vec![10, 20, 30];
+    let receiver = &mut numbers;
+    let length = numbers.len();
+    receiver.push(length);
+}
+```
+
+This version is rejected. The explicit mutable borrow is active from its creation through its later use. `numbers.len()` tries to borrow `numbers` while that mutable borrow is live.
+
+The weak answer is "non-lexical lifetimes make the first one work." Non-lexical lifetimes are relevant to many borrow boundaries, but they do not describe the special reservation and activation used here.
+
+**Constraint change:** replace the method with a free function taking `&mut Vec<usize>` and the length as a second argument. Does the same allowance apply? The candidate should test it instead of extending the method-call rule by intuition.
+
+The compiler team documents which implicit mutable borrows receive this treatment in the [rustc development guide](https://rustc-dev-guide.rust-lang.org/borrow-check/two-phase-borrows.html).
+
+## Problem 2: two different indices are not yet a proof
+
+Write a function returning mutable references to two different elements:
+
+```rust
+fn two_mut<T>(items: &mut [T], i: usize, j: usize) -> (&mut T, &mut T) {
+    assert_ne!(i, j);
+    (&mut items[i], &mut items[j])
+}
+```
+
+The assertion is true at runtime, but this implementation is rejected. Indexing is expressed through a borrow of the slice. From the two indexing operations alone, the borrow checker does not derive that `i` and `j` refer to disjoint locations.
+
+An assertion is also not a general proof consumed by the borrow checker. It prevents the equal-index execution, but it does not change how the two indexing expressions are modelled.
+
+A safe repair is to create two disjoint slices first:
+
+```rust
+fn two_mut<T>(items: &mut [T], i: usize, j: usize) -> (&mut T, &mut T) {
+    assert_ne!(i, j);
+
+    if i < j {
+        let (left, right) = items.split_at_mut(j);
+        (&mut left[i], &mut right[0])
+    } else {
+        let (left, right) = items.split_at_mut(i);
+        (&mut right[0], &mut left[j])
+    }
+}
+```
+
+`split_at_mut` has a safe signature because its implementation establishes that the returned slices do not overlap. After the split, each element borrow comes from a different slice.
+
+If the actual task is only swapping values, the smaller repair is `items.swap(i, j)`. A senior answer notices when the requested abstraction is larger than the product requirement.
+
+**Constraint change:** return mutable references for an arbitrary list of unique indices. Sorting the indices helps establish regions, but the API, ordering, duplicate handling, and cost now need an explicit design. Reaching for `unsafe` before writing those invariants is not a strong answer.
+
+## Problem 3: a future becomes non-`Send`
+
+Why does this fail when a runtime requires a `Send` future?
+
+```rust
+use std::future::pending;
+use std::rc::Rc;
+
+fn require_send<T: Send>(_: T) {}
+
+async fn work() {
+    let local = Rc::new(String::from("result"));
+    pending::<()>().await;
+    println!("{local}");
+}
+
+fn main() {
+    require_send(work());
+}
+```
+
+An async function is translated into a state machine. Values needed after an `.await` must be stored in that state machine. Here, `local` is used after the suspension point, so the future contains an `Rc<String>` while suspended. `Rc` is not `Send`; therefore the future is not `Send`.
+
+"Async Rust needs `Arc`" is the common overcorrection. If `local` is only needed before the suspension, remove it from the future state instead:
+
+```rust
+async fn work() {
+    {
+        let local = Rc::new(String::from("result"));
+        println!("{local}");
+    }
+
+    pending::<()>().await;
+}
+```
+
+Now the `Rc` is destroyed before `.await`. The future does not need to carry it between polls.
+
+Use `Arc` when ownership really crosses tasks or threads. Use a smaller scope when it does not. They solve different problems.
+
+**Constraint change:** replace `Rc` with a mutex guard. Even if the guard type is `Send`, should it be held across `.await`? Type correctness is only the first question; lock duration, cancellation, and deadlock risk are design questions.
+
+## Problem 4: `_` is not `_value`
+
+Does this use a moved value?
+
+```rust
+fn main() {
+    let name = String::from("Ferris");
+    let _ = name;
+    println!("{name}");
+}
+```
+
+It compiles. The wildcard pattern `_` does not bind the value. In this form it does not move `name` into a new binding.
+
+Change one character of meaning:
+
+```rust
+fn main() {
+    let name = String::from("Ferris");
+    let _name = name;
+    println!("{name}");
+}
+```
+
+This fails. `_name` is a normal binding whose name starts with an underscore. It suppresses an unused-variable warning, but it still takes ownership.
+
+This distinction appears in cleanup code and pattern matching. An underscore prefix communicates "I intentionally do not use this binding." A wildcard communicates "do not bind this part."
+
+**Constraint change:** make the value a guard whose `Drop` releases a resource. Ask when each version destroys it. The problem has moved from borrow checking into observable destruction order.
+
+The [Rust Reference on identifier and wildcard patterns](https://doc.rust-lang.org/reference/patterns.html) is the source to verify the distinction.
+
+## Problem 5: atomics without a published relationship
+
+Assume two threads share these atomics:
+
+```rust
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+static VALUE: AtomicUsize = AtomicUsize::new(0);
+static READY: AtomicBool = AtomicBool::new(false);
+```
+
+The writer does this:
+
+```rust
+VALUE.store(42, Ordering::Relaxed);
+READY.store(true, Ordering::Relaxed);
+```
+
+The reader does this:
+
+```rust
+if READY.load(Ordering::Relaxed) {
+    assert_eq!(VALUE.load(Ordering::Relaxed), 42);
+}
+```
+
+Every individual access is atomic. That does not establish the cross-variable ordering the assertion assumes. `Relaxed` prevents tearing and participates in the modification order of each atomic, but seeing `READY == true` is not the synchronization edge that publishes the preceding `VALUE` store.
+
+One repair is to publish readiness with release ordering and observe it with acquire ordering:
+
+```rust
+VALUE.store(42, Ordering::Relaxed);
+READY.store(true, Ordering::Release);
+
+if READY.load(Ordering::Acquire) {
+    assert_eq!(VALUE.load(Ordering::Relaxed), 42);
+}
+```
+
+When the acquire load observes the value written by the release store, earlier operations in the writer happen before later operations in the reader. The relaxed `VALUE` operations participate in that published relationship.
+
+This is not a recipe for replacing locks. Real code also needs to define repeated writes, multiple writers, shutdown, and ownership of the published data.
+
+**Constraint change:** allow the writer to replace the value repeatedly while readers run. A one-time ready flag is no longer an adequate protocol. Ask for the state machine before choosing orderings.
+
+The Rust Nomicon's [atomics chapter](https://doc.rust-lang.org/nomicon/atomics.html) is a starting point, but atomics deserve tests and a small protocol, not a remembered ordering table.
+
+## What these questions actually measure
+
+The five problems cover different rules, but the same engineering habits:
+
+- separating a runtime fact from something the type system can establish;
+- tracing what is stored or borrowed instead of reading only surface syntax;
+- choosing the smallest safe API;
+- explaining the failure that a language rule prevents;
+- verifying a claim when a one-line source change can invalidate it.
+
+This is closer to daily Rust work than reciting definitions. It also leaves room for AI use. A candidate may ask a tool for hypotheses, but they still need to decide which explanation survives the compiler and the changed constraint.
+
+Continue with [cross-language interview problems](/blog/ai-resistant-cross-language-interview-problems) or the [language-agnostic data structures and algorithms set](/blog/ai-resistant-data-structures-algorithms-interview-problems).

@@ -1,0 +1,115 @@
+---
+caseId: "RFA-150"
+title: "Rust macro_rules: Metavariables Repeat Different Numbers of Times"
+date: "2026-09-05T15:50:00+01:00"
+lastmod: "2026-09-05T15:50:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "f9d6ccfcbe17112b70f74f3684625d00e77c7c59ccf35c034f866af65346e268"
+area: "diagnostics-macros"
+symptom: "A macro_rules invocation matches two lists but expansion fails because one metavariable repeats two times while another repeats one time."
+summary: "macro_rules repetition is structural, not an implicit zip operation. Metavariables expanded in one repetition must have compatible repetition paths and counts; encode related values as pairs in the matcher."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets"]
+profiles: ["check", "dev", "release", "test"]
+searchTerms: ["Rust macro variable repeats different number times", "macro_rules zip two repetitions", "metavariable repetition count mismatch"]
+evidence: ["Rust 1.98.1 macro diagnostic", "two-versus-one repetition", "paired-input repair"]
+sources: ["https://doc.rust-lang.org/reference/macros-by-example.html#repetitions", "https://doc.rust-lang.org/reference/macros-by-example.html#metavariables", "https://doc.rust-lang.org/reference/macros-by-example.html#transcribing"]
+---
+
+The confusing part of this macro error is that matching succeeds. Both lists are valid. The compiler complains only when it tries to transcribe them together:
+
+```text
+meta-variable `left` repeats 2 times, but `right` repeats 1 time
+```
+
+The [failing program](/rust-failure-atlas/evidence/RFA-150/fail.rs) accepts identifiers before and after a semicolon, then attempts to print one left and one right inside the same repetition. Rust refuses to invent a pairing rule.
+
+## macro_rules repeats syntax trees, not collection APIs
+
+It is tempting to read two metavariable lists like two vectors and expect a `zip`. Declarative macros do not evaluate that kind of algorithm. The matcher records fragments inside a repetition structure, and the transcriber must follow compatible structure.
+
+The [Reference repetition rules](https://doc.rust-lang.org/reference/macros-by-example.html#repetitions) require a metavariable to appear with the same number, kind, and nesting order of repetitions in the transcriber as in the matcher. It also says that each repetition in the transcriber must contain at least one metavariable and that multiple metavariables in one repetition must repeat the same number of times.
+
+In the failing invocation:
+
+```rust
+print_pairs!(alpha, beta; one);
+```
+
+`left` has two captured fragments. `right` has one. The transcriber contains both under one `*`, so there is no valid expansion count.
+
+Should the macro emit one row and ignore `beta`? Reuse `one` twice? Reject only at runtime? Each behaviour would be a different language. `macro_rules` makes the ambiguity a compile error.
+
+## The matcher should express the relationship
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-150/fixed.rs) changes the input grammar to pairs:
+
+```rust
+macro_rules! print_pairs {
+    ($( $left:ident => $right:ident ),* $(,)?) => {
+        $(
+            println!("{} -> {}", stringify!($left), stringify!($right));
+        )*
+    };
+}
+```
+
+Now each repetition captures one `left` and one `right` together. Their cardinality cannot diverge. The call site also shows the relation directly:
+
+```rust
+print_pairs!(alpha => one, beta => two);
+```
+
+I prefer this over producing two independent lists and hoping their positions agree. It moves an invariant into the syntax accepted by the macro.
+
+## Think in repetition paths
+
+For nested macros, raw counts are not enough. I draw a path for each metavariable:
+
+```text
+$field: outer struct repetition -> inner field repetition
+$name:  outer struct repetition
+```
+
+If I try to use `$name` as though it independently repeated for every field, or move `$field` outside its inner level, transcription fails. The variable is not simply “a list available everywhere.” Its captured shape includes where repetition occurred.
+
+This model helps with diagnostics that say a variable is still repeating at a certain depth. I compare matcher nesting and transcriber nesting one layer at a time.
+
+The [metavariable rules](https://doc.rust-lang.org/reference/macros-by-example.html#metavariables) also matter because fragments are opaque syntax categories when forwarded to another macro, with limited exceptions. Repetition shape and fragment kind together form the macro's real input contract.
+
+## What if I truly need two independent lists?
+
+Sometimes two lists are independently meaningful and only later need combination. `macro_rules` has no general arithmetic or iterator zip facility. I then choose one of these designs:
+
+- change the invocation to provide explicit pairs;
+- use recursive helper rules that consume one item from each side and emit a targeted error when one side ends first;
+- generate separate declarations rather than a pairwise expansion;
+- move complex validation into a procedural macro when the syntax deserves a richer parser and diagnostic.
+
+Recursive matching can emulate a zip, but I use it only when the call-site grammar cannot change. Explicit pairs are usually easier to read and produce better errors near the missing partner.
+
+## Keep the minimal expansion visible
+
+When a large macro fails, I remove the generated body until only the repetition remains:
+
+```rust
+$( stringify!($left); stringify!($right); )*
+```
+
+If that still fails, the problem is structural rather than caused by the generated types. I then test calls with zero, one, and two items on each side. A `2 × 1` input exposes the mismatch immediately.
+
+I also name metavariables according to their relation—`field_name` and `field_type` inside one pair—rather than generic `a` and `b`. This makes the intended grammar reviewable without expanding the macro mentally.
+
+## My repair sequence
+
+For “repeats N times” diagnostics, I use this order:
+
+1. Locate the exact repetition operator in the transcriber.
+2. List every metavariable used inside it.
+3. Trace each variable back through matcher repetition levels.
+4. Check whether those variables were captured together or in independent groups.
+5. Encode required cardinality in the matcher, preferably as one repeated unit.
+6. Add compile tests for empty, singleton, multiple, and mismatched-looking inputs.
+
+The wider principle is useful for API design too: if two values must exist together, represent them together. The compiler error is not merely a limitation of macros. It points at an underspecified relationship in the input language. Once the matcher says “a sequence of pairs,” expansion becomes mechanical and the call site becomes harder to misuse.

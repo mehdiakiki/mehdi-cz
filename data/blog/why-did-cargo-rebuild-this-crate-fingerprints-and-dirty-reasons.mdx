@@ -1,0 +1,155 @@
+---
+title: "Why Did Cargo Rebuild This Crate? Reading Fingerprints and Dirty Reasons"
+date: "2026-09-09T07:20:00+01:00"
+lastmod: "2026-09-09T07:20:00+01:00"
+tags: ["rust", "cargo", "compile times", "fingerprints", "build cache"]
+draft: false
+reviewed: true
+reviewedHash: "cb32cc23902cb920090e6b40b8555f662b2a60a023c4f5b14082b1b5d5fbf772"
+cluster: "rust-under-the-hood"
+campaign: "editorial"
+summary: "Cargo can tell you exactly why it recompiled a crate. Here is the CARGO_LOG fingerprint command and six reproduced triggers, with the dirty reason each one prints."
+---
+
+Cargo will tell you why it rebuilt a crate, if you ask it. The command is `CARGO_LOG=cargo::core::compiler::fingerprint=info cargo build`, and it prints one dirty reason per unit that was not fresh. Those reasons are precise and they distinguish between cases that look identical from the outside.
+
+I reproduced six triggers to see what each one prints. They do not all mean the same thing: some are true invalidations, some are cache misses for a configuration never built before.
+
+Toolchain: `rustc 1.95.0-nightly (3a70d0349 2026-02-27)` and `cargo 1.95.0-nightly (f298b8c82 2026-02-24)` on x86-64 Linux. The fixture is a three-crate workspace where `app` depends on `core-b`, which depends on `core-a`, and `core-b` has a build script. It lives in `experiments/rust-atlas/build-times/diag`, and `dirty-reasons.sh` reproduces every case below.
+
+If your shell wraps `cargo` in anything that summarises output, these log lines disappear. I call `$HOME/.cargo/bin/cargo` by absolute path.
+
+## Trigger 1: a source file was edited
+
+```text
+[core-a]: dirty: FsStatusOutdated(StaleItem(ChangedFile {
+    reference: "WS/target/debug/.fingerprint/core-a-679538f40b6010bc/dep-lib-core_a",
+    reference_mtime: FileTime { seconds: 1788937023, ... },
+    stale: "WS/core-a/src/lib.rs",
+    stale_mtime: FileTime { seconds: 1788937024, ... } }))
+[core-b]: dirty: FsStatusOutdated(StaleDepFingerprint { unit: UnitIndex(1) })
+[app]:    dirty: FsStatusOutdated(StaleDepFingerprint { unit: UnitIndex(1) })
+```
+
+Two different reasons appear here. `StaleItem(ChangedFile)` is the origin: a file listed in the dep-info of `core-a` is newer than the fingerprint that recorded it. `StaleDepFingerprint` is the propagation: `core-b` and `app` are dirty only because something below them is.
+
+Notice that for source files, which Cargo learns about from rustc's dep-info output, the comparison is between modification times and not content hashes. A file that you save without changing anything is still newer than the fingerprint, and it still triggers a rebuild.
+
+## Trigger 2: RUSTFLAGS changed
+
+```text
+[app]:    err: failed to read `WS/target/debug/.fingerprint/app-cdc54fc7d072085f/bin-app`
+[core-a]: err: failed to read `WS/target/debug/.fingerprint/core-a-39bf73763ed67e17/lib-core_a`
+[core-b]: err: failed to read `WS/target/debug/.fingerprint/core-b-ee848f903ead8c46/lib-core_b`
+```
+
+Trimmed: the run printed two more of the same line, for `core-b`'s build script.
+
+This is not an invalidation. There is no `dirty:` line at all. The directory name under `.fingerprint` carries a hash of the compilation settings, so a different `RUSTFLAGS` value asks for a fingerprint that was never written. Everything recompiles because it is a new cache entry.
+
+Two mechanisms produce that same shape and are worth separating. The feature set has been part of a unit's hash since 2016, so different features have always meant a separate cache entry. `RUSTFLAGS` is newer, and is deliberately kept out of the metadata hash that names the artifact files. It entered the fingerprint directory hash only in Cargo 1.85, of February 2025. Before that, changing `RUSTFLAGS` did discard the cache and the folklore was right.
+
+So the result below holds since Cargo 1.85, not before. I built with the new flags, then again with the same flags, then again with the original flags:
+
+| build | crates recompiled |
+| --- | ---: |
+| first build with `RUSTFLAGS="-C debuginfo=1"` | 3 |
+| same flags again | 0 |
+| switched back to no flags | 0 |
+
+Both configurations live in the cache at once. Alternating between them costs one build each, once, and then nothing. It does not thrash.
+
+It does cost disk space, plus one full build the first time a CI job uses a flag set the local machine never used. That trade is why `build.warnings` exists, described in "Denying Rust Warnings Without Throwing Away the Cargo Cache".
+
+## Trigger 3: the feature set changed between two commands
+
+Running `cargo build` and then `cargo build -p core-a` asks for two different versions of `core-a`, because the workspace build activates a feature that the single-package build does not.
+
+```text
+[core-a]: err: failed to read `WS/target/debug/.fingerprint/core-a-22e1851aafc9c500/lib-core_a`
+```
+
+The same shape as the flags case: a new directory hash, one extra compile, and then both variants stay cached. Going back to the workspace build recompiled nothing.
+
+The large version of this is a workspace where a package is compiled twice inside one command, because a build dependency and a normal dependency activate different features. The rules that decide when features unify are in "Cargo Feature Unification Across Workspaces, Host Tools, and Targets".
+
+## Trigger 4: the profile changed
+
+Adding `opt-level = 1` to `[profile.dev]` produced exactly the same shape:
+
+```text
+[core-a]: err: failed to read `WS/target/debug/.fingerprint/core-a-606f1d24647bed36/lib-core_a`
+[core-b]: err: failed to read `WS/target/debug/.fingerprint/core-b-bcfea295921169b4/run-build-script-build-script-build`
+```
+
+Trimmed: two more lines of the same form. Note the second line shown here. The build script's own run is a separate unit with its own fingerprint, and it is also keyed by the profile. So a profile change reruns build scripts, not just compilations.
+
+## Trigger 5: an environment variable read at compile time
+
+`core-a` contains `option_env!("DIAG_TAG")`. rustc records that read in the dep-info file, so Cargo tracks the variable. Changing it prints something different from every case above:
+
+```text
+[core-a]: dirty: FsStatusOutdated(StaleItem(ChangedEnv {
+    var: "DIAG_TAG", previous: Some("one"), current: Some("two") }))
+[core-b]: dirty: EnvVarChanged {
+    name: "DIAG_TAG", old_value: Some("one"), new_value: Some("two") }
+[app]:    dirty: UnitDependencyInfoChanged { unit: UnitIndex(2) }
+```
+
+Trimmed: `core-b` also printed a `UnitDependencyInfoChanged` line. This one is a real invalidation. The variable is part of the fingerprint content, not part of the directory name, so there is only ever one cache entry and each new value overwrites it.
+
+| build | crates recompiled |
+| --- | ---: |
+| `DIAG_TAG=one` after a plain build | 3 |
+| `DIAG_TAG=one` again | 0 |
+| back to `DIAG_TAG=two` | 3 |
+
+That is the difference that matters. Flags and features cost one build per configuration. A tracked environment variable costs a build on every alternation, and if an editor, a shell, and a CI job disagree about one, nobody notices.
+
+The `core-b` line is a second mechanism on the same variable: its build script declared `cargo::rerun-if-env-changed=DIAG_TAG`, so the script reran too.
+
+## Trigger 6: rerun-if-changed points at a file that does not exist
+
+`core-b/build.rs` declares `cargo::rerun-if-changed=schema/table.txt`. I deleted that file and left the declaration:
+
+```text
+[core-b]: dirty: FsStatusOutdated(StaleItem(MissingFile { path: "WS/core-b/schema/table.txt" }))
+[core-b]: dirty: FsStatusOutdated(StaleDepFingerprint { unit: UnitIndex(3) })
+[app]:    dirty: FsStatusOutdated(StaleDepFingerprint { unit: UnitIndex(2) })
+```
+
+I ran the build three times and the same three lines appeared every time. A declared input that does not exist can never be proven unchanged, so the build script unit is dirty forever, and the library and binary above it follow.
+
+This is the quietest of the six, because nothing fails. It usually happens when a generated file moved, or a path is only correct on one platform. How to declare a build script's inputs so this cannot happen is in "Why Cargo Build Scripts Rerun and How to Make Them Predictable".
+
+## Fingerprints and the incremental cache are two different layers
+
+Everything above is Cargo deciding whether to invoke rustc at all. It is a coarse decision about a whole compilation unit.
+
+If Cargo does invoke rustc, a second and finer cache takes over inside the compiler. rustc keeps a dependency graph of its own computations and tries to prove which results survive the edit. A build can be slow because the first layer decided correctly and the second layer still had to redo most of the work. That layer is described in "What Invalidates Rust's Incremental Compilation Cache".
+
+So "Cargo rebuilt this crate" and "rustc recompiled this code" are different statements. The fingerprint log answers the first one only.
+
+## What I check when a crate rebuilds and I cannot explain it
+
+1. Run the build twice in a row with no changes. If the second build compiles anything, the cause is permanent, not an edit.
+2. Read the fingerprint log and separate `dirty:` lines from `err: failed to read` lines. The first group is invalidation. The second group is a configuration that was never built.
+3. If it is `err: failed to read`, compare the directory hashes between the two commands. Something in the settings differs: flags, features, profile, or target.
+4. If it is `StaleItem(MissingFile)`, find the build script that declared the path.
+5. If it is `ChangedEnv` or `EnvVarChanged`, find every place that sets the variable, including the editor and the CI job.
+6. If it is `StaleItem(ChangedFile)` on a file nobody edited, look for a generator or formatter that rewrites files during the build.
+
+The general rule I use is simple. A rebuild that happens once after a change is normal. A rebuild that happens on every single invocation is a declaration bug, and the log names the declaration.
+
+The wider tree that this fits into is in [Why Is My Rust Build Slow? A Diagnostic Tree](/blog/why-is-my-rust-build-slow-a-diagnostic-tree).
+
+## Sources
+
+- [Build cache](https://doc.rust-lang.org/cargo/guide/build-cache.html), the Cargo book, on the `target/` layout and what a fingerprint keys on.
+- [Build scripts](https://doc.rust-lang.org/cargo/reference/build-scripts.html), the Cargo book, on `rerun-if-changed` and `rerun-if-env-changed`.
+- [Environment variables](https://doc.rust-lang.org/cargo/reference/environment-variables.html), the Cargo book, on which variables Cargo sets and which ones it tracks.
+- [Features](https://doc.rust-lang.org/cargo/reference/features.html), the Cargo book, on how a command's feature selection is decided.
+- [Cargo 1.85 changelog](https://doc.rust-lang.org/cargo/CHANGELOG.html), which records "Prevented build caches from being discarded after changes to RUSTFLAGS" under Fixed.
+- [cargo pull request 14830](https://github.com/rust-lang/cargo/pull/14830), the change itself, closing [issue 8716](https://github.com/rust-lang/cargo/issues/8716); features entered the unit hash much earlier, in [pull request 3102](https://github.com/rust-lang/cargo/pull/3102).
+- [Cargo architecture](https://doc.crates.io/contrib/architecture/index.html), the Cargo contributor guide, on where the fingerprint code sits in the build pipeline.
+- [Incremental compilation](https://rustc-dev-guide.rust-lang.org/queries/incremental-compilation.html), the rustc dev guide, on the second cache layer inside the compiler.

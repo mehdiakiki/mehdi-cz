@@ -1,0 +1,76 @@
+---
+caseId: "RFA-238"
+title: "String::with_capacity Reserves Bytes, Not Unicode Characters"
+date: "2026-09-06T00:18:00+01:00"
+lastmod: "2026-09-06T00:18:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "6909111c58a2f3d93cb0b7ad0a9e7575af625dfcb30703cf3a334344e970b494"
+area: "ffi-targets"
+symptom: "A String reserved for two units grows when two non-ASCII characters are pushed into it."
+summary: "String length and capacity use UTF-8 bytes. Reserve from a known byte length, or derive a conservative byte bound when the input is counted in Unicode scalar values; never treat capacity as display width."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets with alloc"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust String capacity bytes or characters", "with_capacity Unicode characters Rust", "preallocate String UTF-8 length"]
+evidence: ["Rust 1.98.1 two-scalar UTF-8 text", "two-byte reservation growth", "byte-length reservation repair"]
+sources: ["https://doc.rust-lang.org/std/string/struct.String.html#method.with_capacity", "https://doc.rust-lang.org/std/string/struct.String.html#method.capacity", "https://doc.rust-lang.org/std/primitive.str.html#method.len"]
+---
+
+I reserved a `String` for two characters and then pushed two `é` characters. The string needed more storage than I had planned. `String` capacity is measured in UTF-8 bytes, not characters.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-238/fail.rs) creates `String::with_capacity(2)` and appends `éé`. Those two Unicode scalar values occupy four bytes, so the allocation grows beyond the original request.
+
+## Capacity follows the representation
+
+[`String::with_capacity`](https://doc.rust-lang.org/std/string/struct.String.html#method.with_capacity) requests space for at least the specified number of bytes. [`String::capacity`](https://doc.rust-lang.org/std/string/struct.String.html#method.capacity) reports byte capacity too.
+
+A Rust `String` is a growable UTF-8 byte buffer with a validity invariant. ASCII characters occupy one byte. Other scalar values occupy two, three, or four bytes. The number returned by `chars().count()` cannot generally predict required storage.
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-238/fixed.rs) uses the source string's [`len`](https://doc.rust-lang.org/std/primitive.str.html#method.len), which is its exact byte length, and proves the append does not need to grow beyond the initial allocation.
+
+## Capacity is a lower bound, not an exact allocation promise
+
+`with_capacity(n)` guarantees capacity of at least `n`. The allocator or collection can provide more. A test requiring `capacity() == n` is therefore too strict even for ASCII.
+
+I test the property I need: initial capacity covers the known byte length, and appending that content leaves capacity unchanged. I do not encode one allocator's growth factor into application tests.
+
+Similarly, shrinking methods do not promise one universal physical allocation strategy. Capacity is useful for reuse and performance reasoning, but it is not a portable memory profiler by itself.
+
+## Character count is not display width either
+
+Switching from bytes to `chars().count()` solves only a scalar-count question. One user-visible symbol can contain several Unicode scalar values. A combining accent and an emoji sequence make this common.
+
+Terminal columns add another model: some displayed characters occupy two columns, zero columns, or environment-dependent width. A text box can care about grapheme clusters, while a protocol frame cares about bytes.
+
+I name the unit in limits and metrics: `max_utf8_bytes`, `scalar_count`, `grapheme_count`, or `display_columns`. A variable called `length` invites incompatible interpretations across layers.
+
+## Reserving from exact existing text is easy
+
+When I concatenate known strings, their byte lengths can be summed with checked arithmetic and passed to `String::with_capacity`. This avoids scanning by characters and exactly matches the stored representation.
+
+For generated characters, each Rust `char` needs at most four UTF-8 bytes. A conservative bound can use `count * 4`, but I check multiplication overflow and decide whether that potentially large reservation is worthwhile. Often incremental growth is safer than trusting an unbounded external count.
+
+`reserve` and `try_reserve` also take additional bytes relative to current length. At an untrusted boundary, `try_reserve` can report allocation failure, but the application still needs a reasonable maximum before attempting resource use.
+
+## Byte limits can split valid text if applied late
+
+A database or network field limited to N bytes cannot accept text merely because it contains at most N characters. Validation uses `str::len()` for the encoded UTF-8 byte contract.
+
+Truncating at byte N can land inside a multibyte scalar and panic or create invalid bytes if performed unsafely. I find a valid character boundary at or before the limit and define whether truncation, rejection, or another encoding is correct.
+
+For user-visible limits, I may enforce both a storage-byte maximum and a grapheme policy. They protect different resources and should produce different validation messages.
+
+## Reallocation invalidates pointers and slices
+
+The mistake is not only one extra allocation. Growing a `String` can move its backing buffer. Raw pointers or unsafe views obtained before the push can become invalid, just like pointers into a growing `Vec`.
+
+Safe Rust prevents ordinary borrowed string slices from coexisting with a mutable push. Unsafe FFI code must not assume a character-based reservation guarantees pointer stability. I finish mutation before exporting pointers, or I reserve a proven byte bound and still respect every later capacity-changing operation.
+
+## My regression uses non-ASCII input deliberately
+
+An ASCII-only test makes byte count and character count equal, hiding the model mismatch. The fixture uses two `é` scalars and asserts both facts: scalar count is two, byte length is four.
+
+Application tests add one-byte ASCII, a four-byte scalar, combining text, empty input, and content exactly at a storage limit. Performance tests measure reallocation under realistic language distributions rather than one English sample.
+
+The core principle is that collection capacity follows stored representation. Rust stores `String` as UTF-8 bytes, so its length, reserve, and capacity APIs speak bytes. I convert from higher-level text units only at a named boundary and never use storage capacity as a proxy for what a user sees.

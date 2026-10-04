@@ -1,0 +1,114 @@
+---
+caseId: "RFA-167"
+title: "Why Cursor::new Overwrites an Existing Vec From Position Zero"
+date: "2026-09-05T17:06:00+01:00"
+lastmod: "2026-09-05T17:06:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "0147adcd070e616a5a4cf335a30888f5668df54db6c03a3f6e341bba98c4c40f"
+area: "concurrency-memory"
+symptom: "Writing to Cursor::new around a populated Vec overwrites bytes at the beginning rather than appending to the vector."
+summary: "A new Cursor always starts at position zero independently of its inner buffer length. Set the position to the end before appending, or use a fresh empty destination when replacement is intended."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets with std::io"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust Cursor new Vec overwrites beginning",
+    "Cursor Vec append starts position zero",
+    "set Cursor position to end before write",
+  ]
+evidence: ["Rust 1.98.1 runtime assertion", "pre-populated byte vector", "set_position repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/std/io/struct.Cursor.html#method.new",
+    "https://doc.rust-lang.org/std/io/struct.Cursor.html#method.set_position",
+    "https://doc.rust-lang.org/std/io/struct.Cursor.html#method.position",
+  ]
+---
+
+Wrapping a populated vector in an I/O writer can look like turning the vector into an append destination. `Cursor` adds seek position, and its initial position is zero.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-167/fail.rs) wraps `[1, 2, 3]`, writes `[9, 8]`, and expects `[1, 2, 3, 9, 8]`. The actual bytes are `[9, 8, 3]`. The write replaced the first two positions.
+
+## Buffer contents and cursor position are separate state
+
+[`Cursor::new`](https://doc.rust-lang.org/std/io/struct.Cursor.html#method.new) creates a cursor with position zero. It does this for an empty vector, a populated vector, a byte array, or another supported inner type.
+
+The inner buffer answers “which bytes exist?” The position answers “where does the next read or write begin?” One does not infer the other.
+
+I picture the failing state as:
+
+```text
+bytes:    [1, 2, 3]
+position:  ^ 0
+write:    [9, 8]
+result:   [9, 8, 3]
+```
+
+This is ordinary seekable-file behaviour in memory. Opening an existing file does not always imply append mode either.
+
+## Set the position explicitly for append
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-167/fixed.rs) reads the buffer length and calls [`set_position`](https://doc.rust-lang.org/std/io/struct.Cursor.html#method.set_position):
+
+```rust
+output.set_position(output.get_ref().len() as u64);
+output.write_all(&[9, 8])?;
+```
+
+The bytes are now appended. I make this step part of a constructor or helper so later callers cannot forget which mode they received.
+
+For replacement output, a fresh `Cursor::new(Vec::new())` is clearer. For patching a known header field, position zero may be exactly correct.
+
+## Position may be beyond the current length
+
+A cursor position is `u64` and may be set beyond the buffer end. The behaviour of a later write depends on the inner type's `Write` implementation. For `Vec<u8>`, writing beyond the current end fills the gap as documented by the implementation.
+
+I do not use a far position without validating conversions and size limits. Turning an untrusted `u64` position into allocation growth can become a memory-exhaustion path.
+
+Before each operation I can inspect [`position`](https://doc.rust-lang.org/std/io/struct.Cursor.html#method.position). Logging both position and length is much more useful than logging “writing buffer.”
+
+## Seeking and appending are not the same mode
+
+An append-only abstraction guarantees every write targets the current end, even if other operations change length. Setting a cursor to the end once gives only an initial position. If code seeks afterward or modifies the inner vector directly, later writes can overwrite again.
+
+When the requirement is truly append-only, I avoid exposing arbitrary seeking. A small wrapper around `Vec<u8>` using `extend_from_slice`, or an API returning only `Write` without `Seek`, may express less authority.
+
+`Cursor` is most useful when tests or encoders need real read, write, and seek semantics over memory.
+
+## `write_all` does not change the start position
+
+The previous Atlas case explains that [`write_all`](/rust/failures/write-may-succeed-after-writing-only-a-prefix) handles partial writes. It does not choose append mode. It writes all bytes beginning at the current cursor position.
+
+These are independent concerns:
+
+```text
+set_position -> where output begins
+write_all    -> whether all supplied bytes are attempted
+```
+
+Using the stronger completion helper with the wrong position reliably overwrites the wrong place.
+
+## Useful failure patterns
+
+I see this issue in tests for serializers. A fixture creates a vector containing a prefix or magic bytes, wraps it in a cursor, then asks the serializer to “add” a payload. The serializer correctly writes from the cursor's current position and destroys the prefix.
+
+It also appears when reusing cursors. After reading to the end, writing appends only because the read left the position there. A later refactor creates a fresh cursor around the same buffer and changes the result. Depending on incidental previous reads is fragile.
+
+I establish the position immediately before the operation whose semantics matter.
+
+## My debugging checklist
+
+For surprising in-memory output, I inspect:
+
+1. inner buffer length;
+2. current cursor position;
+3. whether the operation should overwrite, append, or patch;
+4. any seek performed by the encoder itself;
+5. whether the inner buffer is mutated outside the cursor;
+6. final position and final bytes.
+
+I test with distinct prefix and payload bytes, as the fixture does. Zero-filled input can make overwriting look like successful append.
+
+The broad principle is that data and navigation state are independent. `Cursor::new` preserves the data but initializes navigation at zero. Appending is an application policy, so I set the end position explicitly or expose an append-specific abstraction.

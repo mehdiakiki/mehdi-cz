@@ -1,0 +1,201 @@
+---
+title: "Fault Injection for Integrations: Timeouts, Duplicates, Reordering, and Drift"
+date: "2026-12-31T09:00:00+01:00"
+tags: ["fault injection", "API integration", "distributed systems testing", "data synchronization", "reliability"]
+draft: false
+reviewed: true
+reviewedHash: "cecdbd77c16a6929eed29ba8d723d4d6a11fd8ac7c28e3894a9efa939457ae4d"
+cluster: "reliable-data-integrations"
+campaign: "authority-2026"
+opportunity: "DATA-090"
+summary: "I test integrations with deterministic failures before production: timeouts before and after effects, duplicates, reordering, stale reads, schema-valid drift, and partial recovery."
+---
+
+The happy-path integration test is comforting: start a fake server, return one valid response, and assert that one database row appears.
+
+It proves the mapper works on a good day. It does not prove the integration knows what happened when the network stopped between an external effect and its acknowledgement.
+
+I use fault injection to make those boundaries fail deliberately and repeatably.
+
+## I begin with the contract, not random chaos
+
+Before injecting anything, I name the guarantee I expect:
+
+```text
+no accepted source record is silently lost
+duplicate delivery does not duplicate the business effect
+older versions do not overwrite newer authority
+ambiguous writes are reconciled before retry
+one poison record cannot stop every partition
+backlog stays bounded during dependency failure
+recovery converges without violating live traffic objectives
+```
+
+Each fault exists to challenge one guarantee. Randomly killing containers may discover something useful, but it is difficult to know which contract was tested or reproduce the exact interleaving.
+
+I add randomness later, with a recorded seed and event trace.
+
+## Timeout has at least two important positions
+
+A client can time out before the provider receives the request:
+
+```text
+client -> [network failure] -> provider
+```
+
+Or after the provider commits but before the acknowledgement returns:
+
+```text
+client -> provider commits -> [response lost] -> client
+```
+
+Both look like timeout to the caller. Only the first is safely equivalent to “nothing happened”.
+
+My fake provider exposes control points:
+
+```text
+fail_before_reading_request
+fail_after_read_before_commit
+fail_after_commit_before_response
+delay_response_beyond_deadline
+return_success_then_hide_status_temporarily
+```
+
+The test asserts operation identity and observed state, not only the exception type. After the post-commit timeout, the system must query or retry idempotently rather than create another effect.
+
+## Duplicate every boundary independently
+
+Duplicates can enter through webhook redelivery, queue delivery, client retries, replay, or a worker crash after commit.
+
+I send:
+
+```text
+same event ID, same payload
+same event ID, different payload
+different event ID, same business operation
+same operation after deduplication retention expires
+two workers processing the same leased item
+```
+
+The second case is an invariant breach, not a normal duplicate. The third tests whether business idempotency exists above message identity. The fourth proves that an idempotency key has a time window, as explained in [how long a consumer must remember duplicates](/blog/how-long-must-a-consumer-remember-duplicate-messages).
+
+## Reordering needs versions, not sleeps
+
+I create three updates for one entity:
+
+```text
+v10 -> active
+v11 -> suspended
+v12 -> active
+```
+
+Then deliver them as `v12, v10, v11`, with duplicates between them. The final state must follow the authority/version rule, not arrival time.
+
+I also reorder related entities: a child before its parent, deletion before an old update, and a correction before the original observation. Each needs a defined result such as wait, quarantine, retain a pending reference, or reject stale input.
+
+Wall-clock delays are a weak way to force ordering. The harness controls a deterministic event scheduler so the test describes the sequence exactly.
+
+## Drift remains valid at the schema layer
+
+Fault injection should not stop at malformed JSON. I keep the payload structurally valid and change meaning:
+
+```text
+multiply money units by 100
+replace missing with empty string
+introduce an unknown enum gradually
+reuse an ID in another namespace
+round timestamps to midnight
+reverse a priority array
+delay one source partition
+```
+
+The [semantic-drift article](/blog/detecting-data-drift-when-the-json-schema-has-not-changed) defines the monitors. The fault test proves they alert, quarantine, or stop according to consequence.
+
+## Partial pages and moving pagination expose cursor assumptions
+
+My source simulator can insert and delete records while the reader paginates. It can repeat the last record on the next page, return an empty page with a continuation token, expire a cursor, or fail page 417 after earlier pages committed.
+
+I verify that:
+
+- a durable checkpoint never advances beyond committed effects;
+- resume uses the same snapshot when the provider promises one;
+- overlap and deduplication cover mutable pagination where required;
+- one failed page does not cause earlier pages to replay unsafe effects;
+- cursor expiry enters a controlled backfill, not a reset-to-zero surprise.
+
+The fixture records exact source mutations so a failure can be replayed locally.
+
+## Capacity failure is part of correctness
+
+I slow the destination while source traffic continues. A bounded queue should fill according to policy, then apply backpressure, spill durably, or reject admission. It must not grow until memory exhaustion.
+
+Scenarios include:
+
+```text
+provider returns 429 with Retry-After
+database latency increases tenfold
+one tenant sends a burst
+repair traffic competes with live traffic
+worker concurrency increases beyond destination capacity
+```
+
+I assert queue age, fairness, retry rate, and the user-visible freshness state. More workers are not a valid expected result when the dependency is already saturated.
+
+## The test harness produces evidence
+
+Every run has:
+
+```json
+{
+  "scenario": "timeout_after_commit",
+  "seed": 1842,
+  "source_fixture": "orders-v7",
+  "mapping_version": "order-v12",
+  "fault_schedule": ["provider.commit", "drop.response"],
+  "expected_invariants": ["one_effect", "terminal_outcome"],
+  "trace_id": "test-trace-91"
+}
+```
+
+The result stores safe state transitions and reason codes. Full secrets never enter the test trace. Failed randomized runs print a minimized or directly replayable schedule.
+
+Tools such as [Toxiproxy](https://github.com/Shopify/toxiproxy) can introduce network latency, bandwidth limits, and connection failures around real clients. I combine network proxies with application-aware fakes because a proxy cannot know the moment a provider committed a business effect.
+
+## Recovery is part of the scenario
+
+Stopping at “the alert fired” leaves half the design untested.
+
+After the fault, I restore the dependency and verify:
+
+1. Circuit probes reopen traffic gradually.
+2. Live work retains reserved capacity.
+3. Expired intents do not execute.
+4. Ambiguous outcomes reconcile before retry.
+5. Repair cases reach terminal states.
+6. Checkpoints and data agree.
+7. Freshness returns within its recovery objective.
+8. Counts, checksums, and sampled records converge.
+
+This often finds the second incident: every worker retries at once as soon as the provider returns.
+
+## How I add fault coverage over time
+
+I begin with deterministic boundary cases in CI. Nightly or pre-release tests add combinations and longer runs. A staging environment exercises real queues, databases, and deployment behavior. Carefully scoped production experiments come only after abort controls, ownership, and observability exist.
+
+The scenario catalogue grows from real incidents and near misses, but each incident becomes a small reproducible case rather than only a larger chaos day.
+
+## The result I want
+
+Fault injection is successful when it gives me a falsifiable statement:
+
+```text
+Given a response lost after provider commit,
+the integration creates one logical effect,
+records outcome as unknown,
+reconciles by operation identity,
+and reaches a verified terminal state.
+```
+
+That is much stronger than “we tested retries”.
+
+Integrations fail between components, where each component can look locally correct. I make those gaps programmable: timeouts on both sides of effects, duplicates at every identity layer, reordered versions, valid-but-drifting data, saturated queues, and difficult recovery. The goal is not chaos for its own sake. It is confidence that the system tells the truth when the easy sequence disappears.

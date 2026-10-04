@@ -1,0 +1,91 @@
+---
+caseId: "RFA-135"
+title: "Why mem::forget on MutexGuard Leaves the Mutex Locked"
+date: "2026-09-05T12:35:00+01:00"
+lastmod: "2026-09-05T12:35:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "0e931a5b39151d71831e3e9bba41ef66e8771d935afaff9de2b4ea0bf7728911"
+area: "concurrency-memory"
+symptom: "After a MutexGuard is passed to mem::forget, try_lock reports WouldBlock because the guard's unlocking destructor was deliberately prevented from running."
+summary: "MutexGuard unlocks through Drop, while mem::forget safely consumes a value without running its destructor. The mutex therefore stays logically acquired; keep guards in lexical scopes and never make unsafe-code soundness depend on destructors being guaranteed."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["targets with std::sync"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust mem forget MutexGuard lock never unlocked", "forgotten MutexGuard keeps mutex locked", "Rust safe mem forget resource leak lock"]
+evidence: ["Rust 1.98.1 deterministic WouldBlock", "MutexGuard destructor suppressed", "lexical-scope drop repair"]
+sources: ["https://doc.rust-lang.org/std/sync/struct.MutexGuard.html", "https://doc.rust-lang.org/std/mem/fn.forget.html"]
+---
+
+The [failing program](/rust-failure-atlas/evidence/RFA-135/fail.rs) locks a mutex, passes its guard to `mem::forget`, then uses `try_lock` to avoid hanging the test. The second acquisition reports that it would block because the first guard never unlocked the mutex.
+
+This can surprise people because `mem::forget` is a safe function. Safe means it does not by itself violate Rust's memory-safety rules. It does not mean leaking the value has no operational consequences.
+
+## The guard is the unlock operation
+
+The [`MutexGuard` documentation](https://doc.rust-lang.org/std/sync/struct.MutexGuard.html) describes an RAII guard returned by locking a mutex. While the guard exists, it provides access to protected data. Its `Drop` implementation releases the lock.
+
+There is not a separate automatic timer watching the thread. Unlocking happens because the guard's destructor runs.
+
+Ordinary lexical scope gives the familiar flow:
+
+```rust
+{
+    let mut guard = state.lock().unwrap();
+    *guard += 1;
+} // guard is dropped; mutex unlocks here
+```
+
+Early returns and panic unwinding also normally drop live guards. This is why RAII makes lock release much safer than manually pairing lock and unlock calls.
+
+## mem::forget suppresses destruction on purpose
+
+The [`mem::forget` documentation](https://doc.rust-lang.org/std/mem/fn.forget.html) says it takes ownership and forgets the value without running its destructor. The function is safe because Rust has never guaranteed that every destructor will run. Programs can form reference cycles, terminate the process, or leak values in other safe ways.
+
+For a `MutexGuard`, forgetting means the destructor cannot release the lock. The protected data remains in memory, but future lockers can wait forever. The fixture uses `try_lock` so this state becomes a quick assertion failure instead of a stalled test suite.
+
+I read `forget(guard)` as `leak_the_lock_ownership_token(guard)`. That wording makes the consequence harder to overlook.
+
+## This is different from mutex poisoning
+
+If a thread panics while holding a standard mutex and unwinding drops the guard, the mutex is unlocked but marked poisoned. A later caller can receive a `PoisonError` and choose how to inspect or recover the data.
+
+Forgetting the guard does not run `Drop`, so there is no normal unlock and no useful poisoned acquisition to handle. The immediate problem is permanent ownership of the lock, not a warning that protected data may be inconsistent.
+
+This distinction guides debugging:
+
+```text
+PoisonError -> previous guard unlocked during a panic
+WouldBlock forever -> a guard may still exist or may have been leaked
+```
+
+Platform and scheduling details still matter, but these are different state transitions.
+
+## Lexical scopes are the clean repair
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-135/fixed.rs) confines the guard to a block. The destructor runs at the closing brace, and `try_lock` succeeds afterward.
+
+I prefer a visible scope over a distant explicit `drop(guard)` when possible. Both work, but a small block makes lock duration easy to review. It also discourages I/O, callbacks, or awaited work while holding the lock.
+
+In async code I check the runtime's mutex type and guard rules. Holding a synchronous mutex across an `.await` can block an executor thread or create deadlocks even without `mem::forget`. The general question remains: where exactly does ownership of the guard end?
+
+## Unsafe abstractions must tolerate leaked owners
+
+The `mem::forget` documentation contains a deeper rule for unsafe code: an unsafe abstraction cannot depend on a destructor being guaranteed to run for soundness. A caller may safely forget an owning value.
+
+If a custom guard exposes pointers or changes an invariant, leaking it may cause resource loss or a permanently unavailable object, but it must not permit later safe code to create invalid memory access. Designs often establish the safe state before handing out ownership and treat `Drop` as cleanup, not the only safety barrier.
+
+`ManuallyDrop`, reference cycles, process abort, and deliberate leaks deserve the same review. Searching only for the word `forget` may miss the actual destructor-suppression path.
+
+## My debugging sequence
+
+When a mutex appears permanently locked, I do this:
+
+1. Reproduce with `try_lock` or a bounded timeout rather than an unending blocking call.
+2. Find every path owning the guard and mark its exact drop point.
+3. Search for `mem::forget`, `ManuallyDrop`, leaked boxes, reference cycles, and non-returning calls.
+4. Distinguish a leaked live lock from a poisoned but unlocked mutex.
+5. Shorten the critical section with a lexical scope.
+6. Review unsafe guard abstractions under the assumption that callers can leak them.
+
+The wider principle is that RAII makes cleanup automatic on normal ownership paths, but cleanup is not inevitable. Destructors are a powerful default, not a global guarantee. I keep correctness visible in ownership and use Drop for release without assuming every program path must execute it.

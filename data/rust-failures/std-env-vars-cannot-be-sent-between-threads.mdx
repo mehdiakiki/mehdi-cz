@@ -1,0 +1,114 @@
+---
+caseId: "RFA-710"
+title: "Why std::env::Vars Cannot Cross a Thread Boundary in Rust 1.98"
+date: "2026-09-07T10:32:00+01:00"
+lastmod: "2026-09-07T10:32:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "205d52b8f6afc1e76d025aab66607b4393e9c11ceafbfb0c761d2934bfa7f618"
+area: "upgrades-compatibility"
+symptom: "Moving std::env::vars() into thread::spawn fails with E0277 because VarsOs cannot be sent between threads safely."
+summary: "Rust 1.98 ensures that the lazy environment iterators Vars and VarsOs are neither Send nor Sync. Consume the iterator where it was created and move an owned snapshot to a worker."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all std targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust std env Vars cannot be sent between threads E0277", "VarsOs not Send thread spawn Rust 1.98", "collect environment variables before spawning thread Rust"]
+evidence: ["Rust 1.98.1 E0277 compile failure", "lazy environment iterator moved into thread closure", "owned Vec snapshot crosses thread boundary successfully"]
+sources: ["https://doc.rust-lang.org/releases.html#version-1980-2026-08-20", "https://doc.rust-lang.org/std/env/struct.Vars.html", "https://doc.rust-lang.org/std/env/struct.VarsOs.html", "https://doc.rust-lang.org/std/thread/fn.spawn.html"]
+---
+
+This code used to look like a clean way to move slow work away from the current thread:
+
+```rust
+fn main() {
+    let variables = std::env::vars();
+    let worker = std::thread::spawn(move || variables.count());
+    println!("{}", worker.join().unwrap());
+}
+```
+
+On Rust 1.98 it fails with E0277. The diagnostic eventually names `VarsOs`: it cannot be sent between threads safely. `Vars`, the UTF-8 adapter returned by `std::env::vars`, contains that underlying iterator.
+
+The surprising part is often the `move` keyword. The closure owns `variables`, but ownership alone does not make a type transferable between threads. `thread::spawn` also requires captured values to implement `Send` and to satisfy the spawned lifetime boundary.
+
+Rust 1.98 explicitly ensures that `std::env::Vars` and `VarsOs` do not implement `Send` or `Sync`. The practical repair is to finish the environment traversal on the creating thread and move ordinary owned data:
+
+```rust
+let variables: Vec<_> = std::env::vars_os().collect();
+let worker = std::thread::spawn(move || variables.len());
+```
+
+The [failing evidence](/rust-failure-atlas/evidence/RFA-710/fail.rs) captures the exact compile error. The [repaired evidence](/rust-failure-atlas/evidence/RFA-710/fixed.rs) collects an `OsString` snapshot before spawning and verifies that the owned vector crosses the boundary.
+
+## An iterator is state, not only a sequence description
+
+It is easy to think of `vars()` as “a collection of string pairs.” It actually returns an iterator value which owns traversal state supplied through the standard library and platform environment implementation.
+
+Lazy iterators can contain pointers, handles, guards, borrowed state, or internal representations with thread-affinity constraints. The `Iterator` trait says how to ask for the next item. It does not promise that the iterator itself is `Send`, `Sync`, replayable, immutable, or cheap to transfer.
+
+Auto traits are part of the concrete type's contract. I check them at the boundary instead of inferring them from the yielded item. `(String, String)` is transferable, but that fact does not require the machine producing those pairs to be transferable too.
+
+## Why `move` is not enough
+
+A move closure changes ownership. It lets the closure take captured values rather than borrow them from the current stack. This often solves the `'static` part of `thread::spawn`.
+
+`Send` answers another question: is it valid to transfer ownership of this particular value to another thread? A type can be owned, have no visible references, and still be `!Send` because its implementation relies on thread-local or otherwise non-transferable state.
+
+The compiler message walks through that containment. `Vars` contains `VarsOs`; `VarsOs` is not `Send`; therefore the closure capturing it is not `Send`; therefore `spawn` rejects the closure. Reading the full chain is more useful than stopping at the outer E0277.
+
+## Snapshot first, then parallelize the work
+
+Most programs do not need parallel environment enumeration. They need to parse, validate, filter, redact, or transform the resulting configuration. I separate those phases:
+
+```rust
+use std::ffi::OsString;
+
+let snapshot: Vec<(OsString, OsString)> = std::env::vars_os().collect();
+
+let worker = std::thread::spawn(move || {
+    snapshot
+        .into_iter()
+        .filter(|(name, _)| name.to_string_lossy().starts_with("APP_"))
+        .collect::<Vec<_>>()
+});
+```
+
+Now the platform traversal finishes before the thread boundary. The worker receives explicit owned values with normal `Send` behavior.
+
+I use `vars_os()` when the environment may contain values that are not valid Unicode. `vars()` can panic while iterating if it encounters non-Unicode data. If the application contract requires Unicode, I convert each `OsString` deliberately and return a useful configuration error rather than letting enumeration panic at an arbitrary item.
+
+## A snapshot also defines consistency
+
+Collecting is not only a type-system workaround. It creates a point-in-time input for the rest of the program.
+
+Process environment is global state with platform-specific behavior. Code which mutates it concurrently creates a separate and more serious design problem. I normally read configuration during startup, validate it once, build an owned configuration structure, and pass that structure to workers. Workers should not repeatedly discover configuration from a mutable ambient namespace.
+
+This gives tests a clean boundary too. A parsing function can accept a map or vector without editing the test process environment. The process-specific adapter becomes small.
+
+For secrets, I avoid logging or cloning more than necessary. A full snapshot may be inappropriate if the process has many sensitive variables and the worker needs only two. In that case I read those names before spawning and move only the validated values.
+
+## Other repairs and their trade-offs
+
+The simplest repair may be to create and consume the iterator entirely inside the spawned closure:
+
+```rust
+let worker = std::thread::spawn(|| std::env::vars_os().count());
+```
+
+No `VarsOs` value crosses threads because it is created on the worker. This compiles, but it chooses a different observation time. If other startup code can affect the environment, the semantic difference matters.
+
+I can also avoid spawning when enumeration is tiny. Thread creation usually costs more than walking a normal environment. Parallelism makes sense for substantial downstream work, not because an iterator exists.
+
+Wrapping `Vars` in `Arc<Mutex<_>>` is not a solution. `Mutex<T>` cannot magically make a non-`Send` value transferable; its trait implementations preserve the necessary bounds. Unsafe wrappers which assert `Send` would be claiming knowledge stronger than the standard library's deliberate contract and are not justified here.
+
+## My upgrade check
+
+When Rust changes an auto-trait implementation, the source error appears at a concurrency boundary while the cause lives inside a library type. I reduce it to three facts:
+
+1. which concrete value crosses the boundary;
+2. which nested type is reported as non-`Send` or non-`Sync`;
+3. whether I need to move the producer, move an owned snapshot, or remove parallelism.
+
+I keep the reduction pinned to Rust 1.98.1 and compile the repair without unsafe code. Then I test the real semantic decision: which variables are captured, how non-Unicode input is handled, whether secrets are copied, and when the snapshot is taken.
+
+The wider principle is useful beyond environment variables. Iterator items and iterator state have different contracts. When a lazy producer cannot cross a thread boundary, consume it at the owner boundary and send the smallest explicit data model the worker actually needs.

@@ -1,0 +1,111 @@
+---
+caseId: "RFA-184"
+title: "Why BTreeMap::range Panics When Start Is Greater Than End"
+date: "2026-09-05T17:23:00+01:00"
+lastmod: "2026-09-05T17:23:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "5191a4257cd6fdbde0b27ee40ded58d795b53bc32a7d12b9ab1a9b19d72db5d0"
+area: "concurrency-memory"
+symptom: "BTreeMap::range panics for a dynamic range whose start is greater than its end instead of yielding an empty iterator."
+summary: "An inverted BTreeMap range is malformed, not merely empty. Validate dynamic bounds before constructing the iterator, including the equal-and-both-excluded case that also panics."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets with alloc"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust BTreeMap range start greater end panic",
+    "BTreeMap range invalid bounds empty",
+    "validate dynamic RangeBounds Rust",
+  ]
+evidence:
+  ["Rust 1.98.1 inverted integer range", "documented runtime panic", "pre-validation repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/std/collections/struct.BTreeMap.html#method.range",
+    "https://doc.rust-lang.org/std/ops/trait.RangeBounds.html",
+  ]
+---
+
+An empty interval and an invalid interval can both contain no values, but `BTreeMap::range` does not treat them as the same input.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-184/fail.rs) constructs the dynamic range `3..2`. Instead of returning an iterator with zero items, Rust 1.98.1 panics because the start is greater than the end.
+
+## The method validates ordered bounds
+
+[`BTreeMap::range`](https://doc.rust-lang.org/std/collections/struct.BTreeMap.html#method.range) builds an ordered iterator between `RangeBounds`. It documents two panic cases:
+
+- start is greater than end;
+- start equals end and both bounds are excluded.
+
+A valid range can still be empty. `4..5` is valid even when the map has no key in that interval. `3..2` is not a valid ordered interval.
+
+This distinction catches caller mistakes early, but it means external or computed bounds must be validated before entering the method.
+
+## Range syntax hides inclusion details
+
+Rust syntax represents several policies:
+
+```text
+start..end     included start, excluded end
+start..=end    included start, included end
+..end          unbounded start, excluded end
+start..        included start, unbounded end
+```
+
+The generic [`RangeBounds`](https://doc.rust-lang.org/std/ops/trait.RangeBounds.html) interface also permits explicit `Excluded` bounds. Equal endpoints are valid if at least one side includes that point, though the resulting set may still be empty depending on the combination and keys.
+
+I do not validate only `start <= end` when accepting arbitrary bound kinds. I include inclusion policy in the validator.
+
+## Dynamic filters need a domain result
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-184/fixed.rs) handles the simple integer `start..end` case by returning `None` when start exceeds end. Real APIs may choose a typed error instead:
+
+```rust
+enum RangeError {
+    Inverted,
+    EmptyExcludedPoint,
+}
+```
+
+Returning an empty result for malformed user input can hide a swapped form field or a timezone conversion bug. Rejecting it often produces a better client experience.
+
+For an internal query where inverted bounds intentionally mean no work, normalising to an empty collection before calling the map is reasonable. The choice should be explicit.
+
+I also keep validation beside range construction. Validating in an HTTP handler and reconstructing the bounds differently in a repository layer allows the two interpretations to drift. A small checked range type can carry the invariant across layers and make direct invalid construction impossible in ordinary code.
+
+## Reordering endpoints can change meaning
+
+A tempting repair is `min(start, end)..max(start, end)`. That silently turns a malformed request into a different, non-empty request.
+
+For geometry or symmetric distance, endpoint order may not matter. For time windows, pagination, version ranges, or financial queries, direction often matters a lot. I reject or preserve the direction unless the domain specifically defines swapping.
+
+Validation is not the same as guessing intent.
+
+## Borrowed key ranges add another layer
+
+`BTreeMap` can often range by a borrowed form of its key. The borrowed ordering must agree with the owned key's ordering. If a custom key type violates `Ord` consistency, map behaviour becomes a logic error even though safe Rust prevents memory unsafety.
+
+I keep ordering implementations derived or narrowly reviewed, and I use the same normalization for insertion and query bounds. A range over normalized identifiers should not compare raw input under different rules.
+
+## Panic containment is not input validation
+
+Wrapping `range` in `catch_unwind` would convert the panic into a result, but it would also treat programmer bugs and other panics as normal control flow. Direct bound validation is clearer and keeps the expected error near the input boundary.
+
+Library code accepting untrusted ranges should not rely on callers knowing a panic precondition. Its public contract can expose a checked constructor or result-returning query.
+
+Property tests are useful here because boundary combinations multiply quickly. I generate endpoint order and inclusion kinds, assert that the checked constructor rejects invalid shapes, and compare valid results with a straightforward filtered iteration. The reference implementation is slower, but it makes a good oracle for small generated maps.
+
+## My ordered-range checklist
+
+When a range query unexpectedly panics or returns nothing, I check:
+
+1. Are the resolved start and end in the correct order?
+2. Is each boundary included, excluded, or unbounded?
+3. Are equal excluded endpoints possible?
+4. Should malformed input be rejected or intentionally mapped to empty?
+5. Would swapping endpoints invent a different request?
+6. Does borrowed-key ordering agree with stored-key ordering?
+7. Do tests cover absent values inside a valid range separately from invalid bounds?
+
+The core principle is that structural validity comes before result cardinality. An empty ordered interval is a valid query with no matches. An inverted interval cannot describe the traversal `BTreeMap::range` promises, so Rust rejects it with a panic unless I validate it first.

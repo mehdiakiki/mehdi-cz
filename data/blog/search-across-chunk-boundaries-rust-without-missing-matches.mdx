@@ -1,0 +1,144 @@
+---
+title: "How to Search Across Chunk Boundaries in Rust Without Missing Matches"
+date: "2026-09-07T08:40:00+01:00"
+lastmod: "2026-09-05T12:00:00+01:00"
+tags: ["rust", "streaming", "aho-corasick", "testing", "systems programming"]
+draft: false
+reviewed: true
+reviewedHash: "43a769eec3d9195617feb291c3de232ab976c47e458a9465dcee6b0f999d976f"
+cluster: "rust-under-the-hood"
+campaign: "editorial"
+summary: "A pattern may begin in one input chunk and finish in the next. I explain the state, offsets, and split-point tests needed to keep a Rust streaming scanner correct."
+---
+
+A streaming scanner normally receives inconvenient pieces of data. A network read can end after one byte. A file reader can fill only part of its buffer. Nothing promises that a chunk boundary will also be a word or record boundary.
+
+This creates one small-looking bug that I have learned to test very early: a pattern begins in one chunk and finishes in the next one.
+
+```text
+pattern: failure
+chunk 1: xxfa
+chunk 2: ilureyy
+```
+
+If I search each chunk as a new haystack, I find nothing. The bytes are present, but my implementation forgot the relevant past.
+
+## The boundary is not part of the data
+
+I use this as the first principle:
+
+> Changing how the input is divided must not change the matches.
+
+Chunks are a transport detail. They can change because of the operating system, buffering, network timing, or a caller choosing a different slice size. Unless the product explicitly defines chunks as separate documents, the scanner must behave as if their bytes were one continuous input.
+
+A finite-state matcher makes this possible. At the end of `xxfa`, its state records that `fa` can be a prefix of `failure`. The next call starts from that state rather than the initial state. It does not need the complete first chunk to continue recognition.
+
+Conceptually, the loop is:
+
+```rust
+struct ScanState {
+    automaton_state: u32,
+    absolute_offset: u64,
+}
+
+fn scan_chunk(state: &mut ScanState, chunk: &[u8], table: &TransitionTable) {
+    for &byte in chunk {
+        state.automaton_state = table.next(state.automaton_state, byte);
+        state.absolute_offset += 1;
+
+        if table.is_match(state.automaton_state) {
+            let length = table.match_len(state.automaton_state) as u64;
+            report(state.absolute_offset - length, state.absolute_offset);
+        }
+    }
+}
+```
+
+`TransitionTable` is a simplified interface here, not the public API of every Aho–Corasick implementation. The important parts are the carried automaton state and the monotonically increasing offset.
+
+## Offset bugs survive happy-path tests
+
+Even when recognition is correct, positions can be wrong. A match found at local range `0..5` in the fourth chunk does not start at byte zero of the whole stream.
+
+I keep one coordinate system for public results: absolute byte offsets from the start of the stream. I update the offset for every consumed byte, including bytes that do not match. When an API needs chunk-local positions too, I derive them explicitly rather than overloading the same integer with two meanings.
+
+There is also an overflow question. A `usize` follows the address width of the process, while a stream position is often represented as `u64`. Conversion needs an explicit policy. For ordinary in-memory slices, `usize` is natural. For long-lived streams, I prefer an offset type whose limit matches the external protocol, then check conversions at API boundaries.
+
+## Test every split, not three friendly splits
+
+The most useful test is smaller than a benchmark. I first calculate the expected matches on one contiguous input. Then I feed the same bytes through every possible split point.
+
+The `aho-corasick` crate already provides a streaming API over `Read`. This test forces the reader to return tiny pieces and verifies that the library result stays unchanged:
+
+```rust
+use std::io::{self, Cursor, Read};
+use aho_corasick::AhoCorasick;
+
+struct Limited<R> {
+    inner: R,
+    maximum: usize,
+}
+
+impl<R: Read> Read for Limited<R> {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        let length = output.len().min(self.maximum);
+        self.inner.read(&mut output[..length])
+    }
+}
+
+fn main() {
+    let bytes = b"xxfailure and error";
+    let matcher = AhoCorasick::new(["failure", "error"]).unwrap();
+    let expected: Vec<_> = matcher
+        .find_iter(bytes)
+        .map(|m| (m.pattern().as_usize(), m.start(), m.end()))
+        .collect();
+
+    for maximum in 1..=bytes.len() {
+        let reader = Limited {
+            inner: Cursor::new(bytes),
+            maximum,
+        };
+        let actual: Vec<_> = matcher
+            .stream_find_iter(reader)
+            .map(|result| {
+                let m = result.unwrap();
+                (m.pattern().as_usize(), m.start(), m.end())
+            })
+            .collect();
+
+        assert_eq!(expected, actual, "failed with reads of {maximum} bytes");
+    }
+}
+```
+
+For my own caller-driven chunk API, I go further. I generate several partitions, including empty chunks if the contract permits them, and compare the complete tuple `(pattern_id, start, end)`. Comparing only the number of matches can hide duplicates and incorrect offsets.
+
+## Keeping overlap bytes is a different design
+
+A common workaround saves the final `longest_pattern - 1` bytes and prepends them to the next chunk. It can be correct, but it creates more work:
+
+- retained bytes must be copied or referenced safely;
+- matches entirely inside the overlap must not be emitted twice;
+- local positions must be translated back to global positions;
+- an unusually long pattern increases retained memory.
+
+Carrying automaton state avoids retaining history for recognition. It does not automatically solve replacement, borrowed match text, or leftmost output decisions. Those requirements may still need a bounded buffer, because recognition state and output state are different things.
+
+## The same rule appears outside string search
+
+I apply the same invariant to UTF-8 decoders, framed network protocols, checksums, compressed streams, and incremental parsers. A multi-byte character, header, escape sequence, or token can cross a boundary just as easily as `failure` did.
+
+The implementation details differ, but the review questions stay useful:
+
+1. What minimal state represents the unfinished work?
+2. Which coordinate system do returned offsets use?
+3. Can a result be delayed without losing required input bytes?
+4. Does every partition produce the same logical output?
+5. What happens at end-of-stream with an unfinished prefix?
+
+The official [`AhoCorasick` documentation](https://docs.rs/aho-corasick/latest/aho_corasick/struct.AhoCorasick.html) describes its stream iterator and its constant-memory buffering constraint. The crate's [design document](https://github.com/BurntSushi/aho-corasick/blob/master/DESIGN.md#stream-searching) also explains why stream searching requires care.
+
+My final rule is simple: I do not trust a streaming implementation because it works with a small buffer. I trust it when the one-shot result and the chunked result are identical for every boundary I can generate.
+
+This article supports the deeper explanation in [Zero-Copy Does Not Mean Zero Memory Access](/blog/zero-copy-does-not-mean-zero-memory-access-aho-corasick-rust). The [Aho–Corasick article collection](/blog/tags/aho-corasick/page/1) reveals each related article only when its publication date arrives.

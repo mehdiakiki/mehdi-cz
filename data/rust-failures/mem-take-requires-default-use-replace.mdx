@@ -1,0 +1,97 @@
+---
+caseId: "RFA-137"
+title: "Why mem::take Requires Default and mem::replace Does Not"
+date: "2026-09-05T14:37:00+01:00"
+lastmod: "2026-09-05T14:37:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "097505887eeefa309e30db077b07c82b774a072d5663cf3b221cf16da617cced"
+area: "diagnostics-macros"
+symptom: "mem::take cannot move a Session out through &mut Session because Session has no Default implementation, although the caller can construct a valid replacement."
+summary: "Moving through a mutable reference must leave the borrowed place initialized. mem::take obtains that replacement from T::default and therefore requires Default; mem::replace accepts the replacement explicitly and preserves a domain type with no artificial empty state."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets"]
+profiles: ["check", "dev", "release", "test"]
+searchTerms: ["Rust mem take requires Default use replace", "move field out mutable reference non Default", "std mem take trait bound Default not satisfied"]
+evidence: ["Rust 1.98.1 E0277 compile failure", "borrowed-place initialization contract", "mem::replace repair"]
+sources: ["https://doc.rust-lang.org/std/mem/fn.take.html", "https://doc.rust-lang.org/std/mem/fn.replace.html"]
+---
+
+The [failing program](/rust-failure-atlas/evidence/RFA-137/fail.rs) owns a `&mut Session` and wants to return the old session. Calling `std::mem::take(session)` fails with E0277 because `Session` does not implement `Default`.
+
+This is not a restriction on moving the old value. It is a requirement for what remains behind the mutable reference.
+
+## A borrowed place cannot be left uninitialized
+
+The caller still owns the `Session` storage after `reset` returns. Other code may read it, mutate it, or eventually drop it. The function cannot move the value out and leave an invisible hole where a valid `Session` is expected.
+
+`mem::take` solves this by performing one logical exchange:
+
+```text
+old value leaves dest
+T::default() enters dest
+old value returns to caller
+```
+
+The [`mem::take` signature](https://doc.rust-lang.org/std/mem/fn.take.html) therefore contains `T: Default`. The bound is not an implementation accident. It provides the value needed to keep the borrowed location initialized.
+
+For `Vec<T>` this often feels natural because the default empty vector is a useful reset state. A domain `Session` may have no honest default identity, credentials, or lifecycle state.
+
+## Deriving Default can hide a modeling problem
+
+The compiler suggests deriving `Default`. I do this only when every defaulted field combines into a valid and meaningful domain value.
+
+An empty string may satisfy the type system while violating the application contract. A session with no identifier might later be written to storage, logged as if active, or used to authorize a request. Creating such a sentinel only to call `take` spreads invalid-state handling into unrelated code.
+
+I ask: if another function sees the replacement immediately, is it a normal `Session`? If the answer is no, `Default` is probably not the correct repair.
+
+## mem::replace accepts the state explicitly
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-137/fixed.rs) calls:
+
+```rust
+std::mem::replace(session, Session(String::new()))
+```
+
+The [`mem::replace` documentation](https://doc.rust-lang.org/std/mem/fn.replace.html) states that it moves the supplied source into the destination and returns the old value. It needs no trait bound because the caller provides a value of exactly the required type.
+
+In the reduced fixture, an empty session is accepted for demonstration. In production I would usually provide a real state such as `Session::disconnected()`, or represent absence explicitly with `Option<Session>`.
+
+With `Option`, `take()` is particularly clear: it replaces `Some(session)` with `None`, a state already represented in the type.
+
+## The replacement is part of the operation contract
+
+Suppose a worker owns this state:
+
+```rust
+struct Worker {
+    connection: Connection,
+}
+```
+
+If `finish(&mut self)` needs to consume the connection, it must decide what state the worker has afterward. Replacing it with another live connection, changing the field to `Option<Connection>`, or consuming the entire `Worker` express different lifecycle contracts.
+
+Sometimes the cleanest signature is `fn finish(self)`. Consuming `self` allows fields to be moved according to the type's ownership rules without pretending the original worker remains usable. If the type implements `Drop`, moving fields out has additional restrictions and may need another internal representation.
+
+I choose the signature from the post-operation state, not only from which memory utility compiles.
+
+## take is still the best operation for real defaults
+
+When `Default` is meaningful, `take` is concise and robust. Common examples include resetting a `String`, `Vec`, `Option`, or a configuration accumulator whose default state is explicitly valid.
+
+It also avoids constructing the replacement in every caller. The type owns the definition of its normal empty state.
+
+The problem is not the bound. The problem is adding a dishonest implementation to satisfy it. `take` and `replace` are two different APIs because sometimes the type defines the replacement and sometimes the operation must.
+
+## My debugging sequence
+
+When `mem::take` requests an unwanted `Default` bound, I do this:
+
+1. Identify the value that must remain in the borrowed place.
+2. Decide whether the type has one universally valid default state.
+3. Use `take` when that state is a real part of the type's contract.
+4. Use `replace` when the operation knows a specific successor value.
+5. Use `Option<T>` when temporary or permanent absence is meaningful.
+6. Consider consuming the owner when no usable state should remain.
+
+The wider principle is that moving out and leaving behind are one operation when working through `&mut`. Rust forces both halves to be valid. The right repair names the real state after the move rather than inventing a default only to pass a trait bound.

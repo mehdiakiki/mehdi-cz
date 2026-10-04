@@ -1,0 +1,256 @@
+---
+title: "Retries That Respect Retry-After, Deadlines, and a Retry Budget"
+date: "2026-09-14T09:00:00+01:00"
+tags: ["API retries", "Retry-After", "exponential backoff", "deadlines", "reliability"]
+draft: false
+reviewed: true
+reviewedHash: "6f0d039c6b5dbce8218812ab85492a7c2c7f3860cd6f00aa303ca9b3d5523c17"
+cluster: "reliable-data-integrations"
+campaign: "authority-2026"
+opportunity: "DATA-013"
+summary: "A bounded API retry policy that combines error classification, Retry-After, full-jitter backoff, operation deadlines, idempotency, and a shared retry budget."
+---
+
+Retries are supposed to make a system more reliable. Without limits, they can turn one dependency failure into a much larger outage.
+
+I have learned to treat retrying as admission of extra work. Every new attempt consumes connection capacity, provider quota, queue time, and part of the user's deadline. “Try three times” is not a complete policy.
+
+A production retry loop needs to answer five questions:
+
+1. Is this failure temporary?
+2. Is repeating this operation safe?
+3. When is the earliest useful next attempt?
+4. Does enough total deadline remain?
+5. Does the system still have retry budget?
+
+Only when all five answers allow it do I schedule another request.
+
+## Classify before backing off
+
+I do not retry every non-success response.
+
+| Result | Default decision | Reason |
+| --- | --- | --- |
+| Connection reset before response | Retry if operation is safe | Failure may be temporary, outcome can be uncertain |
+| Timeout | Retry only with idempotency and deadline left | Server may already have applied the request |
+| HTTP 429 | Retry after provider delay | Explicit throttling signal |
+| HTTP 502/503/504 | Usually retry with backoff | Temporary gateway or availability failure |
+| HTTP 400/422 | Do not retry unchanged input | Same request will normally fail again |
+| HTTP 401 | Refresh once when appropriate | Repeating the same expired credential is useless |
+| HTTP 403 | Do not retry automatically | Permission needs policy or human change |
+| HTTP 404 | Depends on consistency contract | Can be permanent or temporary after creation |
+| Parsing/validation failure | Quarantine or fail | Retrying identical bytes does not repair code |
+
+Provider-specific error codes override generic HTTP guesses. Some APIs return 200 with an error object; others use 409 for both safe idempotency conflicts and real business conflicts.
+
+I keep classification close to the provider adapter because that layer understands the external contract.
+
+## Safety comes before retry count
+
+GET is usually safe to repeat, but even reads can trigger expensive exports or consume one-time cursors. A POST may be safe when the provider supports an idempotency key.
+
+For every write, I want one of these guarantees:
+
+- the provider accepts a stable idempotency key;
+- the operation uses a conditional version or unique business key;
+- I can query the outcome before trying again;
+- the application tolerates duplicate effects explicitly.
+
+If a request times out after reaching the server, I do not know whether it ran. Retrying a payment, invitation, or ticket creation without idempotency can create two real effects.
+
+The idempotency key identifies the logical operation and stays the same across attempts. A new key on every retry defeats the protection.
+
+## The deadline belongs to the whole operation
+
+Per-attempt timeouts are necessary but insufficient. Three attempts with ten-second timeouts plus backoff can exceed a fifteen-second user deadline.
+
+I create an absolute deadline when the operation begins:
+
+```text
+operation started: 12:00:00.000
+absolute deadline: 12:00:08.000
+```
+
+Before each attempt, I calculate:
+
+```text
+remaining = deadline - now
+```
+
+If the remaining time cannot cover the planned delay plus a useful attempt timeout, I stop. The caller receives a clear deadline result rather than a request continuing after it is no longer wanted.
+
+This matters in a service chain. Each downstream call should receive a smaller deadline than its caller, leaving time to handle failure and return a response.
+
+## Exponential backoff needs jitter
+
+A deterministic sequence such as 100 ms, 200 ms, 400 ms makes every failed client wake together. The dependency receives synchronized waves.
+
+I use full jitter:
+
+```text
+cap(attempt) = min(max_backoff, base × 2^attempt)
+delay = random_between(0, cap(attempt))
+```
+
+This spreads retries while keeping an exponential upper bound.
+
+I cap both the exponent and arithmetic. A left shift or multiplication can overflow after enough attempts. In practice the operation deadline and attempt limit should stop much earlier, but defensive code should still be correct.
+
+The AWS Architecture Blog explains why jitter improves distributed retry behaviour in [Exponential Backoff and Jitter](https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/). AWS SDK guidance also uses retry quotas so failures cannot create unlimited repeated work; see [Retry behavior](https://docs.aws.amazon.com/sdkref/latest/guide/feature-retry-behavior.html).
+
+## Respect `Retry-After` without surrendering control
+
+HTTP `Retry-After` can contain a number of delay seconds or an HTTP date. [RFC 9110](https://www.rfc-editor.org/rfc/rfc9110.html#name-retry-after) defines both forms.
+
+My parser:
+
+- accepts both formats;
+- treats a past date as no additional wait;
+- accounts for clock uncertainty;
+- rejects invalid values;
+- caps unreasonable waits according to job type;
+- combines the result with the operation deadline.
+
+When the provider says to wait longer than local backoff, I use the provider delay as the earliest retry time:
+
+```text
+delay = max(jittered_backoff, retry_after_delay)
+```
+
+For an interactive request, this may exceed the user's deadline. I stop the synchronous operation and place safe work into a durable asynchronous queue only if the product contract allows it. I do not silently continue after returning failure.
+
+`Retry-After` also does not mean “release the entire backlog at this instant.” Requests still pass through rate and [adaptive concurrency controls](/blog/adaptive-concurrency-for-apis-with-changing-rate-limits).
+
+## A retry budget prevents amplification
+
+Per-request attempt limits do not protect the dependency during a large outage. If 10,000 original calls each retry three times, the failing service can receive 30,000 extra attempts.
+
+I use a shared retry budget per provider and scope. One simple model is a token bucket:
+
+```text
+original requests do not consume retry tokens
+every repeat attempt consumes one token
+successful original traffic refills tokens slowly
+empty bucket means fail or defer without another attempt
+```
+
+This allows occasional recovery while preventing retries from dominating useful traffic.
+
+The budget is scoped to the limit domain. One provider account failing should not consume every retry token for unrelated accounts, but I also keep a global ceiling to protect my infrastructure.
+
+I reserve capacity for fresh requests. Otherwise old retries can starve new work that might succeed.
+
+## A small policy loop
+
+The control flow can stay understandable:
+
+```text
+attempt = 0
+
+loop:
+    remaining = deadline - now
+    if remaining <= minimum_useful_attempt:
+        return deadline_exceeded
+
+    result = call(timeout = min(per_attempt_timeout, remaining))
+    if result is success:
+        return result
+
+    decision = classify(result)
+    if decision is not retryable:
+        return result
+
+    if operation is not replay-safe:
+        return outcome_unknown
+
+    if retry budget cannot admit one attempt:
+        return retry_budget_exhausted
+
+    delay = max(full_jitter(attempt), parsed_retry_after(result))
+    if now + delay + minimum_useful_attempt >= deadline:
+        return deadline_exceeded
+
+    sleep with cancellation until delay
+    attempt += 1
+```
+
+The sleep must respond to cancellation. An abandoned request should not wake later and perform an effect the caller no longer expects.
+
+## My retry simulator
+
+Before using a policy, I run it against a fake clock and scripted responses. This avoids slow and flaky tests.
+
+Each scenario records:
+
+```text
+attempt timestamps
+per-attempt timeout
+chosen backoff cap and random delay
+parsed Retry-After
+remaining deadline
+retry tokens before and after
+final result
+```
+
+I test at least these cases:
+
+### Temporary failure then success
+
+Return 503 twice, then 200. Assert three attempts, increasing backoff caps, and one logical idempotency key.
+
+### Deadline ends during provider delay
+
+Return 429 with `Retry-After: 30` under a five-second remaining deadline. Assert no second attempt.
+
+### HTTP-date and clock skew
+
+Return a date slightly ahead and behind the local clock. Assert bounded, non-negative delay.
+
+### Non-retryable validation failure
+
+Return 422. Assert one attempt and no retry-token consumption.
+
+### Timeout with unsafe write
+
+Simulate a request whose outcome is unknown and has no idempotency support. Assert the client stops and reports uncertainty instead of repeating it.
+
+### Retry budget exhaustion
+
+Start many failing operations together. Assert the total repeat attempts cannot exceed the shared budget.
+
+### Cancellation during backoff
+
+Cancel before the timer fires. Assert no later request occurs.
+
+### Success after a lost response
+
+Let the provider apply a write but drop the response. On retry with the same idempotency key, assert the same logical result and one effect.
+
+These tests prove the policy's timing and safety, not only its final return value.
+
+## Observe logical operations and attempts separately
+
+If metrics count every attempt as an independent request, retries can make traffic and success rates confusing.
+
+I record:
+
+- logical operation ID;
+- attempt number;
+- final outcome;
+- error classification;
+- total deadline spent;
+- server `Retry-After` delay;
+- local backoff delay;
+- retries prevented by budget;
+- uncertain-outcome count;
+- idempotency result.
+
+The ratio of attempts to logical operations is retry amplification. When it rises, I want an alert before the dependency is overwhelmed.
+
+## My practical retry rule
+
+I retry only a classified temporary failure for a replay-safe operation, after a jittered/provider-directed delay, while both deadline and shared budget remain.
+
+This sentence is longer than “retry three times,” but it describes the real contract.
+
+Retries cannot create availability. They can bridge short failures. Deadlines stop obsolete work, idempotency protects effects, jitter reduces synchronized load, `Retry-After` respects provider feedback, and the budget prevents recovery traffic from becoming the outage.

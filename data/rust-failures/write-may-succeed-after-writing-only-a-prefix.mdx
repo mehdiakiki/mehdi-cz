@@ -1,0 +1,113 @@
+---
+caseId: "RFA-164"
+title: "Rust Write::write May Succeed After Writing Only a Prefix"
+date: "2026-09-05T16:54:00+01:00"
+lastmod: "2026-09-05T16:54:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "6ea30b3effc1684ac680d3fab31ca0536c87bf8996434a63d7e262e834589ceb"
+area: "concurrency-memory"
+symptom: "A successful Write::write call stores only the first few bytes because Ok(n) may report a short write rather than complete consumption."
+summary: "write performs one attempt and its successful count is the number of input bytes consumed. Use write_all when the contract requires the complete buffer, while still handling zero progress and errors explicitly."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets with std::io"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust Write write short partial write", "write returns fewer bytes without error Rust", "Write write versus write_all"]
+evidence: ["Rust 1.98.1 deterministic short writer", "three-byte write limit", "write_all repair"]
+sources: ["https://doc.rust-lang.org/std/io/trait.Write.html#tymethod.write", "https://doc.rust-lang.org/std/io/trait.Write.html#method.write_all", "https://doc.rust-lang.org/std/io/enum.ErrorKind.html#variant.WriteZero"]
+---
+
+`Ok` means an operation succeeded according to its contract. For `Write::write`, that contract may be only a prefix of the supplied buffer.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-164/fail.rs) implements a writer that accepts at most three bytes per call. Writing `b"abcdef"` returns `Ok(3)`. The caller ignores the count and later discovers only `abc` in the destination.
+
+There was no I/O error. The caller discarded the progress information.
+
+## One write is one attempt
+
+The required [`Write::write`](https://doc.rust-lang.org/std/io/trait.Write.html#tymethod.write) method returns `io::Result<usize>`. On success, the number tells how many bytes from the beginning of the input were written.
+
+The contract permits:
+
+```text
+0 <= n <= input.len()
+```
+
+If `n` is smaller than the buffer length, bytes `input[..n]` were consumed and `input[n..]` remain for another attempt. Sockets, pipes, buffered layers, rate-limited destinations, and custom writers can all produce short writes.
+
+The method cannot simply return a boolean because partial progress matters after both success and later failure.
+
+## Use write_all for an all-bytes contract
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-164/fixed.rs) calls [`write_all`](https://doc.rust-lang.org/std/io/trait.Write.html#method.write_all). The default helper repeatedly calls `write` with the unwritten suffix until the whole input is accepted or a non-recoverable error occurs.
+
+Against the three-byte writer, the sequence is:
+
+```text
+write abcdef -> Ok(3)
+write def    -> Ok(3)
+complete
+```
+
+The destination contains all six bytes. `write_all` is the right interface when partial output is not a successful application result.
+
+This does not make a multi-call write transactional. If the second call fails, the first three bytes may already be visible. “All or error” describes the function result, not rollback of an external sink.
+
+## Zero progress needs special handling
+
+A writer may return `Ok(0)`. For a non-empty buffer, repeatedly retrying without policy would loop forever. `write_all` converts this no-progress situation into `ErrorKind::WriteZero`.
+
+The distinction matters:
+
+- `Ok(n > 0)`: make progress and continue;
+- `Err(Interrupted)`: retry according to the helper's contract;
+- `Ok(0)` with remaining bytes: cannot complete through ordinary retries;
+- another error: stop and report partial external effects as relevant.
+
+If I write my own loop, I implement all four cases. Usually the standard helper is safer.
+
+## Interrupted is different from a short write
+
+An interrupted system call can report `ErrorKind::Interrupted` without useful progress, and `write_all` retries it. A short write is successful progress and advances the slice.
+
+Mixing the cases can duplicate bytes. If a writer reports that `n` bytes were consumed, I never retry the original full buffer. I retry only the suffix.
+
+This is a general resumable-operation rule: the progress cursor must advance exactly by acknowledged work.
+
+## Framing still belongs above Write
+
+Suppose I send a length-prefixed message. `write_all` can ensure the header buffer and body buffer are each submitted completely, but a failure between them may leave a partial frame at the destination.
+
+For a file, I may write to a temporary path, flush and sync according to durability needs, then rename. For a network stream, the protocol must handle disconnects and incomplete frames. For an external API, an idempotency key and acknowledgement protocol may be needed.
+
+`Write` is a byte-progress abstraction. It does not promise message atomicity, remote durability, or deduplication.
+
+## Flush is another separate contract
+
+Writing all bytes into a buffered writer may only put them into memory. [`Write::flush`](https://doc.rust-lang.org/std/io/trait.Write.html#tymethod.flush) asks the writer to ensure buffered contents reach the underlying destination according to its implementation.
+
+Even flush does not universally mean stable storage. Filesystem durability can require file and directory synchronization, and network delivery requires acknowledgement beyond the local socket buffer.
+
+I name the boundary I need: accepted by this writer, handed to the operating system, persisted, or processed remotely.
+
+## Testing a short writer is better than hoping the OS does it
+
+Short writes can be rare on a developer machine. A test that writes a small buffer to a regular file may never exercise the loop.
+
+The fixture's custom writer deterministically accepts only three bytes. In application tests I also create writers that:
+
+- return one byte at a time;
+- return `Interrupted` once;
+- return `Ok(0)` with data remaining;
+- fail after partial progress;
+- fail during flush.
+
+These cases reveal callers that ignore counts, retry the wrong slice, spin, or assume errors undo previous output.
+
+## My review rule
+
+Whenever I see `.write(buffer)?`, I inspect how its `usize` result is used. Ignoring it is correct only when a short prefix is genuinely enough. That is uncommon for serialization, file output, and protocol messages.
+
+For complete output I use `write_all`. For non-blocking or event-driven I/O, I store the offset explicitly and resume when writable rather than blocking inside a helper. The state still follows the returned count.
+
+The core principle is that success can include measured partial progress. `Write::write` reports exactly that progress. `write_all` builds a completion loop on top, but neither provides transactional delivery. Correct code chooses the required boundary and never throws away the count that tells where reality stopped.

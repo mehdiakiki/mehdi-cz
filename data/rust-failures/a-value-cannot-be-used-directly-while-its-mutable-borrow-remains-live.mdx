@@ -1,0 +1,84 @@
+---
+caseId: "RFA-543"
+title: "A Rust Value Cannot Be Used Directly While Its Mutable Borrow Remains Live"
+date: "2026-09-06T06:22:00+01:00"
+lastmod: "2026-09-06T06:22:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "5b46cab87045edfad2afbeded2b8cceb0511f55fbd6d0f8c0c85c8c751f57d1b"
+area: "concurrency-memory"
+symptom: "Reading count directly after creating &mut count fails with E0503 because the mutable reference is used later and therefore keeps exclusive access active."
+summary: "A mutable reference temporarily becomes the only route to its borrowed place. Use that route, end it before direct access, or snapshot data before borrowing."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust E0503 cannot use because mutably borrowed", "read value while mutable reference live Rust", "last use mutable borrow Rust"]
+evidence: ["Rust 1.98.1 E0503 compile failure", "direct count read before later mutable-reference use", "update through reference then direct read repair"]
+sources: ["https://doc.rust-lang.org/error_codes/E0503.html", "https://doc.rust-lang.org/book/ch04-02-references-and-borrowing.html", "https://doc.rust-lang.org/reference/expressions/operator-expr.html#borrow-operators"]
+---
+
+Creating `&mut count` is not only permission to modify `count`. For the borrow's active period, it is the exclusive route through which the value may be accessed. E0503 reports a direct use that tries to bypass that route.
+
+The [failing fixture](/rust-failure-atlas/evidence/RFA-543/fail.rs) creates `counter`, reads `count` directly to compute `next`, then writes through `counter`. The later write keeps the mutable borrow active across the direct read.
+
+## Unique access prevents observation through aliases
+
+A mutable reference promises that no competing access can observe or modify the same place in ways excluded by Rust's borrowing rules. This gives safe code a stable foundation and lets optimisers reason about references.
+
+Reading the small `u32` may feel harmless, but allowing it as a general rule would also allow reading a complex value while a mutation path is active. Rust applies the ownership rule uniformly rather than inspecting whether this particular read races with a future line.
+
+The [official E0503 page](https://doc.rust-lang.org/error_codes/E0503.html) describes the issue as using a value after it was mutably borrowed.
+
+## Later use determines the borrow interval
+
+If `counter` were never used again, the compiler could end the borrow before the direct read. In this fixture, `*counter = next` is a later use, so the borrow remains live.
+
+I inspect both ends of the interval:
+
+- where the mutable reference is created;
+- where it is last used.
+
+The conflicting access lies between them. This is more precise than assuming every borrow lasts to the end of a lexical block, though a small block remains a useful way to communicate the intended interval.
+
+## The repaired code uses the active access path
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-543/fixed.rs) performs the update through `counter` first. After its last use, the direct read of `count` becomes valid again.
+
+Another repair could compute the snapshot before creating the mutable reference. Which order is correct depends on whether “next” is based on the old value or the updated value. Borrow-checker changes must preserve that domain sequence.
+
+The Book's [references and borrowing chapter](https://doc.rust-lang.org/book/ch04-02-references-and-borrowing.html) gives the shared-versus-mutable reference rules. I use the error locations to map those rules onto actual statement order.
+
+## Reborrowing can pass access without giving it up forever
+
+When I have `counter: &mut u32`, a function call may use a shorter reborrow such as `increment(&mut *counter)`. After that call returns, the original mutable reference can often be used again.
+
+This is common in parsers and state machines: one owner lends its exclusive access for a smaller operation, then resumes. The API should receive the reference it needs rather than reaching back to the original binding through another path.
+
+The Reference documents borrow operators and mutable references under [borrow expressions](https://doc.rust-lang.org/reference/expressions/operator-expr.html#borrow-operators).
+
+## Copy does not permit a late direct read
+
+`u32` is `Copy`, but copying still reads from `count`. Once the mutable borrow is active, that direct source access is disallowed. I can copy the old number before borrowing, because the copied local is independent afterward.
+
+This is different from moving out of a non-Copy value, but the timing rule remains: obtain any independent snapshot before granting unique access.
+
+I do not derive `Copy` on a domain type merely to work around borrow structure. Copy semantics should match the type's meaning and resource behaviour.
+
+## Field splitting can permit truly disjoint access
+
+Rust can often borrow separate struct fields independently. A mutable borrow of `state.count` may coexist with a read of `state.name` because the places are disjoint. Indexing collections is more conservative unless an API such as `split_at_mut` proves separation.
+
+I narrow borrows to the smallest field or slice when operations are genuinely independent. I do not use unsafe pointer arithmetic to assert disjointness that a safe standard API can express.
+
+## My E0503 checklist
+
+- Where was the mutable reference created?
+- Where is its final use?
+- Which direct use occurs inside that interval?
+- Can the operation go through the mutable reference instead?
+- Should a snapshot be copied or cloned before borrowing?
+- Does changing statement order preserve the domain result?
+- Can I narrow the borrow to one field or a safely split slice?
+- Would a helper function create a clearer short reborrow?
+
+The core principle is that `&mut` temporarily centralises access. While it remains live, I work through it; before or after that interval, the original owner becomes directly accessible again.

@@ -1,0 +1,78 @@
+---
+caseId: "RFA-301"
+title: "UnsafeCell Can Disable an Outer Option Niche Optimization"
+date: "2026-09-06T01:21:00+01:00"
+lastmod: "2026-09-06T01:21:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "c6ef38d167c7d718eb8b75eac4a1950e0e21bee680f9667aa2ed117cd7339300"
+area: "concurrency-memory"
+symptom: "Wrapping NonNull in UnsafeCell leaves the inner size unchanged but makes Option around that wrapper larger on a 64-bit target."
+summary: "UnsafeCell has the same in-memory representation as its inner value, but an outer generic type cannot necessarily reuse the inner invalid bit pattern as a niche. Layout equivalence does not compose through wrappers."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["64-bit targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust UnsafeCell Option size niche optimization", "Option UnsafeCell NonNull 16 bytes", "UnsafeCell memory layout outer enum niche"]
+evidence: ["Rust 1.98.1 64-bit layout fixture", "NonNull Option eight bytes", "UnsafeCell-wrapped Option sixteen bytes"]
+sources: ["https://doc.rust-lang.org/std/cell/struct.UnsafeCell.html#memory-layout", "https://doc.rust-lang.org/std/option/index.html#representation", "https://doc.rust-lang.org/reference/type-layout.html"]
+---
+
+I was reviewing a compact state representation and saw two facts that appeared to imply a third. `UnsafeCell<T>` has the same memory representation as `T`. `Option<NonNull<u8>>` is pointer-sized. I assumed `Option<UnsafeCell<NonNull<u8>>>` would also be pointer-sized. On a 64-bit target, it was sixteen bytes.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-301/fail.rs) compares those two `Option` sizes. The wrapped version is larger even though `UnsafeCell<NonNull<u8>>` itself is still the size of `NonNull<u8>`.
+
+## Same inner layout does not guarantee same outer layout
+
+[`UnsafeCell<T>`](https://doc.rust-lang.org/std/cell/struct.UnsafeCell.html#memory-layout) is Rust's primitive for interior mutability. Its documentation says it has the same in-memory representation as `T`. This permits an `UnsafeCell<T>` field without an extra per-field tag or header.
+
+But a generic outer type may use more than the valid byte size of its field. It may exploit a value that the field can never hold. That unused representation is called a niche.
+
+`NonNull<u8>` cannot contain a null pointer. `Option<NonNull<u8>>` can therefore represent `None` with the null bit pattern and `Some` with every valid non-null value. No separate discriminant is required.
+
+Wrapping the pointer in `UnsafeCell` prevents the outer `Option` from relying on that niche in this layout. Rust's own documentation uses exactly this example: the plain option is typically eight bytes on 64-bit platforms, while the `UnsafeCell` option is sixteen.
+
+## Interior mutability changes what an outer type may assume
+
+The purpose of `UnsafeCell` is to mark memory that can change through shared references under the rules enforced by a higher-level abstraction. That boundary matters to compiler reasoning.
+
+If an outer enum stored its discriminant only by treating one inner bit pattern as impossible, mutation through the cell could interfere with the representation invariant the enum depends upon. Rust therefore does not promise that a niche optimization survives this wrapper.
+
+I do not interpret this as “UnsafeCell always doubles size.” It does not. The direct wrapper retains the representation of `T`. The specific failure is assuming an optimization used by another type will compose across the wrapper.
+
+## Niche layout is useful but must be documented
+
+The [`Option` representation](https://doc.rust-lang.org/std/option/index.html#representation) documents a set of types for which `Option<T>` has the same size, alignment, and compatible function-call ABI as `T`. This is stronger than observing a compiler output once.
+
+For other combinations, `size_of` results are measurements for a target and toolchain unless the Reference or standard library gives an explicit guarantee. I can use measured layout internally with assertions, but I should not silently turn it into a stable file format or FFI contract.
+
+This distinction matters during upgrades. An optimization may change while ordinary Rust semantics remain completely compatible. Code using `repr(Rust)` layout as an external protocol already depended on something it was not promised.
+
+## `repr(transparent)` does not solve every outer enum question
+
+A transparent wrapper can establish representation and ABI relationships under its documented conditions. It does not automatically promise that every generic container performs the same niche optimization for the wrapped and unwrapped form.
+
+I separate three questions:
+
+```text
+Does Wrapper<T> have T's representation?
+Does Option<Wrapper<T>> have Wrapper<T>'s size?
+Is the result stable for my target and interface boundary?
+```
+
+They sound close, but they are different guarantees. The RFA-301 case fails by answering the first and assuming the second.
+
+## This is not permission to replace UnsafeCell
+
+Removing `UnsafeCell` only to save a word is not a valid repair when interior mutability is required. Mutating data behind an ordinary shared reference can be undefined behavior. Safe abstractions such as `Cell`, `RefCell`, mutexes, and atomics build their rules on the `UnsafeCell` primitive.
+
+I first preserve the memory model. Then I measure whether layout is actually important. If a dense table contains millions of entries, I may redesign the enum or move mutable state to a separate structure. If there are twenty objects, the clearer safe representation is normally the correct engineering choice.
+
+## What I test
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-301/fixed.rs) runs on the stated 64-bit target. It verifies that `NonNull<u8>` and `UnsafeCell<NonNull<u8>>` have equal direct size, then verifies eight bytes for the plain option and sixteen for the wrapped option.
+
+In production layout-sensitive code I add compile-time or test-time size and alignment assertions for every supported target. I test the actual outer type, not only its fields. For FFI I use explicit representations and validate the matching declaration on the other side. For persisted bytes I prefer a specified encoding rather than native Rust layout.
+
+I also keep a comment linking each assertion to a documented guarantee or marking it as a deliberate target-specific measurement. That makes a future compiler change a reviewable failure rather than a mysterious regression.
+
+The core principle is that representation facts do not compose automatically. `UnsafeCell<T>` can match `T` directly while changing what an enclosing `Option` may encode in the inner niche. Measure the complete type and rely only on the layout guarantee that actually covers it.

@@ -1,0 +1,82 @@
+---
+caseId: "RFA-390"
+title: "slice::copy_within Uses memmove Semantics for Overlap"
+date: "2026-09-06T03:30:00+01:00"
+lastmod: "2026-09-06T03:30:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "7b76b9bb00d52c8e2f00ee3d8f3e3ad94e0146821ca72de312607c91f0da8563"
+area: "concurrency-memory"
+symptom: "An overlapping slice copy produces memmove-style output instead of repeatedly copying values already overwritten earlier in the loop."
+summary: "copy_within supports overlapping ranges and behaves as if the source were copied through temporary storage. Calculate both ranges from the original slice and use copy_from_slice only for separate non-overlapping borrows."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust slice copy_within overlapping ranges", "copy_within memmove semantics Rust", "overlap copy produces unexpected array"]
+evidence: ["Rust 1.98.1 five-element array", "overlapping zero-to-three copy at index two", "original-source result assertion"]
+sources: ["https://doc.rust-lang.org/std/primitive.slice.html#method.copy_within", "https://doc.rust-lang.org/std/ptr/fn.copy.html", "https://doc.rust-lang.org/std/primitive.slice.html#method.copy_from_slice"]
+---
+
+I once replaced a hand-written movement loop with `copy_within` and obtained a different tail value. My loop copied forward through overlapping storage, so an earlier write changed a later read. Rust's slice method preserves the original source sequence.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-390/fail.rs) starts with `[1, 2, 3, 4, 5]` and copies `0..3` to destination index `2`. The result is `[1, 2, 1, 2, 3]`, not `[1, 2, 1, 2, 1]`.
+
+## Overlap is part of the contract
+
+[`slice::copy_within`](https://doc.rust-lang.org/std/primitive.slice.html#method.copy_within) copies a range to another location in the same slice. The element type must implement `Copy`, and the source and destination are allowed to overlap.
+
+Its documented behavior is equivalent to copying through temporary storage. This is the high-level form of `memmove` semantics. The implementation does not have to allocate a temporary vector; it can choose a safe direction or use an intrinsic with the same observable result.
+
+For the fixture, the source values are the original `[1, 2, 3]`. Destination positions two, three, and four receive those values in that order. Position four receives the original `3`, even though position two was overwritten earlier.
+
+## A naive loop selects a direction accidentally
+
+This forward loop is different:
+
+```rust
+for offset in 0..3 {
+    values[2 + offset] = values[offset];
+}
+```
+
+At offset two, `values[2]` has already become `1`, so the loop copies that new value to position four. Iterating backward would work for this rightward movement but fail for some leftward movements.
+
+`copy_within` chooses the overlap-safe behavior without making every caller branch on relative range positions. I use it when the specification says “move this original block,” which is usually what buffer compaction needs.
+
+## Source and destination coordinates differ
+
+The first argument is a source range. The second is only the starting destination index. The destination length equals the source length.
+
+Before calling, I calculate `source_start`, `source_end`, `count`, and `destination_start`. The destination end is `destination_start + count`. Both complete ranges must fit in the slice, or the method panics.
+
+An empty source performs no copy, while its bounds still need to form a valid slice range. I validate offsets derived from input before using the operation in a parser.
+
+## Copy is not move ownership
+
+The method requires `T: Copy`. Both source and destination positions remain initialized, and overwritten destination values are replaced as plain copyable values. It cannot transfer ownership of `String` elements or run domain merge logic.
+
+For owned non-Copy values, I redesign the collection operation around `drain`, rotation, swaps, or an explicit temporary owner. Unsafe pointer copying of owning values can duplicate ownership and cause double destruction.
+
+The name “copy within” refers to bitwise copy semantics permitted by `Copy`, not to relocating arbitrary resources.
+
+## copy_from_slice has a different borrowing shape
+
+[`copy_from_slice`](https://doc.rust-lang.org/std/primitive.slice.html#method.copy_from_slice) copies from another slice and requires equal lengths. Expressing overlapping source and destination from one slice with safe simultaneous borrows is normally rejected.
+
+I use `copy_within` precisely when both ranges belong to one allocation and may overlap. I use `copy_from_slice` for logically distinct source and destination slices.
+
+At the raw-pointer level, [`ptr::copy`](https://doc.rust-lang.org/std/ptr/fn.copy.html) supports overlap, while `ptr::copy_nonoverlapping` requires separation. Safe slice methods let me state that choice without manually proving pointer validity.
+
+## This appears in streaming buffers
+
+After consuming a prefix, a parser may shift unread bytes toward index zero. Source and destination overlap for most buffer sizes. A forward byte loop can appear correct in tests where destination is before source, then fail when reused for another direction.
+
+I test movement both left and right, complete overlap, adjacent ranges, empty ranges, and boundary-sized ranges. The expected result is always calculated from a snapshot of the input.
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-390/fixed.rs) records the smallest right-overlap result. It avoids asserting how the implementation performs the copy; only the contract matters.
+
+The core principle is that overlapping mutation needs a source-time model. `copy_within` treats the complete original range as its source, so writes cannot feed later reads in the same operation. That is safer and more portable than choosing a loop direction by accident.
+
+## A review question that catches the wrong model
+
+When I review this code, I ask which version of the source each destination position should observe: the bytes before the operation, or whatever a loop most recently wrote. If the answer is the original source, `copy_within` states the intention directly. I also keep one overlap test in which the destination begins inside the source. A disjoint-range test cannot distinguish memmove semantics from an ordinary element loop, so it gives false confidence about the exact behavior that matters.

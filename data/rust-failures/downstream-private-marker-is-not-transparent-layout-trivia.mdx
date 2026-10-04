@@ -1,0 +1,99 @@
+---
+caseId: "RFA-717"
+title: "A Downstream Private-Field Marker Cannot Be Ignored by repr(transparent)"
+date: "2026-09-07T11:28:00+01:00"
+lastmod: "2026-09-07T11:28:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "1243d0c70d9548ccf67dc292ad13c579481238dab1d2869a6c81d06c3cbd9fa4"
+area: "upgrades-compatibility"
+symptom: "A repr(transparent) wrapper around u64 and a dependency's zero-sized marker fails with E0690 because the marker type has private fields."
+summary: "A dependency may add storage behind its private fields without breaking its public API. Rust 1.98 therefore refuses to make that current zero-size observation part of another crate's transparent ABI."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets"]
+profiles: ["dev", "release"]
+searchTerms: ["Rust E0690 repr transparent private fields dependency", "private marker could become non zero sized repr transparent", "downstream zero sized type transparent wrapper Rust 1.98"]
+evidence: ["Rust 1.98.1 two-crate Cargo failure", "dependency marker has a private unit field", "PhantomData repair keeps type information without storing the dependency type"]
+sources: ["https://doc.rust-lang.org/releases.html#version-1980-2026-08-20", "https://doc.rust-lang.org/reference/type-layout.html#the-transparent-representation", "https://doc.rust-lang.org/reference/visibility-and-privacy.html"]
+---
+
+I can measure a dependency type today and see that it occupies zero bytes. That does not always give my crate the right to promise that the type occupies zero bytes forever.
+
+Rust 1.98 makes this boundary visible for `repr(transparent)`. Consider a dependency exposing this marker:
+
+```rust
+pub struct PrivateMarker {
+    _private: (),
+}
+```
+
+My crate then tries to keep the marker beside one represented value:
+
+```rust
+#[repr(transparent)]
+struct RequestId(u64, marker::PrivateMarker);
+```
+
+Rust reports E0690. It treats both fields as non-trivial for the transparent-layout rule. The `u64` has storage, and the dependency marker has private fields, so its author could make it non-zero-sized in a future compatible release.
+
+The Atlas proof is intentionally a two-crate project. The [failing application](/rust-failure-atlas/evidence/RFA-717/fail/src/main.rs) depends on the [marker crate](/rust-failure-atlas/evidence/RFA-717/fail/marker/src/lib.rs). The [repaired application](/rust-failure-atlas/evidence/RFA-717/fixed/src/main.rs) carries the type relationship through `PhantomData` and verifies the wrapper's observed size. Rust 1.98.1 compiles both projects through Cargo so the crate boundary is real.
+
+## Privacy preserves the dependency author's choices
+
+Private fields do more than prevent my code from writing a field. They hide the representation choices behind a public type.
+
+The dependency could later change its definition to include a byte, a pointer, or another internal marker. Whether that is a semver-compatible change depends on the promises the crate made, but ordinary Rust layout without a representation guarantee does not expose all internal field choices as my stable ABI.
+
+If my wrapper were accepted as transparent to `u64`, my crate would publish a stronger promise: `RequestId` has the layout and ABI of `u64`. That promise would depend on another crate never exercising freedom which its private fields intentionally preserve.
+
+Rust cannot make both promises true automatically. It therefore refuses to ignore the downstream type as layout trivia.
+
+This is different from saying the marker has non-zero size now. The diagnostic specifically explains that it could become non-zero-sized in the future. The problem is the missing guarantee, not the current measurement.
+
+## Why the same-crate version can look different
+
+The exact crate boundary matters. When my crate defines the private-field type itself, the compiler can treat it with knowledge local to that crate. I own both the marker definition and the transparent wrapper, so one compilation sees the whole relationship.
+
+Across a dependency boundary, private really means that downstream code cannot inspect or construct the hidden state directly. This is the case worth preserving in a reduction. A one-file example may compile and accidentally teach the wrong lesson.
+
+When I diagnose E0690, I therefore ask where the extra field type is defined. “It is zero-sized” is not enough. I need to know who owns its future layout.
+
+## PhantomData is a repair only for type-level information
+
+In the evidence repair, the wrapper becomes:
+
+```rust
+use core::marker::PhantomData;
+
+#[repr(transparent)]
+struct RequestId(u64, PhantomData<marker::PrivateMarker>);
+```
+
+`PhantomData` is the correct tool when the wrapper needs to express a type relationship without storing an actual `PrivateMarker` value. Its layout is designed for this purpose, and the wrapper keeps one meaningful stored field.
+
+I still choose the `PhantomData` form carefully. It can affect variance, drop checking, and auto traits such as `Send` and `Sync`. Replacing a field with `PhantomData` is not a blind text substitution.
+
+More importantly, it is wrong when the marker value is a real capability. Some marker types prove that a lock is held, a generation is active, or access belongs to a particular context. Pretending to own such a token with `PhantomData` can erase the very invariant the type was created to enforce.
+
+If the value must truly be stored, I stop claiming that the wrapper is transparent. I can keep the capability in a separate owner, use a normal Rust-layout struct, or expose explicit conversion functions at the foreign boundary. The ABI should follow the design, not force the design to discard evidence.
+
+## Public fields are not a good mechanical workaround
+
+Making the dependency's private field public may make the current layout easier for downstream code to reason about, but it also expands the dependency's API and construction surface. I would not expose internals only to silence E0690.
+
+The dependency could instead publish an intentional representation guarantee if its design supports one. Yet my application cannot invent that guarantee from outside. A size assertion in my crate proves what one build produced; it does not bind the dependency's next release.
+
+For FFI-facing wrappers, I prefer types whose layout promise is explicit and owned close to the boundary. If an external marker is only a logical tag, `PhantomData` may fit. If it is stored state, I model it outside the transparent value.
+
+## My upgrade checklist for this error
+
+When a Rust upgrade reports this private-field form of E0690, I check four facts:
+
+1. Which field is supposed to provide the wrapper's layout and ABI?
+2. Is every other field actually stored, or is it only type-system information?
+3. Is the extra type defined in this crate, or by a dependency with hidden fields?
+4. Would replacing the value with `PhantomData` preserve ownership and safety semantics?
+
+I then keep a two-crate fixture because collapsing it to one file can remove the reason for the error.
+
+The broader principle is about dependency engineering. A private field is a reserved implementation space. Downstream code should not convert today's observation of that space into a permanent ABI promise. Rust 1.98 rejects the wrapper early, before a dependency update turns a convenient assumption into layout disagreement across a native boundary.

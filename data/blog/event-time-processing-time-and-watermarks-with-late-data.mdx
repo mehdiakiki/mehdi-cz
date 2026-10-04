@@ -1,0 +1,182 @@
+---
+title: "Event Time, Processing Time, and Watermarks With Late Data"
+date: "2026-10-29T09:00:00+01:00"
+tags: ["event time", "watermarks", "late data", "stream processing", "windows"]
+draft: false
+reviewed: true
+reviewedHash: "b068e2dfa5608e9054fcb84d14092b3a7674d36289117781363af76dc6fe1829"
+cluster: "reliable-data-integrations"
+campaign: "authority-2026"
+opportunity: "DATA-054"
+summary: "A watermark is an estimate of event-time completeness, not the wall clock. Define timestamps, partition combination, idleness, allowed lateness, and correction output explicitly."
+---
+
+A stream processor can receive a ten-minute-old event now and process it in five milliseconds. Which time should place it into a window?
+
+There are several clocks:
+
+```text
+event time:       when the source says the business event happened
+ingestion time:   when the streaming platform received it
+processing time:  when this operator handles it
+```
+
+They answer different questions. Watermarks help an event-time computation decide when a result is complete enough to emit.
+
+## Processing-time windows answer an operational question
+
+A five-minute processing-time window groups whatever this worker sees between its local clock boundaries.
+
+This is useful for questions such as:
+
+```text
+How many requests did this service process during the last five minutes?
+```
+
+It is unstable for business history. A replay tomorrow places yesterday's sales into tomorrow's processing window.
+
+## Event-time windows survive delayed delivery
+
+If each sale contains a trusted `occurred_at`, a window can group by that value:
+
+```text
+10:00 <= occurred_at < 10:05
+```
+
+An event produced offline at 10:04 may arrive at 10:10 and still belong to the 10:00 window.
+
+The hard part is deciding when to emit. In an unbounded stream, the processor cannot know with certainty that no older event will ever arrive.
+
+## A watermark is a completeness claim
+
+A watermark of `10:07` means roughly:
+
+```text
+The system believes most or all future records will have
+event timestamps later than 10:07,
+according to this source's watermark policy.
+```
+
+It does not mean the current wall clock is 10:07, and it does not prove no earlier event can arrive.
+
+Apache Flink's [event-time documentation](https://nightlies.apache.org/flink/flink-docs-stable/docs/concepts/time/) describes watermarks as progress through event time and explains that they allow event-time operations to handle out-of-order records.
+
+## A bounded-out-of-orderness policy
+
+One simple source policy tracks the largest event timestamp seen and subtracts a delay:
+
+```text
+watermark = maximum_observed_event_time - 2 minutes
+```
+
+If the maximum observed time is 10:09, the watermark becomes 10:07.
+
+For a window ending at 10:05, the processor can emit its initial result after the watermark passes 10:05. An event for 10:04 arriving then is late according to this policy.
+
+Two minutes is not a magic truth. It is a product trade-off between result latency and correction frequency, based on measured arrival delay.
+
+## The slowest active partition controls progress
+
+Suppose partitions report:
+
+```text
+P0 watermark 10:08
+P1 watermark 10:07
+P2 watermark 09:41
+```
+
+If a downstream operator combines all three, using the maximum could close windows while P2 still has older records. The safe combined watermark is generally bounded by the minimum active input watermark: 09:41 here.
+
+An idle partition creates another problem. If P2 has no records because its source is quiet, it may hold the minimum forever. Stream processors therefore support idleness detection or source-specific handling.
+
+Marking a merely slow partition idle can release windows too early, so the idleness threshold is part of the correctness policy.
+
+## Late data needs a declared outcome
+
+When a late event arrives, I choose among:
+
+```text
+drop and count it
+send to a late-data side output
+update the previous result
+emit a retraction plus corrected result
+recompute a durable window later
+```
+
+The sink must support the choice. An append-only email or external charge cannot retract. A versioned database row can accept a newer window revision.
+
+A useful result key is:
+
+```text
+metric + grouping key + window start + window end
+```
+
+Updates to that key increment a result version or carry a source watermark so downstream consumers can apply corrections idempotently.
+
+## Allowed lateness is not infinite memory
+
+Keeping window state for one hour after its first emission permits one hour of correction. It also keeps state and timers longer.
+
+I calculate:
+
+```text
+active windows × keys per window × bytes per key
+```
+
+and include checkpoint overhead. A wider late-data horizon trades memory and storage for completeness.
+
+Events later than the retained state need a side output or offline repair path. Silently recreating an empty old window can produce a partial result that looks final.
+
+## Source timestamps can be wrong
+
+Event time may come from a device with a bad clock, a client-controlled field, or a provider that changes timezone handling.
+
+I validate:
+
+- acceptable future skew;
+- oldest supported timestamp;
+- timezone and precision;
+- monotonic sequence when the source has one;
+- relationship between occurred, emitted, and ingested time.
+
+One event dated year 2099 can move a naive maximum-timestamp watermark far forward and make normal events appear late.
+
+I quarantine impossible timestamps or cap their influence according to a documented policy.
+
+## Replays must not advance live watermarks accidentally
+
+A backfill can contain old event times but arrive quickly. A replay of future-dated bad data can also move a shared watermark.
+
+I isolate replay and live sources when their progress semantics differ, then merge results through source positions and versioned windows. Processing time of the replay job should not redefine historical event time.
+
+## Measure the delay distribution
+
+For accepted events I record:
+
+```text
+ingestion_delay = ingested_at - occurred_at
+processing_delay = processed_at - ingested_at
+result_delay = first_result_at - window_end
+correction_delay = final_correction_at - window_end
+```
+
+I examine percentiles by source, tenant, partition, event type, and time of day. One global two-minute allowance can hide a provider whose p99 delay is three hours.
+
+The dashboard also needs late-event count, corrected-window count, dropped-late count, idle partitions, and oldest retained window state.
+
+## A deterministic test
+
+For a window `[10:00, 10:05)`, I feed:
+
+```text
+event A at 10:01, arrives first
+event B at 10:04, arrives after an event at 10:09
+watermark advances past 10:05
+event C at 10:03 arrives late
+one partition becomes idle
+event D has impossible time 2099-01-01
+```
+
+I assert the first result, correction or side output, state-retention deadline, combined watermark, and rejection of the impossible timestamp.
+
+Watermarks are not a trick for making streams ordered. They are explicit estimates about event-time progress. Once the estimate, partition rule, idleness, late-data outcome, and sink correction contract are written down, window results become explainable.

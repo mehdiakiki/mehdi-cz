@@ -1,0 +1,158 @@
+---
+caseId: "RFA-034"
+title: "Why a Rust Mutex Was Not Poisoned After the Operation Failed"
+date: "2026-09-04T21:00:00+01:00"
+lastmod: "2026-09-07T10:20:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "4c08e17444489d691ef242560366f89211cd8dc8d614529edad61917eca2111b"
+area: "concurrency-memory"
+symptom: "A mutex remains usable even though the operation protected by it returned an error or an async task failed."
+summary: "Rust mutex poisoning observes a panic while a guard is held, not every failed operation. Separate lock state from application invariants and recover only after validating the data."
+rustVersions: ["stable Rust"]
+targets: ["all targets with std"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust mutex not poisoned after error",
+    "Mutex poison async task panic",
+    "Rust lock poisoning conditions",
+  ]
+evidence: ["panic-boundary fixture", "guard drop trace", "invariant assertion"]
+sources:
+  [
+    "https://doc.rust-lang.org/std/sync/struct.Mutex.html#poisoning",
+    "https://doc.rust-lang.org/std/sync/struct.Mutex.html#method.clear_poison",
+  ]
+---
+
+Mutex poisoning is often described as “the lock knows something failed.” That shortcut is too wide. A standard Rust mutex normally becomes poisoned when a thread panics while holding its guard. An ordinary `Result::Err`, a cancelled async operation, or an error returned after the guard was dropped does not mean the same thing.
+
+The mutex protects exclusive access. Poisoning is an advisory signal about one panic context. It is not a transaction manager for application state.
+
+## An error does not poison the lock
+
+This program returns an error after changing the protected value:
+
+```rust
+use std::sync::Mutex;
+
+fn update(value: &Mutex<Vec<u8>>) -> Result<(), &'static str> {
+    let mut guard = value.lock().unwrap();
+    guard.push(1);
+    Err("remote write failed")
+}
+
+let value = Mutex::new(Vec::new());
+assert!(update(&value).is_err());
+assert!(!value.is_poisoned());
+assert_eq!(&*value.lock().unwrap(), &[1]);
+```
+
+Nothing panicked. The guard was dropped normally when the function returned. Rust cannot know whether `[1]` is valid application state.
+
+The [failing assertion](/rust-failure-atlas/evidence/RFA-034/fail.rs) records the tempting but incorrect expectation that `Err` sets poison. The [repaired assertion](/rust-failure-atlas/evidence/RFA-034/fixed.rs) checks both facts which matter: the mutex is not poisoned and the partial mutation remains visible. This keeps the case separate from Atlas examples in which a thread really does panic while holding the guard.
+
+My first check is therefore precise: did a panic unwind through the scope which held this exact guard? If the answer is no, the lack of poison is expected.
+
+## The panic case
+
+The usual poisoning path is easy to reproduce:
+
+```rust
+use std::sync::{Arc, Mutex};
+
+let value = Arc::new(Mutex::new(vec![0]));
+let worker_value = value.clone();
+
+let _ = std::thread::spawn(move || {
+    let mut guard = worker_value.lock().unwrap();
+    guard.push(1);
+    panic!("invariant update stopped halfway");
+})
+.join();
+
+assert!(value.is_poisoned());
+```
+
+The next `lock` returns a `PoisonError` containing the acquired guard. It does not make the bytes inaccessible. A caller can use `into_inner`, inspect or repair them, and later call `clear_poison`.
+
+That is why poisoning is advisory. It helps safe code avoid casually observing possibly inconsistent data, but it does not guarantee rollback or memory safety.
+
+## Async failures need another model
+
+Holding a standard mutex guard across `.await` is usually a design smell, and some guards cannot be sent between threads. Even with an async-aware mutex, cancellation does not map to standard mutex poisoning.
+
+Imagine this sequence:
+
+```text
+lock state
+mark item as processing
+await remote request
+record completion
+unlock state
+```
+
+If the future is cancelled at the await, local destructors release the guard, but there was no thread panic for `std::sync::Mutex` to observe. The state can remain “processing.” The correct protection is an explicit state machine, rollback guard, idempotent operation, or recovery scan—not a hope that the lock becomes poisoned.
+
+I separate two questions:
+
+1. Can another thread enter the critical section?
+2. Is the protected value in an application-valid state?
+
+The mutex answers the first. The data model and recovery protocol must answer the second.
+
+## Poison detection has documented edge cases
+
+The standard-library documentation also warns that panic detection is not infallible. Panic hooks, unusual guard movement between panic contexts, double panics caught around destructor code, and foreign exceptions can affect whether poisoning is observed.
+
+This matters most in unsafe abstractions. Unsafe code must never rely on poisoning as the only thing preventing access to invalid memory. A missed poison cannot be allowed to become use-after-free or an invalid value.
+
+For ordinary application code, the same warning suggests a good design: validate important invariants directly.
+
+## Recover with evidence
+
+This pattern obtains the guard even when poisoned:
+
+```rust
+let mut guard = match state.lock() {
+    Ok(guard) => guard,
+    Err(poisoned) => poisoned.into_inner(),
+};
+
+if !guard.is_consistent() {
+    *guard = State::rebuild_from_durable_log()?;
+}
+
+state.clear_poison();
+```
+
+I do not call `clear_poison` merely to remove an annoying error. I clear it after restoring or proving the invariant. The recovery action should be testable and should explain which source of truth it uses.
+
+Sometimes the correct response is to terminate the component instead. If partial mutation cannot be inspected safely at the application level, continuing may create silent corruption.
+
+## Better critical sections
+
+I keep fallible work outside the lock when possible:
+
+```rust
+let prepared = prepare_update()?;
+
+{
+    let mut guard = state.lock().unwrap();
+    guard.apply(prepared); // Small, non-blocking commit.
+}
+```
+
+The preparation can fail without touching shared state. The locked section becomes a short commit with a clear invariant. This is not always possible, but it is a strong default.
+
+## The regression proof
+
+I keep separate tests for separate semantics:
+
+- Returning `Err` while holding a guard does not set poison.
+- Panicking while holding the guard normally does.
+- Recovery inspects or rebuilds state before clearing poison.
+- Cancellation at each await leaves an explicitly valid application state.
+
+The important result is not whether the mutex says “poisoned.” It is whether the program can prove the protected value is valid before using it again.

@@ -1,0 +1,77 @@
+---
+caseId: "RFA-616"
+title: "Rust await Is Legal Only Inside an async Context"
+date: "2026-09-06T07:35:00+01:00"
+lastmod: "2026-09-06T07:35:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "5ebc548d79912d65372a1f6dd227d882499ad854ebb527ef389ca9ff3f7ff282"
+area: "async-runtime"
+symptom: "Awaiting an async block inside an ordinary fn fails with E0728 because only an async state machine can suspend and later resume that code."
+summary: "Await is a suspension point, not a blocking call. Make the containing operation async and propagate it, or block once at a deliberate runtime boundary."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust E0728 await outside async", "await only allowed async function Rust", "propagate async versus block_on"]
+evidence: ["Rust 1.98.1 E0728 compile failure", "await used in ordinary prepare function", "async function context repair"]
+sources: ["https://doc.rust-lang.org/error_codes/E0728.html", "https://doc.rust-lang.org/reference/expressions/await-expr.html", "https://doc.rust-lang.org/book/ch17-01-futures-and-syntax.html"]
+---
+
+`.await` may suspend the current computation and store its local state until a future becomes ready. An ordinary function has no generated async state machine to preserve and resume that state. The [failing fixture](/rust-failure-atlas/evidence/RFA-616/fail.rs) awaits inside plain `fn prepare` and receives E0728.
+
+## Await is not thread blocking syntax
+
+Calling a future-producing function returns a future value. Awaiting polls it and, when pending, yields control to the executor so other work can run. The surrounding async function itself returns another future representing this incomplete computation.
+
+The [official E0728 explanation](https://doc.rust-lang.org/error_codes/E0728.html) permits await in an async function or async block. The Reference defines [await expressions](https://doc.rust-lang.org/reference/expressions/await-expr.html) in terms of polling and yielding.
+
+Adding async changes the function's caller-visible return contract. It is not only a keyword that enables syntax.
+
+## The repair propagates async outward
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-616/fixed.rs) makes `prepare` async. Calling it in main creates a future; the fixture does not poll it because it intentionally avoids choosing a runtime.
+
+In a real application, callers normally await `prepare`, becoming async in turn until reaching a deliberate runtime entrypoint. Async runtimes provide macros or builders that drive the top-level future.
+
+I do not create a new runtime or call `block_on` deep inside library code merely to avoid propagation. Nested runtimes can panic, block executor workers, and make cancellation behaviour surprising.
+
+## Async boundaries belong at architecture edges
+
+A synchronous CLI can construct one runtime at main and drive its async application. A server already inside an executor should remain async through I/O paths. A synchronous library API may delegate to worker threads or expose separate sync and async methods, but it should document cost and runtime requirements.
+
+The Book's [future syntax chapter](https://doc.rust-lang.org/book/ch17-01-futures-and-syntax.html) helps connect async functions with the Future values they return.
+
+I avoid holding synchronous mutex guards or non-Send borrows across await unless the primitive and execution model make it safe. Every await divides the function into suspension states whose captured values become fields in the future.
+
+## Await placement affects cancellation
+
+Dropping a future stops its remaining work. At every await, cancellation may occur before subsequent cleanup or commits. A sequence that sends an external request, awaits a response, then records completion needs idempotency or reconciliation if dropped between those steps.
+
+I document cancellation safety for operations used in select loops. Reading part of a frame, acquiring permits, and sending messages have different restart behaviour.
+
+Making code compile by adding async does not solve these state-transition guarantees. It only creates legal suspension machinery.
+
+## Blocking work still blocks inside async
+
+An async function can call a CPU-heavy or synchronous blocking function, and that work runs until it returns without yielding. File APIs, DNS, compression, and locks may block executor threads depending on implementation.
+
+I move truly blocking work to an appropriate blocking pool, bound concurrency, and measure queue latency. Marking a wrapper async does not make its internals non-blocking.
+
+Tests use the runtime supported by the library and control time where possible. They cover readiness, pending behaviour, cancellation, timeouts, and resource release. A compile-only fixture establishes context legality, while executor tests establish operational semantics.
+
+## Keep the synchronous edge visible
+
+Applications eventually need one place that drives the future. I keep that executor entry visible in `main`, a test harness, or a framework callback instead of hiding it inside ordinary helpers. Libraries return futures and let callers choose the runtime. This makes nested-runtime panics, blocked executor threads, and surprising shutdown behaviour less likely. It also lets a synchronous caller decide deliberately whether it can propagate async, dedicate a worker, or expose a separate blocking API.
+
+## My E0728 checklist
+
+- Is the containing function or block actually async?
+- What future does the awaited expression produce?
+- Should async propagate to callers until one runtime boundary?
+- Is someone attempting to build or block a runtime inside library logic?
+- Which values remain live across the new suspension point?
+- Is the operation safe to cancel and retry at that await?
+- Does any synchronous work block the executor despite async syntax?
+- Do tests poll the future under the supported runtime and cover cancellation?
+
+The core principle is that await requires a resumable computation context. E0728 prevents ordinary stack execution from pretending it can suspend. I propagate async deliberately and treat each new await as an ownership, cancellation, and scheduling boundary.

@@ -1,0 +1,79 @@
+---
+caseId: "RFA-690"
+title: "Rc::get_mut Requires No Other Strong or Weak Pointers"
+date: "2026-09-06T08:50:00+01:00"
+lastmod: "2026-09-06T08:50:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "a6fe182aeaf9022ac475a9d2248cbcfea9fabb42bbaa5207bf1e3c8958af698d"
+area: "concurrency-memory"
+symptom: "Rc::get_mut returns None even with one strong owner because a Weak pointer to the same allocation is still alive."
+summary: "Unique strong ownership is not enough for Rc::get_mut; weak allocation observers also prevent its safe unique mutable reference. Drop them or choose clone-on-write."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust Rc get_mut None weak pointer", "Rc get_mut strong count one", "weak_count prevents Rc mutation"]
+evidence: ["Rust 1.98.1 runtime assertion", "one strong owner plus one Weak observer", "dropping Weak enables unique mutation"]
+sources: ["https://doc.rust-lang.org/std/rc/struct.Rc.html#method.get_mut", "https://doc.rust-lang.org/std/rc/struct.Rc.html#method.make_mut", "https://doc.rust-lang.org/std/rc/struct.Weak.html#method.upgrade"]
+---
+
+`Rc::get_mut(&mut owner)` returns a unique mutable reference only when no other `Rc` or `Weak` pointers target the allocation. One strong owner is not sufficient if a weak observer remains. The [failing fixture](/rust-failure-atlas/evidence/RFA-690/fail.rs) demonstrates this exact `None` result.
+
+## Uniqueness includes allocation observers
+
+The [`Rc::get_mut` documentation](https://doc.rust-lang.org/std/rc/struct.Rc.html#method.get_mut) requires absence of other Rc and Weak pointers. If that condition holds, the allocation can be mutably borrowed safely through the returned `&mut T`.
+
+I check both `strong_count` and the existence of weak handles when diagnosing a surprising None. Counts are diagnostic snapshots, though; `get_mut` itself is the safe decision point.
+
+`Rc` is single-threaded, so another thread cannot race these counts. Aliases can still be hidden in graph edges, caches, callbacks, or parent pointers within the same thread.
+
+## Weak does not own T but observes liveness
+
+A [`Weak`](https://doc.rust-lang.org/std/rc/struct.Weak.html#method.upgrade) pointer does not keep the inner `T` alive. Its `upgrade` returns an optional Rc. It does keep access to allocation metadata needed to decide whether a value still lives.
+
+This makes weak pointers useful for breaking ownership cycles, registries, and back-references. It also means allocation identity remains externally observable. `get_mut` uses the conservative uniqueness contract documented by the type rather than exposing a mutable reference in that state.
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-690/fixed.rs) first asserts None, drops the weak observer, then mutates the String uniquely.
+
+## make_mut chooses clone-on-write
+
+[`Rc::make_mut`](https://doc.rust-lang.org/std/rc/struct.Rc.html#method.make_mut) can provide mutable access by cloning inner data when another strong owner exists. Its interaction with weak pointers follows its documented dissociation behaviour and should be understood before using weak identity as a cache key.
+
+Clone-on-write is suitable when readers may keep an old snapshot and a writer can fork state. It is not shared mutation. An earlier Rc owner does not observe changes made to a cloned allocation.
+
+If every observer must see the same updates, interior mutability such as `RefCell` may express the single-threaded model, with runtime borrow checks. The choice is snapshots versus one mutable shared state.
+
+## Cyclic graphs make aliases easy to miss
+
+Trees often own children strongly and parents weakly. A root that appears to have one strong owner can still have weak parent references, registry handles, or UI callbacks. `get_mut` then correctly refuses.
+
+I do not drop weak links merely to make mutation work unless invalidating those observers is part of the transition. A weak handle may carry important identity and its failure to upgrade later may mean removal.
+
+For graph updates, `RefCell`, arena IDs, slot maps, or a separate owner of nodes can make mutation rules clearer than depending on global uniqueness at a particular moment.
+
+## Unsafe uniqueness shortcuts need a full proof
+
+Unchecked mutable access to Rc is unsafe because aliasing a mutable reference with reachable shared access violates Rust's rules. Looking only at strong count is not a complete substitute for the method's contract.
+
+The proof must include weak pointers, raw pointers, leaked references, and every way allocation identity is exposed. Most application code should change the ownership model instead of bypassing `get_mut`.
+
+An optimization that removes one option check is not worth turning graph invariants into undocumented unsafe assumptions.
+
+## Tests should retain the weak handle
+
+Creating a weak pointer in a statement and letting it drop before `get_mut` does not exercise this case. The fixture binds it across the call. Tests cover one strong owner alone, another strong clone, a live weak observer, weak drop, and clone-on-write behaviour.
+
+I assert value visibility through all owners after mutation. A successful mutable call alone does not prove snapshot semantics match the application.
+
+## My Rc uniqueness checklist
+
+- Are there other strong owners hidden in the object graph?
+- Does any Weak pointer still observe this allocation?
+- Would dropping weak identity violate a registry or back-reference contract?
+- Should mutation fork a snapshot through make_mut?
+- Should all observers share updates through interior mutability instead?
+- Is Rc appropriate, or would stable arena IDs simplify the graph?
+- Does unsafe code account for every alias form?
+- Do tests keep weak handles alive across the decision point?
+
+The core principle is that unique mutation depends on the complete alias contract, not one familiar reference count. `Rc::get_mut` includes weak allocation observers in that contract. I either end those observers deliberately or choose a mutation model designed for sharing.

@@ -1,0 +1,198 @@
+---
+title: "Resuming a Paginated Import After Page 417 Fails"
+date: "2026-09-28T09:00:00+01:00"
+tags: ["api integration", "pagination", "data import", "checkpoints", "reliability"]
+draft: false
+reviewed: true
+reviewedHash: "1ebcfb7b4724a701ca3724d22631482630750e25119608de966cf4692ab56dfc"
+cluster: "reliable-data-integrations"
+campaign: "authority-2026"
+opportunity: "DATA-029"
+summary: "A paginated import should resume from a committed cursor and stable item identities, not from a human page number that may no longer describe the same data."
+---
+
+Page 417 fails after an import has already processed hundreds of thousands of records. The tempting solution is to store `417` and restart there.
+
+This works only if pages are stable. Many APIs do not promise that. Records are inserted, deleted, or reordered while the import runs. Page 417 tomorrow can contain a different set from page 417 today.
+
+I treat pagination as a transport mechanism and checkpointing as a data consistency problem. The checkpoint must describe a committed position, not a screen number.
+
+## Start by naming the pagination contract
+
+I have seen four common forms:
+
+| Pagination | Position | Main restart risk |
+| --- | --- | --- |
+| offset/page number | `offset=41600` | inserts or deletes shift later pages |
+| item cursor | `starting_after=item_123` | cursor item can disappear or ordering can change |
+| opaque token | provider-generated token | token may expire or encode the original query |
+| time/key keyset | `(updated_at, id) > (?, ?)` | equal timestamps and late updates need care |
+
+I record the documented consistency guarantee separately. A cursor can make traversal efficient without providing a frozen snapshot.
+
+Stripe's [pagination documentation](https://docs.stripe.com/api/pagination) uses object IDs as cursors for `starting_after` and `ending_before`. Other providers return opaque continuation tokens. Microsoft warns clients to treat its [`$after` token](https://learn.microsoft.com/en-us/azure/data-api-builder/keywords/after-rest) as immutable rather than constructing one.
+
+The client should preserve the provider's token exactly.
+
+## Store the request identity beside the cursor
+
+A token without its original query is dangerous. It may belong to a different account, filter, sort order, or API version.
+
+My import checkpoint looks like this:
+
+```ts
+type ImportCheckpoint = {
+  importId: string;
+  tenantId: string;
+  endpoint: string;
+  queryFingerprint: string;
+  providerApiVersion: string;
+  snapshotUpperBound: string | null;
+  nextCursor: string | null;
+  lastCommittedKey: { changedAt: string; id: string } | null;
+  committedItems: number;
+  status: "running" | "blocked" | "complete";
+  updatedAt: string;
+};
+```
+
+The query fingerprint covers filters, sort, selected scope, and any option that changes membership or order. On resume, the worker refuses to combine a cursor with a different fingerprint.
+
+`snapshotUpperBound` is useful when the provider supports a time filter. At import start I can freeze `updated_before=T`. New changes after `T` belong to the next incremental run rather than moving the current traversal.
+
+## Advance only after durable item effects
+
+For every page, the safe order is:
+
+```text
+fetch page using current cursor
+validate response and item identities
+write or deduplicate every item
+commit item effects
+persist the returned next cursor
+acknowledge page completion
+```
+
+If item writes and checkpoint share one database, I commit them in one transaction:
+
+```sql
+begin;
+
+insert into imported_record (tenant_id, provider_id, payload, source_version)
+values (...)
+on conflict (tenant_id, provider_id)
+do update set
+  payload = excluded.payload,
+  source_version = excluded.source_version;
+
+update import_run
+set next_cursor = :returned_cursor,
+    committed_items = committed_items + :page_count,
+    updated_at = now()
+where import_id = :import_id
+  and next_cursor is not distinct from :requested_cursor;
+
+commit;
+```
+
+The final predicate is a compare-and-set. It prevents two workers from advancing the same run independently.
+
+When the sink is another system, I cannot make its write atomic with my checkpoint. I use stable item idempotency keys and accept that a crash can replay the last page.
+
+## The crash matrix makes the protocol clear
+
+| Crash point | Durable state | Resume behaviour |
+| --- | --- | --- |
+| before fetch | old cursor | fetch same page |
+| after fetch, before writes | old cursor | fetch same page |
+| during item writes | old cursor | replay page; item writes deduplicate |
+| after item commit, before checkpoint | old cursor | replay page; item writes deduplicate |
+| after checkpoint commit | new cursor | fetch next page |
+
+Replaying one page is normal. Skipping one page is data loss. I design for the first outcome.
+
+This is the same commit boundary discussed in [When to Advance a Sync Checkpoint After Partial Success](/blog/when-to-advance-a-sync-checkpoint-after-partial-success), applied to a provider cursor.
+
+## Item identity protects more than the cursor
+
+Even a perfect cursor does not prevent duplicates when:
+
+- the provider repeats a boundary item;
+- records move because their sort key changes;
+- a token is eventually consistent;
+- the client replays after an ambiguous commit;
+- two imports overlap.
+
+I deduplicate by stable provider identity plus tenant scope. If records have versions or update timestamps, I store them and reject older overwrites.
+
+An item timestamp alone is not unique. For keyset pagination I use a total order such as `(updated_at, id)`. The ID breaks timestamp ties.
+
+## Page numbers need an overlap strategy
+
+Sometimes the provider offers only offset pagination. I cannot manufacture snapshot guarantees it does not provide.
+
+My fallback is:
+
+1. use a stable explicit sort if available;
+2. capture an upper bound at run start;
+3. persist the last stable item key as well as the offset;
+4. restart with an overlap before the failed offset;
+5. deduplicate all overlapped records;
+6. run a later reconciliation for missing identities.
+
+For example, after offset 41,600 fails, I may restart at 41,400. The overlap is not a correctness proof, but it reduces boundary loss when combined with identity-based reconciliation.
+
+If ordering can change arbitrarily and no change feed exists, a complete periodic scan may be the only honest repair mechanism.
+
+## Opaque cursors can expire
+
+I treat token expiry as a defined state, not an unexpected exception. When the provider rejects a saved cursor, the run does not silently start from page one and double its work.
+
+It enters `blocked` with:
+
+```text
+reason: cursor_expired
+last committed stable key: (...)
+original query fingerprint: ...
+items committed: ...
+```
+
+Then a provider-specific recovery chooses one of:
+
+- obtain a renewed continuation from the last stable key;
+- restart within the same captured time window and deduplicate;
+- begin a replacement run and mark the old run superseded;
+- request operator review if the API cannot reproduce the scope.
+
+Microsoft's [Table Storage pagination guidance](https://learn.microsoft.com/en-us/rest/api/storageservices/query-timeout-and-pagination) also stresses that continuation requests must preserve the original query options. Losing a filter while resuming is a new import, not a continuation.
+
+## Retries belong around one page request
+
+A transient `503` can retry the same page request with backoff and jitter. A `400` caused by an expired token needs recovery. A timeout after a read is normally safe to retry, while an asynchronous export-creation call may need an idempotency key.
+
+I keep an overall import deadline so page-level retries do not keep an obsolete run alive forever. I also store provider request IDs for support and diagnosis.
+
+## Tests I run before trusting resume
+
+My integration fake can mutate the collection between requests. I test:
+
+- failure on page 1, 417, and the final page;
+- duplicate boundary items;
+- insert and delete before the current position;
+- equal sort timestamps;
+- expired and malformed cursors;
+- crash after item commit but before cursor commit;
+- two workers racing to advance one run;
+- a changed query presented with an old cursor;
+- an empty page that still has a continuation token;
+- a final page repeated after timeout.
+
+The invariant is stronger than “the loop finishes”:
+
+```text
+Every eligible source identity is represented at least once,
+no older version overwrites a newer version,
+and the run is complete only after the terminal cursor is committed.
+```
+
+Page 417 is a useful log message. It is not a durable position. I resume from a provider cursor bound to the original request, advance it only after item effects commit, and rely on stable identities when the last page must be replayed.

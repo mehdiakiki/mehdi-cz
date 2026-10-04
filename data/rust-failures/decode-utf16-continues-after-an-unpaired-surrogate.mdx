@@ -1,0 +1,76 @@
+---
+caseId: "RFA-347"
+title: "decode_utf16 Continues After an Unpaired Surrogate"
+date: "2026-09-06T02:07:00+01:00"
+lastmod: "2026-09-06T02:07:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "86895a0fd5f528122aebfa40793b047b7934363ca9a59e89b055908d3ff80f64"
+area: "ffi-targets"
+symptom: "char::decode_utf16 emits an error for an unpaired surrogate and then yields later valid characters instead of stopping."
+summary: "decode_utf16 is an iterator of per-scalar Results. An invalid surrogate occupies one output position but does not necessarily terminate iteration, letting callers choose strict failure, recovery, or replacement."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust decode_utf16 continues after error", "unpaired surrogate DecodeUtf16 iterator", "decode UTF-16 strict vs lossy Rust"]
+evidence: ["Rust 1.98.1 three-code-unit input", "Ok Err Ok output sequence", "replacement-character repair policy"]
+sources: ["https://doc.rust-lang.org/std/primitive.char.html#method.decode_utf16", "https://doc.rust-lang.org/std/char/struct.DecodeUtf16Error.html#method.unpaired_surrogate", "https://doc.rust-lang.org/std/string/struct.String.html#method.from_utf16_lossy"]
+---
+
+I once matched the first error from `decode_utf16` and assumed the decoder had stopped. When I inspected the iterator directly, valid characters after the unpaired surrogate were still present. The API reports decoding results item by item.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-347/fail.rs) feeds the code units for `A`, an unpaired high surrogate, and `B`. It expects two results but receives three: `Ok('A')`, `Err(...)`, then `Ok('B')`.
+
+## UTF-16 uses one or two code units
+
+Many Unicode scalar values are represented by one 16-bit unit. Values outside the Basic Multilingual Plane use a valid high-surrogate and low-surrogate pair. A surrogate unit standing alone does not represent a Unicode scalar value.
+
+[`char::decode_utf16`](https://doc.rust-lang.org/std/primitive.char.html#method.decode_utf16) accepts an iterator of `u16` and returns an iterator whose items are `Result<char, DecodeUtf16Error>`. That item type is important: invalidity is attached to a position in the decoded sequence, not automatically to the lifetime of the whole iterator.
+
+After reporting the unpaired surrogate, the decoder can continue interpreting later units.
+
+## Iterator errors are data unless a consumer stops
+
+An `Err` inside `Iterator<Item = Result<...>>` does not itself terminate iteration. Methods and loops decide what happens next.
+
+Collecting into `Result<String, _>` uses `FromIterator` behavior that returns the first error and stops consuming for that collection. A manual loop can log the error and continue. Mapping errors to U+FFFD creates lossy output. All are valid policies over the same decoder.
+
+I do not describe the decoder as “strict” or “lossy” without also describing the consumer. The base iterator preserves the choice.
+
+## Preserve the offending unit for diagnosis
+
+[`DecodeUtf16Error::unpaired_surrogate`](https://doc.rust-lang.org/std/char/struct.DecodeUtf16Error.html#method.unpaired_surrogate) returns the `u16` that could not form a scalar. The repaired fixture verifies it is `0xd800`.
+
+In an importer I also track the source unit offset. The raw surrogate and its location are far more useful than a generic “invalid text” message. I avoid placing sensitive surrounding text into logs; an offset and code unit are often enough.
+
+If exact round-trip is required, a `String` is not the right storage for invalid UTF-16. I retain the original units or use a platform-specific string representation.
+
+## Lossy conversion is an explicit recovery policy
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-347/fixed.rs) maps the error to `char::REPLACEMENT_CHARACTER`, producing `A�B`. [`String::from_utf16_lossy`](https://doc.rust-lang.org/std/string/struct.String.html#method.from_utf16_lossy) provides a convenient whole-slice version of this policy.
+
+Replacement is suitable for display, diagnostics, and some document ingestion. It is dangerous for identifiers, access-control names, cryptographic inputs, or protocols that demand rejection. Different malformed inputs can produce the same lossy text.
+
+I choose recovery where the data enters the system and keep that decision visible in the function name or return type.
+
+## Pairing creates a look-ahead boundary
+
+A high surrogate may need the following unit to decide whether a pair is valid. In streaming input, a chunk may end after that high surrogate even though the next chunk begins with its matching low surrogate.
+
+The simple iterator operates over the sequence supplied to it. If I independently decode arbitrary chunks, I can manufacture an error at every split pair. A streaming decoder must retain a trailing high surrogate until it sees the next unit or true end-of-input.
+
+This is the UTF-16 version of retaining an incomplete UTF-8 suffix. Chunk boundaries are transport details, not character boundaries.
+
+## Tests need malformed and recovered suffixes
+
+My table contains an isolated high surrogate, isolated low surrogate, valid pair, high surrogate followed by an ordinary unit, two highs, a malformed unit between ordinary characters, and a final truncated high surrogate.
+
+I assert the complete result sequence rather than only `is_err()`. This catches the mistaken assumption that nothing follows an error. For lossy behavior I assert exact replacement count and positions. For strict behavior I assert where collection stops and whether unconsumed source matters.
+
+For counters and alerts, I record malformed-unit count separately from rejected-document count. A lossy document can contain several errors while still producing one usable preview. Mixing those measurements makes a small number of badly corrupted inputs look like a large population problem, or hides widespread single-unit corruption.
+
+## The core principle is to locate failure scope
+
+An error can invalidate one scalar, one record, one message, or the entire stream. The type and consumer together determine that scope. Treating every `Err` as global termination throws away recoverable information; treating every error as replaceable can corrupt meaning.
+
+Rust's decoder exposes a narrow per-item fact. I then decide, from the product contract, whether to stop, recover, or preserve raw units. The surprising continuation after an error is what makes this choice possible.

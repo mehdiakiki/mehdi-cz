@@ -1,0 +1,96 @@
+---
+caseId: "RFA-277"
+title: "Read::take Uses One Cumulative Byte Limit"
+date: "2026-09-06T00:57:00+01:00"
+lastmod: "2026-09-06T00:57:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "e01e697b425a785cd81913053ded127a1d5e5ba8d53fd732295960af75ba6282"
+area: "ffi-targets"
+symptom: "After three bytes are read through take(4), the next three-byte read returns only one byte and following reads report EOF."
+summary: "Read::take wraps a reader with one remaining byte budget shared by all reads. It does not allow the limit again per call; inspect limit and preserve framing when continuing with the inner stream."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust Read take limit cumulative", "does Read take reset each read call", "Take reader remaining limit EOF Rust"]
+evidence: ["Rust 1.98.1 six-byte slice reader", "three-plus-one bounded reads", "zero remaining limit assertion"]
+sources: ["https://doc.rust-lang.org/std/io/trait.Read.html#method.take", "https://doc.rust-lang.org/std/io/struct.Take.html#method.limit", "https://doc.rust-lang.org/std/io/trait.Read.html#method.read"]
+---
+
+I once read `reader.take(4)` as a maximum size for each low-level `read` call. After the first call consumed three bytes, the next call returned one, even though its destination had room for three.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-277/fail.rs) wraps six bytes with a limit of four. It reads `abc`, then expects three more bytes. [`Take`](https://doc.rust-lang.org/std/io/struct.Take.html) returns only `d` because one byte remains in its total budget.
+
+## The limit belongs to the adapter lifetime
+
+[`Read::take`](https://doc.rust-lang.org/std/io/trait.Read.html#method.take) consumes a reader and returns an adapter that will read at most the supplied number of bytes.
+
+The adapter tracks a remaining count:
+
+```text
+initial limit: 4
+first read:    3 bytes
+remaining:     1
+second read:   1 byte
+remaining:     0
+later reads:   EOF
+```
+
+It does not reset four for every call. A per-call maximum already comes from the length of the buffer passed to `read`.
+
+## Returned EOF can be synthetic
+
+Once the remaining limit reaches zero, `Take` returns `Ok(0)` as EOF even when the underlying reader still has data. In the fixture, bytes `e` and `f` remain underneath.
+
+This synthetic boundary is the feature. It lets a parser see one frame or body as an isolated reader without reading into the next message.
+
+But EOF from the adapter does not prove the network connection or file ended. It proves either the limit was exhausted or the inner reader reached its own EOF first. [`Take::limit`](https://doc.rust-lang.org/std/io/struct.Take.html#method.limit) helps distinguish whether budget remains.
+
+## A short read is not necessarily EOF
+
+The second read returns one byte because only one is allowed, but ordinary `Read` implementations may also return fewer bytes than the destination capacity for many reasons.
+
+Code must use the returned count. It should not treat `n < buffer.len()` as final EOF. Only `Ok(0)` has the EOF meaning for a non-empty destination, and even that meaning belongs to the current adapter layer.
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-277/fixed.rs) asserts the exact count and slices the initialized prefix. It never examines bytes beyond `n` as if they came from the reader.
+
+## take is useful for framed protocols
+
+Suppose a header declares a four-byte body. Wrapping the connection in `take(4)` prevents the body decoder from consuming the next frame by mistake.
+
+After parsing, I verify the policy:
+
+```text
+remaining limit == 0 -> declared body fully consumed
+remaining limit > 0  -> body ended early or parser stopped early
+```
+
+These cases may have different responses. A truncated transport is not the same as a decoder intentionally ignoring optional padding.
+
+If the header length is untrusted, I enforce an application maximum before constructing or allocating for the frame. `take` limits reads but does not stop code from allocating based on the original hostile length.
+
+## Recovering the inner reader needs lifecycle care
+
+The adapter owns its reader. After finishing the bounded section, code can consume the adapter to recover the inner reader and continue with remaining bytes.
+
+With buffered readers, boundaries become more subtle because an outer buffer may already hold bytes fetched from the underlying source. I keep the buffering and framing order deliberate and test multiple frames in one transport chunk.
+
+Dropping `Take` does not drain the rest of its budget. If a parser stops early and then recovers the inner reader, unread bytes from the current frame remain before the next frame. The protocol must drain, reject, or otherwise account for them.
+
+## Resetting the limit is explicit
+
+`Take::set_limit` replaces the remaining budget. It does not mean “increase total allowed bytes by this amount” unless the caller calculates that policy itself.
+
+I avoid resetting one adapter casually in a loop because it can blur frame boundaries. Constructing a fresh adapter per frame often makes ownership and metrics clearer.
+
+When reuse is useful, I log declared length, consumed length, and new limit. This gives enough evidence to diagnose a parser that stopped too early.
+
+## What I test
+
+My matrix covers a source shorter than the limit, exactly equal to it, and longer than it. It reads with destination buffers smaller and larger than the remaining budget.
+
+I also simulate short reads from the inner reader, because a real socket can split data at any point. The total output must never exceed the limit regardless of chunking.
+
+For protocols, I append a second frame and verify that the first decoder cannot consume it. Then I verify the transition to the recovered reader begins at exactly the expected byte.
+
+The core principle is that adapters add stateful contracts. `Read::take(limit)` owns one cumulative remaining budget across every call and can produce an EOF before its inner reader does. Treat the returned counts and the remaining limit as framing state, not as a per-call convenience.

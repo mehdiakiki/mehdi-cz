@@ -1,0 +1,180 @@
+---
+title: "When Relaxed Atomics Are Enough—and What They Never Guarantee"
+date: "2026-10-24T09:00:00+01:00"
+tags: ["rust", "atomics", "memory ordering", "concurrency", "unsafe Rust"]
+draft: false
+reviewed: true
+reviewedHash: "4a9b2bf03931e3db10d35c38b4b9edb2610b6b92be8d376e6eec93ec8b1154a6"
+cluster: "rust-under-the-hood"
+campaign: "authority-2026"
+opportunity: "RUST-037"
+summary: "Relaxed Rust atomics keep one atomic object's modifications coherent but do not publish surrounding memory. Use them for independent facts, not as a vague faster lock."
+---
+
+`Ordering::Relaxed` is sometimes explained as “the CPU may do anything.” That is too pessimistic. It is also explained as “an atomic operation without ordering,” which is too vague to guide a design.
+
+Relaxed operations still provide atomic access and a coherent modification order for that atomic object. What they do not create is a happens-before relationship for surrounding memory.
+
+## Begin with one atomic counter
+
+This is a natural use:
+
+```rust
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static REQUESTS: AtomicU64 = AtomicU64::new(0);
+
+fn record_request() {
+    REQUESTS.fetch_add(1, Ordering::Relaxed);
+}
+```
+
+Concurrent increments do not tear and each read-modify-write occupies a place in the counter's modification order. The final counter will not lose increments because two threads wrote the same old value non-atomically.
+
+If this metric is approximate in time and controls no other memory, Relaxed can be enough.
+
+The [Rust `Ordering` documentation](https://doc.rust-lang.org/std/sync/atomic/enum.Ordering.html) describes Relaxed as imposing no ordering constraints while preserving atomic operations.
+
+## “I saw the flag” does not publish the data
+
+This design is wrong:
+
+```rust
+use std::cell::UnsafeCell;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+struct Slot {
+    value: UnsafeCell<u64>,
+    ready: AtomicBool,
+}
+
+// Producer, conceptually:
+unsafe { *slot.value.get() = 42; }
+slot.ready.store(true, Ordering::Relaxed);
+
+// Consumer, conceptually:
+if slot.ready.load(Ordering::Relaxed) {
+    let value = unsafe { *slot.value.get() };
+}
+```
+
+Seeing `true` does not establish that the non-atomic write to `value` happens before the consumer's read. In Rust this can become a data race and undefined behaviour, not only a stale result.
+
+The usual publication pair is:
+
+```rust
+// Producer
+unsafe { *slot.value.get() = 42; }
+slot.ready.store(true, Ordering::Release);
+
+// Consumer
+if slot.ready.load(Ordering::Acquire) {
+    let value = unsafe { *slot.value.get() };
+}
+```
+
+When the Acquire load observes the value from the Release sequence, earlier producer writes become visible through the happens-before relationship.
+
+The unsafe container still needs a complete proof for initialization, aliasing, destruction, and all accesses. The ordering pair is one part.
+
+## Relaxed is enough when no other fact travels with it
+
+I ask: “Does observing this atomic value grant permission to observe other memory?”
+
+If no, Relaxed may be suitable.
+
+Examples include:
+
+- statistics that do not protect data;
+- allocation of unique numeric tickets when their numerical order carries no publication meaning;
+- a best-effort progress value used only for display;
+- independent feature counters;
+- some reference-count increments when object lifetime is already guaranteed by another live reference.
+
+The word “some” matters for reference counts. Destruction after the final decrement needs stronger reasoning, usually a Release decrement and Acquire synchronization before destroying the data.
+
+## Unique does not mean chronological
+
+A relaxed `fetch_add` can issue unique IDs:
+
+```rust
+static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_id() -> u64 {
+    NEXT_ID.fetch_add(1, Ordering::Relaxed)
+}
+```
+
+Each returned value is distinct until integer wraparound becomes relevant. The numbers do not prove real-time completion order:
+
+```text
+thread A obtains 10, pauses
+thread B obtains 11, finishes work
+thread A finishes work
+```
+
+ID 10 completed after ID 11. If consumers interpret the number as a committed sequence or publication barrier, Relaxed ID allocation is not the needed protocol.
+
+## One atomic object has modification order
+
+All modifications of a particular atomic object form one order consistent with the memory model. A thread cannot observe that one atomic value travelled backwards through its modification history in arbitrary fashion.
+
+This per-object coherence is why relaxed counters and state bits still have meaning.
+
+It does not create one combined order across two atomic objects:
+
+```rust
+x.store(1, Ordering::Relaxed);
+y.store(1, Ordering::Relaxed);
+```
+
+Another thread can observe the two updates in an order that does not act like a transaction. Seeing `y == 1` does not by itself prove `x == 1`.
+
+If the invariant needs both values to change atomically, I pack them into one atomic representation when practical, use a lock, or design a versioned protocol.
+
+## Relaxed read-modify-write has read and write parts
+
+Operations such as `fetch_add`, `swap`, and successful compare-exchange both read and modify the atomic. With Relaxed, the operation is atomic but does not independently acquire earlier ordinary writes or release earlier ordinary writes to another observer.
+
+A relaxed read-modify-write can still participate in a release sequence headed by another Release operation. That is a precise advanced rule, covered in [Release Sequences in Rust: The Rule Behind a Surprising Acquire Load](/blog/release-sequences-in-rust-the-rule-behind-a-surprising-acquire-load).
+
+I do not generalise this into “RMW makes Relaxed stronger.” Its role comes from the exact sequence and which value an Acquire observes.
+
+## Compiler and hardware reordering are not the whole explanation
+
+People often explain atomics only by drawing instructions moving above or below each other. This is useful intuition, but Rust correctness is stated through memory-model relations: sequenced-before, modification order, reads-from, synchronizes-with, and happens-before.
+
+Two processors may emit the same machine instruction for several Rust orderings on one architecture while the compiler is allowed different transformations. Conversely, a weaker architecture may require different instructions.
+
+I choose the weakest ordering that satisfies a written proof, not the one that happened to compile to the same assembly on my laptop.
+
+## A proof template
+
+For a proposed Relaxed operation, I write:
+
+```text
+Atomic fact:
+  What exact value or transition must be indivisible?
+
+Related memory:
+  Does seeing the atomic permit reading or writing anything else?
+
+Required relation:
+  Is per-object modification order sufficient, or is happens-before needed?
+
+Lifetime:
+  Which operation proves the referenced object is still alive?
+
+Wraparound and ABA:
+  Can the atomic value repeat while old observations remain relevant?
+```
+
+If “related memory” is non-empty, I expect to need an Acquire/Release protocol, a lock, or another synchronization mechanism.
+
+## Test interleavings, but keep the proof
+
+Stress tests rarely force the weak execution that breaks an ordering. I use a model-checking tool such as [Loom](https://docs.rs/loom/latest/loom/) for small concurrency protocols and test important transitions.
+
+Passing Loom tests depends on the model and assertions. It does not replace explaining why each non-atomic access happens before its conflicting access.
+
+Relaxed is not the unsafe ordering. Unproved synchronization is unsafe. Relaxed is precise and useful when the atomic value is an independent fact and per-object atomicity is the whole requirement.

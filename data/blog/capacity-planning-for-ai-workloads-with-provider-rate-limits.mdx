@@ -1,0 +1,165 @@
+---
+title: "Capacity Planning for AI Workloads With Provider Rate Limits"
+date: "2026-12-29T09:00:00+01:00"
+tags: ["AI capacity planning", "LLM rate limits", "queueing", "production AI", "reliability"]
+draft: false
+reviewed: true
+reviewedHash: "1196568739b72fe6faba5d4d28b34fcd149bbc7bf5f83ca6a34498d5e633fc1a"
+cluster: "reliable-ai-systems"
+campaign: "authority-2026"
+opportunity: "AI-040"
+summary: "AI capacity is constrained by requests, tokens, concurrency, latency, budgets, and provider quotas at once. I plan from distributions, reserve before calls, and shed work before queues break deadlines."
+---
+
+AI capacity planning becomes misleading when I count only requests. One request may classify a sentence. Another may send a long document, retrieve context, call tools, and generate thousands of output tokens.
+
+Both increment the request counter by one. They do not consume the same capacity.
+
+I plan with several limiting dimensions and with the full task, not only one model call.
+
+## The quota has more than one axis
+
+Provider limits can include:
+
+```text
+requests per minute
+input/output or total tokens per minute
+requests or tokens per day
+concurrent connections
+model/deployment-specific capacity
+batch or tool-specific limits
+```
+
+OpenAI's [rate-limit guide](https://developers.openai.com/api/docs/guides/rate-limits) explains that limits can exist across requests and tokens and recommends handling them explicitly. The exact quota is account- and model-dependent, so I load current limits from configuration or provider responses rather than copying a number into architecture documentation forever.
+
+The effective capacity is whichever relevant dimension reaches its boundary first.
+
+## I start with distributions
+
+Averages hide the long requests that create queue spikes. For each task type I measure:
+
+```text
+arrival rate: p50, p95, burst
+input tokens: p50, p95, p99
+output tokens: p50, p95, p99
+model calls per task
+service time per call and task
+retry/fallback rate
+deadline and business priority
+```
+
+I keep task types separate. A support classification and a document extraction should not share one imaginary average request.
+
+For a rough token bound:
+
+```text
+required_tokens_per_minute
+  = tasks_per_minute
+  × calls_per_task
+  × (reserved_input + reserved_output)
+  × retry_headroom
+```
+
+This is a planning model. Load tests and production traces replace guesses as evidence arrives.
+
+## Latency creates concurrency
+
+If requests arrive at rate `λ` and spend average time `W` in service, average in-flight work is approximately `L = λW` under stable conditions.
+
+Ten tasks per second with a five-second model step imply roughly fifty concurrent model steps before burst headroom. If the provider slows to fifteen seconds, concurrency triples without traffic changing.
+
+This is why a latency incident becomes a capacity incident. A bounded semaphore protects the process, while an admission queue and deadline decide who waits.
+
+I calculate with tail latency too. An average that fits can still create a p99 backlog that misses the product promise.
+
+## Reserve tokens before sending
+
+Providers may account against requested maximum output, estimated input, or actual usage in different ways. My local scheduler stays conservative.
+
+Before admitting a call, it reserves:
+
+```text
+one request slot
+estimated input token capacity
+maximum useful output capacity
+task money budget
+deadline-compatible queue position
+```
+
+After the response, it settles from actual usage and releases the difference. Reservation prevents fifty workers from simultaneously reading the same remaining token allowance.
+
+This uses the same idea as [task-level cost budgets](/blog/give-an-ai-task-a-cost-budget-before-optimizing-tokens), but capacity is shared across tasks and must include fairness.
+
+## The queue has an admission policy
+
+An unbounded queue turns a rate limit into increasing latency and memory usage.
+
+My admission decision can:
+
+```text
+run now
+queue within a predicted deadline
+route to another already-qualified deployment
+degrade to a tested non-AI path
+reject with retry guidance
+```
+
+I estimate whether a new item can finish before its deadline using current queue work and reserved capacity. Accepting a task I already know will expire is not kindness.
+
+Queues are partitioned or weighted by tenant and priority so one bulk user cannot consume every interactive slot. Minimum shares prevent starvation; maximum shares protect the system.
+
+## Retry storms consume the recovery margin
+
+Rate-limit errors often trigger retries, which create more rate-limit errors.
+
+I use exponential backoff with jitter, honor provider retry guidance, and share a retry budget across the whole task. SDK, HTTP, and workflow retries must not multiply independently.
+
+The scheduler counts a retry against future capacity before releasing it. Circuit breaking and load shedding create room for provider recovery.
+
+A fallback model is used only if it passed the quality and policy gates described in [model routing](/blog/model-routing-is-a-policy-engine-with-quality-consequences). Spare capacity is not permission to lower correctness silently.
+
+## Streaming holds a connection while it helps perception
+
+Streaming may improve time to first useful output, but it can keep connections and task state active for the whole generation. Slow clients add another capacity dimension.
+
+I bound per-stream buffering and propagate cancellation upstream. Capacity metrics distinguish provider generation time from client drain time. The [streaming latency article](/blog/streaming-an-ai-response-moves-latency-it-does-not-remove-it) covers this path in detail.
+
+## Load tests need a controllable model boundary
+
+I do not spend a large provider bill to test every queue branch. A model simulator produces configured:
+
+```text
+input/output token usage
+first-event and completion latency
+429 with Retry-After
+timeouts before and after partial output
+invalid structured responses
+capacity recovery
+```
+
+This validates admission, fairness, cancellation, retries, and metrics deterministically. A smaller approved test against the real provider checks assumptions the simulator cannot prove.
+
+I run step load, burst load, long-output mixes, one noisy tenant, and a latency-degradation scenario. The result includes queue age and useful completion, not only throughput.
+
+## The dashboard I operate
+
+I need:
+
+- admitted, queued, degraded, and rejected tasks;
+- request and token reservations versus actual use;
+- in-flight work and connection count;
+- queue age against task deadlines;
+- limit responses by model/deployment;
+- retry and fallback amplification;
+- throughput and quality by task type;
+- capacity consumed by cancelled or failed work.
+
+I alert on predicted deadline misses before the provider returns 429. A quota error is late evidence that admission already exceeded a boundary.
+
+## Capacity is a product choice
+
+More quota can help, but it does not choose which work deserves it. I need a policy for interactive versus batch, high-risk versus optional, and paid plan versus internal maintenance.
+
+The engineering goal is controlled overload: reserve multiple constrained resources, keep queues bounded, protect fairness, stop retry amplification, and return an honest alternative when work cannot finish in time.
+
+That is how I make an AI workload behave like an operated system rather than a collection of model calls hoping the provider limit is larger than today's traffic.

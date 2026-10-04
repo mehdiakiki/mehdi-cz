@@ -1,0 +1,77 @@
+---
+caseId: "RFA-666"
+title: "HashMap Entry::or_insert Does Not Replace an Existing Value"
+date: "2026-09-06T08:26:00+01:00"
+lastmod: "2026-09-06T08:26:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "bc4cc95de69416149c4568d77e7ad6f55c3fd170c90203ecdf769d0cc61e94b6"
+area: "concurrency-memory"
+symptom: "Calling entry(key).or_insert(fallback) leaves the old map value in place when the key already exists."
+summary: "or_insert is a defaulting operation, not an overwrite. Use insert for replacement or and_modify plus or_insert for explicit update-or-create logic."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust or_insert not replacing value", "HashMap entry overwrite existing", "or_insert versus insert Rust"]
+evidence: ["Rust 1.98.1 runtime assertion", "occupied entry retains ready state", "HashMap insert performs replacement"]
+sources: ["https://doc.rust-lang.org/std/collections/hash_map/enum.Entry.html#method.or_insert", "https://doc.rust-lang.org/std/collections/struct.HashMap.html#method.insert", "https://doc.rust-lang.org/std/collections/hash_map/enum.Entry.html#method.and_modify"]
+---
+
+`map.entry(key).or_insert(value)` inserts only when the key is absent. For an occupied entry, it returns a mutable reference to the existing value. The [failing fixture](/rust-failure-atlas/evidence/RFA-666/fail.rs) expects a fallback to replace `"ready"`, but the map correctly keeps `"ready"`.
+
+## or_insert is about defaults
+
+The [`Entry::or_insert` contract](https://doc.rust-lang.org/std/collections/hash_map/enum.Entry.html#method.or_insert) chooses between an occupied value and a supplied vacant default. The word “or” matters: existing value or inserted value.
+
+This pattern avoids two map lookups. It is excellent for counters, grouped vectors, caches, and aggregation:
+
+```rust
+*counts.entry(key).or_insert(0) += 1;
+```
+
+It is not a setter. If a configuration reload, state transition, or authoritative response must replace old data, [`HashMap::insert`](https://doc.rust-lang.org/std/collections/struct.HashMap.html#method.insert) says that directly and returns the previous value.
+
+## The returned reference points at the selected map value
+
+Both occupied and vacant branches produce `&mut V`. Mutating through it updates the value stored in the map. This lets one expression initialise and then modify without another lookup.
+
+That borrow keeps the map mutably borrowed while the reference is used. I keep its scope short before performing another map operation. Non-lexical lifetimes often end the borrow after last use, but an unnecessarily stored reference can still make later insertions fail to compile.
+
+The reference is also why `or_insert` returns the existing value rather than the supplied default. It gives one stable continuation for both entry states.
+
+## Eager and lazy defaults differ
+
+The argument to `or_insert` is evaluated before the call. If building a fallback allocates, performs computation, or records a side effect, that work happens even when the entry is occupied.
+
+`or_insert_with` accepts a closure and constructs the default only for a vacant entry. `or_insert_with_key` additionally lets construction inspect the owned key held by the entry. I use lazy variants when the default is not a cheap literal.
+
+Lazy construction is an efficiency guarantee at the API level, but the closure should still avoid hidden I/O while the map is mutably borrowed. I often prepare fallible external work before entering the map operation, because entry default closures cannot return a `Result` in the ordinary shape.
+
+## Update-or-create should state both branches
+
+[`and_modify`](https://doc.rust-lang.org/std/collections/hash_map/enum.Entry.html#method.and_modify) applies an update to occupied entries and then permits `or_insert` for vacant ones. It expresses logic such as “increment if present, otherwise start at one.”
+
+Replacement has another important outcome: what happens to the old value. `insert` returns it in `Option<V>`, so code can close a resource, compare revisions, emit an audit event, or reject an unexpected overwrite. Ignoring this return value can hide a duplicate identity problem.
+
+For concurrent maps or locks around a map, the entry operation is only atomic relative to the chosen synchronization boundary. It does not make network fetch plus insertion globally atomic. I define stampede prevention and retry policy separately.
+
+## Defaults can hide invalid absence
+
+Not every missing key deserves a default. In authorization, routing, schema registries, and financial state, absence may be an error. `or_insert` can turn incomplete data into plausible data that travels further.
+
+I reserve defaulting for domains where the neutral value is real: zero count, empty collection, or explicitly documented initial state. Otherwise I return an error or use the vacant entry to attach context.
+
+Tests cover vacant and occupied paths. They also verify whether an expensive factory ran and whether replacement returns the previous value. Testing only an empty map cannot distinguish defaulting from setting.
+
+## My entry checklist
+
+- Is this operation defaulting, replacing, or updating?
+- Should absence be valid or an error?
+- Is the default expensive enough to require `or_insert_with`?
+- Does occupied state require a distinct `and_modify` transition?
+- Should the previous value from `insert` be inspected or cleaned up?
+- Is a returned mutable reference kept alive longer than necessary?
+- Does external fallible work occur outside the map borrow?
+- Do tests exercise both occupied and vacant entries?
+
+The core principle is that insertion APIs encode conflict policy. `or_insert` says existing state wins, while `insert` says the new value wins. I choose that policy explicitly because a map being memory-safe does not decide which version of domain state is authoritative.

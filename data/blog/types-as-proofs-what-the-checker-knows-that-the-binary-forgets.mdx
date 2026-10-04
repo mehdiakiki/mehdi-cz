@@ -1,0 +1,142 @@
+---
+title: "Types as Proofs: What the Checker Knows That the Binary Forgets"
+date: "2026-09-11T08:10:00+01:00"
+lastmod: "2026-09-11T08:10:00+01:00"
+tags: ["types", "rust", "typescript", "newtype", "types under the hood"]
+draft: false
+reviewed: true
+reviewedHash: "971b95630131478516ea23d0f33267e99ed87368f5a0ccb3c4b98fe3e80db3c5"
+cluster: "rust-under-the-hood"
+campaign: "editorial"
+summary: "Wrapping an f64 in a Meters type makes adding meters to seconds a compile error, and the optimized build merged the wrapped addition with the plain one into a single function. Then I fed the same function disguised bits and it computed a wrong answer without complaining. This is the last article of the series."
+---
+
+A type is a proof about a program that the compiler checks once and then throws away. I wrapped a `f64` in a type called `Meters` and another in a type called `Seconds`. Adding them became a compile error. The compiled addition became the same single function as adding two plain floats, so the proof cost nothing at runtime.
+
+This is the last article of the types series, and the spoke that answers the question the first one asked. In [What Is a Type?](/blog/what-is-a-type-a-set-of-values-a-promise-about-operations-or-both) I compiled `type Human = "man" | "woman"` in three languages and found nothing of it in the machine code. Nine articles later I can say what the type was doing instead.
+
+The programs and a script that reproduces every output are in the `types-under-the-hood` fixture of the site repository. I used rustc 1.95 nightly on x86-64 Linux, and the assembly below comes from an optimized build, which matters for the last step.
+
+## A proof that costs nothing
+
+```rust
+#[derive(Clone, Copy)] pub struct Meters(pub f64);
+#[derive(Clone, Copy)] pub struct Seconds(pub f64);
+
+#[no_mangle] pub fn add_plain(a: f64, b: f64) -> f64 { a + b }
+#[no_mangle] pub fn add_meters(a: Meters, b: Meters) -> Meters { Meters(a.0 + b.0) }
+#[no_mangle] pub fn speed(d: Meters, t: Seconds) -> f64 { d.0 / t.0 }
+```
+
+The sizes first:
+
+```text
+size of f64 8 / Meters 8 / Seconds 8
+speed: 15 m/s
+```
+
+A `Meters` is eight bytes, the same as the `f64` inside it. That is what rustc does today for a struct with one field. The language does not promise it, and `#[repr(transparent)]` is the way to ask for it and get a guarantee.
+
+Then the machine code:
+
+```asm
+add_meters:
+    addsd   %xmm1, %xmm0
+    retq
+
+speed:
+    divsd   %xmm1, %xmm0
+    retq
+
+add_plain = add_meters
+```
+
+One instruction each, and `add_plain` is an alias of `add_meters`. The compiler could not find any difference between adding two meters and adding two floats, so it kept one function and gave it two names. This is the fourth time in the series that the optimizer has merged two functions I wrote as different types, and it is the case where it says the most: the distinction between a distance and a number does not exist in the program that runs. In a debug build the two bodies would stay separate, because that merging only happens at optimized levels.
+
+The distinction exists here. The error is shortened to its first line. The compiler also prints the source excerpt, a note suggesting the missing implementation, and a closing count of errors:
+
+```rust
+let d = Meters(150.0);
+let t = Seconds(10.0);
+let _nonsense = d + t;
+```
+
+```text
+error[E0369]: cannot add `Seconds` to `Meters`
+```
+
+That is the value of the newtype, and its whole cost.
+
+## Where the proof stops
+
+The checker refuses `speed(t, d)`, so I cannot swap the arguments by writing them in the wrong order. But the proof guards the source text, not the bytes. If the bits of a duration reach the first argument some other way, the division happens anyway:
+
+```rust
+let disguised: Meters = unsafe { std::mem::transmute(t) };
+let nonsense: Seconds = unsafe { std::mem::transmute(d) };
+println!("speed(disguised): {} and nothing complained", speed(disguised, nonsense));
+```
+
+The first line is reprinted here from the same run, for comparison:
+
+```text
+speed: 15 m/s
+speed(disguised): 0.06666666666666667 and nothing complained
+```
+
+Fifteen meters per second in the checked call, and one fifteenth in the second one, which is the same two numbers divided the other way around. `divsd` does not know that its first operand was supposed to be a distance. I used `transmute` to arrange this deliberately, and in real code the same thing arrives through a foreign function, a byte buffer, or a deserializer.
+
+## What the checker knew
+
+Look at what the compiler had to believe to produce the alias in the previous section. It knew `Meters` and `Seconds` are different types, so `d + t` is not allowed. It knew a `Meters` contains one `f64` at offset zero, so a `Meters` in a register is an `f64` in a register. Then it emitted `addsd`, and nothing in the binary carries the first fact.
+
+## The opinion: this is the cheapest correctness there is
+
+A newtype is one line. It costs zero bytes and zero instructions. It catches a class of mistake that tests often miss, because the wrong value has the right shape and looks plausible in a log.
+
+I see raw primitives at boundaries in most code I read. A function taking three `String` parameters for a user id, an email, and a display name. A timestamp that is sometimes seconds and sometimes milliseconds and is a `u64` in both cases. A price as a `f64` with the currency in a comment.
+
+Every one of those is a case where the compiler was willing to do the checking for free and nobody asked. This is a preference rather than a rule, and there are two honest objections to it.
+
+The first is verbosity, and it is fair. The wrapper needs constructors, and arithmetic between wrapped values needs trait implementations, which is more code than the raw version. My rule is that if two values of the same primitive type can be swapped at a call site without a compile error, and swapping them would be a bug, they should be different types.
+
+The second is that the type does not validate anything, and this one is more important. `Meters(-5.0)` compiles. The type proves that a distance is not a duration, not that a distance is sensible.
+
+Those checks belong in the constructor, and then the type carries the fact that the check happened, which is the reason to make the field private and the constructor fallible. A public field means the proof ends wherever someone writes `.0`.
+
+## The answer to the series
+
+The question the first article asked was whether a type really exists, and the nine experiments gave a consistent answer.
+
+A type exists in the compiler. It is a set of allowed values and a set of allowed operations, it is carried from one compiler stage to the next, and each stage keeps only the part it still needs. The processor receives instructions that would be the same for a different type, and the last physical trace is a layout: a size, an alignment, and a field offset that had to be chosen before any code could be written.
+
+In the compiled languages I measured, the only runtime object a type system produced was a vtable, and it appeared exactly when I asked the program to postpone a decision the compiler wanted to make. The dynamic languages in the previous article are the other case: they keep a type pointer or a shape with every value, all the time, which is what it costs to have no checker.
+
+So, to repeat the line this series opened with, a type is a way to constrain the person writing the program, and it has no real representation at the level of machine instructions. The constraint is on me, when I write, and not on the machine, when it runs. Everything else here follows from that: the sizes come from counting the members, the checks that do exist are ones the compiler chose to emit, and the guarantees stop at the edge of the program.
+
+That last part is the one I keep. The compiler will check anything I can express as a type and charge me nothing at runtime. It will not protect a value that arrives from outside the program, because by then the proof has been discarded and only the bytes are left.
+
+## The model I take from this
+
+1. A newtype is a proof that two values of the same underlying type are not interchangeable. It is checked once and costs nothing at runtime.
+2. The proof covers the source text. Bits that arrive another way are not covered, which the disguised call above shows.
+3. The type proves relationships between values. It does not validate a value, and that job belongs to a constructor.
+4. After the check, the binary knows only the bits. Every guarantee a type gave was a compile-time guarantee.
+
+## What I check at a boundary
+
+- Can two parameters of this function be swapped without a compile error, and would swapping them be a bug?
+- Does this primitive carry a unit, a currency, a scale, or an origin that only exists in a name or a comment?
+- Is the inner field public? Then anyone can write `.0` and step around the proof.
+- Does the value come from outside the program? Then a type is not enough, and the constructor has to check.
+
+## The whole series
+
+The ten articles are on the [types under the hood tag page](/blog/tags/types-under-the-hood/page/1), and the wider index is on [Rust Under the Hood](/blog/topics/rust-under-the-hood).
+
+## Sources
+
+- [The Rust Programming Language: type safety and abstraction with the newtype pattern](https://doc.rust-lang.org/book/ch20-03-advanced-types.html)
+- [The Rust Reference: the transparent representation](https://doc.rust-lang.org/reference/type-layout.html#the-transparent-representation)
+- [Rust standard library: std::mem::transmute](https://doc.rust-lang.org/std/mem/fn.transmute.html)
+- [x86 instruction reference: ADDSD](https://www.felixcloutier.com/x86/addsd)

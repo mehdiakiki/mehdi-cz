@@ -1,0 +1,110 @@
+---
+caseId: "RFA-198"
+title: "Why BTreeMap::append Overwrites Conflicting Values"
+date: "2026-09-05T17:37:00+01:00"
+lastmod: "2026-09-05T17:37:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "16870b24dac8f042d36ea35244d6f69633fe29e6333f8630e22a66e63e89eb33"
+area: "concurrency-memory"
+symptom: "BTreeMap::append replaces an existing configuration value with the conflicting value from the other map."
+summary: "BTreeMap::append moves every entry out of the other map and uses an other-map-wins value policy for duplicate keys, while retaining self's equal key object. Use Entry or an explicit merge loop when conflicts need preservation, rejection, or combination."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets with alloc"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust BTreeMap append duplicate key value",
+    "BTreeMap append overwrite conflict",
+    "merge BTreeMap keep existing value",
+  ]
+evidence: ["Rust 1.98.1 duplicate-key maps", "other-map value wins", "Entry-based repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/std/collections/struct.BTreeMap.html#method.append",
+    "https://doc.rust-lang.org/std/collections/btree_map/enum.Entry.html#method.or_insert",
+    "https://doc.rust-lang.org/std/collections/struct.BTreeMap.html#method.insert",
+  ]
+---
+
+The word “append” sounds harmless when both maps contain different keys. With a duplicate key, it needs a conflict policy, and Rust has already chosen one.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-198/fail.rs) has a current configuration where `mode` is `safe` and an incoming map where `mode` is `fast`. After `current.append(&mut incoming)`, the value in `current` is `fast`. The incoming map is empty.
+
+## Values from `other` win
+
+[`BTreeMap::append`](https://doc.rust-lang.org/std/collections/struct.BTreeMap.html#method.append) moves all elements from `other` into `self`, leaving `other` empty. If both maps contain a key, the value from `self` is overwritten by the value from `other`.
+
+That gives the operation two effects:
+
+```text
+unique other key     -> moved into self
+conflicting key      -> other value replaces self value
+all other entries    -> removed from other
+```
+
+It is a destructive merge with a fixed last-input-wins style policy. It is not a set union that preserves the destination, and it does not report conflicts.
+
+The map type cannot infer whether `safe` or `fast` is more authoritative. Its rule is structural and consistent; application policy remains my responsibility.
+
+## Use `Entry` to preserve existing values
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-198/fixed.rs) consumes the incoming map in a loop and calls [`BTreeMap::entry`](https://doc.rust-lang.org/std/collections/enum.btree_map.Entry.html#method.or_insert):
+
+```rust
+for (key, value) in incoming {
+    current.entry(key).or_insert(value);
+}
+```
+
+Now existing values win and new keys are inserted. Because `value` already came out of the incoming map, eager evaluation of `or_insert` does not create extra work in this example. If construction were expensive and conditional, `or_insert_with` would be the relevant choice.
+
+For rejection, I match the entry and return a conflict error. For combination, I modify the occupied value with a domain-specific function. Writing the loop makes policy reviewable.
+
+## The original equal key in `self` is retained
+
+There is another subtle rule in the documentation: on a conflict, the value is overwritten but the key object already stored in `self` is not. Two keys can compare equal without being identical in every field.
+
+For example, a key type may order only by an ID while carrying a display label that does not participate in `Ord`. Appending an equal incoming key updates the value but retains the old key representation.
+
+This matches the general insert behaviour documented for ordered maps and resembles the `HashMap::insert` case elsewhere in the Atlas. If key metadata must be refreshed, I should not hide mutable attributes inside identity keys. I put them in the value, or remove and reinsert deliberately.
+
+Map equality is about the key's `Ord` contract, not every byte stored in the key object.
+
+## `other` becoming empty is part of ownership transfer
+
+`append` takes `&mut other`, not ownership by value, but it moves the entries out and leaves a valid empty map. Existing references into either map cannot survive the mutable borrow.
+
+This is useful when I want to reuse `other`'s allocation or keep the variable in scope. It can also surprise code that expects to inspect rejected or overwritten inputs afterward.
+
+If audit data matters, I collect conflicts before merging or have the merge loop return them. Once overwritten values are dropped and `other` is empty, the original input is no longer available.
+
+The fixture asserts emptiness separately from the conflict result. A test of only the destination would not capture the full ownership transition.
+
+## Configuration layering needs named direction
+
+In configuration systems, “append environment into defaults” and “append defaults into environment” produce opposite winners. Generic variable names such as `a` and `b` make this easy to reverse.
+
+I use names like `defaults`, `file_config`, `environment`, and `cli_overrides`, then write a merge helper whose name states precedence. The order of layers becomes part of the product contract.
+
+I also distinguish absence from a value explicitly set to empty. A map overwrite cannot by itself express deletion, inheritance, or “use default.” Those states may require an enum value rather than a missing key convention.
+
+## Conflict policies deserve independent tests
+
+The smallest useful fixture contains one unique key on each side and one duplicate. It asserts:
+
+1. unique destination data survives;
+2. unique incoming data arrives;
+3. the duplicate follows the chosen policy;
+4. the incoming map has the expected final ownership state;
+5. equal-but-not-identical keys follow the intended representative rule when that matters.
+
+Testing only disjoint maps never executes the important branch. Large realistic maps can also hide which layer supplied the final value.
+
+## Do not infer database merge semantics
+
+The same vocabulary appears in SQL, distributed state, and version control, but `BTreeMap::append` does not provide transactions, causal ordering, or conflict records. It is an in-memory collection operation under one mutable owner.
+
+When values carry versions or timestamps, I compare those fields explicitly. “Other wins” is correct only if the caller has already established that `other` is the authoritative later layer.
+
+The core principle is that every merge has a conflict policy even when the method signature does not accept a closure. `BTreeMap::append` chooses the other map's value and empties that map. When my domain needs another rule, I make the rule code rather than hoping “append” means preserve.

@@ -1,0 +1,83 @@
+---
+caseId: "RFA-113"
+title: "Why Calling OnceLock::set Twice Panics After unwrap"
+date: "2026-09-05T10:13:00+01:00"
+lastmod: "2026-09-05T10:13:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "c0535ca363bdd88521978af443cca385a9059338835cf1c378dcbdbecdfaff4d"
+area: "concurrency-memory"
+symptom: "A second OnceLock::set returns the rejected value in Err, and an unconditional unwrap turns that expected state into a panic."
+summary: "OnceLock publishes one value once; it is not a replaceable configuration cell. Decide who owns initialization, use get_or_init for competing equivalent initializers, and handle duplicate set explicitly."
+rustVersions: ["Rust 1.98.1"]
+targets: ["all targets with std"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["OnceLock set twice panic unwrap", "OnceLock set returns Err value", "Rust global initialized more than once"]
+evidence: ["Rust 1.98.1 deterministic runtime panic", "second set Err reproduction", "explicit duplicate handling repair"]
+sources: ["https://doc.rust-lang.org/std/sync/struct.OnceLock.html", "https://doc.rust-lang.org/std/sync/struct.OnceLock.html#method.get_or_init"]
+---
+
+`OnceLock` has “once” in its name, but duplicate initialization can still hide behind an innocent `unwrap`. The [failing program](/rust-failure-atlas/evidence/RFA-113/fail.rs) sets `"primary"`, calls `set("replacement")`, and unwraps the result. The second call returns `Err("replacement")`, so the program panics.
+
+The lock did not become poisoned and there was no data race. It correctly preserved the first value.
+
+## set returns ownership when publication loses
+
+The [`OnceLock` documentation](https://doc.rust-lang.org/std/sync/struct.OnceLock.html) describes a synchronization primitive that can be written only once. After initialization, shared references can read the value without taking a conventional lock on every access.
+
+`set` returns `Result<(), T>`. On success, the cell owns the value. If it was already initialized, `Err(T)` gives the new value back to the caller. This is useful because construction may be expensive and Rust must not silently drop or replace the rejected input.
+
+Calling `unwrap` says duplicate initialization is impossible. In the fixture it is plainly possible, so the panic belongs to the caller's assertion, not to `OnceLock` internals.
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-113/fixed.rs) checks the returned `Err` and confirms the original value remains.
+
+## One-time configuration needs one owner
+
+I use `set` when an initialization phase has a clear owner: main loads validated configuration, publishes it, then starts workers. A duplicate `set` then indicates an actual lifecycle bug and may deserve a clear error.
+
+Problems appear when several modules all decide they can initialize the same global. Test setup, lazy startup, plugin registration, and application bootstrap can race or repeat. The type keeps memory safe, but it cannot decide whose value is semantically correct.
+
+I document three things:
+
+- who is allowed to initialize;
+- whether two candidate values are equivalent;
+- what happens if reading occurs before initialization.
+
+This turns a primitive into a lifecycle contract.
+
+## get_or_init solves a different case
+
+[`get_or_init`](https://doc.rust-lang.org/std/sync/struct.OnceLock.html#method.get_or_init) is useful when callers agree on how to construct the same logical value. It initializes if empty and returns a reference to the published value. Competing callers do not need to treat losing initialization as an error.
+
+I avoid using it when candidates carry different configuration. “Whichever request arrives first” is a poor way to select a database endpoint or security policy. For those, one bootstrap owner and `set` make disagreement visible.
+
+The initializer closure should also avoid reentrant initialization of the same cell. Reentrancy can deadlock or panic depending on API behavior and version; it is not a recursive cache.
+
+## OnceLock is not reloadable state
+
+A frequent design mistake is using `OnceLock<Config>` for configuration expected to reload. The second `set` then fails exactly as designed.
+
+Reloadable configuration needs a different ownership model: perhaps `RwLock<Arc<Config>>`, a watch channel, or an immutable snapshot swapped through a suitable synchronization primitive. Readers need a defined consistency and version policy.
+
+I choose `OnceLock` only when the value's lifecycle truly matches the process or containing object. “Global and convenient” is not enough.
+
+## Tests expose process-global lifetime
+
+Rust tests in one binary share process globals. If several tests call a setup function that sets one static `OnceLock`, later tests can fail depending on order. Serializing tests hides some races but does not reset the cell.
+
+I prefer dependency injection for test-varying configuration. When a global is intentional, setup can use `get_or_init` with one stable value and tests must not expect to replace it. A separate process per configuration is another honest boundary.
+
+Recent APIs may permit mutable access or taking a value only with exclusive access to the cell; a shared static does not normally provide that exclusive ownership during arbitrary tests.
+
+## My debugging sequence
+
+When a `OnceLock` initialization panics, I do this:
+
+1. Find the `unwrap` or `expect`; inspect the actual `Result` from `set`.
+2. Search every initialization path, including test helpers and error recovery.
+3. Decide whether duplicates mean a bug, an equivalent race, or intended reload.
+4. Use one owner with `set`, shared lazy construction with `get_or_init`, or a reloadable primitive accordingly.
+5. Test concurrent initialization and process-global test behavior.
+6. Preserve or account for the rejected value returned in `Err`.
+
+`OnceLock` guarantees one published value. It does not guarantee the application calls initialization once. I make that responsibility explicit, and then a duplicate set becomes either a handled state or a precise invariant failure rather than a mysterious panic.

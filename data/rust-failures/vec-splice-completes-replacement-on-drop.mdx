@@ -1,0 +1,116 @@
+---
+caseId: "RFA-197"
+title: "Why Dropping Vec::Splice Still Completes the Replacement"
+date: "2026-09-05T17:36:00+01:00"
+lastmod: "2026-09-05T17:36:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "bb498a99f4a5cc76d5aa670d09c059accde2ca73c2c88f1b57086d40896e9097"
+area: "concurrency-memory"
+symptom: "After one removed value is read from Vec::splice, dropping the iterator removes the whole selected range and inserts every replacement."
+summary: "Vec::splice uses its iterator to return removed values, not to decide how much replacement occurs. Normal drop completes range removal and consumes the replacement iterator, so select the exact mutation range before creating Splice."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets with alloc"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust Vec splice dropped before consumed",
+    "Vec Splice removes full range on drop",
+    "splice replacement iterator consumed when dropped",
+  ]
+evidence:
+  ["Rust 1.98.1 four-element vector", "partial removed-value iteration", "range-sized repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/std/vec/struct.Vec.html#method.splice",
+    "https://doc.rust-lang.org/std/vec/struct.Splice.html",
+    "https://doc.rust-lang.org/std/vec/struct.Vec.html#method.extract_if",
+  ]
+---
+
+`Vec::splice` gives back an iterator, but that iterator does not make the vector replacement partial. It gives my code a chance to receive the removed values while one complete range operation is being performed.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-197/fail.rs) replaces indices `1..3` in `[1, 2, 3, 4]` with `[7, 8, 9]`. It reads only the first removed value, `2`, and drops the `Splice`. The final vector is `[1, 7, 8, 9, 4]`. The unyielded `3` is still removed and every replacement is inserted.
+
+## The range defines the write
+
+[`Vec::splice`](https://doc.rust-lang.org/std/vec/struct.Vec.html#method.splice) creates a splicing iterator that replaces a selected range and yields removed items. The replacement length may be shorter, equal, or longer than the range.
+
+The documentation makes two timing rules explicit:
+
+- the range is removed even if the returned iterator is not consumed before normal drop;
+- the replacement iterator is consumed when the `Splice` is dropped.
+
+Calling `next` controls which removed values reach my code. It does not reduce the selected range. This is the same mutation-versus-observation split seen in `String::drain`.
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-197/fixed.rs) intends to remove only `2`, so it selects `1..2`. After drop, the replacements appear before the untouched `3` and `4`.
+
+## Dropping is part of the normal operation
+
+The [`Splice`](https://doc.rust-lang.org/std/vec/struct.Splice.html) value holds a mutable borrow of the vector. When it goes out of scope, its destructor finishes the structural work needed to leave a valid vector.
+
+This makes a statement that ignores the return value valid and useful:
+
+```rust
+values.splice(position..position, replacements);
+```
+
+The empty range inserts values. The temporary `Splice` is dropped at the end of the statement, and the replacement iterator is consumed then.
+
+It also means expensive or side-effecting replacement iterators may run later than the method call appears to suggest. If timing matters, I bind the `Splice` to a name and keep its scope small, or materialize the replacements before splicing.
+
+I never hide important fallible work inside a replacement iterator whose errors cannot be returned through `Drop`.
+
+## Collect only when removed values are data
+
+If I need all removed values, I collect the splice:
+
+```rust
+let removed: Vec<_> = values.splice(range, replacements).collect();
+```
+
+This exhausts the removal side and retains ownership of every removed element. The replacement is still finalized as the `Splice` is dropped at the end of the expression.
+
+If removed values are irrelevant, allowing the temporary to drop is clearer and avoids a second collection. A code review should be able to tell whether discarded old values are intentional.
+
+Reading only one removed value is valid when I deliberately want the first old item and accept that all others are dropped. I name that policy because it looks very similar to an accidental early exit.
+
+## Do not generalize from `extract_if`
+
+[`Vec::extract_if`](https://doc.rust-lang.org/std/vec/struct.Vec.html#method.extract_if) couples removal to predicate visitation. Dropping it early keeps unvisited elements because their predicates were never evaluated.
+
+`splice` already knows the complete range to remove. It does not need user code to decide each item's fate, so drop can complete the operation without calling another predicate.
+
+This gives three distinct behaviours in nearby APIs:
+
+```text
+extract_if  -> unvisited candidates remain
+drain       -> selected range is removed
+splice      -> selected range is removed and replacements are installed
+```
+
+The correct expectation comes from the operation contract, not from the fact that all three return iterators.
+
+## Leaking is a different and weaker state
+
+If a `Splice` is leaked with `mem::forget`, the documentation says it is unspecified how many elements are removed. Destructor cleanup did not complete. Leaking is not a supported cancellation mechanism.
+
+This remains memory-safe, but the vector's logical contents may no longer express either the old or intended new state. I keep `Splice` away from ownership cycles and deliberate forgetting.
+
+If a transaction must be cancelable, I build and validate the replacement first, then call `splice` only at the commit point. Standard collection mutation is not a database rollback protocol.
+
+## Performance depends on shape
+
+The standard documentation describes shapes where splicing is optimal: no tail, replacements no longer than the removed range, or an exact lower size hint. Other shapes may require a temporary vector and move the tail twice.
+
+I begin with correctness and then measure realistic sizes. Replacing a middle range with a poorly sized streaming iterator can have a different cost from inserting an exact array.
+
+Precollecting replacements may improve size knowledge, but it also adds an allocation. This is a measurement choice, not a universal fix.
+
+## What I test
+
+A useful splice regression records the initial vector, exact range, removed values actually consumed, replacement iterator calls, and final vector. It includes a retained tail so skipped or duplicated movement is visible.
+
+I also test empty replacement, empty range, shorter and longer replacements, and invalid bounds when the range comes from external input.
+
+The core principle is that destructor work can be semantic work. With `Vec::splice`, dropping the iterator normally completes the replacement. Iterator consumption controls access to removed values; the range and replacement input control the vector's final state.

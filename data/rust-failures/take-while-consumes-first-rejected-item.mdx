@@ -1,0 +1,116 @@
+---
+caseId: "RFA-159"
+title: "Rust take_while Consumes the First Rejected Item"
+date: "2026-09-05T16:49:00+01:00"
+lastmod: "2026-09-05T16:49:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "f9b158b314233dbeefc1436cd52fa2563b11165309450a9e749c206811939732"
+area: "concurrency-memory"
+symptom: "After take_while collects a prefix through by_ref, the original iterator resumes after the boundary item rather than returning the item that first failed the predicate."
+summary: "take_while must pull an item before evaluating its predicate, so the first false item is consumed even though it is not yielded. Use a persistent Peekable when the next phase must retain that boundary item."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust take_while consumes first false item", "iterator by_ref take_while missing boundary", "preserve rejected item after take_while"]
+evidence: ["Rust 1.98.1 runtime assertion", "consumed boundary item", "Peekable loop repair"]
+sources: ["https://doc.rust-lang.org/std/iter/trait.Iterator.html#method.take_while", "https://doc.rust-lang.org/std/iter/trait.Iterator.html#method.by_ref", "https://doc.rust-lang.org/std/iter/struct.Peekable.html#method.peek"]
+---
+
+I often want to split an iterator into a prefix and the rest. `take_while` gives the prefix, but it does not preserve the first item outside that prefix.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-159/fail.rs) iterates over `[1, 2, 3, 4]`, collecting values smaller than `3` through `values.by_ref().take_while(...)`. The prefix is `[1, 2]`. When the code returns to `values`, its next item is `4`, not `3`.
+
+The boundary value was tested and discarded.
+
+## The predicate runs after next
+
+[`Iterator::take_while`](https://doc.rust-lang.org/std/iter/trait.Iterator.html#method.take_while) cannot know whether an item satisfies the predicate before obtaining it. Its internal sequence is conceptually:
+
+```text
+call source.next()
+if None: finish
+if predicate(item): yield item
+otherwise: return None and do not yield item
+```
+
+By the time the predicate returns false, ownership has already moved out of the source iterator. The adapter does not have a general way to push the value back.
+
+The official documentation demonstrates this exact interaction with [`by_ref`](https://doc.rust-lang.org/std/iter/trait.Iterator.html#method.by_ref): the first rejected item is consumed, and subsequent use begins after it.
+
+## `by_ref` preserves the iterator, not every item
+
+`by_ref` borrows the iterator so an adapter can consume part of it without taking ownership of the iterator object. This is useful for sequential parsing:
+
+```rust
+let header = input.by_ref().take(4).collect::<Vec<_>>();
+let body = input.collect::<Vec<_>>();
+```
+
+But borrowing does not add rollback. Every call to `next` still advances the original iterator. `take_while` needs one extra call to discover where the prefix ends.
+
+This explains why the code compiles and the source remains usable, yet one value is absent.
+
+## Use one persistent Peekable to retain the boundary
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-159/fixed.rs) converts the source to `Peekable` once. It tests the next item by reference and consumes only accepted values:
+
+```rust
+while values.peek().is_some_and(|value| *value < 3) {
+    prefix.push(values.next().unwrap());
+}
+```
+
+When `3` fails the condition, it remains cached. The next call returns it.
+
+The word “persistent” matters. The neighbouring case [Why Peekable::peek advances the underlying iterator](/rust/failures/peekable-peek-advances-underlying-iterator) shows that the first peek has already pulled the value into the adapter. If I drop that temporary adapter, the cached boundary item drops with it. I keep using the same `Peekable` across both phases.
+
+## Sometimes consuming the delimiter is correct
+
+In a line-oriented parser, I may take tokens until a separator and intentionally discard that separator. Then `take_while` is a compact fit.
+
+For example, reading a header up to a blank marker often wants the marker removed before parsing the body. The first false item acts as a consumed delimiter.
+
+The bug comes from leaving this choice implicit. I name it in the parsing contract:
+
+- prefix excludes and consumes delimiter;
+- prefix excludes and preserves boundary;
+- prefix includes boundary;
+- no boundary is an error or means end of input.
+
+Different adapters or small loops implement each policy. No single method name can infer it.
+
+## `map_while` has a related boundary effect
+
+`map_while` also asks the source for an item before its closure can return `None`, so the input that produces `None` is consumed. It additionally is not fused, as documented in [the Atlas map_while case](/rust/failures/map-while-is-not-fused-after-none).
+
+These behaviours matter in multi-stage parsers. A stage may consume the delimiter and then allow later manual polling to resume after it. I test the exact sequence instead of assuming all “while” adapters share one termination protocol.
+
+## Errors represented as false can disappear
+
+A predicate sometimes combines validation with boundary detection. The first malformed record returns false, the prefix is processed successfully, and the bad record vanishes. The next stage sees only what follows it.
+
+If rejection is an error, I use an item type such as `Result<T, E>` and preserve the error explicitly. `take_while` offers a boolean boundary, not an error channel. A custom loop is often easier to audit:
+
+```text
+peek item
+classify as accepted, delimiter, or error
+consume only according to that classification
+```
+
+This becomes important for input where silently skipping one record can corrupt offsets or acknowledgements.
+
+## My boundary tests
+
+I test more than the collected prefix:
+
+1. boundary at the first item;
+2. boundary in the middle;
+3. every item accepted;
+4. empty input;
+5. the next source item after the adapter finishes;
+6. whether the boundary should be kept, discarded, or reported.
+
+The fifth assertion is the one missing from many tests. `[1, 2]` is a correct prefix in both designs, but only inspecting the remaining iterator reveals whether `3` survived.
+
+The core principle is that detecting a boundary can consume evidence of that boundary. `take_while` yields only accepted items, yet it must own the first rejected one long enough to reject it. When another phase needs that value, I put lookahead state into the iterator design instead of expecting pushback from a one-way stream.

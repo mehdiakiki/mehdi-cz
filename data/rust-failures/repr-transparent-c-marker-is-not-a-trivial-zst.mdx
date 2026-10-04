@@ -1,0 +1,106 @@
+---
+caseId: "RFA-708"
+title: "Why an Empty repr(C) Marker Breaks repr(transparent) in Rust 1.98"
+date: "2026-09-07T10:16:00+01:00"
+lastmod: "2026-09-07T10:16:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "c223e43584700d1cfb2411a69b0c284a6586a128b81c3f2c3b2424644607415e"
+area: "upgrades-compatibility"
+symptom: "A repr(transparent) wrapper that previously ignored an empty repr(C) marker now fails with E0690 after upgrading to Rust 1.98."
+summary: "repr(transparent) may ignore only fields whose trivial layout is guaranteed. Rust 1.98 no longer treats an empty repr(C) field as guaranteed zero-sized and one-aligned on every target."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets"]
+profiles: ["dev", "release"]
+searchTerms: ["Rust 1.98 repr transparent repr C zero sized field E0690", "repr transparent field not guaranteed zero sized all targets", "empty repr C marker transparent wrapper rejected"]
+evidence: ["Rust 1.98.1 E0690 compatibility diagnostic", "empty repr(C) marker is not a guaranteed trivial field", "ordinary zero-sized marker restores transparent wrapper"]
+sources: ["https://doc.rust-lang.org/releases.html#version-1980-2026-08-20", "https://doc.rust-lang.org/reference/type-layout.html#the-transparent-representation", "https://doc.rust-lang.org/error_codes/E0690.html"]
+---
+
+This wrapper looks as if it has one real field and one field which costs nothing:
+
+```rust
+#[repr(C)]
+struct Marker;
+
+#[repr(transparent)]
+struct Handle(u32, Marker);
+```
+
+On a familiar target, `size_of::<Marker>()` may be zero. It is tempting to conclude that `Handle` can transparently have the layout and ABI of `u32`.
+
+Rust 1.98 rejects the definition with E0690. The diagnostic says the `repr(C)` marker is not guaranteed to be zero-sized on all targets. This is not the generic rule that a transparent wrapper cannot contain two ordinary data fields. It is a narrower compatibility issue: a field which happens to look trivial here is not necessarily trivial under the representation guarantees Rust must preserve.
+
+The [failing fixture](/rust-failure-atlas/evidence/RFA-708/fail.rs) isolates that combination. The [repaired fixture](/rust-failure-atlas/evidence/RFA-708/fixed.rs) removes an unnecessary `repr(C)` from the private marker and checks the resulting wrapper size on the verifier target.
+
+## repr(transparent) is a guarantee, not a size optimization
+
+I use `repr(transparent)` when a one-field wrapper must have the same layout and ABI as its meaningful field. A typed identifier around `u32`, a handle around a pointer, or a newtype crossing FFI can need that promise.
+
+The representation permits extra fields only when their layout is sufficiently trivial: zero size and alignment one. Those extra fields can carry type-system information without affecting the wrapper's physical contract.
+
+The important word is “guarantee.” Rust is not asking only what `size_of` reports for my current compiler and machine. It must know that the extra field can be ignored across every target for which the type's transparent promise applies.
+
+`repr(C)` asks Rust to follow C-compatible layout rules for the marked type. Empty aggregates do not have one portable C layout story across all relevant language and target environments. Rust 1.98 therefore stops treating an empty `repr(C)` type as a field it can automatically ignore inside a transparent wrapper.
+
+## Measuring one build does not establish a public ABI
+
+I can print this:
+
+```rust
+println!("{}", std::mem::size_of::<Marker>());
+```
+
+and observe zero. That output proves one toolchain-target combination. It does not create a language guarantee for other targets or future compilers.
+
+The same caution applies to `align_of`, debugger displays, and a single generated assembly file. They are observations. Representation attributes are contracts. Code which crosses FFI, is serialized by layout, or is reinterpreted through raw pointers needs the contract.
+
+This distinction is why the compiler rejecting the type is useful. Without it, the wrapper may appear correct throughout development and only disagree at another ABI boundary.
+
+## The smallest repair is often to remove repr(C) from the marker
+
+If `Marker` is private type-level information and never crosses C on its own, it usually does not need `repr(C)`:
+
+```rust
+struct Marker;
+
+#[repr(transparent)]
+struct Handle(u32, Marker);
+```
+
+Now the marker is an ordinary Rust zero-sized, one-aligned field that the transparent layout rule can ignore. This is the repair used in the evidence file.
+
+`PhantomData<T>` is another usual choice when the extra field exists to express ownership, variance, drop checking, or a type relationship. I select the precise `PhantomData` shape because different forms can affect variance and auto traits. It is not only decorative syntax.
+
+I do not remove `repr(C)` mechanically when native code actually constructs or observes the marker type. In that case there are two public layout requirements fighting for attention, and the design may need to change instead of the attribute.
+
+## When the marker has its own foreign meaning
+
+Suppose a native header exposes the marker as a real aggregate, stores it beside the integer, or takes its address. Then pretending it is absent from the transparent wrapper may be the wrong model.
+
+I can make the foreign-facing aggregate explicit, keep the Rust newtype separate, or define conversion functions at the boundary. The correct structure depends on what native code sees. A transparent wrapper should not be used as a shortcut around a two-field C record.
+
+The compiler error is therefore not telling me that `repr(C)` is bad. It is telling me that one type cannot simultaneously claim, without further redesign, “follow the representation rules for this extra C field” and “this wrapper is exactly the meaningful field everywhere.”
+
+## Similar-looking cases have different causes
+
+There are several routes to E0690.
+
+A wrapper with both `u32` and `u16` has two clearly non-zero fields. The repair is to choose one represented field or stop claiming transparency.
+
+This Rust 1.98 case has one `u32` and one empty `repr(C)` field. Its search intent is different because the developer already checked that the marker is empty. The missing fact is that observed emptiness is not a portable trivial-layout guarantee.
+
+Types with private fields from another module and `non_exhaustive` types also require care under the stricter rule. Their authors retain freedom that callers cannot replace with current size observations. I inspect the exact field type and its representation rather than reducing every E0690 to “remove a field.”
+
+## My upgrade test for transparent wrappers
+
+Before a compiler upgrade, I inventory transparent types, especially those used in FFI or unsafe casts. For each one I identify the single field which owns the layout. Then I classify every other field:
+
+1. Is it guaranteed zero-sized and one-aligned by the relevant Rust contract?
+2. Does it carry an explicit representation such as `repr(C)`?
+3. Is the type private, external, or non-exhaustive in a way that preserves layout freedom?
+4. Does foreign code ever name, construct, or address it?
+
+I compile the reductions for all supported targets and keep size/alignment assertions as observations, not as substitutes for documentation. When the public ABI matters, I also test a native caller.
+
+The core principle is portable engineering: layout correctness comes from declared guarantees. “It is zero bytes on my machine” is useful evidence, but it cannot justify a transparent ABI by itself.

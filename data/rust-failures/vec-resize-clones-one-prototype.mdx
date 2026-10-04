@@ -1,0 +1,104 @@
+---
+caseId: "RFA-204"
+title: "Vec::resize Clones One Value; resize_with Builds Fresh Values"
+date: "2026-09-05T17:43:00+01:00"
+lastmod: "2026-09-05T17:43:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "5a204990bcc48e81c3c5aa52b19148c9b9fc590d98d2a3e5f64e04b7a1a1cec9"
+area: "concurrency-memory"
+symptom: "Vec::resize creates several new elements with the same logical identity although the caller expected a fresh identifier for every slot."
+summary: "Vec::resize extends a vector by cloning one supplied prototype. Use resize_with when each new position needs a separate constructor call, fresh identity, or independent reference-counted allocation."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets with alloc"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust Vec resize clones same value",
+    "Vec resize fresh value each element",
+    "resize versus resize_with Rust",
+  ]
+evidence: ["Rust 1.98.1 three-slot vector", "repeated prototype identity", "per-slot closure repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/std/vec/struct.Vec.html#method.resize",
+    "https://doc.rust-lang.org/std/vec/struct.Vec.html#method.resize_with",
+    "https://doc.rust-lang.org/std/macro.vec.html",
+  ]
+---
+
+I needed to extend a vector with three worker states. I passed one initial state to `resize` and expected the IDs to advance. Instead, every new worker had the same logical ID.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-204/fail.rs) resizes an empty vector with `Worker { id: 7 }`. The resulting IDs are `7, 7, 7`, not `7, 8, 9`.
+
+`resize` receives a value to clone. It does not receive a generator.
+
+## The method repeats one prototype
+
+[`Vec::resize`](https://doc.rust-lang.org/std/vec/struct.Vec.html#method.resize) requires `T: Clone` when growing. Each additional slot is filled from the supplied value. For integers and simple enums, this is usually exactly what I want.
+
+For values with identity or shared ownership, cloning can have deeper meaning:
+
+```text
+String clone     -> separate owned byte allocation with equal text
+Arc clone        -> another pointer to the same allocation
+custom Clone     -> whatever valid semantics the implementation defines
+```
+
+The type system promises a valid clone, not a fresh domain entity.
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-204/fixed.rs) uses [`resize_with`](https://doc.rust-lang.org/std/vec/struct.Vec.html#method.resize_with). Its closure is called once for each new slot, so it can allocate or increment an ID separately.
+
+## `vec![value; count]` has the same question
+
+The repetition form of the [`vec!` macro](https://doc.rust-lang.org/std/macro.vec.html) also clones the expression. Writing `vec![Arc::new(State::default()); 4]` creates four `Arc` handles to one allocation, not four independent `State` allocations.
+
+If sharing is intentional, that expression is compact and honest after the reader knows the rule. If independence is required, I write an iterator or generator:
+
+```rust
+let states = (0..4)
+    .map(|id| State::new(id))
+    .collect::<Vec<_>>();
+```
+
+The code now states where identity comes from.
+
+## `Default` can still hide identity
+
+`resize_with(new_len, Default::default)` creates a new value for each call, but that does not automatically guarantee globally unique IDs or separate external resources. The `Default` implementation defines the result.
+
+A default that contains `Arc::clone` of global state may still share. A default ID of zero gives every item the same ID. Fresh construction is necessary only when its semantics meet the requirement.
+
+I test the property I need: distinct IDs, distinct pointer identities, isolated mutation, or separate file descriptors. Testing only `len()` proves almost nothing about the new elements.
+
+## Shrinking does not use the prototype
+
+When the new length is smaller, `resize` truncates the vector. Values beyond the new length are dropped, and the supplied value is not used to fill anything. It was still evaluated before the method call, because Rust evaluates ordinary arguments first.
+
+This can create surprising work:
+
+```rust
+values.resize(smaller_len, expensive_default());
+```
+
+Even though the vector shrinks, `expensive_default()` is constructed and then dropped. When construction should happen only during growth, `resize_with` expresses that laziness.
+
+This connects to a wider Atlas trail: eager argument construction is different from a closure that is invoked only when needed.
+
+## Panic and partial progress need type invariants
+
+The generator passed to `resize_with` is called repeatedly. If it panics after creating some values, the vector remains a valid Rust value, but application-level work may be partially completed.
+
+If construction opens files, reserves external IDs, or writes to another system, I do not assume vector rollback. I separate fallible resource acquisition from infallible insertion, or I build a temporary collection and commit it after every element succeeds.
+
+`resize_with` takes a closure returning `T`, not `Result<T, E>`. Fallible batch construction is often clearer with an iterator collected into `Result<Vec<T>, E>`, while remembering that this collect short-circuits at the first error.
+
+## Clone should preserve its own contract
+
+It is possible to write a `Clone` implementation that generates a new ID on every clone. I avoid using that as a hidden repair. Most readers expect cloning to preserve logical equality or identity according to the type's documented semantics. Smuggling “create a new entity” into `Clone` makes many generic APIs surprising.
+
+I use named constructors for domain creation and reserve `Clone` for the meaning the type can explain consistently.
+
+My regression matrix grows from empty and non-empty vectors, shrinks and grows, and checks the construction-call count. I also verify what happens when the vector already has spare capacity, because allocation capacity is independent from element construction.
+
+The core principle is that repetition and generation are different operations. `Vec::resize` repeats by cloning one prototype. `Vec::resize_with` invokes construction per slot. Once identity matters, I choose the second form and assert the identity property directly.

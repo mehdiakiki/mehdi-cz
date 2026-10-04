@@ -1,0 +1,108 @@
+---
+caseId: "RFA-153"
+title: "Why Rust read_to_string Appends Instead of Replacing"
+date: "2026-09-05T15:53:00+01:00"
+lastmod: "2026-09-05T15:53:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "961740b55fe2ff1be059b485af8647a17854362f41e891c20ea82f4d26d16712"
+area: "concurrency-memory"
+symptom: "Read::read_to_string keeps an old prefix in a reused String, so newly read input is appended instead of replacing the previous contents."
+summary: "read_to_string preserves the destination and appends newly read UTF-8 bytes. Clear or recreate the String when replacement is the intended state transition, and define retry behaviour before reusing a partial buffer."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets with std::io"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust read_to_string appends existing String", "Read read_to_string does not clear buffer", "Rust reused String prefix duplicate input"]
+evidence: ["Rust 1.98.1 runtime assertion", "pre-populated String", "clear-before-read repair"]
+sources: ["https://doc.rust-lang.org/std/io/trait.Read.html#method.read_to_string", "https://doc.rust-lang.org/std/string/struct.String.html#method.clear", "https://doc.rust-lang.org/std/io/trait.Read.html#method.read_to_end"]
+---
+
+This bug often appears after a reasonable optimization. A loop reuses one `String` to avoid repeated allocation. The first item is correct. Later items contain a prefix from earlier work.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-153/fail.rs) starts with `"prefix:"`, reads `"payload"` through a `Cursor`, and expects the destination to equal `"payload"`. The actual value is `"prefix:payload"`.
+
+Nothing went wrong in the reader. The expectation used the wrong state transition.
+
+## The destination is an accumulator
+
+[`Read::read_to_string`](https://doc.rust-lang.org/std/io/trait.Read.html#method.read_to_string) takes `&mut String` and appends bytes read until EOF. It returns the number of bytes appended. It does not reset the destination.
+
+This design allows a caller to assemble content from several readers:
+
+```rust
+first.read_to_string(&mut document)?;
+second.read_to_string(&mut document)?;
+```
+
+It also lets the caller keep allocated capacity between operations. Clearing a string can remove its contents while retaining its allocation, but the `Read` trait cannot assume every caller wants that.
+
+I now read the signature as “extend this buffer,” not “load this source into this variable.” The method name alone can suggest replacement, while the mutable destination API and documentation describe accumulation.
+
+## Clear before reading when the operation means replace
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-153/fixed.rs) calls [`String::clear`](https://doc.rust-lang.org/std/string/struct.String.html#method.clear) first:
+
+```rust
+output.clear();
+reader.read_to_string(&mut output)?;
+```
+
+`clear` sets the length to zero and keeps the capacity for reuse. That is suitable for a loop processing similarly sized inputs.
+
+A fresh `String::new()` is also correct and sometimes clearer. I choose based on ownership and measurement, not automatically. Reusing capacity can help hot paths, but it also retains the largest allocation seen so far. A worker that once reads a 100 MB object may keep that capacity while later reading tiny messages.
+
+For bounded memory I may replace or shrink oversized buffers according to an explicit threshold.
+
+## Retries make accumulation more dangerous
+
+Suppose a network reader appends part of a body and then returns an error. The documentation describes how `read_to_string` handles UTF-8 validity, but application-level retry remains my responsibility.
+
+If I retry into the same string without restoring its starting length, I can duplicate the partial prefix:
+
+```text
+attempt 1: existing + first half + error
+attempt 2: existing + first half + complete body
+```
+
+For a replace operation, I clear before every full retry. For an intentional resume, I need a reader offset and a protocol proving the next bytes continue exactly where the buffer ends. Calling the method again is not itself a resume protocol.
+
+A careful helper can remember the initial length and truncate back on error. Whether that is correct depends on the reader and the meaning of partial progress.
+
+## UTF-8 validation is part of the contract
+
+`read_to_string` differs from [`read_to_end`](https://doc.rust-lang.org/std/io/trait.Read.html#method.read_to_end) because the final destination must remain valid UTF-8. If input is arbitrary binary, I read into `Vec<u8>` and decode according to the actual format.
+
+This avoids two mistakes: treating network or file bytes as guaranteed text, and using lossy decoding without making that policy visible.
+
+The append behaviour exists for both methods. A reused `Vec<u8>` also needs `clear` when each read should replace the previous message.
+
+## A wrapper can encode the intended meaning
+
+At application boundaries I often prefer a function that returns an owned value:
+
+```rust
+fn read_text(mut reader: impl Read) -> io::Result<String> {
+    let mut text = String::new();
+    reader.read_to_string(&mut text)?;
+    Ok(text)
+}
+```
+
+This API makes replacement natural because each call constructs one result. In a measured hot loop, I may instead expose `read_text_into(reader, destination)` and document that the helper clears first.
+
+The naming matters. `append_text` should preserve contents; `replace_with_text` should remove them. Wrapping a general standard-library primitive gives the domain operation one unambiguous meaning.
+
+## How I diagnose repeated or prefixed input
+
+I use a small sequence:
+
+1. Log or assert the destination length before the read.
+2. Record the returned byte count separately from the final length.
+3. Reproduce with `Cursor`, removing filesystem and network uncertainty.
+4. Decide whether the operation is append, replace, or resume.
+5. Make reset and retry policy explicit.
+6. Test two consecutive reads with different contents.
+
+That last test is important. A fresh destination always hides reuse bugs. I begin with a non-empty sentinel, as the fixture does, so the contract becomes visible in one run.
+
+The larger lesson is about mutable output parameters. They often preserve existing state because this makes composition and allocation reuse possible. Before calling one, I ask whether it appends, overwrites, partially updates, or clears on error. The correct code follows from that state transition. Here, `read_to_string` is an accumulator; replacement belongs to the caller.

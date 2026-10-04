@@ -1,0 +1,100 @@
+---
+caseId: "RFA-264"
+title: "Why i32::MIN.abs() Can Panic or Stay Negative"
+date: "2026-09-06T00:44:00+01:00"
+lastmod: "2026-09-06T00:44:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "fdc5663808bf5b9a2965edc6d0be9afafc4b3afbee4c5d6f7b2c27af17ed94c9"
+area: "upgrades-compatibility"
+symptom: "Taking abs of i32::MIN overflows: checked builds panic, while optimized unchecked-overflow builds can return the same negative minimum."
+summary: "Two's-complement signed integers have one more negative value than positive values. Use checked_abs for fallibility, unsigned_abs for the full magnitude, or a documented saturation policy."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets"]
+profiles: ["dev", "release with overflow policy recorded", "test"]
+searchTerms: ["Rust i32 MIN abs panic release negative", "absolute value integer minimum overflow Rust", "checked_abs vs unsigned_abs"]
+evidence: ["Rust 1.98.1 checked-overflow execution", "captured minimum panic", "checked and unsigned repairs"]
+sources: ["https://doc.rust-lang.org/std/primitive.i32.html#method.abs", "https://doc.rust-lang.org/std/primitive.i32.html#method.checked_abs", "https://doc.rust-lang.org/std/primitive.i32.html#method.unsigned_abs"]
+---
+
+Most negative integers have a positive counterpart of the same signed type. The minimum value does not.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-264/fail.rs) hides `i32::MIN` from constant folding and evaluates [`i32::abs`](https://doc.rust-lang.org/std/primitive.i32.html#method.abs) with overflow checks enabled. The operation panics.
+
+## Signed range is asymmetric
+
+An `i32` ranges from `-2^31` through `2^31 - 1`. Its minimum magnitude is `2^31`, but the largest positive `i32` is one smaller.
+
+Negating `i32::MIN` therefore cannot produce a representable `i32`. Absolute value encounters the same overflow as unary negation.
+
+This is not specific to Rust or to 32 bits. Fixed-width two's-complement signed integer types have this asymmetric endpoint.
+
+## Ordinary abs follows overflow-check policy
+
+The Rust documentation states that `abs(MIN)` overflows. With overflow checks enabled, it panics. In optimized code without those checks, it can return `MIN`, which remains negative.
+
+This makes the bug especially dangerous: a debug test may panic clearly while a release build produces a plausible integer with the wrong sign. I do not write `value.abs()` when minimum is possible and later assume non-negativity.
+
+Build profile is part of the reproduction, not noise.
+
+## checked_abs preserves the signed type
+
+[`checked_abs`](https://doc.rust-lang.org/std/primitive.i32.html#method.checked_abs) returns `None` for the minimum and `Some(magnitude)` otherwise. It is right when the caller wants an `i32` result and can handle an unrepresentable endpoint.
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-264/fixed.rs) asserts this `None` explicitly. Application code can turn it into an error, widen the type, or select another policy.
+
+Replacing `None` with `i32::MAX` is saturation, not exact absolute value, and should be named that way.
+
+## unsigned_abs represents the complete magnitude
+
+[`unsigned_abs`](https://doc.rust-lang.org/std/primitive.i32.html#method.unsigned_abs) returns `u32`. That type can represent `2^31`, so the minimum's magnitude is exact.
+
+This is often the best choice for distances, byte magnitudes, and serialization that naturally require nonnegative output. Downstream arithmetic must remain unsigned or deliberately widen; casting the result back to `i32` recreates the problem.
+
+An unsigned magnitude also does not prove it is safe as a memory allocation. Resource limits remain separate.
+
+## Widening before negation works when the wider domain is intended
+
+Converting `i32` to `i64` before taking absolute value provides enough positive range. The order matters: calling `abs` first can already overflow.
+
+```rust
+let magnitude = i64::from(value).abs();
+```
+
+This is useful when later calculations need signed wider arithmetic. `unsigned_abs` avoids widening sign semantics when only magnitude matters.
+
+## Common distance formulas can overflow earlier
+
+`(a - b).abs()` may overflow during subtraction even when the final mathematical distance is representable in an unsigned type. `abs_diff` is designed to compute the absolute difference without that intermediate signed overflow.
+
+I inspect the complete expression, not only its final `.abs()`. Changing the last method cannot repair a subtraction that already wrapped or panicked.
+
+For coordinates and timestamps, a wider intermediate or domain-specific duration type may be clearer.
+
+## Sentinel minimum values make this operational
+
+Minimum integers often appear through untrusted parsing, hash-derived values, negated counters, or sentinel conventions. Random tests may rarely hit the single endpoint.
+
+I include every numeric boundary deliberately. Property testing is useful only if its generator does not exclude or almost never produce `MIN`.
+
+## What I test
+
+My table includes `MIN`, `MIN + 1`, negative one, zero, one, and `MAX`. It runs under the relevant overflow-check configurations and asserts exact type and value.
+
+For a repaired magnitude API, I test that the return type can represent every input and that later conversions remain checked. A passing `unsigned_abs` assertion alone does not protect a subsequent narrowing cast.
+
+## Sorting by magnitude needs a tie rule
+
+Using absolute value as a sort key groups `-n` and `n` together. Even after fixing the minimum overflow, the comparator must decide which signed value comes first for equal magnitudes.
+
+I use `unsigned_abs` as the primary key and add the original sign or value as a secondary key when deterministic order matters. Otherwise a stable versus unstable sort can select different representatives among magnitude ties.
+
+The minimum value also has the largest unsigned magnitude, so tests should prove it reaches the intended end of the order rather than wrapping to a negative key.
+
+## Serialization must record the result type
+
+An unsigned magnitude of `2_147_483_648` cannot be decoded back into positive `i32`. If a wire schema still declares the field signed, fixing the Rust calculation alone creates an encoding failure later.
+
+I update the schema or widen the representation at the same boundary. Numeric correctness across one expression is not enough when another system owns the destination range.
+
+The core principle is that a mathematical operation can leave the range of its input type even when it sounds sign-preserving. `i32::MIN` has no positive `i32` counterpart. Make the response explicit with `checked_abs`, exact unsigned magnitude, widening, or a named saturation rule instead of inheriting build-profile behavior.

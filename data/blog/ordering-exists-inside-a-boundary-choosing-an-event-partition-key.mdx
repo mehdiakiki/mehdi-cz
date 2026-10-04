@@ -1,0 +1,172 @@
+---
+title: "Ordering Exists Inside a Boundary: Choosing an Event Partition Key"
+date: "2026-10-04T09:00:00+01:00"
+tags: ["event ordering", "kafka", "partition key", "distributed systems", "event streaming"]
+draft: false
+reviewed: true
+reviewedHash: "39d5106282d638ce49ae3c402f4c5918f0d63cc23b416f8ad3c276a9c2022eb3"
+cluster: "reliable-data-integrations"
+campaign: "authority-2026"
+opportunity: "DATA-042"
+summary: "A partition key defines both the ordering boundary and the load distribution. Use the smallest business entity that truly requires ordered events, then test its skew."
+---
+
+“The events must be ordered” sounds precise, but it is incomplete. Ordered for the whole company? One customer? One account? One order?
+
+In a partitioned event log, ordering exists inside a boundary. The key chooses that boundary and also decides where the traffic goes.
+
+I start with the business invariant, not the broker setting.
+
+## Global order is usually a hidden throughput limit
+
+Imagine these events:
+
+```text
+Order 17: Created -> Paid -> Shipped
+Order 82: Created -> Cancelled
+```
+
+The state of Order 17 depends on the relative order of its three events. It normally does not matter whether Order 82 was cancelled before or after Order 17 was paid.
+
+If I demand one global order, every unrelated order joins the same sequence. I have created coordination that the business rule did not require.
+
+The smaller honest requirement is:
+
+```text
+All state-changing events for the same order
+must be observed in producer order.
+```
+
+That statement points towards `order_id` as a partition key.
+
+## The key makes two decisions at once
+
+For a typical partitioner:
+
+```text
+partition = stable_hash(key) mod partition_count
+```
+
+Records with the same key go to the same partition, so a consumer can observe their partition sequence. Records with different keys can be processed in parallel and no useful cross-partition order should be assumed.
+
+The [Kafka producer API](https://kafka.apache.org/41/javadoc/org/apache/kafka/clients/producer/KafkaProducer.html) documents ordering for records sent to the same partition. The guarantee belongs to that partition, not to the topic as a single global timeline.
+
+Choosing a key therefore controls:
+
+- which events share an ordered log;
+- how work spreads across partitions;
+- the unit that one consumer worker handles sequentially;
+- what happens when one entity becomes very hot.
+
+## A measured three-key comparison
+
+I simulated 20,000 orders with five events each: 100,000 events across eight partitions. One tenant owned 30% of the orders. The other orders were spread across 99 tenants.
+
+I used the same deterministic hash for three strategies:
+
+```js
+const key = strategy === "tenant"
+  ? tenantId
+  : strategy === "order"
+    ? orderId
+    : eventId;
+
+const partition = stableHash(key) % 8;
+```
+
+The result was:
+
+| Key | Busiest partition / average | Orders split across partitions |
+| --- | ---: | ---: |
+| `tenant_id` | 3.14× | 0.0% |
+| `order_id` | 1.00× | 0.0% |
+| `event_id` | 1.00× | 100.0% |
+
+This is a synthetic distribution, not a production benchmark. Its job is to expose the trade-off.
+
+The tenant key preserved per-order order, but it also placed all work for the hot tenant on one partition. The event key balanced load while destroying the order boundary. The order key preserved the required sequence and distributed this particular workload well.
+
+## Use the smallest stable entity that owns the invariant
+
+My default method is:
+
+1. Write the state transition that fails when events swap.
+2. Name the entity whose history contains that transition.
+3. Use a stable identity for that entity as the candidate key.
+4. Test the real key distribution, including the largest customers.
+
+Examples:
+
+| Invariant | Candidate key |
+| --- | --- |
+| one order cannot ship before it is paid | `order_id` |
+| withdrawals for one account must serialize | `account_id` |
+| one device's readings require sequence | `device_id` |
+| all changes to one document need revision order | `document_id` |
+
+“Tenant” is correct only when events across the tenant truly share one serial invariant. It is often chosen because the application is multi-tenant, not because the ordering rule is tenant-wide.
+
+## A random key is a semantic decision
+
+Generating a unique key per event looks attractive when one partition is hot. It spreads work, but it also says events for the same entity may run concurrently and arrive in either order.
+
+That is safe only if the consumer has another rule, such as:
+
+- version checks that reject stale transitions;
+- commutative operations;
+- conflict resolution by a business sequence number;
+- reordering buffers with a clear missing-event policy.
+
+Randomness is not a free performance fix. It moves ordering complexity into every consumer.
+
+## Producer order is not event-time order
+
+Even inside one partition, I distinguish several clocks:
+
+```text
+business occurred_at
+producer emitted_at
+broker append position
+consumer processed_at
+```
+
+A mobile device may upload yesterday's event today. Two producers may race for the same key. A retry can happen later than a newer command.
+
+Partition ordering gives a log order. It does not prove that `occurred_at` is increasing or that two independent producers agreed on one business sequence.
+
+If state transitions require stronger ordering, I put a monotonic version or expected previous version in the event:
+
+```json
+{
+  "order_id": "17",
+  "previous_version": 4,
+  "version": 5,
+  "type": "OrderShipped"
+}
+```
+
+The consumer can then detect a gap or stale write instead of silently trusting arrival time.
+
+## Repartitioning changes the physical history
+
+Adding partitions can change `hash(key) mod partition_count`. Existing records remain in old partitions while new records for the same key may map differently, depending on the platform and migration design.
+
+I treat partition-count changes as data migrations when ordering matters. A safe plan may require a new topic, a controlled cutover position, producer fencing, or consumer logic that understands both histories.
+
+The exact mechanism depends on the broker. The principle does not: never assume that increasing partitions preserves an entity's physical sequence without checking the platform's mapping rules.
+
+## Measure skew with business-shaped data
+
+Average load hides the key that hurts. I record at least:
+
+```text
+events per partition
+bytes per partition
+processing time per partition
+consumer lag per partition
+top keys by volume and processing cost
+```
+
+A key with few events can still be hot if each event triggers expensive work. I replay a recent anonymised key distribution through the proposed partitioner before launch.
+
+The right key is not the one with the most even chart. It is the smallest boundary that preserves the real business sequence while leaving enough independent entities to scale.

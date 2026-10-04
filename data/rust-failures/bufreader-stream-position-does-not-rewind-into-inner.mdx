@@ -1,0 +1,66 @@
+---
+caseId: "RFA-340"
+title: "BufReader stream_position Does Not Rewind into_inner"
+date: "2026-09-06T02:00:00+01:00"
+lastmod: "2026-09-06T02:00:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "f520fdcc0a805e94984bdf34d25a12d5f8f69de52ffd64f4cce7dd0e7fe2810a"
+area: "ffi-targets"
+symptom: "BufReader reports logical position one, yet the reader returned by into_inner is already at position six."
+summary: "stream_position describes the position seen through BufReader. It does not promise that immediately unwrapping exposes an inner seekable source at that same position; an explicit seek reconciles buffered read-ahead first."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust BufReader stream_position into_inner", "BufReader logical position underlying position", "rewind BufReader before into_inner"]
+evidence: ["Rust 1.98.1 Cursor source", "logical position one and physical position six", "SeekFrom Current zero reconciliation"]
+sources: ["https://doc.rust-lang.org/std/io/struct.BufReader.html#method.stream_position", "https://doc.rust-lang.org/std/io/struct.BufReader.html#method.seek", "https://doc.rust-lang.org/std/io/struct.BufReader.html#method.into_inner"]
+---
+
+I once added a position check before handing a buffered file to another parser. The check returned the number I expected, so I believed the inner cursor must now be there too. After `into_inner`, the next parser started much later. Asking for the logical position had not moved the source backwards.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-340/fail.rs) makes this visible without a real file. A `BufReader` reads one byte from a six-byte `Cursor`. `stream_position` says one, while the cursor returned by `into_inner` says six.
+
+## One reader carries two positions
+
+`BufReader` may fetch more bytes than the immediate call requested. Its inner reader advances when this read-ahead happens. The wrapper keeps the extra bytes and presents them later, so callers still observe a logical sequence with no gap.
+
+There is therefore a logical position after the bytes consumed through `BufReader`, and a physical position after the bytes already fetched from its source. The unread buffer accounts for the distance between them.
+
+[`BufReader::stream_position`](https://doc.rust-lang.org/std/io/struct.BufReader.html#method.stream_position) reports the logical position. This is exactly useful when I need to tell where the buffered consumer is in a stream. It is not a request to discard the buffer or permanently reposition the source.
+
+## A query is not a state transfer
+
+The misleading assumption is easy: if a method talks to `Seek` and returns a position, perhaps the underlying reader now sits there. The documentation explicitly avoids that promise for the optimized `BufReader` implementation. Calling `stream_position` does not guarantee that a following `into_inner` has the same position.
+
+This distinction matters because `stream_position` is an observation. Forcing it to reconcile the inner source on every call could add a seek and throw away useful buffered bytes. A position query used for logging should not quietly change later performance or I/O behavior.
+
+[`into_inner`](https://doc.rust-lang.org/std/io/struct.BufReader.html#method.into_inner) then consumes the wrapper. Any unread buffer is no longer available, and the returned source exposes its real advanced position.
+
+## Seek explicitly when handoff requires it
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-340/fixed.rs) calls `seek(SeekFrom::Current(0))` before unwrapping. [`BufReader::seek`](https://doc.rust-lang.org/std/io/struct.BufReader.html#method.seek) discards its buffer and seeks the underlying object. Position one becomes true at both layers, so the inner cursor reads `bcdef` after handoff.
+
+I like this repair because the extra operation and its possible error are visible. The caller says that physical reconciliation is required. A plain query remains only a query.
+
+This repair needs `Read + Seek`. It cannot be copied to a TCP stream or a pipe, because those sources cannot rewind. For them I retain the same buffering owner and pass it to the next protocol stage, or I explicitly pass the unread bytes along with the stream.
+
+## Do not subtract buffer length by hand
+
+It is tempting to inspect `buffer().len()`, take the inner position, subtract, and then seek. That duplicates library state accounting and becomes delicate around seeks, errors, custom readers, and integer conversions. The buffered seek implementation already owns this responsibility.
+
+I use the public operation that states my intent. If I only need the logical number, I ask `stream_position`. If I need the inner object aligned to it, I perform a seek and handle failure before `into_inner`.
+
+## Position tests need forced read-ahead
+
+A test that reads a large block can accidentally consume everything in the buffer and hide the bug. My fixture uses a capacity larger than the source, then requests one byte. It asserts the logical and physical positions separately.
+
+For production parsers I test a tiny logical read, an input shorter than buffer capacity, an input longer than capacity, a seek around a boundary, and handoff after both a full and partial buffer. I also check the exact remaining bytes, because a position alone may look plausible while data is skipped.
+
+I avoid asserting undocumented details such as exactly how much a general reader prefetched. The deterministic cursor fixture is allowed to pin its constructed observation; application code should only rely on the documented difference and the explicit repair.
+
+## The same principle appears outside Rust I/O
+
+Read-ahead caches, database cursors, decompression layers, and message consumers often maintain a logical progress point ahead of or behind a lower-level handle. Asking one layer for its progress does not necessarily synchronize every layer below it.
+
+My rule is simple: observation and reconciliation are separate operations. Before transferring ownership, I decide which position the recipient contract requires and make that position real. `BufReader` makes this systems principle small enough to test in six bytes.

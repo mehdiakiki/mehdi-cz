@@ -1,0 +1,121 @@
+---
+caseId: "RFA-048"
+title: "Why a Pointer Into Vec Broke After an Unrelated push"
+date: "2026-09-04T21:00:00+01:00"
+lastmod: "2026-09-07T11:25:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "d07451d7fe6307741acf290379023576077f80eab16ca514a00004bfce183801"
+area: "concurrency-memory"
+symptom: "A raw pointer into a Vec becomes invalid after an unrelated push, reserve, or extension of the vector."
+summary: "Growing Vec beyond capacity may reallocate its buffer and invalidate interior pointers. Store indices or stable owned allocations when references must survive growth."
+rustVersions: ["stable Rust"]
+targets: ["all targets; allocator behavior varies"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust pointer into Vec invalid after push",
+    "Vec reallocation dangling pointer Rust",
+    "Rust reserve invalidates references",
+  ]
+evidence:
+  ["capacity and address trace", "forced-growth fixture", "index or stable-allocation repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/std/vec/struct.Vec.html#capacity-and-reallocation",
+    "https://doc.rust-lang.org/reference/behavior-considered-undefined.html#dangling-pointers",
+  ]
+---
+
+A vector stores a pointer, length, and capacity. Its elements live in a contiguous allocation when allocation is needed. If length grows beyond capacity, `Vec` must obtain enough storage for more elements, and the element allocation may move.
+
+Any raw pointer into the old allocation then becomes dangling. The fact that a push concerns the last element does not protect a pointer to the first.
+
+## The dangerous pattern
+
+Unsafe code can keep a pointer past a mutation:
+
+```rust
+let mut values = Vec::with_capacity(1);
+values.push(String::from("first"));
+
+let first: *const String = &values[0];
+values.push(String::from("second"));
+
+// Dereferencing `first` here is not justified. Growth may have reallocated.
+```
+
+Safe Rust would not allow `&values[0]` to stay live across the mutable push. Converting to a raw pointer removes borrow-checker enforcement; it does not extend the allocation's lifetime.
+
+I compare three values before and after growth: buffer address, length, and capacity.
+
+```rust
+let before = values.as_ptr();
+let old_capacity = values.capacity();
+values.reserve(old_capacity.saturating_add(1));
+let after = values.as_ptr();
+
+eprintln!("before={before:p} after={after:p} capacity={}", values.capacity());
+```
+
+An equal address does not prove future safety. Allocators can grow in place or reuse an address. A changed address proves that old interior pointers are invalid.
+
+The [Atlas failure fixture](/rust-failure-atlas/evidence/RFA-048/fail.rs) removes allocator luck from this experiment. Its test-only global allocator implements `realloc` by allocating the new block before releasing the old one, which guarantees a different live address when `Vec` grows past capacity. It compares the saved and current addresses but never dereferences the stale pointer. The [repaired fixture](/rust-failure-atlas/evidence/RFA-048/fixed.rs) forces the same relocation and proves that index `0` still identifies value `10` through the vector's current allocation.
+
+## Capacity is a temporary operational fact
+
+If `len < capacity`, pushing an ordinary non-zero-sized element does not need to increase capacity. Rust's `Vec` documentation gives useful allocation guarantees, but relying on spare capacity requires controlling every operation which can change it.
+
+`reserve`, `reserve_exact`, `shrink_to_fit`, replacing the vector, converting it, and passing `&mut Vec<T>` to unknown code can affect the allocation contract. Capacity also does not prevent the vector itself from being dropped.
+
+I do not expose a long-lived raw pointer together with unrestricted mutable access to its vector owner.
+
+## Store an index when order is stable
+
+An index survives reallocation:
+
+```rust
+let first = 0_usize;
+values.push(String::from("second"));
+println!("{}", values[first]);
+```
+
+It does not survive arbitrary removal or reordering. `swap_remove`, insertion before the index, sorting, and compaction change identity. If those operations exist, I use a generational key or stable object ID instead.
+
+## Use stable pointees when their addresses matter
+
+`Vec<Box<T>>` may move `Box` handles during vector growth while each `T` remains in its separate heap allocation:
+
+```rust
+let mut values: Vec<Box<Entry>> = Vec::new();
+values.push(Box::new(Entry::new()));
+
+let first: *const Entry = &*values[0];
+values.push(Box::new(Entry::new()));
+```
+
+Vector reallocation alone does not move the boxed `Entry`. The pointer still becomes invalid if that box is removed and dropped, and aliasing rules still apply. Stable allocation solves one dimension, not ownership as a whole.
+
+A slot map or arena with generational handles is often clearer for long-lived cross-references. It can detect that an index now refers to a removed generation.
+
+## FFI makes invalidation easy to miss
+
+Passing `values.as_ptr()` to C lends a view of the current buffer. Rust must not reallocate or drop the vector while C retains the pointer. If C needs asynchronous ownership, copy into a separately owned buffer or define a handle whose API prevents mutation until the borrow ends.
+
+The C type cannot express Rust's borrow duration. Documentation and wrapper structure must.
+
+## Zero-sized types are special
+
+Vectors of zero-sized types do not allocate storage in the usual way and can report a nonzero-looking capacity sentinel. Pointer experiments with `Vec<()>` do not model normal allocated elements. I use a representative non-zero-sized type in the reproduction.
+
+## False repairs
+
+Calling `with_capacity(1000)` only postpones reallocation unless 1000 is a proven maximum and no shrinking or replacement occurs. Checking that the address did not change once proves only that run. Storing `NonNull<T>` instead of `*mut T` adds non-null meaning, not allocation stability.
+
+Pinning the `Vec` value pins its three-word control structure, not necessarily the heap buffer it is allowed to reallocate.
+
+## The regression proof
+
+The safe repair test forces growth past every earlier capacity and verifies identity through indices, generational handles, or boxed stable owners. If unsafe pointer access remains, the API test proves that no growth or drop operation is available during the pointer lifetime.
+
+I run the minimized unsafe path under Miri where possible. The central invariant is simple: an interior pointer is usable only while the same live allocation and permitted access remain. A later `push` is relevant because it can change exactly that allocation.

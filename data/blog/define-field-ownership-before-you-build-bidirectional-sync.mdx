@@ -1,0 +1,223 @@
+---
+title: "Define Field Ownership Before You Build Bidirectional Sync"
+date: "2026-09-09T14:00:00+01:00"
+tags: ["bidirectional sync", "data integration", "field ownership", "conflict resolution", "system design"]
+draft: false
+reviewed: true
+reviewedHash: "6bf65e9960b3c61877b56eaa8cb03a3592f882958f6d7452eb38fb3d3a61a637"
+cluster: "reliable-data-integrations"
+campaign: "authority-2026"
+opportunity: "DATA-006"
+summary: "A practical field-ownership matrix for deciding which system may write each value before loops, silent overwrites, and deletion conflicts enter a bidirectional sync."
+---
+
+“Keep both systems in sync” is one of the most dangerous short requirements I receive.
+
+It sounds like a transport problem: read changes from A, write them to B, then do the reverse. In practice, the difficult question is not how to move a value. It is **which system is allowed to decide that value**.
+
+I learned to answer this before implementing bidirectional synchronization. Without an ownership model, two individually correct workers can form a loop, overwrite a human edit, or revive data that another system intentionally deleted.
+
+The useful design document is not a large architecture diagram. It is a field-ownership matrix.
+
+## “Both systems own it” is not a rule
+
+Imagine a customer record shared by a product and a CRM:
+
+```text
+Product: email = billing@example.com
+CRM:     email = founder@example.com
+```
+
+Which value is correct?
+
+The newest timestamp is not enough. The product may store the login email while the CRM stores the commercial contact. They may look like the same field but have different meanings. Or both may be valid writers, but only under specific conditions.
+
+Before choosing conflict resolution, I define the domain meaning. Sometimes the real fix is to model two fields:
+
+```text
+authentication_email
+commercial_contact_email
+```
+
+Synchronization cannot repair a missing product concept.
+
+## The ownership matrix I use
+
+This is an example, not a universal answer:
+
+| Canonical field | Meaning | Authoritative source | Allowed writers | Conflict rule | Deletion rule |
+| --- | --- | --- | --- | --- | --- |
+| `legal_name` | Contracting entity name | Billing system | Finance workflow | Billing wins | Retain for audit |
+| `display_name` | Name shown in product | Product | Customer admins | Product wins | Clear only on explicit edit |
+| `plan` | Entitlement tier | Billing system | Billing events | Reject CRM writes | Cancel according to subscription state |
+| `sales_owner` | Commercial account owner | CRM | Sales operations | CRM wins | Unassign, do not delete customer |
+| `support_priority` | Operational support level | Derived policy | No direct writer | Recompute from plan and contract | Recompute |
+| `notes` | Local free text | Each system locally | Local users | Never synchronize as one field | Local retention policy |
+
+I add more columns when needed: data classification, transformation, null meaning, source version, and who approves a manual override.
+
+The word “authoritative” means the source whose accepted state wins for that field. It does not mean that the source owns the whole entity.
+
+## Ownership exists at field level
+
+A common shortcut is to say, “The CRM is the source of truth for customers.” This becomes inaccurate quickly.
+
+The CRM may own sales assignment. The billing system owns the paid plan. The product owns user preferences. A policy service derives permissions. An identity provider owns login status.
+
+I therefore keep three ideas separate:
+
+- **identity authority**: which record represents the same entity;
+- **field authority**: which source decides a particular value;
+- **workflow authority**: which system accepts a command such as cancel or approve.
+
+An [identity mapping table](/blog/identity-mapping-tables-the-small-data-structure-every-integration-needs) solves correspondence. It does not solve field ownership.
+
+## Commands and facts should not bounce forever
+
+Bidirectional loops often start because an action and its result are represented by the same mutable field.
+
+For example:
+
+```text
+CRM sets plan = enterprise
+sync writes plan to billing
+billing rejects it and keeps plan = trial
+sync writes trial back to CRM
+sales changes it again
+```
+
+The CRM did not really observe a fact. A salesperson requested a plan change. I model that as a command:
+
+```text
+request_plan_change(customer, desired_plan)
+```
+
+The billing workflow accepts or rejects it. Billing then publishes the authoritative subscription fact. This makes the direction clear and gives failure a visible state.
+
+I use direct field synchronization for facts that have an owner. I use workflows for changes that require validation, payment, approval, or side effects.
+
+## Last-write-wins hides the important question
+
+Last-write-wins is attractive because it needs little domain design. It also gives clock and delivery order the power to choose business truth.
+
+Consider this sequence:
+
+```text
+10:00 user corrects the product display name
+10:01 an old CRM retry arrives with its own timestamp of 10:02
+10:02 local correction is overwritten
+```
+
+The newest technical event was not the newest business decision.
+
+I only use last-write-wins when both writers truly have equal authority, timestamps are comparable, and losing either concurrent edit is acceptable. This is much rarer than it first appears. [Last-Write-Wins: Simple Conflict Resolution With Sharp Edges](/blog/last-write-wins) explores this trade-off separately.
+
+## Prevent echo loops with provenance, not guesses
+
+Suppose A changes a field, the sync writes it to B, and B emits a change event. The reverse worker may write the same value to A and create an endless echo.
+
+Useful protections include:
+
+- provider idempotency keys when supported;
+- source version or event ID stored with the applied observation;
+- a write journal connecting the outbound request to the returned event;
+- compare-before-write so equal normalized values produce no request;
+- a canonical transformation shared by both directions.
+
+I do not rely only on “ignore updates for five seconds.” Time windows reduce noise but cannot prove origin. A legitimate human edit can happen inside the window, while a delayed echo can arrive after it.
+
+## Null, absence, and deletion are different
+
+Many ownership bugs hide in empty values.
+
+These states may have different meanings:
+
+```text
+field absent: source did not send or does not know it
+field null: source explicitly cleared it
+object missing from page: pagination is incomplete
+object missing from complete snapshot: possible deletion
+delete event: source explicitly deleted it
+```
+
+The matrix must say which source may clear a field and what proof is required to delete an entity. I never infer deletion from one incomplete API response.
+
+If one system must retain an object for audit while another deletes it, the synchronized state may be a tombstone or an inactive status rather than physical deletion. [Tombstones: Deleting Data Across Systems](/blog/tombstones-deleting-across-systems) covers the lifecycle details.
+
+## Overrides need an expiry and an owner
+
+Real operations sometimes need exceptions. A support engineer may temporarily override a value while the authoritative source is unavailable.
+
+A permanent hidden override becomes a second source of truth. I store it explicitly:
+
+```text
+field
+override value
+reason
+approved by
+created at
+expires at or resolution condition
+```
+
+The sync engine can then report that it preserved an override instead of silently ignoring source updates. When the override ends, the system performs a deliberate reconciliation.
+
+## Applying the matrix in code
+
+I want one shared function to receive every observation, whether it came from a webhook, a poller, a backfill, or a manual repair:
+
+```text
+apply(field, value, source, source_version, observed_at)
+```
+
+It performs these steps:
+
+1. find the canonical entity through its identity mapping;
+2. load the ownership rule for the field;
+3. normalize the value without changing its meaning;
+4. reject a source that cannot write the field;
+5. compare source version when the source is allowed;
+6. preserve provenance and previous value;
+7. emit a command instead when the change needs a workflow;
+8. schedule derived fields for recomputation.
+
+This avoids having one rule in webhook code and another in a nightly importer.
+
+## The review scenarios I run
+
+I test the matrix with sequences, not only single updates.
+
+### Concurrent permitted writers
+
+If two sources are allowed, what deterministic policy resolves the conflict? If there is no acceptable automatic answer, the result should enter manual review instead of choosing silently.
+
+### Unauthorized source update
+
+Send a plan change from the CRM when billing owns `plan`. Assert that the product state does not change and that the rejected observation is visible.
+
+### Delayed echo
+
+Apply A to B, wait beyond the normal delivery window, then replay B's event. Assert that no write is sent back to A.
+
+### Explicit clear versus omitted field
+
+Send one partial payload without the field and another with `null`. Assert the first preserves the value and the second follows the field's clear rule.
+
+### Delete followed by stale update
+
+Deliver a tombstone, then an older update. Assert that ownership and version rules do not resurrect the object.
+
+### Manual override expiry
+
+Apply an authoritative source update during an override, then expire the override. Assert the documented reconciliation result.
+
+These cases are where the matrix becomes an executable contract rather than a spreadsheet forgotten after planning.
+
+## My practical rule
+
+I do not start bidirectional sync by drawing two arrows. I list the shared concepts, separate fields that only look similar, assign authority per field, and turn state-changing requests into commands where needed.
+
+Only then do I choose webhooks, polling, versions, and retries.
+
+Microsoft's cross-tenant synchronization documentation is a useful real-world example of declaring the source tenant as the authority and avoiding automatic reverse synchronization; see its [source-of-authority model](https://learn.microsoft.com/en-us/entra/identity/multi-tenant-organizations/cross-tenant-synchronization-overview). Its synchronization rules also show why multiple contributors need explicit [attribute-flow precedence](https://learn.microsoft.com/en-us/entra/identity/hybrid/connect/concept-azure-ad-connect-sync-default-configuration).
+
+The general lesson is simple: movement is a technical mechanism, but ownership is a product decision. If I leave that decision implicit, the integration will make it for me during a failure.

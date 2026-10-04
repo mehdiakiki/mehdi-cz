@@ -1,0 +1,122 @@
+---
+caseId: "RFA-039"
+title: "Why a Rust FFI Symbol Disappeared After Enabling LTO"
+date: "2026-09-04T21:00:00+01:00"
+lastmod: "2026-09-07T12:10:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "698f752d4a5d3009a158c031a45c705e4af245acb7c0d5b11f9516556b080238"
+area: "ffi-targets"
+symptom: "A Rust function which appeared in a no-LTO symbol table disappears under LTO, and a foreign host reports that its expected entry point is undefined."
+summary: "LTO can expose a missing ABI root rather than remove a correct export. Check the exact final symbol name, define its ABI and export explicitly, then call it from a foreign host."
+rustVersions: ["stable Rust", "Cargo stable"]
+targets: ["affected native target and linker"]
+profiles: ["release with LTO", "paired release without LTO"]
+searchTerms:
+  [
+    "Rust LTO removes FFI symbol",
+    "undefined symbol only with lto Rust",
+    "Rust exported symbol garbage collected",
+  ]
+evidence: ["paired symbol tables", "exact-name check", "foreign static-link and call fixture"]
+sources:
+  [
+    "https://doc.rust-lang.org/rustc/codegen-options/index.html#lto",
+    "https://doc.rust-lang.org/rustc/symbol-mangling/index.html",
+    "https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-attributes.html",
+  ]
+---
+
+Link-time optimization sees more of a program at once. This permits inlining and removal across crate boundaries, but it can also expose a hidden FFI assumption: a Rust item was visible in one symbol table without ever being a valid foreign entry point.
+
+A plugin loader may find a function by name. An embedded host may call an exported entry point. A linker script may retain a registration table. None of these necessarily creates a normal Rust call edge.
+
+The important correction is that seeing `plugin_initialize` somewhere inside a long mangled name does not mean C can link the exact name `plugin_initialize`. In my current Rust 1.98.1 evidence, a correctly declared `#[unsafe(no_mangle)] pub extern "C"` root survives both no LTO and thin LTO. The item which disappears is the ordinary Rust-mangled function that lacked this contract.
+
+## Compare artifacts, not only build success
+
+I build two otherwise identical release profiles:
+
+```toml
+[profile.release-no-lto]
+inherits = "release"
+lto = "off"
+
+[profile.release-thin-lto]
+inherits = "release"
+lto = "thin"
+```
+
+Then I inspect the final exports and the symbols before stripping. Platform tools differ: `nm`, `readelf`, `objdump`, and `dumpbin` answer related but not identical questions. I record the exact tool and whether I am viewing an archive member, all final symbols, or only the dynamic export table.
+
+The Atlas fixture makes the misleading observation deterministic by retaining dead code in the no-LTO comparison. Its failing Rust source declares only `pub extern "C" fn plugin_initialize`. GNU `nm` then shows:
+
+```text
+no LTO: ...mangled Rust name containing plugin_initialize...
+thin LTO: no such Rust item
+```
+
+But the exact unmangled symbol is absent from the first archive too. A [C host](/rust-failure-atlas/evidence/RFA-039/host.c) which declares `plugin_initialize` cannot link the [failing Rust library](/rust-failure-atlas/evidence/RFA-039/fail/lib.rs), even without LTO. This separates “I found related text in `nm`” from “the foreign consumer can resolve its exact ABI name.”
+
+The [repaired library](/rust-failure-atlas/evidence/RFA-039/fixed/lib.rs) defines the external name intentionally. The verifier finds exact `plugin_initialize` symbols in both paired archives, links the C host against the thin-LTO artifact, runs it, and observes status `39`.
+
+This result does not prove that every LTO-related missing-symbol report has the same cause. Export lists, linker garbage collection, visibility, crate type, and stripping can still be responsible. It does prove that I must test those layers before saying LTO removed a correct export.
+
+## Define an intentional external name
+
+Rust normally mangles symbol names. A C-facing definition needs a foreign ABI and an intentional external name:
+
+```rust
+#[unsafe(no_mangle)]
+pub extern "C" fn plugin_initialize(api: *const HostApi) -> i32 {
+    // Validate the pointer and initialize the plugin.
+    0
+}
+```
+
+In the 2024 edition, `no_mangle`, `export_name`, and `link_section` are unsafe attributes. The annotation reminds me that the global symbol namespace and section placement carry obligations the compiler cannot verify. I document why the symbol name is unique and who calls it.
+
+`pub` alone means visible in Rust's module system. It does not promise a stable unmangled C symbol or inclusion in a platform's dynamic export set. `extern "C"` chooses a calling convention; it does not disable Rust symbol mangling by itself. The name and the ABI are two separate parts of the boundary.
+
+## Reachability and export are separate
+
+Several layers can remove or hide a function:
+
+1. Rust may decide no generated code needs the item.
+2. LLVM may internalize or remove it during LTO.
+3. The linker may garbage-collect an unreferenced section.
+4. A version script or platform export list may hide it from dynamic lookup.
+5. A later stripping step may remove information used by inspection tools.
+
+This is why `-C link-dead-code` is not my permanent fix. Rust documents it as a broad attempt to retain dead code and does not recommend it for normal linking. It can make a mangled item appear during inspection, grow the artifact, and still leave the exact foreign name undefined. In the failing fixture it is useful only as an experimental control.
+
+I prefer a narrow exported root and the platform's supported export mechanism. For a registration table, a linker script or used-section contract may also be required. The exact solution is target-specific and belongs beside the final link configuration.
+
+## Confirm the consumer model
+
+There are two common FFI consumers:
+
+- A normal native object references the symbol at static link time.
+- A runtime loader looks up the symbol by string after the library is built.
+
+The first creates a linker-visible undefined reference. The second may not. I reproduce with the same mechanism as production. Calling the Rust function from another Rust function can keep it alive, but that test does not prove a string-based host can find it.
+
+A small C or host-language fixture should consume the real artifact, resolve the exact `plugin_initialize` name, call it with valid inputs, and finish cleanly. For a static library this is a real foreign link and call. For a plugin it is a runtime load and lookup. I do not substitute a Rust-to-Rust call, because that creates a reachability edge which the production host does not have.
+
+## Check the crate type and final artifact
+
+An `rlib` is not the deployed shared library. A `cdylib`, `staticlib`, executable exporting symbols, and platform plugin each have different final-link behavior. I inspect the artifact the host loads, not an intermediate object where the symbol still exists.
+
+Cross-language LTO adds another layer because the native linker consumes LLVM bitcode and needs compatible plugin support. I first reproduce with Rust-only LTO before adding native bitcode.
+
+## False repairs
+
+Adding a dummy Rust call can retain the function but lies about why it exists. Searching `nm` output for a substring confuses a mangled implementation name with the exact link name. Disabling LTO may restore the previous internal artifact, but gives up optimization globally and leaves the external contract undocumented. Applying `no_mangle` without `extern "C"` gives a stable name but not necessarily the calling convention the host expects.
+
+The repair must specify name, ABI, reachability, visibility, and ownership of inputs.
+
+## The regression proof
+
+My release test has two layers. First, parse the final artifact and assert the exact external symbol, not a substring or an intermediate LLVM item. Second, run a foreign fixture which links or loads and calls it.
+
+I run this with the production crate type, LTO, visibility, export, and strip settings. A development build is not enough because the failure belongs to the final link. The paired no-LTO build remains useful for localization, but it is not the success criterion. The foreign call makes the non-Rust edge part of the build contract, so future optimization or linker changes cannot silently erase it.

@@ -1,0 +1,116 @@
+---
+caseId: "RFA-090"
+title: "E0373: Returning an Async Block That Borrows a Local Value"
+date: "2026-09-05T09:10:00+01:00"
+lastmod: "2026-09-05T09:10:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "c300fa9a00f0e3507d33da73b25954361e4bbcdf31b7ed7cc70b7fa4d2078f89"
+area: "async-runtime"
+symptom: "Returning an async block fails because it borrows a local String that is destroyed when the factory function returns."
+summary: "A returned future is delayed state, not an executed result. async move transfers owned locals into that state; adding a lifetime cannot preserve a stack local after return."
+rustVersions: ["Rust 1.98.1"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust async block may outlive borrowed value E0373",
+    "return impl Future borrows local String",
+    "async move returned future",
+  ]
+evidence: ["Rust 1.98.1 compile failure", "capture-state model", "async-move repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/error_codes/E0373.html",
+    "https://doc.rust-lang.org/reference/expressions/block-expr.html#async-blocks",
+  ]
+---
+
+This function returns a future rather than awaiting it:
+
+```rust
+use std::future::Future;
+
+fn build_length() -> impl Future<Output = usize> {
+    let text = String::from("atlas");
+    async { text.len() }
+}
+```
+
+Rust 1.98.1 reports E0373: the async block may outlive the function, but it borrows `text`. The [failing fixture](/rust-failure-atlas/evidence/RFA-090/fail.rs) records the exact boundary.
+
+The function has finished constructing the future when it returns. It has not executed `text.len()`. The caller may store the future and poll it later, after the local `text` would have been dropped.
+
+## Async blocks capture like closures
+
+A plain async block captures values from its environment using modes inferred from how they are used. Reading `text.len()` can borrow `text`. That is acceptable while the future remains inside the same scope and is awaited before `text` disappears.
+
+Returning the future changes the lifetime requirement. The [E0373 documentation](https://doc.rust-lang.org/error_codes/E0373.html) covers captured values that may not live long enough. The [Reference section on async blocks](https://doc.rust-lang.org/reference/expressions/block-expr.html#async-blocks) explains that `async move` captures referenced variables by value.
+
+The future is best understood as an object containing everything needed to make progress later. A reference to a destroyed stack local cannot be one of its fields.
+
+## async move transfers the String
+
+The direct repair is:
+
+```rust
+fn build_length() -> impl Future<Output = usize> {
+    let text = String::from("atlas");
+    async move { text.len() }
+}
+```
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-090/fixed.rs) compiles because the future owns `text`. The String now lives until the future completes or is dropped.
+
+`move` does not necessarily copy heap contents. It transfers the String handle and its ownership into the generated state. For an `Arc`, moving a cloned Arc transfers one owned reference count. For a Copy integer, capture by value copies the integer.
+
+## The cost is part of the API
+
+Moving a large value can extend its lifetime for as long as the future is stored. If the future is cancelled before polling, its captured values are still dropped correctly, but resources may have been retained longer than expected.
+
+Sometimes the better design computes a small owned result before constructing the async block:
+
+```rust
+let length = text.len();
+async move { length }
+```
+
+In real code this can mean parsing configuration synchronously and moving only an ID or client handle into the future. I inspect what the future actually needs rather than adding `move` to a wide block and capturing everything nearby.
+
+## Borrowing can be correct when the input outlives the future
+
+A factory taking a borrowed argument may return a future tied to that argument:
+
+```rust
+fn length_of(text: &str) -> impl Future<Output = usize> + '_ {
+    async move { text.len() }
+}
+```
+
+Here the reference comes from the caller. The returned future cannot outlive it, and the return type states that relationship. This is different from borrowing a local created inside the factory: no caller lifetime can keep that local stack variable alive after return.
+
+That distinction prevents a common dead end. Adding `+ '_` to the original example cannot create an owner for `text`.
+
+## move can capture more than expected
+
+An async move block captures variables it uses, not every variable in the scope, but small source changes can expand that set. Logging an entire request rather than its ID may keep buffers, authentication data, or guards alive across awaits.
+
+I keep future factories narrow and create explicit local values for the state I intend to transfer. This improves Send diagnostics and reduces accidental resource retention.
+
+## Cancellation also drops captured state
+
+A returned future can be dropped before completion. Owned captures are then dropped with the future. If constructing the future performs no work, this is straightforward. If resources or external effects are created before the async block, cancellation may leave a different lifecycle than expected.
+
+I prefer entering resource acquisition inside the async body when it should happen only on poll, and outside when construction intentionally reserves the resource. The capture boundary makes that choice visible.
+
+## My diagnostic sequence
+
+For E0373 around an async block I ask:
+
+1. Is the future awaited locally or returned/stored?
+2. Who owns each captured value?
+3. Can the future borrow a caller-owned input with an explicit lifetime?
+4. Should it instead own a smaller derived value?
+5. Does moving the value change Send, cancellation, or resource lifetime?
+
+The shortest fix is `async move`, but the real explanation is ownership of delayed computation. A future that leaves a function must either own its required state or borrow state whose lifetime is carried in the returned type. A function-local String offers only the first option.

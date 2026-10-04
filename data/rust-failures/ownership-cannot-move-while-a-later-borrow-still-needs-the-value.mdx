@@ -1,0 +1,87 @@
+---
+caseId: "RFA-544"
+title: "Rust Ownership Cannot Move While a Later Borrow Still Needs the Value"
+date: "2026-09-06T06:23:00+01:00"
+lastmod: "2026-09-06T06:23:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "a8d41f1896beeae0adad3adc0c261a488a9b5842c0a782135b8d48b53ddbb1b6"
+area: "concurrency-memory"
+symptom: "Moving payload into archive fails with E0505 because event_id borrows its string storage and is used after the ownership transfer."
+summary: "A move may relocate or destroy the owner, so references into that owner must finish first or be replaced with independently owned data."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust E0505 cannot move out because borrowed", "move String while str slice still used", "finish borrow before ownership transfer Rust"]
+evidence: ["Rust 1.98.1 E0505 compile failure", "string slice used after payload move", "finish event-id observation before archive repair"]
+sources: ["https://doc.rust-lang.org/error_codes/E0505.html", "https://doc.rust-lang.org/book/ch04-01-what-is-ownership.html", "https://doc.rust-lang.org/reference/expressions.html#moved-and-copied-types"]
+---
+
+A reference can remain valid only while the value backing it remains in a valid location and state. Moving that owner while the reference will be used later would break the promise, so Rust reports E0505.
+
+The [failing fixture](/rust-failure-atlas/evidence/RFA-544/fail.rs) takes a string slice from `payload`, moves the `String` into `archive`, and then prints the slice. `event_id` points into the allocation owned by the moved string.
+
+## The function signature makes the move visible
+
+`archive(value: String)` accepts ownership. At the call, `payload` is moved into the function. The function may drop it, store it, move it again, or return it only if its API says so.
+
+The caller cannot assume the string allocation survives until the next line. A slice into that allocation therefore cannot remain usable across the call.
+
+The [official E0505 explanation](https://doc.rust-lang.org/error_codes/E0505.html) gives the three broad options: avoid the move, finish the borrow first, or use a type whose move is a copy. For a `String`, blindly making data copyable is not the model.
+
+## Last use often gives the cheapest repair
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-544/fixed.rs) prints `event_id` before calling `archive`. After the slice's last use, its borrow ends, and ownership can move.
+
+This repair allocates nothing and accurately models “inspect, then hand off.” I prefer it when the order is semantically valid.
+
+If archiving must happen first, the design needs independent data or a different function contract. Moving lines solely because they compile can be wrong when operations have effects or failures.
+
+## Borrowing the owner may express shared use
+
+If `archive` only reads the payload, its signature can accept `&str` or `&String`. Then the caller retains ownership and may continue using both payload and derived slices after the call.
+
+I change this signature only when the callee does not need to retain or consume the value. Ownership in an API communicates lifecycle. Weakening every consuming API to a borrow can push cloning or lifetime complexity deeper into the system.
+
+The Book's [ownership chapter](https://doc.rust-lang.org/book/ch04-01-what-is-ownership.html) explains how passing an owning type transfers it unless the type is `Copy`.
+
+## Owning the derived value separates lifetimes
+
+If the event identifier is needed after archiving, I can create a `String`:
+
+```rust
+let event_id = payload[6..].to_owned();
+archive(payload);
+println!("{event_id}");
+```
+
+The new allocation is independent. For a small identifier this cost may be acceptable; for hot parsing paths it may matter. A parser could instead return structured ownership, ranges, or an object whose owner and views remain together.
+
+I clone the smallest semantic unit, not the entire payload by reflex.
+
+## Returning ownership can model temporary consumption
+
+A function can take a `String` and return it, perhaps alongside a result. This makes the move explicit and restores ownership afterward. It is occasionally useful for builders or transformations, though borrowing is simpler for pure inspection.
+
+Another option is for the callee to accept and return a wrapper that contains both original data and parsed offsets. Safe self-referential structures are difficult because moves can invalidate internal references, so storing byte ranges rather than direct slices is often more robust.
+
+## Copy types change move syntax, not borrowing law
+
+For a `Copy` scalar, passing by value copies bits and leaves the original usable. That is appropriate for integers and some small plain values. `String` owns a heap allocation and cannot be copied implicitly without double ownership, so it is not `Copy`.
+
+Deriving `Clone` gives an explicit duplication operation, not automatic move avoidance. I use it when two owners are required and the cost is understood.
+
+The Reference distinguishes [moved and copied types](https://doc.rust-lang.org/reference/expressions.html#moved-and-copied-types).
+
+## My E0505 checklist
+
+- Which reference still points into the value being moved?
+- Where is that reference used for the final time?
+- Does the called function truly need ownership?
+- Can observation finish before the handoff?
+- If not, what smallest derived data should become owned?
+- Would returning ownership clarify a temporary transformation?
+- Am I cloning because two owners are real, or only hiding poor ordering?
+- Does any stored range remain valid if the underlying content changes?
+
+The core principle is that borrows depend on an owner's continued validity. I finish borrowed work before ownership transfer, or create genuinely independent data when both lifecycles must continue.

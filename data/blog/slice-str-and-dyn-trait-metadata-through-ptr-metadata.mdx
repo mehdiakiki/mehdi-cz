@@ -1,0 +1,204 @@
+---
+title: "Slice, str, and dyn Trait Metadata Through ptr::metadata"
+date: "2026-11-27T09:00:00+01:00"
+tags: ["rust", "fat pointers", "ptr metadata", "trait objects", "unsized types"]
+draft: false
+reviewed: true
+reviewedHash: "9cc8b96ea80cd6c367c4e9c055f6c0e6d5cecdbfac64854abf483295e6aeac16"
+cluster: "rust-under-the-hood"
+campaign: "authority-2026"
+opportunity: "RUST-058"
+summary: "Wide Rust pointers carry typed metadata: element count for slices, byte length for str, and DynMetadata for trait objects. The nightly ptr_metadata API inspects this without assuming a two-usize layout."
+---
+
+A Rust pointer to a dynamically sized value carries enough metadata to use that value. For `[T]`, the metadata is an element count. For `str`, it is a byte length. For `dyn Trait`, it is typed vtable metadata.
+
+People often demonstrate this by transmuting a reference into two `usize` values. I avoid that approach. It confuses a common implementation shape with the typed guarantee and makes provenance mistakes easy.
+
+Rust's `ptr::metadata` API exposes the model directly, although it is still nightly-only in Rust 1.98.
+
+## Thin and wide describe metadata, not ownership
+
+Pointers to sized values have metadata type `()`:
+
+```text
+*const u64 -> data pointer + ()
+```
+
+Pointers to dynamically sized types have non-empty metadata:
+
+```text
+*const [u16]       -> data pointer + element count
+*const str         -> data pointer + byte length
+*const dyn Display -> data pointer + DynMetadata<dyn Display>
+```
+
+This applies to raw pointers and references. “Fat pointer” says nothing about whether the pointer owns, borrows, or may mutate the value.
+
+## Slices carry element count
+
+On nightly:
+
+```rust
+#![feature(ptr_metadata)]
+
+fn main() {
+    let values = [10_u16, 20, 30, 40];
+    let slice: &[u16] = &values[1..3];
+
+    let length: usize = std::ptr::metadata(slice);
+    assert_eq!(length, 2);
+}
+```
+
+The metadata is two elements, not four bytes. The element type supplies the scale needed for indexing.
+
+The nightly [`ptr::metadata` documentation](https://doc.rust-lang.org/std/ptr/fn.metadata.html) returns the associated metadata type rather than an untyped machine word.
+
+## `str` metadata is byte length
+
+```rust
+#![feature(ptr_metadata)]
+
+fn main() {
+    let text: &str = "سلام";
+
+    assert_eq!(std::ptr::metadata(text), text.len());
+    assert_eq!(text.len(), 8); // UTF-8 bytes, not four characters
+}
+```
+
+The metadata supports the byte-oriented representation of UTF-8 `str`. It does not cache Unicode scalar-value or grapheme count.
+
+This is why slicing a string uses byte indices and must land on UTF-8 boundaries.
+
+## Trait objects carry `DynMetadata`
+
+```rust
+#![feature(ptr_metadata)]
+
+trait Describe {
+    fn describe(&self) -> String;
+}
+
+impl Describe for u64 {
+    fn describe(&self) -> String { self.to_string() }
+}
+
+fn main() {
+    let value = 42_u64;
+    let object: &dyn Describe = &value;
+    let metadata = std::ptr::metadata(object);
+
+    assert_eq!(metadata.size_of(), std::mem::size_of::<u64>());
+    assert_eq!(metadata.align_of(), std::mem::align_of::<u64>());
+}
+```
+
+[`DynMetadata`](https://doc.rust-lang.org/std/ptr/struct.DynMetadata.html) exposes size, alignment, and layout of the concrete value. Conceptually it identifies a vtable containing destruction and method information.
+
+I do not index into that vtable or assume its field order. The internal vtable layout is not the API.
+
+## Same data address can have different metadata
+
+```rust
+let values = [10_u16, 20, 30, 40];
+let first_two: &[u16] = &values[..2];
+let all: &[u16] = &values[..];
+```
+
+Both slices can begin at the same element. Their lengths differ, so they are different slice pointers.
+
+Likewise, the same concrete object can be viewed through different trait-object types. The data address may match while the trait metadata differs.
+
+Pointer identity for a DST therefore cannot be reduced blindly to the data address when metadata is relevant to the operation.
+
+## Custom DSTs inherit tail metadata
+
+A struct may have an unsized last field:
+
+```rust
+#[repr(C)]
+struct Packet<T: ?Sized> {
+    kind: u16,
+    payload: T,
+}
+```
+
+For `Packet<[u8]>`, pointer metadata is the metadata needed by the `[u8]` tail: its element count. This does not mean constructing such a value is simple. Allocation size, alignment, field offset, initialization, and pointer provenance all need proof.
+
+I use this model to understand library implementations, not as a reason to hand-build DST pointers without a concrete need.
+
+## Reconstruction separates data and metadata
+
+The experimental API also provides `from_raw_parts` and `from_raw_parts_mut`. Conceptually:
+
+```text
+wide pointer = data pointer + metadata of the target pointee type
+```
+
+Recombining arbitrary parts is not automatically safe. For a slice:
+
+```text
+data points to length initialized T values
+range stays inside one allocation
+alignment is correct
+address arithmetic preserves provenance
+borrow and aliasing rules are satisfied before making a reference
+total byte size does not overflow isize limits
+```
+
+The [strict provenance article](/blog/rust-strict-provenance-pointer-address) covers why a numerically correct address may still be the wrong pointer.
+
+For a trait object, metadata must belong to the concrete value and trait implementation represented by the data pointer. Mixing a data pointer from one type with metadata from another is not type erasure; it is an invalid object.
+
+## Do not infer two-word FFI compatibility
+
+Even if a wide pointer occupies two machine words on a target, Rust trait objects and slices are not C ABI types by default.
+
+For FFI I define an explicit representation:
+
+```rust
+#[repr(C)]
+pub struct ByteSlice {
+    pub data: *const u8,
+    pub len: usize,
+}
+```
+
+Then I document ownership, nullability, lifetime, and validation. A `dyn Trait` needs a designed C-compatible function table rather than exporting Rust's internal vtable.
+
+## Metadata is not capacity or allocation size
+
+For `&[T]`, length tells how many elements are in the view. It does not reveal:
+
+```text
+the original Vec capacity
+allocation size outside the view
+whether elements before or after are initialized
+who owns the allocation
+how long it remains alive
+```
+
+For `str`, byte length plus a valid reference implies UTF-8 because reference construction already requires validity. Raw parts alone do not establish it.
+
+## Metadata equality is not type equality
+
+Two slices can have equal length and point to unrelated allocations. Two trait-object metadata values can describe the same concrete implementation while their data pointers refer to different objects. Conversely, equal-looking raw addresses reused at different times do not preserve allocation identity.
+
+I compare the property my algorithm needs: element range for a slice, concrete layout for allocation work, or a stable application identity for an object. I do not turn metadata into a universal runtime type identifier or persistence key.
+
+## My pointer inspection checklist
+
+I ask:
+
+- What is the pointee type's metadata type?
+- Does the API I use remain nightly-only?
+- Is this length measured in elements or bytes?
+- Is trait metadata paired with the correct concrete value?
+- Am I preserving data-pointer provenance?
+- Have I proved allocation bounds and alignment?
+- Am I assuming an internal two-word or vtable layout?
+- Is this crossing FFI, where an explicit representation is needed?
+
+Pointer metadata is best understood as typed information required to operate on an unsized pointee. `ptr::metadata` makes that idea visible. Its largest benefit is not extracting a second word—it is preventing me from pretending every second word means the same thing.

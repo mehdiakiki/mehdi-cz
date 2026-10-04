@@ -1,0 +1,95 @@
+---
+caseId: "RFA-416"
+title: "BufReader::seek Discards Lookahead After Restoring Position"
+date: "2026-09-06T03:56:00+01:00"
+lastmod: "2026-09-06T03:56:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "7a02d4d4e1e369e46cdcceeec8f656ab706bdb4962a4935cf916a72de78163a7"
+area: "ffi-targets"
+symptom: "Seeking a BufReader by Current(0) empties its two unread cached bytes, although the next read still begins at the correct logical byte."
+summary: "BufReader may read ahead beyond its logical consumer position. Its Seek implementation reconciles the underlying cursor with that logical position and discards the cache; seek_relative may preserve it for movements within the buffer."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets implementing the underlying Read and Seek contracts"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust BufReader seek discards buffer", "BufReader seek current zero clears buffer", "seek_relative preserve internal buffer Rust"]
+evidence: ["Rust 1.98.1 capacity-four BufReader", "two consumed and two buffered bytes", "empty buffer followed by correct reread"]
+sources: ["https://doc.rust-lang.org/std/io/struct.BufReader.html", "https://doc.rust-lang.org/std/io/trait.Seek.html", "https://doc.rust-lang.org/std/io/struct.BufReader.html#method.seek_relative"]
+---
+
+I read two bytes through a four-byte BufReader and saw two more bytes in its cache. Seeking by zero felt like a no-op, so I expected the cache to survive. The logical position stayed the same, but the cache was discarded.
+
+The [failing fixture](/rust-failure-atlas/evidence/RFA-416/fail.rs) makes this visible with `abcdef`: after consuming `ab`, `cd` is buffered. `seek(SeekFrom::Current(0))` returns position two and leaves `buffer()` empty.
+
+## BufReader has two positions to reconcile
+
+[`BufReader`](https://doc.rust-lang.org/std/io/struct.BufReader.html) reads ahead from its inner reader. The inner Cursor in the fixture has already advanced through `abcd`, while the consumer has only received `ab`.
+
+Conceptually:
+
+```text
+logical consumer position = 2
+inner reader position      = 4
+unread cached bytes        = cd
+```
+
+The wrapper makes these states appear as one sequential reader during ordinary reads. Direct seeking must reconcile them.
+
+## Current(0) is still a seek operation
+
+[`Seek`](https://doc.rust-lang.org/std/io/trait.Seek.html) changes or queries stream position through the seek contract. For BufReader, its implementation accounts for unread buffer bytes, delegates the appropriate underlying movement, and discards the internal buffer.
+
+Even an offset of zero goes through this state transition. It restores the inner reader to logical position two and clears cached `cd` because those bytes were read from the old inner position state.
+
+The next read obtains `c` again from the inner source. No application byte is skipped or duplicated.
+
+## Buffer loss is performance state, not data loss
+
+The word “discards” can sound unsafe. BufReader discards cached copies, not the source bytes. Because the source is seekable, it repositions so those bytes remain available for future reads.
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-416/fixed.rs) asserts an empty cache after seek and then reads `c`. This proves logical correctness independently from cache retention.
+
+If the inner reader could not seek backward, BufReader would not implement this ordinary Seek path for it.
+
+## seek_relative can preserve nearby cache
+
+[`BufReader::seek_relative`](https://doc.rust-lang.org/std/io/struct.BufReader.html#method.seek_relative) can move within the current buffer without discarding it when the requested position is available there. The documentation notes that it may avoid unnecessary underlying seeks.
+
+I use it for relative parser movement when I do not need the resulting absolute position. Ordinary `seek` returns the new position and has the stronger cache-discard behavior described here.
+
+Choosing the method affects performance state, while both must preserve the intended logical byte sequence.
+
+## Seeking frequently can defeat read-ahead
+
+A parser that calls `seek(Current(0))` after every small read can repeatedly discard useful lookahead and force the inner source to read the same regions again.
+
+I keep cursor bookkeeping within BufReader and use `stream_position` or parser-local offsets only when needed. If the parser mostly moves forward, consuming buffered slices is more efficient than treating every boundary as a file seek.
+
+For random-access workloads, memory mapping, positioned reads, or a block cache may better match the access pattern.
+
+## Direct inner access can lose cached bytes
+
+Calling `into_inner` without accounting for unread buffer leaves the returned inner reader at its read-ahead position. The logical consumer position may be earlier. This is another case where wrapper state and inner state differ.
+
+I let BufReader perform the seek while it still owns the cache. If I must recover the inner object, I first decide how unread bytes and cursor position should be preserved.
+
+## Errors leave a state question
+
+A seek can fail. Application code should not assume the buffer and inner cursor are unchanged unless the API guarantees that exact failure state.
+
+For a parser that must recover, I retain higher-level checkpoints and reopen or reconstruct state when necessary. A generic `io::Error` is not a transaction rollback signal.
+
+The Atlas fixture uses an infallible in-memory Cursor so it isolates successful seek behavior.
+
+## My test timeline
+
+I assert four observations:
+
+1. first two bytes returned are `ab`;
+2. unread buffer is `cd` before seek;
+3. returned logical position is two and buffer is empty after seek;
+4. the next read returns `c`.
+
+Checking only the next byte would miss the cache behavior. Checking only the cache could be misread as data loss. Together they define state and output.
+
+The core principle is that buffering introduces hidden lookahead. A seek is a synchronization boundary between logical and inner positions, even when its requested offset is zero. BufReader discards old cached lookahead after reconciliation and continues from the correct source byte.

@@ -1,0 +1,104 @@
+---
+caseId: "RFA-718"
+title: "A non_exhaustive Marker Cannot Be Layout Trivia in repr(transparent)"
+date: "2026-09-07T11:36:00+01:00"
+lastmod: "2026-09-07T11:36:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "4d01a3a6553ecb004cefcbca2610045cb595cfbce654be0d41c6388eabe1dd99"
+area: "upgrades-compatibility"
+symptom: "A repr(transparent) wrapper around u64 and a dependency's non_exhaustive unit struct fails with E0690 even though the marker is zero-sized today."
+summary: "non_exhaustive explicitly reserves room for a dependency to add fields. Rust 1.98 will not ignore that evolvable type while promising that a downstream wrapper is transparently equal to another field."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets"]
+profiles: ["dev", "release"]
+searchTerms: ["Rust E0690 repr transparent non_exhaustive marker", "non exhaustive zero sized field could become non zero sized", "repr transparent dependency FutureMarker Rust 1.98"]
+evidence: ["Rust 1.98.1 two-crate Cargo failure", "non_exhaustive unit marker is rejected as an ignorable field", "PhantomData repair separates type tagging from stored layout"]
+sources: ["https://doc.rust-lang.org/releases.html#version-1980-2026-08-20", "https://doc.rust-lang.org/reference/type-layout.html#the-transparent-representation", "https://doc.rust-lang.org/reference/attributes/type_system.html#the-non_exhaustive-attribute"]
+---
+
+`#[non_exhaustive]` is an API evolution promise. It says that callers must leave space in their reasoning for more variants or fields later. Rust 1.98 now carries that meaning into transparent layout checking.
+
+Suppose a dependency publishes a marker which is empty today:
+
+```rust
+#[non_exhaustive]
+pub struct FutureMarker;
+```
+
+A downstream crate tries to place it beside a request identifier:
+
+```rust
+#[repr(transparent)]
+struct RequestId(u64, marker::FutureMarker);
+```
+
+The marker has zero size in the current build, but Rust reports E0690. The diagnostic explains that the field is marked `non_exhaustive`, so it could become non-zero-sized in the future. The wrapper cannot promise at the same time that its representation is always exactly the representation of `u64`.
+
+The [failing project](/rust-failure-atlas/evidence/RFA-718/fail/src/main.rs) uses a real path dependency whose [marker definition](/rust-failure-atlas/evidence/RFA-718/fail/marker/src/lib.rs) is outside the application crate. The [repaired project](/rust-failure-atlas/evidence/RFA-718/fixed/src/main.rs) uses `PhantomData` when only a type tag is needed. The Atlas verifies the pair with Cargo and Rust 1.98.1.
+
+## Zero size today and guaranteed trivial layout are different
+
+I often use size checks while investigating layout:
+
+```rust
+assert_eq!(core::mem::size_of::<marker::FutureMarker>(), 0);
+```
+
+This is a useful observation for one dependency version, compiler, and target. It does not cancel the meaning of `non_exhaustive`.
+
+The dependency author selected that attribute specifically so a later compatible release may extend the type. A unit struct can become a struct with fields without allowing downstream construction or exhaustive matching assumptions to freeze the old shape. The attribute communicates that the visible definition is not the final set of possibilities.
+
+`repr(transparent)` makes a different kind of promise. A transparent wrapper has the layout and ABI of its one non-trivial field. Any other fields must be safe for the compiler to ignore as layout contributors.
+
+If Rust ignored `FutureMarker`, my crate could export `RequestId` through FFI as if it were always a `u64`. If the dependency later added storage, that transparent promise would no longer describe the actual two-field value. Rejecting the type prevents an ABI contract from depending on an intentionally unfinished shape.
+
+## This is not only a private-field error
+
+A type with private fields and a `non_exhaustive` type can produce similar E0690 messages, but the design signal is different.
+
+Private fields preserve implementation freedom because downstream code cannot see the internals. `non_exhaustive` states evolution freedom directly, even when the currently visible type is a unit struct. Searching only for “private marker repr transparent” can miss this case because there may be no fields at all in the source today.
+
+An empty `repr(C)` marker is another related but distinct case. Its problem is portable C representation, not dependency evolution. I keep these reductions separate because their first checks and safe repairs differ.
+
+For this case, the first check is the type definition and the crate boundary. If the extra field is from a dependency, I look for `non_exhaustive` before trusting current size output.
+
+## Use PhantomData only when no value must be carried
+
+If `FutureMarker` is only a type-level label, I can write:
+
+```rust
+use core::marker::PhantomData;
+
+#[repr(transparent)]
+struct RequestId(u64, PhantomData<marker::FutureMarker>);
+```
+
+The wrapper no longer stores the dependency value. It states a relationship to the type through a standard marker designed to have no storage. The evidence repair also checks that the wrapper and `u64` have equal observed size on the verification target.
+
+This repair is not correct if owning a `FutureMarker` is meaningful. A zero-sized value can still be a capability. Its constructor may be restricted, and possessing it may prove that setup happened or access was granted. `PhantomData<FutureMarker>` does not magically obtain that capability.
+
+When the real marker value matters, I keep it in an ordinary struct and remove `repr(transparent)`, or store it in a separate context which owns the operation. At a foreign boundary, explicit conversion into a plain ABI type is usually clearer than making a stateful Rust object pretend to be an integer.
+
+## Do not work around an evolution promise
+
+I would not remove `non_exhaustive` in the dependency only to satisfy a downstream wrapper unless the dependency author truly wants to give up that evolution space. The attribute is doing useful work.
+
+I also avoid unsafe casts justified by current `size_of` and `align_of` results. Those casts preserve the same fragile assumption while removing the compiler check which exposed it. A test can catch a later size change, but an unsafe public ABI may already be unsound or incompatible before the test is run by every consumer.
+
+The correct question is not “How can I prove this field is empty now?” It is “Which project is allowed to promise that this field remains layout-trivial?” For a downstream `non_exhaustive` type, my wrapper crate is not that project.
+
+## My review method
+
+For each transparent wrapper during an upgrade, I make a small table of its fields. I record the owning crate, representation attributes, current size and alignment, and the documented future-change permissions. Then I identify exactly one field as the representation owner.
+
+For every remaining field, I ask whether it is:
+
+- a standard type-level marker with a suitable contract;
+- a real stored value or capability;
+- an external type with private internals;
+- or explicitly `non_exhaustive`.
+
+Only the first category is a simple candidate for `PhantomData`. The other categories usually require an API or storage redesign.
+
+The larger principle is that extensibility has physical consequences. `non_exhaustive` is not only a matching inconvenience. It protects a dependency's ability to grow. Rust 1.98 prevents a downstream transparent wrapper from quietly spending that reserved space on a permanent ABI assumption.

@@ -1,0 +1,255 @@
+---
+title: "Contract Tests That Detect Provider Drift Before Production"
+date: "2026-09-25T09:00:00+01:00"
+tags: ["contract testing", "api integration", "provider drift", "schema evolution", "testing"]
+draft: false
+reviewed: true
+reviewedHash: "2852a3ace5b30991d32033ac9f23f9c7dd73acc6da070bd33ffa23d39bef6b64"
+cluster: "reliable-data-integrations"
+campaign: "authority-2026"
+opportunity: "DATA-026"
+summary: "Schema validation catches only part of provider drift. Test the fields, behaviours, and semantic mappings your consumer actually depends on, then verify them safely."
+---
+
+An external API can keep returning valid JSON while breaking the product that consumes it.
+
+A field changes from required to conditionally absent. A timestamp keeps the same format but changes meaning. A `200` response becomes an asynchronous acceptance. Pagination starts repeating the boundary record. None of these necessarily violate a broad schema.
+
+I use contract tests to make the consumer's real assumptions executable.
+
+The key word is **consumer**. I do not test every field the provider offers. I test the subset of structure and behaviour my integration needs in order to preserve product meaning.
+
+## There are several contracts, not one
+
+I separate four layers:
+
+| Contract | Example question |
+| --- | --- |
+| transport | Can the client decode the status, headers, and body? |
+| structure | Are required fields present with supported types? |
+| behaviour | How do pagination, retries, and idempotency work? |
+| semantics | What does `active`, missing, or a timestamp mean in the product? |
+
+An OpenAPI document helps with transport and structure. It may describe some behaviour. It cannot prove the provider still uses a value with the same business meaning.
+
+A useful test suite therefore combines schemas, examples, interaction tests, and operational signals.
+
+## Begin from code that makes a decision
+
+I inventory every external value used by product logic:
+
+```ts
+function mapAccount(source: ProviderAccount): Account {
+  return {
+    externalId: source.id,
+    lifecycle: source.status === "active" ? "usable" : "blocked",
+    changedAt: parseTimestamp(source.updated_at),
+  };
+}
+```
+
+This tiny mapper assumes:
+
+- `id` is present, stable, and unique in the correct namespace;
+- `status` has understood values;
+- `active` really permits the product's “usable” behaviour;
+- every other status can safely become `blocked`;
+- `updated_at` advances for every relevant change;
+- the timestamp has a known precision and timezone.
+
+Generating a client from a schema does not validate the last four assumptions. I write them down before writing the tests.
+
+## Keep the smallest meaningful fixture set
+
+One full production response is hard to review and often contains irrelevant or private data. I prefer synthetic fixtures with one reason to exist:
+
+```text
+minimum-valid.json
+active-account.json
+suspended-account.json
+missing-optional-owner.json
+unknown-status.json
+timestamp-with-offset.json
+legacy-version.json
+```
+
+Each fixture has an expected semantic result:
+
+```ts
+expect(mapAccount(activeFixture)).toEqual({
+  externalId: "acct_42",
+  lifecycle: "usable",
+  changedAt: new Date("2026-09-20T10:30:00Z"),
+});
+
+expect(() => mapAccount(unknownStatusFixture)).toThrow(
+  /unsupported account status: archived_pending/
+);
+```
+
+For some products, unknown status should become an explicit `unknown` variant instead of throwing. The important part is that the decision is deliberate and observed.
+
+## Test tolerant decoding and strict meaning separately
+
+External APIs add fields. A decoder that rejects every unknown field creates avoidable outages.
+
+At the same time, silently accepting unknown enum values or missing decision fields can corrupt meaning.
+
+I use this boundary:
+
+```text
+unknown unused field     → accept and observe if useful
+unknown decision value   → preserve as unknown or quarantine
+missing required meaning → reject the record explicitly
+```
+
+This gives structural tolerance without semantic indifference.
+
+A fixture with an extra field should keep passing. A fixture with an unrecognized lifecycle should prove the product's chosen safe result.
+
+## Exercise the interaction, not only the body
+
+A consumer contract includes the request it sends and the sequence it expects.
+
+For a paginated read, I verify:
+
+```text
+GET /accounts?limit=100
+Authorization: Bearer <token>
+
+200
+items: [...]
+next_cursor: "c2"
+```
+
+Then:
+
+```text
+GET /accounts?limit=100&cursor=c2
+```
+
+I add cases for an empty page with a next cursor, a repeated cursor, rate limiting, token refresh, and malformed records. These are behavioural contract tests even if a schema tool is used to validate each body.
+
+For writes, I verify that the same idempotency key remains attached after a timeout and retry. A mock that answers every POST with `200` cannot test this contract.
+
+## Consumer-driven contracts help when both sides cooperate
+
+In an internal service architecture, a consumer can publish the interactions it relies on and the provider can verify them against its implementation before deployment. [Pact](https://docs.pact.io/) calls this consumer-driven contract testing.
+
+The useful property is not the framework name. It is the feedback direction:
+
+```text
+consumer records a specific expectation
+provider verifies all supported consumer expectations
+deployment checks whether this version combination is safe
+```
+
+This prevents a provider from removing a field that its own unit tests no longer use but a real consumer still needs.
+
+For a third-party API, I normally cannot make the provider run my tests. I run a safe verification probe against their sandbox or read-only production endpoint and compare observations with the local contract.
+
+## Verify without copying production data
+
+A provider probe should be narrow and safe:
+
+- use a dedicated test tenant or known synthetic record;
+- make read-only requests where possible;
+- redact tokens and private values;
+- store structural fingerprints and selected semantics, not entire responses;
+- respect provider rate limits;
+- fail with a useful diff.
+
+One captured observation can look like:
+
+```json
+{
+  "endpoint": "GET /accounts/{known_test_id}",
+  "status": 200,
+  "fields": ["id", "status", "updated_at"],
+  "status_value": "active",
+  "updated_at_shape": "RFC3339-offset",
+  "observed_at": "2026-09-24T06:00:00Z"
+}
+```
+
+I avoid snapshotting every unknown field. Large approval snapshots teach people to accept diffs without understanding them.
+
+## Detect semantic drift with distributions
+
+Some drift passes every fixture and probe.
+
+Suppose the provider changes `active` to include trial accounts. The shape and sample test account remain valid. Production distribution may suddenly move from 60% to 93% active.
+
+I monitor signals tied to mapping decisions:
+
+- proportions of each source and internal enum;
+- missingness by field and credential scope;
+- number of unknown values;
+- timestamp lag and ordering violations;
+- records per page and duplicate identities;
+- differences between old and new mapper output.
+
+An alert does not prove the provider broke the contract. It tells me the interpretation needs investigation.
+
+For a risky mapper change, I run both versions on the same retained or synthetic observations:
+
+```text
+source observation → mapper v11 → old internal result
+                   └→ mapper v12 → candidate result
+```
+
+The diff makes a semantic migration reviewable before product state changes.
+
+## Version every assumption with evidence
+
+I keep metadata around the mapping:
+
+```ts
+type MappedAccount = {
+  value: Account;
+  provider: string;
+  providerApiVersion: string | null;
+  mappingVersion: number;
+  observedAt: Date;
+  sourceHash: string;
+};
+```
+
+This does not require storing raw sensitive payloads forever. A source hash, selected provenance, and policy-controlled observation store may be enough.
+
+Without mapper identity, a strange stored value cannot be connected to the rule that created it.
+
+## Know what a contract test cannot prove
+
+A passing contract suite does not prove:
+
+- the provider will never change after the test;
+- all tenants receive the same fields or permissions;
+- production latency and rate limits match a sandbox;
+- undocumented semantics remain stable;
+- a valid response represents a possible business state;
+- retries and concurrent changes are safe unless those are tested.
+
+I keep load, failure, reconciliation, and monitoring tests beside the contract suite. Naming the limitation is part of using the tool correctly.
+
+## A release gate that gives useful failures
+
+My integration release gate has this order:
+
+1. validate synthetic fixtures against the local structural contract;
+2. test each fixture's mapping into explicit product meaning;
+3. run scripted interaction sequences for pagination, auth, and retries;
+4. verify consumer contracts against providers I control;
+5. run a safe observation probe for external providers;
+6. compare mapping distributions during staged rollout;
+7. keep reconciliation able to repair missed drift.
+
+When a gate fails, it should name the assumption: “`status` gained unknown value `archived_pending`” is more useful than “snapshot changed.”
+
+## The contract belongs at the boundary
+
+Provider drift cannot be eliminated. It can be made visible before the changed meaning spreads through the product.
+
+I test the exact external fields and behaviours the consumer depends on, translate them at one boundary, verify cooperative providers before deployment, and monitor semantic distributions after deployment.
+
+A schema tells me whether data fits a shape. A strong consumer contract tells me whether my product can still make the same safe decisions from it.

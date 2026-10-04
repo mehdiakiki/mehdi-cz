@@ -1,0 +1,109 @@
+---
+caseId: "RFA-179"
+title: "Why File::create Truncates an Existing File Immediately"
+date: "2026-09-05T17:18:00+01:00"
+lastmod: "2026-09-05T17:18:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "d64e14f05c57e5b245e6af1421cff1f2891ae4e432221d4917b5f2a09b555f97"
+area: "ffi-targets"
+symptom: "Opening an existing file with File::create reduces its length to zero before the application writes replacement data."
+summary: "File::create means write, create, and truncate. Opening succeeds after the destructive truncation, so durable replacement needs a temporary file and rename while non-truncating access needs explicit OpenOptions."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets; replacement durability remains platform-specific"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust File create truncates existing file",
+    "File create data lost before write Rust",
+    "OpenOptions write without truncate Rust",
+  ]
+evidence:
+  [
+    "Rust 1.98.1 temporary file",
+    "zero-length observation after open",
+    "explicit OpenOptions repair",
+  ]
+sources:
+  [
+    "https://doc.rust-lang.org/std/fs/struct.File.html#method.create",
+    "https://doc.rust-lang.org/std/fs/struct.OpenOptions.html",
+    "https://doc.rust-lang.org/std/fs/struct.File.html#method.create_new",
+  ]
+---
+
+I once read `File::create` as “give me a file, creating it only when missing.” That interpretation is wrong in the most damaging direction: an existing file is truncated as part of opening it.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-179/fail.rs) writes `important payload`, calls `File::create`, writes nothing through the returned handle, and then reads metadata. The file length is already zero.
+
+## Successful open is the destructive step
+
+[`File::create`](https://doc.rust-lang.org/std/fs/struct.File.html#method.create) opens in write-only mode, creates a missing file, and truncates an existing one. It is equivalent to enabling `write`, `create`, and `truncate` in `OpenOptions`.
+
+The data is not preserved until my first `write`. This sequence is therefore unsafe for preserving the old version:
+
+```rust
+let file = File::create(path)?;
+let replacement = expensive_or_fallible_work()?;
+write_all(&file, &replacement)?;
+```
+
+If the computation fails after the open, the old contents are already gone. A crash between open and write has the same basic problem.
+
+## State the intended open policy
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-179/fixed.rs) uses [`OpenOptions`](https://doc.rust-lang.org/std/fs/struct.OpenOptions.html) with `write(true)` and no truncation. Merely opening the handle preserves the payload.
+
+That repair demonstrates the narrow contract, but production code needs to answer what future writes mean. Writing at offset zero overwrites a prefix; appending writes at the end; truncating replaces the length. These are distinct policies.
+
+I avoid helper functions whose name hides those choices at an important storage boundary.
+
+## Safe replacement uses a second file
+
+When the goal is to replace a configuration or database snapshot, I first produce the complete new contents in a temporary file in the same destination directory. I flush according to the durability requirement, then rename it over the destination using platform-appropriate semantics.
+
+This reduces the window where readers see an empty or partial file. It does not automatically guarantee durability after power loss: directory metadata and file data may require separate synchronization, and rename replacement rules differ by platform and filesystem.
+
+The application should state whether it needs process-level atomic visibility, crash durability, both, or neither.
+
+## Create-only is another distinct contract
+
+If overwriting is forbidden, checking `path.exists()` and then calling `File::create()` has a race. Another process can create the path between those operations.
+
+[`File::create_new`](https://doc.rust-lang.org/std/fs/struct.File.html#method.create_new) makes the create-if-absent decision atomically and fails if the destination already exists. This is the right primitive for lock files, unique outputs, and other create-once policies, subject to filesystem behaviour.
+
+It also avoids confusing a negative observation with permission to mutate later.
+
+## Open modes do not define the whole write protocol
+
+Even after choosing the correct options, I still handle:
+
+- partial writes by using `write_all` or an explicit progress loop;
+- buffered-write errors, including errors reported only by `flush`;
+- close-time and durability requirements;
+- permissions and ownership of newly created files;
+- symlink and path-replacement threats when input is untrusted;
+- concurrent writers and lost updates.
+
+The Atlas case about `BufWriter` drop errors is closely related: constructing the right handle is only the first part of a reliable persistence boundary.
+
+## A good test observes before writing
+
+A test that creates a file and immediately writes replacement data can miss when truncation occurred. I keep the reproduction intentionally between the two operations: open the existing path, then inspect its length before any write.
+
+For replacement logic, I add fault injection after temporary-file creation, after data flush, before rename, and after rename. Each failure point should leave a state that startup code can understand.
+
+## My file-opening checklist
+
+Before opening a path for writing, I ask:
+
+1. Must the target already exist, be absent, or may either state be accepted?
+2. Should existing bytes be preserved, appended, partially overwritten, or replaced?
+3. At what exact operation can old data disappear?
+4. Do concurrent creators or writers exist?
+5. Is atomic visibility enough, or is crash durability required?
+6. Which errors can appear during write, flush, synchronization, rename, and close?
+
+I encode those answers in a small storage function and test its interruption points.
+
+The core principle is that opening is a state transition, not only preparation for I/O. `File::create` includes truncation. If destruction, exclusivity, or replacement matters, the open flags and commit protocol must say so explicitly.

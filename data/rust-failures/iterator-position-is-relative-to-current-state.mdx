@@ -1,0 +1,84 @@
+---
+caseId: "RFA-220"
+title: "Iterator::position Is Relative to the Iterator's Current State"
+date: "2026-09-06T00:00:00+01:00"
+lastmod: "2026-09-06T00:00:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "f2ee516a02b52dc48ac830d21768f20c60bd7ac982403327dc5749bb3a5ec8d9"
+area: "concurrency-memory"
+symptom: "Iterator::position reports one for a value at source index two after one element was consumed."
+summary: "Iterator::position starts counting at zero from the iterator's present state, and it consumes through the match. Preserve the source offset explicitly when callers need original coordinates."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust Iterator position wrong index after next",
+    "Iterator position relative current state Rust",
+    "find original index consumed iterator Rust",
+  ]
+evidence: ["Rust 1.98.1 stateful iterator", "one consumed prefix item", "explicit source-offset repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/std/iter/trait.Iterator.html#method.position",
+    "https://doc.rust-lang.org/std/iter/trait.Iterator.html#method.enumerate",
+  ]
+---
+
+I once logged an index from `Iterator::position` and used it as an index into the original input. It worked while the iterator was fresh. It became wrong as soon as another check consumed one element first.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-220/fail.rs) starts with four integers, calls `next`, and then searches for `30`. The value lives at index two in the array, but `position` returns one.
+
+That result is not an off-by-one bug. It is the coordinate system promised by the iterator.
+
+## Position starts from where iteration starts now
+
+[`Iterator::position`](https://doc.rust-lang.org/std/iter/trait.Iterator.html#method.position) calls the predicate on successive items and returns the index of the first match. Its count starts at zero for the first item it examines during that call.
+
+An iterator is state, not a permanent view of the complete collection. After `next` returns `10`, the remaining sequence is logically `20, 30, 40`. Inside this remaining sequence, `30` is at position one.
+
+This distinction matters with iterators received from another function. The type rarely says how much was already consumed. A `slice::Iter` can still expose its remaining length, but that does not recover an original offset unless the original length or another coordinate is available.
+
+## The search also consumes the iterator
+
+There is a second state change. `position` consumes items up to and including the matching item. After finding `30`, the next value is `40`.
+
+I do not call `position` as if it were a read-only query. This code is dangerous when the later stage expects to see the match again:
+
+```rust
+let found = iter.position(predicate);
+let matching_item = iter.next(); // this is the item after the match
+```
+
+When I need both the index and item, I often use [`enumerate`](https://doc.rust-lang.org/std/iter/trait.Iterator.html#method.enumerate) and return the pair from one search. When I need to keep the iterator untouched, I use a clone only if the iterator implements `Clone` and duplicating its state is semantically correct.
+
+## I name the coordinate in the variable
+
+Names such as `index` hide the main question: index in what? I prefer `remaining_index`, `source_index`, `byte_offset`, or `record_number`.
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-220/fixed.rs) preserves the number of consumed source items and adds it to the relative result. It also shows that calling `position` on a fresh iterator returns the original array index directly.
+
+This repair is safe only when every consumed iterator item corresponds to one source item. A pipeline containing `filter`, `flat_map`, `flatten`, or variable-sized decoding breaks that simple arithmetic. In those pipelines I attach the source coordinate before changing the stream:
+
+```rust
+source.iter().enumerate().filter(|(_, item)| keep(item))
+```
+
+The coordinate now travels with the item rather than being reconstructed after information was lost.
+
+## Byte positions and item positions are different again
+
+For text, a character iterator position counts Unicode scalar values. It is not necessarily a byte offset usable for string slicing. If I need byte coordinates, `char_indices` carries them. If I need grapheme-cluster positions visible to a user, standard-library character iteration is not enough.
+
+This is why I make coordinate choice part of an API contract. A parser diagnostic can need a byte span, a text editor can need a grapheme position, and an input record can need a stable sequence number. Calling all of them “index” invites a later mismatch.
+
+## My regression starts from a partially consumed iterator
+
+A fresh-iterator test cannot reveal this failure. I consume a known prefix, locate a later item, and assert both the remaining coordinate and source coordinate. I also assert the next item after the search so the consuming behaviour stays visible.
+
+For filtered pipelines I test a removed item before the match. For repeated values I state first-match behaviour. For an absent value I verify that the iterator reaches exhaustion. These cases describe the state transition, not only one returned number.
+
+When an iterator is exposed by a public API, I also document whether the caller receives a fresh stream or a resumable cursor. That small sentence determines whether any returned position can be interpreted without additional state.
+
+The deeper principle is that an iterator owns a moving frontier. Methods report facts relative to that frontier unless a source coordinate was deliberately retained. When a position must outlive the pipeline, I attach or preserve its coordinate before consumption begins.

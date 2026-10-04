@@ -1,0 +1,115 @@
+---
+caseId: "RFA-072"
+title: "E0507: Why an `FnMut` Closure Cannot Consume a Captured String"
+date: "2026-09-05T08:40:00+01:00"
+lastmod: "2026-09-05T08:40:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "e2f42998c7a9ada57eeaec3f37cad32b1f77b6c0bb5a30f8ec500fd40943e947"
+area: "diagnostics-macros"
+symptom: "A closure passed as FnMut cannot move and consume one captured String even when the API currently calls it only once."
+summary: "FnMut permits repeated calls, so its body cannot move a non-Copy value permanently out of the environment. Accept FnOnce for a consuming callback or store an explicit Option when later calls have defined behavior."
+rustVersions: ["Rust 1.98.1"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust E0507 cannot move captured variable FnMut closure",
+    "FnMut closure consume captured String",
+    "change callback to FnOnce Rust",
+  ]
+evidence: ["Rust 1.98.1 compile failure", "call-trait comparison", "FnOnce repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/error_codes/E0507.html",
+    "https://doc.rust-lang.org/std/ops/trait.FnOnce.html",
+  ]
+---
+
+`FnMut` sounds permissive because the closure can mutate its state. It still cannot make that state disappear on the first call:
+
+```rust
+fn call<F: FnMut()>(mut callback: F) {
+    callback();
+}
+
+fn main() {
+    let value = String::from("atlas");
+    call(|| drop(value));
+}
+```
+
+Rust 1.98.1 emits E0507: it cannot move `value` out of an `FnMut` closure. The helper happens to invoke the callback once, but its generic contract says more than its body currently does. The [failing fixture](/rust-failure-atlas/evidence/RFA-072/fail.rs) captures the exact message.
+
+## `FnMut` must leave an environment that can be called again
+
+Calling `drop(value)` takes `String` by value. The string moves out of the closure's captured environment and is destroyed. If the closure were called a second time, there would be no `String` left to pass to `drop`.
+
+`FnMut` uses a conceptual `&mut self` receiver. Mutable access permits replacing or changing a field, but moving a non-Copy field directly through a borrowed struct is not allowed unless a valid replacement is left behind. The closure environment follows the same ownership rule as an ordinary struct.
+
+[`FnOnce`](https://doc.rust-lang.org/std/ops/trait.FnOnce.html) instead consumes `self`. It is the call trait able to move captured values out because no second call is promised.
+
+## State the one-call contract
+
+If the helper truly calls once, its bound should say so:
+
+```rust
+fn call_once<F: FnOnce()>(callback: F) {
+    callback();
+}
+```
+
+The closure may then consume `value`. The [repaired fixture](/rust-failure-atlas/evidence/RFA-072/fixed.rs) compiles and runs this exact ownership transfer on Rust 1.98.1.
+
+Every closure implements `FnOnce`, because every callable closure can be consumed for a call. Closures that do not move out of captures may additionally implement `FnMut` and `Fn`. Accepting `FnOnce` for a one-shot operation is therefore flexible, not unusually restrictive.
+
+It also lets the helper move the callback into another one-shot layer without inventing a repeatability promise it cannot use.
+
+## When the API really must call more than once
+
+Repeated calls need defined state after the first one. An `Option` makes this explicit:
+
+```rust
+let mut value = Some(String::from("atlas"));
+let mut callback = || {
+    if let Some(value) = value.take() {
+        drop(value);
+    }
+};
+```
+
+The first call replaces `Some` with `None` and consumes the string. Later calls see `None`. The closure remains an `FnMut` because it mutates the option but never moves a field out without replacement.
+
+Whether later calls do nothing, return an error, or panic is an application decision. I do not introduce `Option` merely to keep an inaccurate repeatable API. If repeated invocation is a programmer error, a named one-shot type may communicate the lifecycle better.
+
+## Cloning changes the event being represented
+
+The compiler may suggest cloning:
+
+```rust
+call(|| drop(value.clone()));
+```
+
+This leaves the captured original available and destroys a fresh copy on every call. It compiles, but it no longer means “consume this resource once.” For strings it allocates; for handles or reference-counted owners it may change cleanup timing. I only clone when duplicated ownership is correct.
+
+Borrowing also changes the operation. `drop(&value)` drops a reference, which does nothing to the owned string. The `dropping_references` lint often catches this false repair.
+
+## `move` capture is not enough
+
+The original closure already needs to capture `value` by value because its body moves the string. Writing `move || drop(value)` makes the capture explicit but does not make an `FnMut` caller consume the closure. The mismatch is at the receiver contract.
+
+This is the mirror of a different case: a closure that only mutates a captured value can implement `FnMut`; a closure that removes it can implement only `FnOnce` unless it installs a replacement.
+
+## Callback bounds are lifecycle promises
+
+I review callback APIs by asking:
+
+1. Can the implementation call zero times?
+2. Can it call once or multiple times?
+3. Are calls sequential or concurrent?
+4. Does the callback retain valid state after each call?
+5. Who owns captures when the callback is cancelled or dropped without running?
+
+These answers determine more than compilation. They affect cleanup, retries, and side effects.
+
+The official [E0507 explanation](https://doc.rust-lang.org/error_codes/E0507.html) shows moving through borrowed content and suggests replacing the value. A closure environment is one more borrowed container. If the callback consumes its environment, accept `FnOnce`; if it is repeatable, model the post-call state explicitly.

@@ -1,0 +1,81 @@
+---
+caseId: "RFA-236"
+title: "Rust Thread::unpark Tokens Do Not Accumulate Beyond One"
+date: "2026-09-06T00:16:00+01:00"
+lastmod: "2026-09-06T00:16:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "455a4b169f1168241506edc6b3273d41f2467550e0f628d1cda3a819375cf628"
+area: "concurrency-memory"
+symptom: "Two unpark calls made before two park calls release the first park, but the second park still waits."
+summary: "Each thread has a single park token, not a counting semaphore. Repeated unpark calls coalesce while the token is present; protect a real condition in a loop and use a counting primitive when every signal must be retained."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets with std threads; timing resolution is platform-specific"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust unpark called twice one token", "thread park unpark tokens accumulate", "lost wakeup park unpark Rust"]
+evidence: ["Rust 1.98.1 current-thread token", "bounded second park", "fresh-unpark repair"]
+sources: ["https://doc.rust-lang.org/std/thread/fn.park.html", "https://doc.rust-lang.org/std/thread/struct.Thread.html#method.unpark", "https://doc.rust-lang.org/std/thread/fn.park_timeout.html"]
+---
+
+I once treated `unpark` like adding one permit to a counter. Two calls should release two later `park` calls, I thought. Rust stores at most one token per thread, so repeated wakeups can coalesce.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-236/fail.rs) calls `unpark` twice on the current thread. The first `park` consumes the available token immediately. A bounded second park waits for its timeout instead of consuming a second token.
+
+## The model is one token, present or absent
+
+The [`thread::park`](https://doc.rust-lang.org/std/thread/fn.park.html) documentation defines a conceptual token initially absent. `unpark` makes it available if it is not already present. `park` atomically consumes an available token or waits.
+
+Calling `unpark` while the token is already present does not create another token. This prevents the mechanism from acting as an unbounded queue of wakeups.
+
+An `unpark` before `park` is not lost: the later park can consume that token. Two early unparks, however, still represent only one available permit.
+
+## Wakeups should point to a condition
+
+Low-level parking is normally used around shared state:
+
+```text
+loop:
+    check protected condition
+    if ready, consume work and continue
+    otherwise park
+```
+
+The condition is the source of truth. The token only prompts another check. If ten jobs arrive before the worker wakes, one unpark can be enough because the queue retains all ten jobs.
+
+Counting unparks instead of queued work reverses those roles and loses information when tokens coalesce.
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-236/fixed.rs) issues a fresh unpark for the second park. A production repair usually goes farther by storing pending work in a mutex-protected queue or atomic state.
+
+## Spurious returns are also allowed
+
+`park` may return spuriously without consuming the token. Code must recheck its condition even when nobody intentionally called `unpark`.
+
+This is the same reason condition-variable waits use loops. A wakeup is permission to inspect state, not proof that a particular event occurred or that a resource belongs to this waiter.
+
+If every permit must be counted, I use a semaphore, channel, or explicit counter with a correct wait protocol. Choosing a higher-level primitive often removes the difficult check-then-sleep race.
+
+## Other synchronization can interfere with a park protocol
+
+The standard documentation warns that some library internals may use parking. To rely on `unpark` followed by `park`, the unpark must occur after any park operations performed by other data structures on that thread.
+
+This warning influenced the evidence fixture itself. An initial experiment used channels to stage the calls, and the channel wait consumed the thread's park token. The corrected fixture touches the tested token only through explicit park and unpark operations.
+
+Application code should not build a private park-token protocol on a thread also handed to unrelated blocking machinery unless the ordering is understood.
+
+## Memory ordering exists, but it does not count events
+
+`unpark` synchronizes with park calls that consume the token according to the documented release/acquire-style ordering. This can make preceding writes visible to the awakened thread.
+
+Visibility does not turn one bit of token state into an event queue. If several updates occur, shared state must encode enough information for the consumer to discover them after one wakeup.
+
+I separate two proofs: the memory ordering that makes data visible, and the data structure invariant that prevents work from disappearing.
+
+## Timing is only bounded in the evidence
+
+The failure program uses `park_timeout` to prevent a bad fixture from hanging the complete verification suite. Its generous threshold distinguishes the immediate first park from the intentionally delayed second call on the pinned test environment.
+
+For application tests I prefer controlled conditions and a watchdog around the whole scenario. I test unpark-before-park, repeated unpark, spurious-style extra checks, multiple work items under one wakeup, and shutdown. I never use a sleep duration as the application protocol itself.
+
+Shutdown needs its own condition bit. Repeatedly unparking a worker without setting “stop” can wake it, let it find an empty queue, and send it back to sleep forever. The worker exits because shared state says so, not because a special wakeup has a different shape.
+
+The core principle is that notifications and state have different capacities. Rust's park token remembers at most one pending notification. Durable or counted work belongs in shared state; `unpark` merely ensures the worker gets another opportunity to observe it.

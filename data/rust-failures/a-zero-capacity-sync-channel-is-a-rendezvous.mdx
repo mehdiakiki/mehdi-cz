@@ -1,0 +1,81 @@
+---
+caseId: "RFA-683"
+title: "A Zero-Capacity sync_channel Is a Rendezvous"
+date: "2026-09-06T08:43:00+01:00"
+lastmod: "2026-09-06T08:43:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "28ad6406c6b42f4ad1c3c25e06d1fa8e1d3b12e0b2b5c6af203e3a39087f6652"
+area: "concurrency-memory"
+symptom: "try_send on sync_channel(0) returns Full when no receiver is waiting because the channel has no buffering slot."
+summary: "A zero-bound synchronous channel hands each message directly to a receiver. It provides maximum backpressure, not a one-item queue."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["targets supporting std threads"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust sync_channel zero capacity", "try_send Full zero bound channel", "rendezvous channel Rust std"]
+evidence: ["Rust 1.98.1 runtime assertion", "try_send without waiting receiver returns Full", "blocking send completes with receiver rendezvous"]
+sources: ["https://doc.rust-lang.org/std/sync/mpsc/fn.sync_channel.html", "https://doc.rust-lang.org/std/sync/mpsc/struct.SyncSender.html#method.try_send", "https://doc.rust-lang.org/std/sync/mpsc/enum.TrySendError.html"]
+---
+
+`sync_channel(0)` creates a synchronous rendezvous channel with no buffered capacity. A send completes only when a receiver accepts the message. The [failing fixture](/rust-failure-atlas/evidence/RFA-683/fail.rs) uses `try_send` without a waiting receiver and gets `Full`.
+
+## Capacity zero means no storage slot
+
+The [`sync_channel` documentation](https://doc.rust-lang.org/std/sync/mpsc/fn.sync_channel.html) identifies the zero-bound special case as a rendezvous. Producer and consumer meet for each transfer.
+
+This differs from capacity one. A one-slot channel lets one message wait even when the receiver is doing other work. Capacity zero permits no queued message at all.
+
+I write “rendezvous” in comments and architecture notes because “small bounded channel” hides this behavioural boundary.
+
+## try_send reports current readiness
+
+[`SyncSender::try_send`](https://doc.rust-lang.org/std/sync/mpsc/struct.SyncSender.html#method.try_send) never blocks. With no waiting receiver on a zero-capacity channel, it returns `TrySendError::Full` and gives the unsent value back.
+
+Full does not mean a permanent configuration error. It means the handoff cannot complete now. The caller can retry under a defined strategy, do alternative work, drop the message intentionally, or use blocking `send`.
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-683/fixed.rs) starts a receiver and uses blocking send, which completes the rendezvous without relying on a buffer.
+
+## Backpressure becomes direct coupling
+
+Rendezvous ensures a fast producer cannot outrun its consumer. It can reduce memory growth and make handoff timing precise. It also couples their progress: if the receiver is slow, stopped, or scheduled poorly, the sender waits.
+
+This can be excellent between dedicated pipeline threads. It can deadlock when both sides hold locks or wait for responses through each other. I draw the wait-for graph around blocking sends, receives, mutexes, and joins.
+
+In an async runtime, std blocking channels can block executor workers. An async channel with equivalent capacity semantics or a dedicated blocking thread is generally more appropriate.
+
+## Full and disconnected retain the message
+
+`TrySendError<T>` contains the original value. On Full, the caller still owns work and chooses what happens next. On Disconnected, no receiver remains, so retrying the same channel cannot succeed.
+
+Ignoring the error drops the message. For telemetry this might be an explicit overload policy; for durable work it can be data loss. I count drops and distinguish overload from shutdown.
+
+Blocking send also returns the value in its error when the receiver disconnects. Ownership is never silently transferred on a failed send.
+
+## Capacity is part of system behaviour
+
+Changing a channel bound is not only tuning memory. It changes how far producers can proceed, where latency accumulates, and which lock interleavings are possible. A large buffer can hide overload until memory and tail latency grow. Zero can expose backpressure immediately but reduce throughput.
+
+I measure service time, burst size, acceptable queue delay, and shutdown paths. Bounded queues make overload explicit, but the selected bound needs operational evidence.
+
+Metrics include occupancy where available, Full outcomes, send wait time, receive processing time, and disconnects. A throughput number alone does not show whether producers spend their lives blocked.
+
+## Tests coordinate without sleeps
+
+The fixture demonstrates the no-receiver state deterministically. Larger tests use barriers or secondary channels to establish that a receiver is ready before asserting a handoff. Scheduling sleeps are not readiness proofs.
+
+Tests also cover receiver drop, sender drop, values returned on errors, and shutdown while a thread is blocked. Deadlock tests use bounded time at the harness level while the protocol itself remains deterministic.
+
+Rendezvous can also transfer ownership without ever accumulating a backlog. That makes memory use easy to bound, but the payload still occupies producer memory until accepted. Large messages and many blocked producer threads can therefore consume substantial memory even with channel capacity zero.
+
+## My rendezvous checklist
+
+- Is capacity zero intentional or mistaken for one pending item?
+- May the producer block until a consumer receives?
+- Which locks are held across send and receive?
+- What does the caller do with Full and the returned value?
+- Does disconnected mean shutdown or failure?
+- Is std blocking appropriate in the current runtime?
+- Which measurements justify the chosen capacity?
+- Do tests establish readiness with synchronization rather than sleep?
+
+The core principle is that buffer capacity encodes coordination, not only storage. At zero, send and receive become one joint event. I choose that direct backpressure when coupling is wanted and review every blocking edge it introduces.

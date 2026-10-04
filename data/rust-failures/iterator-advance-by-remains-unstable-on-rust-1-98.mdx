@@ -1,0 +1,105 @@
+---
+caseId: "RFA-399"
+title: "Iterator::advance_by Remains Unstable on Rust 1.98"
+date: "2026-09-06T03:39:00+01:00"
+lastmod: "2026-09-06T03:39:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "6b81a313b7a5975ed2b244c27db81b65275fb9a88320908b35bb04b74fdcd9f9"
+area: "upgrades-compatibility"
+symptom: "Iterator::advance_by fails to compile on stable Rust 1.98.1 with E0658, even though its standard-library page fully describes the return value."
+summary: "Iterator::advance_by remains guarded by iter_advance_by on Rust 1.98.1. A stable explicit next loop can report how many requested steps remain when the iterator ends, while making consumption and side effects visible."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust advance_by unstable E0658 1.98", "iter_advance_by stable replacement", "advance iterator report remaining steps"]
+evidence: ["Rust 1.98.1 E0658 compile failure", "iter_advance_by feature gate", "stable explicit-next loop"]
+sources: ["https://doc.rust-lang.org/std/iter/trait.Iterator.html#method.advance_by", "https://doc.rust-lang.org/std/iter/trait.Iterator.html#method.nth", "https://doc.rust-lang.org/error_codes/E0658.html"]
+---
+
+Skipping a number of iterator items sounds basic enough that I expected `advance_by` to be an ordinary stable method. On Rust 1.98.1, that expectation is wrong.
+
+The [failing fixture](/rust-failure-atlas/evidence/RFA-399/fail.rs) calls the documented method and compilation fails with E0658. The diagnostic names `iter_advance_by`, showing that the API remains behind an unstable feature gate.
+
+There is a second trap waiting after stabilization: the error reports the remaining shortfall, not the original requested amount.
+
+## Documentation is not a stability promise
+
+[`Iterator::advance_by`](https://doc.rust-lang.org/std/iter/trait.Iterator.html#method.advance_by) describes advancing by `n` calls to `next`. A successful result is `Ok(())`. If the iterator ends early, the error contains a non-zero count of how many advances could not be completed.
+
+That is a useful contract, but the Rust 1.98.1 page marks it experimental. Stable projects cannot enable it just by importing another trait. The [E0658 documentation](https://doc.rust-lang.org/error_codes/E0658.html) explains the channel restriction.
+
+I verify availability against the minimum supported Rust version of the project, not only the newest toolchain installed on my machine. For libraries, that minimum is part of the user contract.
+
+## The error is a remainder
+
+Suppose I request five advances from an iterator containing two items. Two calls succeed, the third sees the end, and three requested steps remain. The intended error value is therefore three.
+
+It is not five, because some progress happened. It is not two, because the error does not report consumed items. It is not an index into the original sequence.
+
+Naming this value `remaining` or `shortfall` prevents mistakes. A name such as `count` is too vague in retry and pagination code.
+
+## The stable repair is deliberately boring
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-399/fixed.rs) uses the oldest and clearest iterator operation:
+
+```rust
+fn advance_by_stable<I: Iterator>(
+    values: &mut I,
+    requested: usize,
+) -> Result<(), usize> {
+    for completed in 0..requested {
+        if values.next().is_none() {
+            return Err(requested - completed);
+        }
+    }
+    Ok(())
+}
+```
+
+If the first `next` fails, `completed` is zero and every requested step remains. If two items were consumed before failure, the loop reaches `completed == 2`, so `requested - completed` is the uncompleted remainder.
+
+For `requested == 0`, the range is empty, no call is made, and the function succeeds. This boundary falls naturally out of the loop without subtracting one from zero.
+
+## Why I do not automatically replace it with nth
+
+[`Iterator::nth`](https://doc.rust-lang.org/std/iter/trait.Iterator.html#method.nth) can skip elements and return a later one, but its contract asks a different question. `nth(n)` consumes and returns the element at offset `n`; it therefore consumes up to `n + 1` items.
+
+To advance exactly `n` positions with `nth`, code is tempted to call `nth(n - 1)`. That needs a special case for zero and returns the last consumed item rather than a shortfall count. The explicit loop is easier to audit when exact progress reporting matters.
+
+An optimized custom iterator may eventually provide faster internal advancement through the standard method once it is stable. My fallback favors stable semantics and clarity, not a claim of maximum specialization.
+
+## Advancing drives lazy work
+
+Skipped values are not necessarily free values sitting in memory. Calling `next` can parse input, read a file, receive from a generator, increment counters, or execute adapter closures.
+
+Advancing means performing and discarding that iterator work. It does not seek an arbitrary data source unless the iterator implementation can optimize the operation under its contract.
+
+This matters when code says “just skip one million rows.” For a streaming decoder, that can still mean decoding one million rows. If random access or seeking is required, the data source needs an API that promises it.
+
+## Early exhaustion permanently consumes progress
+
+The error does not roll back successful steps. In the two-of-five example, the two existing items are gone and the iterator is exhausted. Retrying the remaining three on that same iterator immediately fails again with a shortfall of three.
+
+For checkpointing, I record completed progress before deciding whether an early end is an error, normal completion, or a reason to fetch another segment. A `Result` return can make failure look transactional when it is actually a partial state transition.
+
+The fixed fixture asserts the shortfall and then calls `next` to prove the source is exhausted. It also tests a successful two-step advance and verifies that the third item remains.
+
+## A wrapper gives upgrades one boundary
+
+I keep the stable helper local to the behavior that needs it. Its error type is `usize`, while the intended standard method uses a non-zero integer wrapper. That difference is acceptable inside a private adapter with tests, but I would consider a stronger domain error before exposing it as a public API.
+
+When a future minimum Rust version stabilizes `advance_by`, the wrapper is one place to adopt it. Until then, every build stays on the promised stable channel.
+
+## The review checklist
+
+I ask four questions around iterator advancement:
+
+- Is the chosen method stable on the pinned minimum Rust version?
+- Does the returned number mean completed work or remaining work?
+- What side effects happen for each consumed item?
+- What cursor position remains after success or early exhaustion?
+
+These questions catch more bugs than treating advancement as pointer arithmetic.
+
+The core principle is that skipping is still consumption. Rust 1.98.1 does not yet expose `advance_by` to stable code, so an explicit `next` loop is a good compatibility boundary. It also makes partial progress and the meaning of the shortfall difficult to misunderstand.

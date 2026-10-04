@@ -1,0 +1,331 @@
+---
+title: "Why a Rust Future Is Not Send Across .await"
+date: "2026-09-05T19:00:00+01:00"
+tags: ["rust", "async rust", "send", "sync", "tokio"]
+draft: false
+reviewed: true
+reviewedHash: "d80a4ea335b84d8f9230bbd85996e13e002abf3c0bdfa94de5a5ba04e99b847f"
+cluster: "rust-under-the-hood"
+campaign: "authority-2026"
+opportunity: "RUST-027"
+summary: "A Rust future is Send only when every stored state is safe to move across threads. Trace captures and locals across await to fix spawn errors."
+---
+
+The error often appears at `tokio::spawn`, far away from the value that caused it:
+
+```text
+future cannot be sent between threads safely
+```
+
+Then rustc points at an `.await` and says a value "may be used later." The natural reaction is to add `Send` bounds until the compiler stops. This can make the API worse and still miss the real problem.
+
+A better approach is to read the generated future as stored state. A future is `Send` only if it is safe to move that full state machine to another thread.
+
+## `Send` belongs to the future value
+
+An async function returns a concrete anonymous future:
+
+```rust
+async fn work() {
+    // body
+}
+
+let future = work();
+```
+
+Before an executor polls it, `future` is an ordinary value. A multithreaded executor may poll it on one worker, suspend it, move the task, and resume it on another worker.
+
+That requires the future type to implement `Send`.
+
+The rule is structural: every field that may be present in the future's states must satisfy the auto-trait requirements. I do not manually implement `Send` for an async block. The compiler derives it from what the generated state machine stores.
+
+## A minimal failing future
+
+`Rc<T>` is not `Send`. Keep one across an await and the future is not `Send`:
+
+```rust
+use std::rc::Rc;
+
+async fn not_send() {
+    let value = Rc::new(String::from("local"));
+
+    std::future::ready(()).await;
+
+    println!("{value}");
+}
+
+fn require_send<T: Send>(_: T) {}
+
+fn main() {
+    require_send(not_send()); // does not compile
+}
+```
+
+The generated waiting state needs to store `value`, because code after `.await` uses it. Moving that future to another thread would move the `Rc`. Rust rejects this before any runtime is involved.
+
+The small `require_send` helper is useful. It places the diagnostic next to the future constructor instead of waiting for a large generic error inside an executor.
+
+## End the non-Send state before `.await`
+
+If the `Rc` is only needed for synchronous preparation, make its lifetime end before suspension:
+
+```rust
+use std::rc::Rc;
+
+async fn can_be_send() {
+    let prepared = {
+        let local = Rc::new(String::from("local"));
+        local.len()
+    }; // `local` cannot be stored in a later suspension state
+
+    std::future::ready(()).await;
+    println!("prepared length: {prepared}");
+}
+
+fn require_send<T: Send>(_: T) {}
+
+fn main() {
+    require_send(can_be_send()); // compiles
+}
+```
+
+The inner scope communicates the boundary clearly. I transform local-only state into the plain `usize` that later work needs.
+
+An explicit `drop(local)` before `.await` can also work when it consumes the value, but a scope often survives refactoring better. It is harder to accidentally add one later use beyond the closing brace.
+
+## Function arguments are captured before the first poll
+
+There is a less obvious case. Async functions capture all their arguments into the returned future, including arguments that the source body never uses:
+
+```rust
+use std::rc::Rc;
+
+async fn ignores(_value: Rc<String>) {
+    std::future::ready(()).await;
+}
+
+fn require_send<T: Send>(_: T) {}
+
+fn main() {
+    let value = Rc::new(String::from("captured"));
+    require_send(ignores(value)); // does not compile
+}
+```
+
+Why? Calling an async function does not execute its body. The returned future must own the arguments so they remain available when polling eventually begins. Its initial state therefore contains the `Rc`.
+
+This is different from a local created and destroyed entirely during one poll. Even if an argument would be dropped before the first `.await`, it is already part of the unpolled future value.
+
+If the async operation only needs a derived `Send` value, compute it before constructing the future:
+
+```rust
+fn prepare(value: Rc<String>) -> usize {
+    value.len()
+}
+
+async fn run(prepared: usize) {
+    std::future::ready(()).await;
+    println!("{prepared}");
+}
+
+fn main() {
+    let value = Rc::new(String::from("captured"));
+    require_send(run(prepare(value)));
+}
+```
+
+Splitting synchronous preparation from async execution is often cleaner than changing `Rc` to `Arc` everywhere.
+
+## Guards are a common production cause
+
+Some guard types intentionally are not `Send`. Holding one across an await makes the future local to its current thread:
+
+```rust
+use std::sync::Mutex;
+
+async fn problematic(state: &Mutex<Vec<u64>>) {
+    let mut guard = state.lock().unwrap();
+    guard.push(1);
+
+    send_notification().await;
+
+    guard.push(2);
+}
+```
+
+There are two concerns here:
+
+1. the guard may make the future `!Send`;
+2. the lock remains held while unrelated async work is pending.
+
+Usually I copy or move the required data out, release the lock, and then await:
+
+```rust
+async fn better(state: &Mutex<Vec<u64>>) {
+    let count = {
+        let mut guard = state.lock().unwrap();
+        guard.push(1);
+        guard.len()
+    };
+
+    send_count(count).await;
+}
+```
+
+Even an async-aware mutex should not be held across network I/O without a deliberate consistency reason. "The guard is Send" and "the critical section is well designed" are different reviews.
+
+## Shared references translate `Sync` into `Send`
+
+Another diagnostic surprise comes from references. A shared reference `&T` is `Send` only when `T: Sync`.
+
+This makes sense: moving `&T` to another thread lets that thread access the same `T` concurrently. The underlying value must be safe for shared cross-thread access.
+
+For example, a future holding `&RefCell<T>` across await cannot be `Send`, because `RefCell<T>` is not `Sync`:
+
+```rust
+use std::cell::RefCell;
+
+async fn read_later(cell: &RefCell<u64>) -> u64 {
+    std::future::ready(()).await;
+    *cell.borrow()
+}
+```
+
+The compiler may mention that `RefCell<u64>` cannot be shared safely, even though the local field in the future is a reference. Follow the chain:
+
+```text
+future stores &RefCell<u64>
+&T is Send only if T is Sync
+RefCell<u64> is not Sync
+therefore the future is not Send
+```
+
+Error notes are easier to read when I reconstruct this chain.
+
+## `async move` changes ownership, not thread safety
+
+Adding `move` to an async block transfers captured values into the future:
+
+```rust
+let value = Rc::new(1);
+let future = async move {
+    println!("{value}");
+};
+```
+
+This may solve a lifetime error because the future no longer borrows the surrounding stack variable. It does not make `Rc` sendable. The future now owns a non-Send field more explicitly.
+
+`move` answers "who owns the capture?" `Send` answers "may the resulting value cross threads?" Do not use one as a synonym for the other.
+
+## `Arc` is sometimes right, not a compiler tax
+
+Replacing `Rc<T>` with `Arc<T>` can be correct when the data genuinely has shared cross-thread ownership:
+
+```rust
+use std::sync::Arc;
+
+async fn sendable(value: Arc<String>) {
+    std::future::ready(()).await;
+    println!("{value}");
+}
+```
+
+`Arc<T>` is `Send` and `Sync` only when the appropriate bounds on `T` hold. It adds atomic reference counting because the ownership model needs it.
+
+It is not the right fix when the value should remain thread-local, when a short scope can remove it before await, or when the real resource behind the wrapper is not thread-safe.
+
+Never write `unsafe impl Send` only to satisfy a spawn call. That is a claim about all possible safe uses of the type and requires a full unsafe proof.
+
+## Not every executor requires `Send`
+
+A single-threaded executor can poll `!Send` futures because they never move to another thread. Tokio provides `LocalSet` and `spawn_local` for this kind of task.
+
+This is useful for GUI state, `Rc`-based graphs, some embedded systems, and bindings to thread-affine libraries.
+
+Choosing local execution is an architectural decision:
+
+- the task must always run in the local context;
+- APIs called from it must not accidentally spawn onto the multithreaded pool;
+- blocking work can stall all local tasks;
+- shutdown and task ownership still need design.
+
+A `!Send` future is not defective when locality is intentional.
+
+## Public async traits need an explicit policy
+
+An `async fn` in a public trait does not automatically promise that implementations return `Send` futures:
+
+```rust
+pub trait Store {
+    async fn load(&self, key: &str) -> Vec<u8>;
+}
+```
+
+A downstream generic function cannot assume `store.load(key)` is spawnable on a multithreaded executor. The trait author must decide whether local implementations are allowed or whether returned futures require `Send`.
+
+This is not only syntax. Adding a `Send` requirement later can be a breaking change for implementations that borrow non-Send state.
+
+For public libraries, write the executor policy as part of the API contract and use the currently supported trait pattern that expresses it. For private traits awaited in place, a local future may be completely fine.
+
+## Read the diagnostic from the bottom upward
+
+A long error often has this structure:
+
+```text
+spawn requires Future + Send
+the async block's future is not Send
+because value X is used across an await
+because X contains or references Y
+and Y does not implement Send or Sync
+```
+
+Start with the lowest concrete type. Then locate:
+
+1. where it enters the future: argument, move capture, or local;
+2. which await keeps it alive;
+3. whether later code truly needs it;
+4. whether locality is intended.
+
+Adding a generic bound at the top before answering these questions often hides a better ownership boundary.
+
+## A compact review checklist
+
+When a future is unexpectedly `!Send`, I check:
+
+- all async-function arguments, even unused ones;
+- `Rc`, `RefCell`, raw pointers, and thread-affine handles;
+- shared references whose pointee is not `Sync`;
+- lock or borrow guards held across `.await`;
+- nested child futures with non-Send state;
+- async closures borrowing their captures;
+- trait methods that never promised a Send future;
+- whether the task needs multithreaded execution at all.
+
+Then I add a focused assertion:
+
+```rust
+fn assert_send<T: Send>(_: T) {}
+
+assert_send(the_specific_future());
+```
+
+This keeps the proof close to the abstraction that should provide it.
+
+## Fix the stored state, not the spawn call
+
+A Rust future is a value containing every capture and live-across-await local needed by its states. `Send` is derived from that stored structure.
+
+Do not fight the executor error at the executor. Find the non-Send field, find why it survives, and decide one of three valid outcomes:
+
+- end its lifetime before suspension;
+- replace it with a genuinely thread-safe ownership model;
+- keep the future on a local executor.
+
+Once this becomes a state-machine investigation, the error is much less magical.
+
+## Further reading
+
+- [Async blocks and their captures in the Rust Reference](https://doc.rust-lang.org/reference/expressions/block-expr.html#async-blocks)
+- [Async functions capture their parameters](https://doc.rust-lang.org/reference/items/functions.html#async-functions)
+- [`Send` in the standard library](https://doc.rust-lang.org/std/marker/trait.Send.html)
+- [Tokio spawning and `Send`](https://tokio.rs/tokio/tutorial/spawning#send-bound)

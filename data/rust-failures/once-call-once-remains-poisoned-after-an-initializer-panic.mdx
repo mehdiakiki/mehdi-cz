@@ -1,0 +1,83 @@
+---
+caseId: "RFA-688"
+title: "Once::call_once Remains Poisoned After an Initializer Panic"
+date: "2026-09-06T08:48:00+01:00"
+lastmod: "2026-09-06T08:48:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "596d9f042742b43991ab1b22ced5bace6b399ad4a54f2f62b366866791c057c9"
+area: "concurrency-memory"
+symptom: "After a call_once initializer panics, a later ordinary call_once panics again instead of running a replacement closure."
+summary: "Once records failed initialization as poison. call_once_force is the explicit recovery path and must rebuild a valid invariant before completion."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["targets supporting std threads"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust Once poisoned call_once panic", "retry poisoned Once initialization", "call_once_force is_poisoned"]
+evidence: ["Rust 1.98.1 caught initializer panic", "second call_once panics on poison", "call_once_force observes poison and completes"]
+sources: ["https://doc.rust-lang.org/std/sync/struct.Once.html#method.call_once", "https://doc.rust-lang.org/std/sync/struct.Once.html#method.call_once_force", "https://doc.rust-lang.org/std/sync/struct.OnceState.html#method.is_poisoned"]
+---
+
+If a closure passed to `Once::call_once` panics, the Once becomes poisoned. A later ordinary `call_once` also panics rather than silently retrying. The [failing fixture](/rust-failure-atlas/evidence/RFA-688/fail.rs) catches the first panic and then observes the poisoned second call.
+
+## Failed initialization is remembered
+
+[`Once::call_once`](https://doc.rust-lang.org/std/sync/struct.Once.html#method.call_once) synchronizes one successful execution. Poison records that an earlier attempt began but did not complete normally. The primitive cannot know whether external or unsafe state was left half-initialized.
+
+Automatically running another closure could build on that uncertain state. Re-panicking makes recovery a deliberate action.
+
+I do not catch the first panic merely to make startup appear healthy. I decide whether the component can be reconstructed or the process should fail.
+
+## call_once_force is explicit recovery
+
+[`call_once_force`](https://doc.rust-lang.org/std/sync/struct.Once.html#method.call_once_force) runs even when poisoned and passes a `OnceState` indicating that condition. If the recovery closure completes, the Once is considered complete and future calls do not run.
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-688/fixed.rs) observes poison, completes forced initialization, and proves a later ordinary call is skipped. In production, the force closure must replace or validate every state affected by the failed attempt.
+
+If it panics too, poison remains. Repeated recovery needs limits and diagnostics so startup does not loop invisibly.
+
+## Unsafe globals make this especially important
+
+Historically Once often guards initialization of static mutable memory or foreign libraries. If a panic happens after writing some fields but before publication completes, later readers must not assume the object is valid.
+
+Modern `OnceLock` and `LazyLock` can avoid much unsafe storage for value initialization. They provide references tied to a safe container. Once remains useful for one-time actions without a returned value or legacy integration.
+
+The action itself can still have partial external effects. Creating a directory, registering a signal handler, or calling a C library is not rolled back by poison.
+
+## Panic hooks still run when caught
+
+`catch_unwind` catches unwinding panics but the panic hook normally prints first. The fixture may therefore show messages even when the process later continues. Catching also works only for unwind-capable panic paths and unwind-safe boundaries.
+
+I use catch_unwind at carefully selected isolation boundaries, not as general error handling. Expected fallibility belongs in `Result`. Builds configured to abort on panic cannot recover this way.
+
+Foreign exceptions and unwinding across FFI require their own ABI rules. Once poisoning is not a universal exception boundary.
+
+## Completion synchronizes published effects
+
+A successful Once execution establishes synchronization so later completed calls can observe its effects according to the primitive contract. Those effects still must be written through a valid representation.
+
+I keep initializer dependencies acyclic and avoid blocking on work that itself waits for the Once. Reentrance and dependency cycles can deadlock.
+
+Long initializers make all waiting callers pay startup latency. Performing fallible preparation before entering a small publication step can simplify recovery, although only one caller must own that preparation.
+
+## Tests force both attempts
+
+Tests catch a first panic, assert the second ordinary call panics, force recovery, and assert later calls skip. They also verify the actual protected state, not only Once flags.
+
+Logging keeps the original failure and records whether forced recovery ran. A successful recovery should not erase evidence needed for incident diagnosis.
+
+## Recovery ownership must be singular
+
+`call_once_force` still serializes callers, so one recovery closure runs. Application code should not add a parallel manual recovery path beside it. Two repair mechanisms touching the same external state can conflict even though the Once itself remains synchronized. I place the complete repair behind one function and make all callers use the primitive's result.
+
+## My Once poison checklist
+
+- What state could the failed initializer have changed?
+- Should the process fail instead of attempting recovery?
+- Can forced initialization rebuild the complete invariant?
+- Are external effects idempotent or reversible?
+- Is OnceLock or LazyLock a safer value container?
+- Can panic actually unwind in this build and boundary?
+- Is the dependency graph free from cycles and reentrance?
+- Do tests validate state after force, not only control flow?
+
+The core principle is that once-only execution must distinguish never-started from started-and-failed. Once poison preserves that evidence. I use forced completion only when the recovery closure can honestly establish the full invariant.

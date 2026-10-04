@@ -1,0 +1,97 @@
+---
+caseId: "RFA-143"
+title: "Why Weak::upgrade Fails Inside Arc::new_cyclic"
+date: "2026-09-05T14:43:00+01:00"
+lastmod: "2026-09-05T14:43:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "626768ad8a49a68940d5e98ffac78c2ee15e8c56d2c5e19b17bcc3cff90b31a4"
+area: "concurrency-memory"
+symptom: "The Weak pointer provided to Arc::new_cyclic cannot be upgraded inside the construction closure and returns None until construction finishes."
+summary: "new_cyclic allocates first, passes a Weak handle into the closure, then writes the returned T and completes the strong Arc. Store the Weak self-reference during construction and upgrade only after the function returns."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["targets with atomic pointer-width support"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust Arc new_cyclic weak upgrade returns None", "cannot upgrade Weak inside new_cyclic closure", "Arc self reference construction weak pointer"]
+evidence: ["Rust 1.98.1 deterministic None upgrade", "pre-initialization Weak handle", "post-construction upgrade repair"]
+sources: ["https://doc.rust-lang.org/std/sync/struct.Arc.html#method.new_cyclic", "https://doc.rust-lang.org/std/sync/struct.Weak.html#method.upgrade"]
+---
+
+The [failing program](/rust-failure-atlas/evidence/RFA-143/fail.rs) calls `Arc::new_cyclic` and immediately tries to upgrade the `Weak<Node>` supplied to its closure. The upgrade returns `None`, and the fixture panics with an explicit message.
+
+The allocation exists at this point, but a fully constructed strong value does not.
+
+## new_cyclic has a deliberate construction order
+
+The [`Arc::new_cyclic` documentation](https://doc.rust-lang.org/std/sync/struct.Arc.html#method.new_cyclic) gives the order:
+
+1. allocate space for the reference-counted value;
+2. create a weak pointer to that allocation;
+3. call the user closure with the weak pointer;
+4. place the closure's returned `T` into the allocation;
+5. finish and return the strong `Arc<T>`.
+
+Inside step three, there is not yet an initialized `T` to access. Allowing `upgrade` to return a strong pointer would make it possible to dereference uninitialized or partially constructed data.
+
+The method therefore guarantees that upgrading inside the closure fails with `None`.
+
+## Store the weak relationship, not a strong self
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-143/fixed.rs) clones the provided weak pointer into the new `Node`. After `new_cyclic` returns, the stored pointer upgrades successfully and `Arc::ptr_eq` confirms that it reaches the same allocation.
+
+This models a self-reference without making the node own itself:
+
+```rust
+struct Node {
+    itself: Weak<Node>,
+}
+```
+
+A strong `Arc<Node>` stored inside the same `Node` would create a reference-count cycle. The strong count could never reach zero through ordinary drops, so the node and its resources would leak. A weak back-reference avoids that ownership cycle.
+
+The [`Weak::upgrade` documentation](https://doc.rust-lang.org/std/sync/struct.Weak.html#method.upgrade) returns `Option<Arc<T>>` because the strong value may not exist yet or may already have been dropped. Callers must handle both states.
+
+## Construction code cannot call self-dependent methods
+
+A common desire is calling a method on the new node from inside the closure. That method would require `&Node` or `Arc<Node>`, but the node is still being built.
+
+I separate initialization into two phases:
+
+```text
+construct fields and store Weak links
+return Arc from new_cyclic
+perform operations that require a complete self
+```
+
+If phase two can fail, I decide whether the partially configured object should be visible. A builder can perform fallible work before allocation, while a private post-construction function can complete registration before publishing the `Arc` to other components.
+
+I avoid a public object that says “constructed” while mandatory self-registration is still pending.
+
+## The weak handle is not evidence of readiness
+
+This case generalizes to other systems with reserved identities. Allocating an address, row ID, or actor handle is not the same as publishing initialized state at that identity.
+
+The weak pointer names an allocation but cannot prove that a live strong owner is available. `upgrade` is the readiness and liveness check at the time of use.
+
+After construction, an upgrade can later return `None` once the final strong owner drops. Code holding a weak parent pointer or registry reference must treat disappearance as normal unless a stronger lifecycle contract exists.
+
+## Panic during construction does not leave a value
+
+The `new_cyclic` documentation also states that if the closure panics, the panic propagates and the temporary weak pointer is dropped normally. The strong `Arc<T>` is never returned.
+
+I keep side effects inside the constructor limited because external registrations performed before a panic may still need cleanup. Memory ownership of the allocation is handled, but database rows, global registries, tasks, and files are separate concerns.
+
+As with other initialization code, I build fallible external prerequisites before publishing shared ownership when possible.
+
+## My debugging sequence
+
+When `upgrade` inside `new_cyclic` returns `None`, I do this:
+
+1. Mark the closure as pre-initialization, not as a method on a finished `Arc`.
+2. Clone and store the supplied `Weak<T>` without upgrading it.
+3. Return the complete `T` from the closure.
+4. Upgrade only after `new_cyclic` returns, while a strong owner remains.
+5. Keep back-references weak to avoid reference-count cycles.
+6. Design fallible post-construction work so incomplete objects are not published accidentally.
+
+The broad principle is that identity, allocation, initialization, and publication are separate moments. `Arc::new_cyclic` exposes this sequence safely. The temporary weak pointer lets the final value remember its own allocation, but it does not allow that value to exist before construction finishes.

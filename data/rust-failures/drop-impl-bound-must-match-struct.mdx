@@ -1,0 +1,92 @@
+---
+caseId: "RFA-126"
+title: "Why a Drop impl Cannot Add a Bound Missing From the Struct"
+date: "2026-09-05T12:26:00+01:00"
+lastmod: "2026-09-05T12:26:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "8a442e1c3afdb14e863c708c617ad6a5f8aa0acfe32ec1f01c9b0d93ce253203"
+area: "diagnostics-macros"
+symptom: "Rust reports E0367 because a Drop implementation requires T: Display while the generic structure itself accepts T without that bound."
+summary: "Drop is part of a type's contract for every legal instantiation. Its implementation cannot add a conditional generic bound that the type declaration did not require; align the type bound or redesign the cleanup boundary."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets"]
+profiles: ["check", "dev", "release", "test"]
+searchTerms: ["Rust E0367 Drop impl requires bound struct does not", "Drop implementation bound not on struct Rust", "Rust conditional Drop generic type"]
+evidence: ["Rust 1.98.1 E0367 compile failure", "generic destructor contract", "type-level Display bound repair"]
+sources: ["https://doc.rust-lang.org/error_codes/E0367.html", "https://doc.rust-lang.org/std/ops/trait.Drop.html"]
+---
+
+I meet this error when a generic type looks broad at its declaration but its destructor wants a narrower capability. The [failing program](/rust-failure-atlas/evidence/RFA-126/fail.rs) declares `Wrapper<T>`, then implements `Drop` only when `T: Display`. Rust rejects the implementation with E0367.
+
+At first, conditional cleanup can sound reasonable: if the inner value implements `Display`, print it during destruction. The problem is that `Wrapper<NotDisplay>` remains a perfectly legal type. Rust must still know what happens when such a value reaches the end of its lifetime.
+
+## Drop belongs to every value of the type
+
+The [E0367 explanation](https://doc.rust-lang.org/error_codes/E0367.html) gives the central rule: a `Drop` implementation cannot require a bound that is absent from the structure definition. The compiler does not select between multiple destructors at runtime or decide that some instantiations simply have no cleanup.
+
+I find it useful to read these two declarations as contracts:
+
+```rust
+struct Wrapper<T>(T);              // Wrapper is valid for every T
+impl<T: Display> Drop for Wrapper<T> { /* ... */ }
+                                      // cleanup only exists for some T
+```
+
+Those contracts disagree. Destruction is not an optional extension method. It is part of the lifecycle of the type.
+
+The [`Drop` documentation](https://doc.rust-lang.org/std/ops/trait.Drop.html) also explains that Rust calls `drop` automatically when a value goes out of scope. Users do not choose which implementation should run. There can only be one `Drop` implementation for the type.
+
+## The direct repair changes the type contract
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-126/fixed.rs) puts `T: Display` on `Wrapper` itself:
+
+```rust
+struct Wrapper<T: Display>(T);
+```
+
+Now every value that can be constructed satisfies what its destructor needs. The implementation and the type declaration tell the same story, so rustc accepts them.
+
+This repair is correct only if displaying during cleanup is truly essential to the abstraction. It makes the bound visible throughout the API. Every function mentioning `Wrapper<T>` may need to carry the same constraint, and callers can no longer use the wrapper with a non-`Display` value.
+
+I do not add the bound automatically just to silence E0367. I first ask whether the destructor should require this operation at all.
+
+## Often the cleanup behaviour belongs elsewhere
+
+Formatting is a good example because it is not normally a resource invariant. A log line can fail to happen, logging during shutdown can be undesirable, and `Display` says nothing about releasing a resource safely.
+
+When the extra behaviour is optional, I move it into an explicit method available under a bounded implementation:
+
+```rust
+impl<T: Display> Wrapper<T> {
+    fn report(&self) {
+        println!("{}", self.0);
+    }
+}
+```
+
+The wrapper can remain generic over every `T`, while only callers with a displayable value can request reporting. The ordinary destructor then performs only cleanup valid for every `T`.
+
+For real resource types, I separate mandatory release from optional finalization. `Drop` may close a handle or restore an invariant, while an explicit `finish(self) -> Result<_, _>` can report errors. A destructor cannot return a `Result`, so important fallible work should not exist only there.
+
+## Bounds on Drop are not specialization
+
+Another common interpretation is that the bounded implementation should behave like specialization: use a richer destructor for types with a trait and a basic destructor for other types. Stable Rust does not treat two possible `Drop` behaviours this way. Overlapping lifecycle semantics would make generic code difficult to reason about and would interact badly with drop checking.
+
+If I need two different ownership behaviours, I represent two different types. A `ReportedWrapper<T: Display>` and a plain `Wrapper<T>` make the distinction visible. An enum can also model two modes when they must travel through one API.
+
+This can feel more verbose, but it prevents a hidden type-level branch during destruction.
+
+## Why the diagnostic points at the implementation
+
+E0367 points to the bound on the `Drop` implementation and mentions that the implementor must specify the same requirement. It is easy to read this as a syntax limitation. I read it instead as a mismatch between the set of constructible values and the set of destructible values.
+
+My debugging sequence is:
+
+1. Compare all bounds on the structure with those on its `Drop` implementation.
+2. Decide whether the bound is a real invariant of every value.
+3. If yes, place it on the type and accept the public API consequence.
+4. If no, move the bounded behaviour to an explicit method or another wrapper.
+5. Keep mandatory destructor work valid for every legal instantiation.
+
+The wider principle goes beyond this one error: generic parameters describe the population of values a type permits. Cleanup must work for that complete population. When only some values support an operation, I make that operation conditional—not the existence of their destructor.

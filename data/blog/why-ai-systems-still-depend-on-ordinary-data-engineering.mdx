@@ -1,0 +1,237 @@
+---
+title: "Why AI Systems Still Depend on Ordinary Data Engineering"
+date: "2026-09-05T09:00:00+01:00"
+tags: ["ai", "data engineering", "software architecture", "reliability", "startups"]
+draft: false
+reviewed: true
+reviewedHash: "dd5c9a338d108d47bdbe05364c7ef96927a740f8af089cf0bbf1466ef0ae580f"
+cluster: "reliable-ai-systems"
+campaign: "authority-2026"
+opportunity: "AI-023"
+summary: "A system-boundary model showing why useful AI products still depend on identity, freshness, permissions, schemas, replay, and observable data flows."
+---
+
+When an AI feature gives a wrong answer, people often look first at the model or the prompt. While building data-heavy products and AI-enabled workflows, I have found that the problem is frequently somewhere more ordinary.
+
+The document was old. Two records referred to the same customer with different IDs. A deleted permission was still present in the search index. A background job stopped halfway. The answer looked fluent because the model did not know that the data path was broken.
+
+This is why I treat an AI product as a data system with a probabilistic component inside it. The model matters, but it cannot repair missing identity, unclear ownership, silent partial failure, or data that arrived three hours too late.
+
+This article gives the boundary model I use. It is deliberately independent of one provider or framework.
+
+## The model is only one box
+
+A useful AI workflow normally has a path like this:
+
+```text
+source systems
+    ↓
+capture and checkpoints
+    ↓
+identity and normalization
+    ↓
+product state / document store
+    ↓
+retrieval or tool input
+    ↓
+model
+    ↓
+validation and policy
+    ↓
+user-visible answer or external action
+    ↓
+trace, feedback, and evaluation
+```
+
+The visible response comes from the model, so it receives most of the attention. But every box above it can change the meaning of its input. Every box below it can turn a plausible suggestion into a real side effect.
+
+I start by writing the contract of every boundary. A contract says:
+
+- who owns the data;
+- how identity is represented;
+- how fresh it must be;
+- which schema version it follows;
+- which user may see it;
+- how failure becomes visible;
+- whether the operation can be replayed.
+
+If I cannot answer these questions, prompt tuning is premature.
+
+## Freshness is a product requirement
+
+"Use current data" is not precise enough. Current for an incident dashboard may mean ten seconds. Current for a company handbook may mean one day. Current for an invoice may mean the latest committed transaction.
+
+I prefer to make freshness measurable:
+
+```text
+observed_at  = when the source said the fact was true
+captured_at  = when our system received it
+indexed_at   = when retrieval could return it
+answered_at  = when the user received the response
+```
+
+These timestamps describe different delays. If a record was observed at 09:00 but indexed at 12:00, a fast model at 12:01 still answers from data that travelled for three hours.
+
+A useful service-level objective might be:
+
+```text
+99% of accepted source changes become retrievable within 5 minutes.
+```
+
+That is better than saying the index is "near real time." It can be monitored, tested, and connected to user impact.
+
+## Identity comes before embeddings
+
+Suppose a CRM calls a company `org_42`, a billing platform calls it `cus_981`, and the product database uses a UUID. Embeddings cannot decide that these three values represent the same organization. That relationship belongs in an explicit identity model.
+
+I normally keep a mapping close to this:
+
+```text
+(tenant, provider, object_type, external_id)
+    → internal_id
+```
+
+The tenant and provider are part of the key. External IDs are rarely globally unique, and test accounts often reuse values that also exist in production.
+
+Without a stable mapping, retrieval can duplicate documents, attach facts to the wrong entity, or keep an old document after its source record was deleted. A semantic search index is still an index; it needs keys with defined meaning.
+
+The important part is to keep this relationship explicit and test its race conditions. An embedding is not an identity constraint.
+
+## Normalization can lose meaning
+
+Teams often create one clean internal schema and translate every provider into it. This is useful until the translation hides a difference the product later needs.
+
+Imagine two ticket systems:
+
+- provider A has `closed`, which is final;
+- provider B has `resolved`, which a customer can reopen;
+- our internal model maps both to `done`.
+
+The model receives a simple status, but the simplification removed a real behavioural difference. If it tells a support agent that no further action is possible, the text is wrong because the data contract was lossy.
+
+I keep a small lossiness ledger during integration work:
+
+| Internal field | Source meanings combined | Information lost | Safe for |
+|---|---|---|---|
+| `done` | closed, resolved | reopen capability | reporting only |
+| `owner_id` | user, team, queue | owner kind | display, not routing |
+
+This makes the compromise reviewable. It also tells retrieval code which claims it cannot safely derive.
+
+## A document needs provenance
+
+Text alone is not enough for a reliable retrieval system. I want every indexed unit to carry the information needed to explain and remove it:
+
+```typescript
+type IndexedDocument = {
+  documentId: string
+  sourceSystem: string
+  sourceObjectId: string
+  sourceVersion: string
+  observedAt: string
+  indexedAt: string
+  tenantId: string
+  visibility: string[]
+  contentHash: string
+  text: string
+}
+```
+
+`contentHash` can prevent unnecessary re-embedding. `sourceVersion` helps reject an older update that arrives late. `visibility` gives retrieval a filter that can be enforced before content reaches the model.
+
+Provenance also changes how I debug. I can move from a sentence in an answer to the retrieved chunk, then to the indexed version, then to the source record and the capture attempt. Without this chain, "the AI hallucinated" becomes a bucket for failures we did not instrument.
+
+## Permissions must travel with the data
+
+An internal assistant can become a new path around existing access controls. The user may not have access to a salary document, an incident report, or another customer's ticket even if a service account used for indexing can read it.
+
+I do not rely on the model to obey a sentence like "do not reveal confidential documents." The retrieval query must enforce the caller's authorized scope. Tool calls must receive a constrained identity or a server-side policy decision. Logs and evaluation datasets need the same care.
+
+The important separation is:
+
+```text
+model proposes an action
+policy decides whether this user may perform it
+application executes the approved action
+```
+
+The model is not the authorization server.
+
+## Deletion is part of synchronization
+
+Insert-only pipelines are attractive because they are easy to demo. They are dangerous when documents can be corrected, revoked, or deleted.
+
+For every source, I ask:
+
+- Does the API emit deletion events?
+- Can a full listing reveal that an object disappeared?
+- How is a soft delete represented?
+- How quickly must revoked content leave retrieval?
+- Can an old retry recreate a deleted document?
+
+A tombstone normally needs a version or source timestamp. Otherwise an earlier create event arriving after the delete may bring the record back.
+
+This is the same distributed-systems problem described in [Tombstones: Deleting Data Across Systems](/blog/tombstones-deleting-across-systems). Adding a vector database does not remove it.
+
+## Replay should be designed before the demo
+
+Data pipelines fail between steps. A worker may update the relational record and crash before updating the search index. An embedding request may time out after the provider accepted it. A queue may redeliver a message whose first attempt completed.
+
+I make each stage safe to repeat:
+
+```text
+source version + transformation version + destination
+    → deterministic operation key
+```
+
+The destination write then becomes an upsert guarded by version, or the worker records completion in a durable ledger. This is not magical exactly-once execution. It is an explicit way to make repeated execution converge.
+
+When two stores must change, I avoid pretending they are one transaction. I record enough state to reconcile them. The [outbox pattern](/blog/outbox-pattern) and [cross-system reconciliation](/blog/reconciliation-cross-system-sync) are useful building blocks.
+
+## An incident walkthrough
+
+Consider a product assistant that gives the wrong price for a customer plan.
+
+The first investigation should not be "try another model." I trace the fact:
+
+1. Which source record contains the price?
+2. Which source version did we capture?
+3. Was the customer mapped to the correct internal organization?
+4. Which normalized field was produced?
+5. Which document version was indexed?
+6. Did retrieval filter by tenant and active plan?
+7. Which chunks reached the model?
+8. Did output validation detect a price without an authoritative citation?
+
+This path creates specific failure classes. Perhaps polling stopped after an invalid cursor. Perhaps two plan IDs were merged. Perhaps the retriever returned an archived document because deletion did not propagate.
+
+Once the failed boundary is known, the fix can be tested. Changing a prompt without that evidence may only hide the symptom.
+
+## The tests I want before production
+
+For the data path, I use deterministic tests:
+
+- the same source version produces the same normalized record;
+- an older event cannot replace a newer version;
+- a retry does not create a second document;
+- a deletion removes or tombstones every derived representation;
+- a user cannot retrieve a document outside their permission set;
+- a full reconciliation repairs a deliberately missed event;
+- schema changes fail visibly instead of silently dropping fields.
+
+For the AI behaviour, I add evaluations over the complete workflow: retrieval, tool calls, final state, latency, and cost. Anthropic's current [guide to agent evaluations](https://www.anthropic.com/engineering/demystifying-evals-for-ai-agents) makes a useful distinction between the trace of actions and the final outcome. I use both. A correct sentence reached through an unauthorized tool call is still a failed run.
+
+## My practical rule
+
+Before I improve a model, I check four things:
+
+1. Did the right data arrive?
+2. Does it still mean what the source meant?
+3. Is this user allowed to use it?
+4. Can I explain and replay the path that produced it?
+
+If any answer is unclear, I work on the data system first.
+
+This approach is less fashionable than a new prompt technique. It is also what makes the AI feature dependable after the first demo.
+
+This view is supported by research that treats data preparation, quality, and infrastructure as a distinct part of AI engineering. A useful overview is the CAIN 2024 mapping study, [What About the Data?](https://doi.org/10.1145/3644815.3644954).

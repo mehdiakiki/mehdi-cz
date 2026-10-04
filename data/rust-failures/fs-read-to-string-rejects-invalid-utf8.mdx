@@ -1,0 +1,74 @@
+---
+caseId: "RFA-345"
+title: "fs::read_to_string Rejects Invalid UTF-8"
+date: "2026-09-06T02:05:00+01:00"
+lastmod: "2026-09-06T02:05:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "22366b483e5f2603e8facab300c77258c8cefde73575398d017b8b893b382cd7"
+area: "ffi-targets"
+symptom: "A file exists and can be read as bytes, but fs::read_to_string returns an I/O error because one byte is not valid UTF-8."
+summary: "A file is a byte source, while String requires valid UTF-8. read_to_string combines I/O and text validation; binary, unknown, and legacy-encoded inputs need an explicit byte-to-text policy."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust fs read_to_string invalid UTF-8", "file valid bytes but read_to_string fails", "Rust read file lossy UTF-8"]
+evidence: ["Rust 1.98.1 temporary file", "ASCII prefix followed by byte FF", "byte read and explicit lossy conversion"]
+sources: ["https://doc.rust-lang.org/std/fs/fn.read_to_string.html", "https://doc.rust-lang.org/std/fs/fn.read.html", "https://doc.rust-lang.org/std/string/struct.String.html#method.from_utf8_lossy"]
+---
+
+I once diagnosed a file import as a permission problem because `read_to_string` returned an `io::Error`. The file opened correctly. Its bytes were valid for the producer's format, but one byte was not valid UTF-8, so it could not become a Rust `String`.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-345/fail.rs) writes `o`, `k`, and byte `0xff` to a temporary file. `fs::read_to_string` rejects it even though the operating system stored and returned all three bytes.
+
+## A file does not have an automatic text type
+
+At the filesystem boundary, contents are bytes. A format, protocol, or application convention gives those bytes an encoding. File extensions and human expectations do not enforce that encoding.
+
+A Rust `String` has a stronger invariant: its bytes are valid UTF-8. [`fs::read_to_string`](https://doc.rust-lang.org/std/fs/fn.read_to_string.html) combines opening the file, reading all contents, and validating that invariant. Its documentation explicitly lists invalid UTF-8 as an error.
+
+The operation failed during conversion to text, not necessarily during storage I/O. Logging only “could not read file” hides the useful distinction.
+
+## Start with bytes when the encoding is uncertain
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-345/fixed.rs) calls [`fs::read`](https://doc.rust-lang.org/std/fs/fn.read.html). It receives the exact bytes `[111, 107, 255]` and can now apply a policy appropriate to the format.
+
+For binary formats I keep `Vec<u8>` and parse fields as bytes. For a required UTF-8 format I validate strictly and report the byte offset. For user-facing display where replacement is acceptable, I may use [`String::from_utf8_lossy`](https://doc.rust-lang.org/std/string/struct.String.html#method.from_utf8_lossy), which replaces invalid sequences with U+FFFD.
+
+These choices are not interchangeable. Lossy conversion is useful for logs and previews but can corrupt identifiers, signatures, source code, or data that must round-trip.
+
+## Error types can contain two layers of meaning
+
+`read_to_string` returns `io::Result<String>` because reading into a string is an I/O operation whose contract includes valid UTF-8. The error category may carry an invalid-data kind, but application messages should preserve the context: which path, which operation, and whether decoding failed.
+
+When I need a precise validation boundary, I often call `fs::read`, then `String::from_utf8`. That separates filesystem errors from `FromUtf8Error` and preserves the original bytes for diagnosis or another decoder.
+
+This is especially helpful in import pipelines where I want different metrics for missing files, denied access, truncated reads, invalid encoding, and invalid business syntax.
+
+## Lossy decoding must be a declared product decision
+
+Replacement characters make output printable, but they also merge many different invalid byte sequences into the same visible character. If the result is used as a database key, two distinct inputs may become indistinguishable.
+
+I keep the raw bytes when audit or retry matters. A UI preview can show a lossy string alongside a warning. A strict API can reject the input with a safe offset and expected encoding. A legacy format can use a decoder for its specified character set.
+
+“Make it a String somehow” is not an encoding strategy.
+
+## Chunked reading adds incomplete sequences
+
+Even a fully valid UTF-8 file can end one read chunk in the middle of a multi-byte character. A streaming decoder must retain that incomplete suffix and combine it with the next chunk. Validating each arbitrary chunk independently can reject valid content.
+
+`fs::read_to_string` reads the complete file and handles whole-input validation, so this particular boundary disappears. Once I build incremental processing for memory or latency, I need an explicit decoder state. The Atlas UTF-8 remainder case covers the `Utf8Error` distinction in detail.
+
+## Tests should use bytes that cannot be accidental text
+
+Plain ASCII passes every UTF-8 check, so it cannot test the error branch. My fixture uses `0xff`, which is never valid by itself in UTF-8. It removes the temporary file before asserting so a deliberate panic does not leave test debris.
+
+In a real importer I test valid ASCII, valid multi-byte text, an invalid leading byte, an invalid continuation, a truncated sequence, an empty file, and a file whose declared encoding differs from its bytes. If lossy conversion is supported, I assert exact replacement positions.
+
+I also test binary zero. A NUL byte is valid UTF-8, although another consumer such as a C API may reject it for a different reason.
+
+## The core principle is boundary refinement
+
+Moving from a file to bytes is I/O. Moving from bytes to `String` is validation. Moving from text to a domain object is parsing. Combining them is convenient only when all three failure modes deserve the same policy.
+
+Rust's `String` invariant prevents invalid text from leaking deeper into safe string operations. I keep that advantage by making encoding policy explicit at the boundary, not by assuming every readable file is UTF-8 text.

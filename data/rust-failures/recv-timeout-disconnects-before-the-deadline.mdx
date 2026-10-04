@@ -1,0 +1,76 @@
+---
+caseId: "RFA-344"
+title: "recv_timeout Reports Disconnect Before the Deadline"
+date: "2026-09-06T02:04:00+01:00"
+lastmod: "2026-09-06T02:04:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "9bf61d7f693027dc897e7dc5a55efc7a69fb30a60a20c6f7d23ab736fede8335"
+area: "concurrency-memory"
+symptom: "Receiver::recv_timeout returns Disconnected immediately instead of waiting for the requested timeout."
+summary: "A receive deadline bounds waiting for a message only while delivery remains possible. Once every sender is dropped and buffered values are exhausted, disconnection is already known and must be handled separately from timeout."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust recv_timeout returns Disconnected immediately", "mpsc timeout vs disconnected", "Receiver recv_timeout sender dropped"]
+evidence: ["Rust 1.98.1 standard mpsc channel", "all senders dropped before receive", "live empty channel zero timeout contrast"]
+sources: ["https://doc.rust-lang.org/std/sync/mpsc/struct.Receiver.html#method.recv_timeout", "https://doc.rust-lang.org/std/sync/mpsc/enum.RecvTimeoutError.html", "https://doc.rust-lang.org/std/sync/mpsc/struct.Receiver.html#method.recv"]
+---
+
+I once treated `recv_timeout(one_minute)` as a small timer inside a worker loop. During shutdown it returned at once, and the loop spun quickly because I classified every error as an elapsed minute. The deadline was not broken; the channel was disconnected.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-344/fail.rs) drops the only sender, then asks the receiver to wait for sixty seconds. It immediately receives `RecvTimeoutError::Disconnected`.
+
+## A timeout only matters while waiting can help
+
+[`Receiver::recv_timeout`](https://doc.rust-lang.org/std/sync/mpsc/struct.Receiver.html#method.recv_timeout) waits for a message for at most the supplied duration. There are two reasons it can return without a value: the deadline expires, or the sending side disconnects.
+
+When all senders have been dropped and the channel has no buffered messages, no future send is possible. Sleeping until the deadline cannot change the answer. The receiver already knows that the stream of messages has ended.
+
+The duration is therefore an upper bound on blocking, not a promise to block for exactly that long.
+
+## Timeout and disconnection mean different things
+
+[`RecvTimeoutError`](https://doc.rust-lang.org/std/sync/mpsc/enum.RecvTimeoutError.html) keeps the states distinct. `Timeout` means the channel is still connected but no message arrived before the wait ended. A later receive may succeed.
+
+`Disconnected` means all sending halves are gone. Buffered messages, if any, can still be delivered first; after they are drained, another value cannot arrive through this channel.
+
+Retrying these two states identically loses useful lifecycle information. A timeout may trigger periodic housekeeping. A disconnect normally triggers shutdown, supervisor notification, or an explicit decision to construct a new channel.
+
+## Match the variants before looping
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-344/fixed.rs) proves both states. A dropped sender produces `Disconnected`, while a still-live empty channel with a zero duration produces `Timeout`.
+
+In a worker I match `Ok(job)`, `Err(Timeout)`, and `Err(Disconnected)` separately. The timeout branch may update metrics or check a cancellation flag. The disconnect branch exits the loop unless the architecture has a documented reconnection owner.
+
+I avoid `while let Ok(job) = recv_timeout(...)` when I need to distinguish why it stopped. Concise control flow should not erase the operational contract.
+
+## Sender ownership defines service lifetime
+
+Unexpected disconnection often means a sender was dropped earlier than intended. Cloned senders count too: the receiver remains connected while at least one clone exists.
+
+Conversely, keeping an unused sender clone in a coordinator can prevent a receiver from ever observing shutdown. I make channel ownership visible in structs and drop the final sender deliberately. A channel is not only a queue; its endpoints encode part of the component lifecycle.
+
+When debugging, I first inventory every sender clone, who owns it, and when it is dropped. Increasing the receive timeout does not repair ownership.
+
+## Buffered values come before final disconnection
+
+Dropping senders does not delete messages already sent. `recv` and `recv_timeout` can still return buffered values, and only afterwards return a disconnection error.
+
+This allows a graceful drain pattern: stop producers, drop their endpoints, process remaining jobs, then finish when the receiver reports disconnection. But it also means that “a producer exited” and “the queue is fully drained” are separate moments.
+
+I test both an empty disconnect and a disconnect with several queued messages. Otherwise shutdown logic can accidentally abandon work or wait for work that can never exist.
+
+## Do not test this with elapsed-time precision
+
+The important contract is the returned variant, not whether “immediate” means one microsecond or ten milliseconds on a busy machine. Timing thresholds create flaky tests and add no semantic proof.
+
+The fixture uses a very long duration so `Timeout` would clearly be the wrong outcome, but it does not assert wall-clock speed. Channel state deterministically selects `Disconnected`.
+
+For real timeout behavior I use controlled clocks where available or generous bounds, and I keep those scheduling tests separate from the pure disconnection case.
+
+## The wider principle is impossibility beats a deadline
+
+Many blocking APIs wake early when success becomes impossible: a closed socket, a cancelled context, a terminated process, or a disconnected channel. A deadline limits uncertainty; it does not suppress definitive state changes.
+
+I treat timeout, cancellation, closure, and failure as separate protocol states even when they all interrupt a wait. That makes retry policy, logs, metrics, and shutdown behavior match reality. In Rust, `RecvTimeoutError` already gives the distinction; the application only has to preserve it.

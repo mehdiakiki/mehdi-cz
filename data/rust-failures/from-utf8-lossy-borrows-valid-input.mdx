@@ -1,0 +1,72 @@
+---
+caseId: "RFA-239"
+title: "String::from_utf8_lossy Borrows Valid Input but Allocates for Repairs"
+date: "2026-09-06T00:19:00+01:00"
+lastmod: "2026-09-06T00:19:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "e9ab247b83dbd6069d11fe437354250c12ffc6627e263fcb23d5f35a0f6a97dc"
+area: "ffi-targets"
+symptom: "String::from_utf8_lossy returns Cow::Borrowed for valid bytes although caller code expected an owned String."
+summary: "Lossy UTF-8 decoding returns Cow so valid input can remain borrowed and only invalid input needs replacement allocation. Keep Cow through read-only stages or call into_owned at the lifetime boundary deliberately."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets with alloc"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust from_utf8_lossy Cow Borrowed valid input", "does from_utf8_lossy allocate", "convert Cow str into owned String Rust"]
+evidence: ["Rust 1.98.1 valid and invalid byte slices", "Cow variant comparison", "explicit ownership repair"]
+sources: ["https://doc.rust-lang.org/std/string/struct.String.html#method.from_utf8_lossy", "https://doc.rust-lang.org/std/borrow/enum.Cow.html", "https://doc.rust-lang.org/std/borrow/enum.Cow.html#method.into_owned"]
+---
+
+I saw the name `String::from_utf8_lossy` and assumed it returned a new `String`. The actual return type is `Cow<'a, str>`. For completely valid UTF-8, it can borrow the input without allocating.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-239/fail.rs) decodes valid bytes and expects `Cow::Owned`. Rust returns `Cow::Borrowed`.
+
+## Repair is conditional, so ownership is conditional
+
+[`String::from_utf8_lossy`](https://doc.rust-lang.org/std/string/struct.String.html#method.from_utf8_lossy) replaces invalid UTF-8 sequences with the replacement character. If no replacement is necessary, the original byte slice is already a valid `str`, and the function can return a borrowed view.
+
+When invalid bytes exist, output length or contents change and the function creates an owned `String`. [`Cow`](https://doc.rust-lang.org/std/borrow/enum.Cow.html) represents these two paths behind one read-only string-like interface.
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-239/fixed.rs) asserts both variants: borrowed for valid input and owned for bytes containing `0xff`.
+
+## Most read-only code should not care about the variant
+
+`Cow<str>` dereferences to `str`, so formatting, searching, comparison, and parsing can operate without matching on ownership. Keeping the `Cow` through these stages preserves the no-allocation path.
+
+Code that immediately calls `.to_string()` allocates even for valid input and discards the optimization. That can be acceptable at a storage boundary, but I do it because ownership is required, not because the type looks inconvenient.
+
+[`Cow::into_owned`](https://doc.rust-lang.org/std/borrow/enum.Cow.html#method.into_owned) moves out an existing owned value or clones borrowed data. It clearly marks the lifetime boundary where a `String` becomes necessary.
+
+## The borrowed result cannot outlive the bytes
+
+The lifetime on `Cow<'a, str>` remains tied to the input slice when the borrowed branch is possible. A function cannot return that value after dropping a local byte vector unless it converts to owned form first.
+
+This sometimes makes a developer force allocation near the decoder. Another design is to keep the input buffer owned by a larger request or record object and let decoded views borrow during processing.
+
+I choose based on lifecycle clarity. Saving one allocation is not worth a confusing ownership graph, but allocating at every step can be expensive in log ingestion or protocol parsing.
+
+## Lossy output is not reversible
+
+Different invalid byte sequences can produce the same replacement character. Once converted lossily, the original bytes cannot be reconstructed from the text.
+
+For diagnostics shown to a human, that tradeoff is often correct. For signatures, identifiers, database keys, paths, or a protocol requiring valid UTF-8, lossy conversion can merge distinct inputs and hide corruption.
+
+I keep original bytes when evidence or exact identity matters. Strict decoding with `str::from_utf8` or `String::from_utf8` returns an error containing the failure position rather than changing data.
+
+## Variant-dependent allocation affects measurement
+
+A benchmark using only ASCII input can conclude that lossy decoding allocates nothing. Production input with occasional invalid bytes takes the owned path and copies valid regions around replacements.
+
+I measure the input distribution and include valid, early-invalid, late-invalid, and repeated-invalid samples. If the output must become owned anyway, I benchmark the complete pipeline rather than only the decoding call.
+
+Matching on `Cow::Owned` as a proxy for “input was invalid” works for this particular API contract, but I prefer explicit validation when that fact drives security or metrics. Ownership is primarily a storage detail.
+
+## My regression tests content and ownership separately
+
+The fixture checks the `Cow` variant and the decoded replacement text. An equality assertion alone cannot reveal allocation because borrowed and owned cows with the same text compare equal.
+
+Application tests add empty input, multibyte valid characters, truncated sequences, adjacent invalid bytes, and a lifetime boundary requiring `into_owned`. I also assert whether original bytes are retained when diagnostics need them.
+
+When this function appears in a public API, returning `Cow` exposes the allocation choice but also a lifetime. Returning `String` offers simpler ownership with a possible copy. I select the signature from caller lifetimes and measured traffic, then avoid changing it casually because ownership is part of the API contract.
+
+The core principle is that fallbacks often make cost conditional. `from_utf8_lossy` borrows the fast valid path and owns repaired output. I keep that flexibility through read-only processing, cross into ownership deliberately, and never confuse readable replacement text with preservation of the original data.

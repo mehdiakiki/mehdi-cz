@@ -1,0 +1,92 @@
+---
+caseId: "RFA-226"
+title: "Rust mpsc Sender::send Returning Ok Does Not Mean Processed"
+date: "2026-09-06T00:06:00+01:00"
+lastmod: "2026-09-06T00:06:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "67c8b0857f0b4ce0cd94648bc8c7d77fb95afb9bd5f0e94e68d2cc31c898d17f"
+area: "concurrency-memory"
+symptom: "Sender::send returns Ok, but the receiver is dropped with the queued job still unprocessed."
+summary: "A successful asynchronous mpsc send proves that the receiver had not disconnected at the send decision. It is not an application acknowledgement; use an explicit reply, durable protocol, or completion state when processing matters."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets with std threads"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust mpsc send Ok message not received",
+    "Sender send success not processed Rust",
+    "Rust channel application acknowledgement",
+  ]
+evidence: ["Rust 1.98.1 asynchronous channel", "successful enqueue before receiver drop", "explicit receive-and-process repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/std/sync/mpsc/struct.Sender.html#method.send",
+    "https://doc.rust-lang.org/std/sync/mpsc/fn.channel.html",
+    "https://doc.rust-lang.org/std/sync/mpsc/struct.SyncSender.html#method.send",
+  ]
+---
+
+I have seen code return success to a caller immediately after `sender.send(job)` returned `Ok(())`. The worker had not completed the job. In fact, it had not even received it yet.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-226/fail.rs) sends a job successfully and then drops the receiver. The job's `processed` flag remains false. Send success and processing success are different events.
+
+## Ok means the receiver was connected at the send decision
+
+[`Sender::send`](https://doc.rust-lang.org/std/sync/mpsc/struct.Sender.html#method.send) is unusually direct about this: `Err` means the value will never be received, but `Ok` does not mean it will be received. The receiver can disconnect immediately after the call succeeds.
+
+The asynchronous [`mpsc::channel`](https://doc.rust-lang.org/std/sync/mpsc/fn.channel.html) has a conceptual unbounded buffer, and sends do not wait for processing. An accepted value can remain queued while the consumer exits, panics, or is dropped.
+
+So the evidence provided by `Ok` is limited. The channel accepted ownership under its connection rules. No business action has been proven.
+
+## Delivery and processing are separate protocol states
+
+I name the states because one word, “sent,” is too vague:
+
+```text
+created -> accepted by channel -> received -> processing -> committed
+```
+
+An application may also need `acknowledged`, `failed`, `retrying`, or `compensated`. A standard in-memory channel does not persist or expose all these states.
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-226/fixed.rs) keeps the example small: the receiver obtains the job and marks it processed. In a threaded service, the producer would need an explicit reply channel or another completion mechanism if it must wait for that fact.
+
+## A reply must acknowledge the right boundary
+
+Even an acknowledgement can be placed too early. A worker might reply after parsing but before writing to a database. A crash then leaves the producer believing the operation completed.
+
+I define the commit point first. If the promise is “stored durably,” the acknowledgement follows the durable write. If the promise is “accepted for best-effort background work,” channel acceptance might be enough, but the API response must say that honestly.
+
+For side effects such as sending email or charging money, retries introduce duplicate execution. An acknowledgement protocol needs stable operation IDs and idempotency or deduplication at the side-effect boundary.
+
+## A synchronous channel changes less than it seems
+
+[`SyncSender::send`](https://doc.rust-lang.org/std/sync/mpsc/struct.SyncSender.html#method.send) can block until buffer space exists. With a buffer larger than zero, success still does not guarantee that the receiver saw the value.
+
+A zero-capacity rendezvous channel guarantees that a receiver received the value when send succeeds. It still does not prove the receiver completed application processing after receipt.
+
+Backpressure, handoff, and completion are three separate properties. Switching channel types can improve capacity control without creating business acknowledgement.
+
+## Shutdown is where the hidden assumption appears
+
+During normal operation the worker is fast, so send and processing happen close together. Shutdown widens the gap. A coordinator stops accepting work, producers still enqueue, or the receiver disappears before draining.
+
+I design shutdown order explicitly:
+
+1. stop admitting new work;
+2. drop or close producer capabilities;
+3. let the receiver drain according to policy;
+4. wait for worker completion;
+5. record or return unfinished work.
+
+An abrupt process termination can still lose in-memory messages. Work that must survive a process crash needs durable storage or an external broker with a stated acknowledgement model.
+
+## My tests force the gap instead of racing it
+
+A test with two fast threads may pass thousands of times and still prove nothing. The fixture makes the state deterministic: send, drop receiver, inspect the completion flag.
+
+For a real worker I use barriers or controlled channels to pause it after receive and before commit. Then I test shutdown, panic, retry, and acknowledgement at each boundary. I assert ownership of the job and the visible completion record, not timing or sleeps.
+
+Metrics follow the same state model. Queue depth, accepted count, started count, committed count, and failed count answer different operational questions. Calling all of them “processed” hides loss.
+
+The core principle is that infrastructure success is not domain success. `send(Ok)` proves a narrow channel event. If a caller depends on completed work, I add an explicit application-level acknowledgement at the real commit point and test every gap where ownership can move without the work becoming durable.

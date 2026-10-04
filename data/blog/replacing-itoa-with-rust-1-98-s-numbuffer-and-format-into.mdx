@@ -1,0 +1,147 @@
+---
+title: "Replacing itoa With Rust 1.98's NumBuffer and format_into"
+date: "2026-12-08T09:00:00+01:00"
+tags: ["Rust 1.98", "NumBuffer", "integer formatting", "no_std", "performance"]
+draft: false
+reviewed: true
+reviewedHash: "fc4539415d6f0fccb7e5d656ad74c31afad0916d1c00c3f7af4995d16a06c73e"
+cluster: "rust-under-the-hood"
+campaign: "authority-2026"
+opportunity: "RUST-063"
+summary: "Rust 1.98 can format integers into a caller-owned NumBuffer without allocation. I compare it with to_string, write!, and itoa, including the borrowed-result trap and when migration is not useful."
+---
+
+Integer formatting is one of those small operations I meet in unglamorous places: protocol fields, metric labels, adapter paths, and compact serializers. Most of the time I use `to_string()` and move on. That is the correct engineering decision when the operation is not hot.
+
+Rust 1.98 adds another standard-library choice. `core::fmt::NumBuffer` and the integer method `format_into` let me format a decimal integer into a caller-owned buffer and receive a borrowed `&str`.
+
+It is close to what the `itoa` crate has provided for years. It is not a command to delete `itoa` from every dependency tree.
+
+## The smallest example
+
+```rust
+use core::fmt::NumBuffer;
+
+fn main() {
+    let mut buffer = NumBuffer::new();
+
+    let text = 42_u64.format_into(&mut buffer);
+    assert_eq!(text, "42");
+}
+```
+
+The [Rust 1.98 release notes](https://doc.rust-lang.org/releases.html#version-1980-2026-08-20) list both `NumBuffer` and integer `format_into` as newly stable APIs. The standard [`NumBuffer` documentation](https://doc.rust-lang.org/stable/core/fmt/struct.NumBuffer.html) is important here: the buffer is parameterized for an integer type and is large enough for that type's decimal representation.
+
+No heap allocation is required for the formatted digits. The returned string borrows the buffer.
+
+## The borrow is the API
+
+The first mistake I expect is trying to keep several results from one buffer:
+
+```rust,compile_fail
+use core::fmt::NumBuffer;
+
+let mut buffer = NumBuffer::new();
+let first = 17_u64.format_into(&mut buffer);
+let second = 29_u64.format_into(&mut buffer);
+
+println!("{first} {second}");
+```
+
+The second mutable borrow cannot happen while `first` is still used. This is not the compiler being difficult. Formatting the second value reuses the same storage, so the first view cannot remain valid.
+
+I consume or copy each result before reusing the buffer:
+
+```rust
+use core::fmt::NumBuffer;
+
+let mut buffer = NumBuffer::new();
+let mut output = String::new();
+
+output.push_str(17_u64.format_into(&mut buffer));
+output.push(',');
+output.push_str(29_u64.format_into(&mut buffer));
+
+assert_eq!(output, "17,29");
+```
+
+The final `String` still allocates because I asked for owned combined output. `NumBuffer` only removes temporary integer strings.
+
+## Four tools solve different problems
+
+I choose by destination:
+
+| Need | Usual tool |
+| --- | --- |
+| own the decimal string | `to_string()` |
+| write into a `fmt::Write` or `io::Write` sink | `write!` |
+| borrow digits from a reusable standard buffer | `NumBuffer` + `format_into` |
+| support an older MSRV with the same style | `itoa::Buffer` |
+
+`write!` can already avoid a temporary `String` when the destination implements the right writing trait. If I am writing directly to a response buffer, replacing `write!` with `NumBuffer` may add code without improving the full path.
+
+`itoa` remains useful when the minimum supported Rust version is below 1.98, or when an existing abstraction already works and benchmarks do not justify churn. A standard-library alternative mainly changes dependency and MSRV decisions.
+
+## Signed values and type inference
+
+The same pattern works for signed integers:
+
+```rust
+use core::fmt::NumBuffer;
+
+let mut buffer = NumBuffer::new();
+assert_eq!((-128_i16).format_into(&mut buffer), "-128");
+```
+
+I keep the integer suffix in examples because it makes the buffer's inferred type obvious. If a long-lived struct stores the buffer, its concrete integer type becomes part of that struct.
+
+For mixed integer types, I use separate buffers or normalize deliberately to one type after checking conversion. I do not cast values only to make buffer reuse convenient; a formatting optimization is a bad reason to hide overflow.
+
+## The benchmark I would trust
+
+The opportunity is not “format one constant one billion times”. My real question is whether temporary allocation or formatting cost matters in the surrounding operation.
+
+I benchmark:
+
+```text
+small and maximum-width integers
+signed and unsigned values
+one value and batches
+format only
+format plus final destination write
+warm steady state and realistic request size
+```
+
+I use `std::hint::black_box` or a benchmark framework so the compiler cannot remove the work. I count allocations separately from time. Then I inspect whether the output destination dominates everything.
+
+A useful harness has four functions with the same observable output:
+
+```text
+to_string_then_push
+write_macro_to_string
+std_numbuffer_then_push
+itoa_buffer_then_push
+```
+
+I report the compiler version, target CPU, optimization flags, input distribution, and allocation count. Without these, a tiny nanosecond result is not a reusable engineering conclusion.
+
+## `no_std` is a strong reason to care
+
+`NumBuffer` lives in `core::fmt`. This makes it relevant when allocation is absent or deliberately controlled. The formatted `&str` can be passed to a device writer, fixed-capacity container, or protocol encoder without creating an owned `String`.
+
+The destination still defines the full guarantee. A fixed writer can become full. An I/O device can fail. `format_into` proves only that decimal integer formatting itself fits its number buffer.
+
+## Migration without noise
+
+My migration checklist is short:
+
+1. Confirm MSRV is at least Rust 1.98.
+2. Find hot integer-only formatting, not every formatting call.
+3. Preserve the exact decimal output with boundary tests.
+4. Benchmark the complete destination path.
+5. Remove `itoa` only if no other dependency or feature needs it.
+6. Keep the simpler code when the difference is irrelevant.
+
+This last point matters. Standard-library availability is valuable, but dependency count is not the only measure of quality.
+
+I see `NumBuffer` as a precise new tool: caller-owned decimal storage, a borrowed result, no formatting allocation, and availability in `core`. I will use it where those properties solve a measured problem. Everywhere else, `to_string()` remains pleasantly boring.

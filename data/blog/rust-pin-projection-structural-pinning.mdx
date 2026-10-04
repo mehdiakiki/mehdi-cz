@@ -1,0 +1,275 @@
+---
+title: "Structural Pinning in Rust: Which Fields Are Actually Pinned?"
+date: "2026-09-07T14:00:00+01:00"
+tags: ["rust", "pin", "unpin", "async rust", "unsafe rust"]
+draft: false
+reviewed: true
+reviewedHash: "2c5ecf65de5ccca5edf4296b18480a5476a0e62dfbedc97d1b107554b863dacb"
+cluster: "rust-under-the-hood"
+campaign: "authority-2026"
+opportunity: "RUST-029"
+summary: "Pinning a Rust struct does not pin every field automatically. Learn structural pinning, safe projection, Drop obligations, and Future wrappers."
+---
+
+Many explanations of `Pin` stop at one sentence: "the value cannot move." This is useful, but too small for writing a real API.
+
+The difficult part starts when a pinned value is a struct. Are all its fields pinned too? Can one field still be replaced? What must `Drop` do? These are not details that `Pin` decides automatically. They are decisions made by the type author.
+
+This is structural pinning.
+
+## First: `Pin` wraps a pointer
+
+The type is `Pin<Ptr>`, not `Pin<T>`. Consider:
+
+```rust
+use std::pin::Pin;
+
+fn inspect(value: Pin<Box<MyFuture>>) {
+    // ...
+}
+```
+
+the `Box` handle may move between stack variables. Moving the handle does not move `MyFuture` out of its heap allocation. The pinning promise is about the pointee.
+
+The same idea applies to `Pin<&mut T>`. The reference value itself can move. The `T` it points to must remain at its address while the pinning contract is active.
+
+This distinction removes one common confusion: `Pin<Box<T>>` is not an immovable box. It is a movable owner whose pointee is pinned.
+
+## `Unpin` makes the promise uninteresting
+
+Most Rust types implement the auto trait `Unpin`. For them, moving after pinning is allowed because the type does not rely on address stability.
+
+That is why this works when `T: Unpin`:
+
+```rust
+use std::pin::Pin;
+
+fn replace_value<T: Unpin>(mut pinned: Pin<&mut T>, replacement: T) -> T {
+    std::mem::replace(&mut *pinned, replacement)
+}
+```
+
+`Pin` becomes restrictive for `!Unpin` values: generated async futures, explicitly address-sensitive types, and types containing them in a structural way.
+
+A custom type can opt out of automatic `Unpin` with `PhantomPinned`:
+
+```rust
+use std::marker::PhantomPinned;
+
+struct AddressSensitive {
+    data: String,
+    _pin: PhantomPinned,
+}
+```
+
+Adding `PhantomPinned` does not pin an instance by itself. It only prevents the easy `Unpin` escape. The value must still be placed behind a valid pinning pointer, for example with `Box::pin` or the `pin!` macro.
+
+## A struct has two kinds of fields
+
+Imagine a future wrapper:
+
+```rust
+struct Tracked<F> {
+    inner: F,
+    polls: u64,
+}
+```
+
+I want `inner` to remain pinned because calling `Future::poll` requires `Pin<&mut F>`. The counter has no address-sensitive meaning. It can be accessed as an ordinary `&mut u64`.
+
+So the intended API is conceptually:
+
+```rust
+struct Projection<'a, F> {
+    inner: Pin<&'a mut F>,
+    polls: &'a mut u64,
+}
+```
+
+`inner` is a **structurally pinned field**. The pinning contract of `Tracked<F>` propagates to it.
+
+`polls` is not structurally pinned. Moving or replacing the integer cannot invalidate any promise made by the parent.
+
+This is not inferred from field types alone. The methods and unsafe implementation of `Tracked` establish the choice.
+
+## Why normal field access is unavailable
+
+Here is the tempting implementation. It does not compile for an arbitrary `F`, which is the useful part of this example:
+
+```rust,compile_fail
+use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
+impl<F: Future> Future for Tracked<F> {
+    type Output = F::Output;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        this.polls += 1;
+        Pin::new(&mut this.inner).poll(cx)
+    }
+}
+```
+
+For an arbitrary `F`, `Tracked<F>` may be `!Unpin`. `Pin<&mut Self>` therefore does not provide a normal mutable reference to the whole struct. That would allow safe code to call `mem::replace` and move the pinned `inner` field out.
+
+The projection from parent to fields has to preserve the contract.
+
+## The manual projection, and its safety proof
+
+I can write the projection by hand:
+
+```rust
+impl<F> Tracked<F> {
+    fn project(self: Pin<&mut Self>) -> (Pin<&mut F>, &mut u64) {
+        // SAFETY:
+        // - `inner` will never be moved while `self` is pinned;
+        // - `Tracked` is not `repr(packed)`, so the field is properly aligned;
+        // - this returns disjoint borrows of `inner` and `polls`;
+        // - the Drop implementation will not move `inner`.
+        unsafe {
+            let this = self.get_unchecked_mut();
+            (Pin::new_unchecked(&mut this.inner), &mut this.polls)
+        }
+    }
+}
+```
+
+Then polling is ordinary:
+
+```rust
+impl<F: Future> Future for Tracked<F> {
+    type Output = F::Output;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let (inner, polls) = self.project();
+        *polls += 1;
+        inner.poll(cx)
+    }
+}
+```
+
+The unsafe block is only two operations, but its safety argument belongs to the whole type. A later method that returns `&mut F`, a `Drop` implementation that replaces `inner`, or a layout change to `repr(packed)` can invalidate it.
+
+This is why production code commonly uses a reviewed projection crate such as `pin-project` instead of repeating this unsafe proof.
+
+## The tempting implementation that is too restrictive
+
+I can avoid unsafe code by requiring `F: Unpin`:
+
+```rust
+impl<F: Future + Unpin> Future for Tracked<F> {
+    type Output = F::Output;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.polls += 1;
+        Pin::new(&mut self.inner).poll(cx)
+    }
+}
+```
+
+This is sound, but many futures returned by async functions do not implement `Unpin`. A wrapper intended for general futures would reject exactly the values it should support.
+
+This version is still useful when the API naturally works only with `Unpin` inputs. Do not add unsafe projection only to avoid a valid bound.
+
+## Non-structural fields stay movable
+
+Suppose a wrapper contains configuration that I want to replace while it is pinned:
+
+```rust
+struct Driver<F> {
+    operation: F,
+    label: String,
+}
+```
+
+If only `operation` participates in address-sensitive behavior, a projection can return:
+
+```rust
+struct DriverProjection<'a, F> {
+    operation: Pin<&'a mut F>,
+    label: &'a mut String,
+}
+```
+
+Safe callers may use `mem::take(label)`. This does not move `operation` or invalidate its address.
+
+The type author must stay consistent. If `label` is exposed as movable in one API, unsafe code elsewhere must not rely on its address being stable.
+
+## `Drop` is part of the pinning API
+
+Pinning promises that an address-sensitive value remains valid at its location until the end of its lifetime. Destruction is included in that promise.
+
+This `Drop` implementation would be wrong for a structurally pinned field:
+
+```rust
+// Do not do this for a structurally pinned `inner`.
+fn move_inner_out<F: Default>(this: &mut Tracked<F>) -> F {
+    std::mem::take(&mut this.inner)
+}
+```
+
+`Drop::drop` receives `&mut self`, not `Pin<&mut Self>`, but this is not permission to move pinned fields. Once your type promises structural pinning, its destructor must respect that promise.
+
+There is a second issue: if a type relies on pinning for soundness, safe code must not be able to prevent its destructor and then invalidate its storage. This is called the drop guarantee. APIs that own pinned values need to consider operations such as overwriting storage, custom pointer types, and manual deallocation very carefully.
+
+Again, projection libraries help encode these obligations. They are not only syntax generators.
+
+## `Box::pin` and `pin!` solve different ownership needs
+
+Heap pinning returns an owner that can leave the current scope:
+
+```rust
+let future = Box::pin(async {
+    do_work().await;
+});
+```
+
+Local pinning avoids a dedicated heap allocation:
+
+```rust
+use std::pin::pin;
+
+let future = async {
+    do_work().await;
+};
+let mut future = pin!(future);
+```
+
+The reference from `pin!` is tied to local storage and cannot be returned as an owning pinned value. Also, "stack pinning" is not always a precise name: inside an async function, a local that survives an await is stored inside that function's future, wherever that future itself lives.
+
+Choose based on ownership and lifetime, not from a general rule that pinning requires the heap.
+
+## A checklist for a pinned struct
+
+Before exposing a projection, I write down these answers:
+
+1. Which fields are structurally pinned?
+2. Which fields may be returned as ordinary mutable references?
+3. Can any safe method move a structurally pinned field?
+4. Does `Drop` move, replace, or invalidate one?
+5. Is the type ever `repr(packed)` or otherwise potentially unaligned?
+6. Does the `Unpin` implementation match the chosen structure?
+7. Who guarantees that the original pinned storage remains valid?
+
+If one answer is implicit, a future refactor can create unsoundness far away from the unsafe line.
+
+## The useful mental model
+
+`Pin` is a library contract carried by a pointer. Structural pinning says which subobjects inherit that contract. Projection is the API that exposes the decision.
+
+Once I see these as one design, the signatures become readable:
+
+- `Pin<&mut Field>` means this field inherits address stability;
+- `&mut Field` means this field does not;
+- `T: Unpin` means moving `T` does not violate its own invariants.
+
+The hard part is not remembering an unsafe function name. It is keeping the story consistent for the full lifetime of the type.
+
+## Further reading
+
+- [`std::pin` module documentation](https://doc.rust-lang.org/std/pin/)
+- [Pinning in the Async Rust Book](https://rust-lang.github.io/async-book/part-reference/pinning.html)
+- [`pin!` and local pinning](https://doc.rust-lang.org/std/pin/macro.pin.html)
+- [`Future::poll`](https://doc.rust-lang.org/std/future/trait.Future.html#tymethod.poll)

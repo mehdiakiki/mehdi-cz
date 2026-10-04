@@ -1,0 +1,219 @@
+---
+title: "Trace an AI Workflow Across Retrieval, Models, and Tools"
+date: "2026-11-29T09:00:00+01:00"
+tags: ["OpenTelemetry", "AI observability", "distributed tracing", "LLM tools", "RAG"]
+draft: false
+reviewed: true
+reviewedHash: "63057fbd600ed4d71e974903d6c1c9be00797a4bfa4fe8c7739fe633a303ee74"
+cluster: "reliable-ai-systems"
+campaign: "authority-2026"
+opportunity: "AI-034"
+summary: "An AI workflow trace should connect admission, retrieval, reranking, every model attempt, tool calls, queues, approval, and final outcome while keeping prompts, results, and secrets out of default telemetry."
+---
+
+A model-provider dashboard can tell me that one model call took 1.8 seconds. It cannot tell me why the user waited twelve seconds, which retrieval generation was used, whether a tool retried, or where an approval paused the workflow.
+
+I trace the product workflow, not only the model API.
+
+```text
+request -> retrieval -> reranking -> model -> tool -> model -> approval -> result
+```
+
+Each arrow can cross a process, queue, provider, or time boundary.
+
+## Start one root span at the product operation
+
+The root represents the outcome the user requested:
+
+```text
+ai.workflow answer_question
+ai.workflow reconcile_invoice
+ai.workflow propose_code_change
+```
+
+It carries low-cardinality identity:
+
+```text
+workflow name and version
+request class
+tenant tier, not customer name
+deployment and region
+final outcome
+```
+
+I do not name spans with prompts, document titles, user IDs, or generated text. High-cardinality values make tracing expensive and can leak data.
+
+## Use child spans for real operations
+
+A trace can look like:
+
+```text
+ai.workflow answer_question
+├── auth.resolve_permissions
+├── retrieval.search
+│   ├── embedding.create
+│   └── vector.query
+├── rerank.candidates
+├── gen_ai.chat attempt=1
+├── tool.execute customer_lookup
+│   └── http.client provider
+├── gen_ai.chat attempt=2
+└── answer.verify_citations
+```
+
+OpenTelemetry publishes developing [GenAI semantic conventions](https://opentelemetry.io/docs/specs/semconv/gen-ai/) for model, agent, retrieval, and tool operations. I follow stable conventions where available and namespace temporary custom attributes so they can migrate later.
+
+## Propagate context through every boundary
+
+[OpenTelemetry context propagation](https://opentelemetry.io/docs/concepts/context-propagation/) carries trace and parent identity across services. For HTTP this commonly uses W3C Trace Context. For a queue I put trace context in governed message metadata.
+
+```text
+enqueue span -> message metadata -> consumer span
+```
+
+An asynchronous consumer may use a span link instead of pretending the producer remains its direct synchronous parent, especially when one batch combines several messages.
+
+I keep business idempotency keys separate from trace IDs. Sampling, retention, and retries make trace identity unsuitable for deduplication.
+
+## Record attempts, not only the final model call
+
+If a provider times out and the router falls back, I want:
+
+```text
+attempt 1: provider A, model family X, timeout
+backoff: 200 ms
+attempt 2: provider B, model family Y, success
+```
+
+Each attempt gets a span. The logical model step groups attempts and records the selected result.
+
+Otherwise the trace shows one successful 900 ms call while hiding three seconds lost before it.
+
+I record token counts when the provider returns them, cache status, configured timeout, finish reason, and error class. I avoid inferred token precision presented as provider fact.
+
+## Retrieval needs data-version attributes
+
+For a retrieval span I keep:
+
+```text
+index generation
+embedding model/config identity
+retrieval and filter mode
+requested and returned candidate counts
+permission-policy version
+reranker version
+latency by stage
+```
+
+I store opaque document/chunk IDs only in a protected event or linked evaluation record when needed. Raw passages do not belong in default spans.
+
+[Citations Need Claim-Level Provenance, Not Decorative Links](/blog/citations-need-claim-level-provenance-not-decorative-links) describes durable answer evidence. A trace explains execution; provenance explains support.
+
+## Tool calls are ordinary distributed operations
+
+A tool span records:
+
+```text
+tool name and version
+read-only, external, expensive, or irreversible risk class
+validated argument-schema version
+stable effect/idempotency identity where applicable
+attempt and timeout
+result class and bounded size
+approval decision reference
+```
+
+It does not record API keys or complete arguments by default. The OpenTelemetry GenAI material explicitly warns that tool arguments, results, prompts, and completions can contain sensitive information.
+
+I use an allowlist of safe attributes rather than a growing denylist of secrets.
+
+## Human approval creates a long pause
+
+Keeping one in-memory span open for days is not always useful or supported by the backend.
+
+I end the execution with `waiting_for_approval`, persist workflow state and trace reference, then start a resumed trace linked to the earlier execution:
+
+```text
+trace A: proposed action -> waiting_for_approval
+durable workflow record
+trace B: approval received -> execute -> completed
+          link to trace A
+```
+
+The workflow ID connects product history. Span links connect telemetry causality.
+
+## Errors need a stage and an outcome
+
+“AI request failed” is too coarse. I classify:
+
+```text
+authentication
+retrieval empty or unauthorized
+provider rate limit
+provider timeout
+invalid model output
+tool argument rejected
+tool effect ambiguous
+approval expired
+citation verification failed
+workflow deadline exhausted
+```
+
+The root outcome may be successful fallback even when a child span errors. Both facts should remain visible.
+
+## A trace is not the workflow database
+
+Telemetry can be sampled, delayed, or unavailable. I never use span export as the durable record that a payment was approved, a tool effect committed, or a workflow may resume.
+
+The workflow store owns state and idempotency. The trace carries opaque references to those records and helps explain execution. If the exporter fails, the product must continue according to its safety policy; if the product transaction fails, a successful span export must not pretend the action committed.
+
+## Sampling should retain rare bad paths
+
+Head sampling cannot know the final result. Tail sampling can prefer traces with:
+
+```text
+errors or ambiguous effects
+high end-to-end latency
+many model/tool attempts
+fallback routing
+approval expiry
+high cost
+security-policy rejection
+```
+
+I still keep aggregate metrics for every request. Traces provide examples; metrics provide rates.
+
+Sampling policy must not select sensitive content. It selects structured outcome and latency attributes.
+
+## My trace completeness test
+
+I run fixtures for:
+
+- normal retrieval and one model call;
+- empty authorized corpus;
+- reranker timeout with fallback;
+- model rate limit then provider switch;
+- invalid tool arguments;
+- retried idempotent tool effect;
+- ambiguous external effect;
+- workflow crossing a queue;
+- human approval resumed later;
+- content recording disabled.
+
+I assert that the trace reconstructs causal stages and time while prompts, retrieved passages, secrets, and personal identifiers are absent from default exported attributes.
+
+## The dashboard I actually need
+
+From spans and metrics I derive:
+
+```text
+end-to-end latency by workflow outcome
+time in retrieval, model, tools, queues, and approval
+attempts and fallbacks per logical step
+token and cost contribution by stage
+error class and recovery path
+index/model/workflow versions on regressions
+trace coverage and dropped-span rate
+```
+
+An AI system is still a distributed system. Once the root span represents the user's operation and context survives every boundary, model calls become understandable parts of the path instead of isolated provider timings.

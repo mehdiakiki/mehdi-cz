@@ -1,0 +1,73 @@
+---
+caseId: "RFA-668"
+title: "VecDeque::make_contiguous Changes Layout, Not Logical Order"
+date: "2026-09-06T08:28:00+01:00"
+lastmod: "2026-09-06T08:28:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "e690ea61b4caed2dc3c8f6725e6bb3c909ad60e8ab38ca3ff9fbe84ab11a2e67"
+area: "concurrency-memory"
+symptom: "Calling make_contiguous on a wrapped VecDeque rearranges its backing storage but iteration still returns exactly the previous order."
+summary: "make_contiguous linearises the ring representation and returns one mutable slice while preserving queue order. Storage coordinates are not logical coordinates."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust VecDeque make_contiguous order", "VecDeque wrapped storage as_slices", "linearise ring buffer Rust"]
+evidence: ["Rust 1.98.1 runtime assertion", "wrapped deque order measured before and after", "one returned contiguous mutable slice"]
+sources: ["https://doc.rust-lang.org/std/collections/struct.VecDeque.html#method.make_contiguous", "https://doc.rust-lang.org/std/collections/struct.VecDeque.html#method.as_slices", "https://doc.rust-lang.org/std/collections/struct.VecDeque.html#method.rotate_left"]
+---
+
+A `VecDeque` may store its logical sequence across the end and beginning of a ring buffer. `make_contiguous` rearranges that representation into one slice without changing queue order. The [failing fixture](/rust-failure-atlas/evidence/RFA-668/fail.rs) expects layout work to alter the sequence and proves that it does not.
+
+## Logical order is the public contract
+
+Iteration starts at the deque's logical front and continues to its back, even when memory wraps. [`VecDeque::as_slices`](https://doc.rust-lang.org/std/collections/struct.VecDeque.html#method.as_slices) can expose this as two slices: the first logical segment followed by the second.
+
+[`make_contiguous`](https://doc.rust-lang.org/std/collections/struct.VecDeque.html#method.make_contiguous) moves elements as needed and returns a single mutable slice in the same logical order. Afterward, `as_slices` has an empty second slice.
+
+I separate these two coordinate systems in my head: queue position zero means the front element; backing-array position zero is an implementation storage location. Code should normally depend only on the first.
+
+## Why linearise a ring buffer?
+
+Many slice algorithms require one contiguous region. Sorting a deque, passing bytes to an API expecting `&[u8]`, running a parser, or applying vectorised processing may be easier after linearisation.
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-668/fixed.rs) keeps a copy of the logical sequence, calls `make_contiguous`, verifies the returned slice, and checks that the second storage slice is empty. The transformation changes representation while preserving meaning.
+
+Calling it on every operation can waste the advantage of a deque. Push and pop at both ends are efficient partly because wraparound is allowed. I linearise at a boundary that truly needs a slice, not merely to make memory look familiar.
+
+## Returned mutable slice can change values and order
+
+`make_contiguous` returns `&mut [T]`. Mutating or sorting that slice changes the deque's logical sequence. The method itself preserves order; operations performed through its returned borrow may not.
+
+This distinction is valuable when reading code such as `queue.make_contiguous().sort()`. The first call only establishes layout and the second call defines a new order. Review comments should attribute behaviour to the correct operation.
+
+The borrow also prevents other deque operations while the slice is live. I keep it within a small scope. After structural mutations, old raw pointers or external indexes must not be assumed valid.
+
+## Rotation is a logical operation
+
+[`VecDeque::rotate_left`](https://doc.rust-lang.org/std/collections/struct.VecDeque.html#method.rotate_left) changes which elements appear at the logical front. This differs from `make_contiguous`, even though both may move storage.
+
+A scheduler may intentionally rotate fairness order. A serializer may only need contiguous bytes. Choosing by an imagined internal movement rather than public semantics can substitute one for the other and introduce a real ordering bug.
+
+Unsafe code must be even stricter. The deque does not promise a stable permanent arrangement after later mutations. Safe slices borrowed from it carry lifetimes that prevent structural change, while cached addresses outside those rules require a fully documented invariant.
+
+## Representation-sensitive performance needs measurement
+
+Linearisation cost depends on length, capacity, and current wrap. Some calls may have little work; others move many elements. The standard contract does not promise one fixed algorithmic path for every state.
+
+I measure at the boundary where a contiguous consumer needs data. Sometimes consuming into a `Vec`, writing two slices separately, or teaching an I/O layer vectored writes avoids movement. Sometimes one linearisation followed by substantial processing is cheapest and clearest.
+
+Tests construct an actually wrapped deque through pushes and pops rather than assuming `VecDeque::from` has two slices. They assert the logical sequence before and after, and test any mutation through the returned slice separately.
+
+## My deque checklist
+
+- Is code reasoning about logical queue order or backing storage positions?
+- Does the consumer truly require one contiguous slice?
+- Can it accept the two slices or vectored I/O instead?
+- Is later sorting or mutation being confused with make_contiguous itself?
+- How long does the returned mutable slice need to live?
+- Are external positions incorrectly treated as stable identities?
+- Does the benchmark include wrapped and already-contiguous states?
+- Does the test deliberately construct wraparound?
+
+The core principle is that data structures separate abstract order from physical representation. `make_contiguous` is a representation bridge. It preserves the deque's meaning while making one specific class of consumers easier to serve.

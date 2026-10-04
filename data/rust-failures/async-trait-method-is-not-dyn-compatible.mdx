@@ -1,0 +1,100 @@
+---
+caseId: "RFA-369"
+title: "A Trait With async fn Is Not Directly dyn Compatible"
+date: "2026-09-06T02:26:00+01:00"
+lastmod: "2026-09-06T02:26:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "22201b1d9ba915bee1ade966019ef7b635f1d8d741bfed80d9b2fbe73149c9ae"
+area: "diagnostics-macros"
+symptom: "A trait containing async fn compiles for static dispatch but produces E0038 when code tries to create &dyn HealthCheck."
+summary: "async fn in a trait returns a hidden implementation-specific Future, which cannot occupy one ordinary vtable return slot. Use generics, an explicit boxed future, or another deliberate type-erasure boundary."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust async fn trait not dyn compatible E0038", "async trait object vtable", "Box dyn async trait method Rust"]
+evidence: ["Rust 1.98.1 E0038", "async method hidden Future diagnostic", "Pin Box dyn Future repair"]
+sources: ["https://doc.rust-lang.org/reference/items/traits.html#dyn-compatibility", "https://doc.rust-lang.org/std/future/trait.Future.html", "https://doc.rust-lang.org/std/pin/struct.Pin.html"]
+---
+
+I defined an `async fn` in a trait and used it successfully through a generic type. When I changed the registry to store `&dyn HealthCheck`, Rust produced E0038. Stable async trait methods and direct trait-object dispatch solve different problems.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-369/fail.rs) has one implementor and one async method. The trait implementation is valid, but converting `&Local` to `&dyn HealthCheck` fails because the trait is not dyn compatible.
+
+## Every async function has a hidden future type
+
+Calling an async function does not run it to completion immediately. It returns a value implementing [`Future`](https://doc.rust-lang.org/std/future/trait.Future.html). The compiler creates a state-machine type holding arguments and any locals that live across suspension points.
+
+Different implementations of a trait's async method can produce different hidden future types and sizes. Static dispatch knows the concrete implementor and can compile the corresponding future. A normal vtable method needs one callable signature with one known return representation.
+
+The hidden implementation-specific future is why the Reference classifies an async method as having an opaque return type that cannot be dispatched from a trait object.
+
+## Async traits are still useful without dyn
+
+The error does not mean async functions in traits are unusable. A generic function such as `fn register<T: HealthCheck>(check: &T)` can call the method with static dispatch. The compiler monomorphizes code for each concrete implementor.
+
+This is often the best choice when types are known at compile time. It avoids per-call future boxing and permits optimization across the concrete implementation.
+
+I do not introduce type erasure only because a design diagram says “interface.” Rust traits serve both generic bounds and trait objects, but not every trait must support both.
+
+## An explicit boxed future erases the return type
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-369/fixed.rs) changes the method to return:
+
+```rust
+Pin<Box<dyn Future<Output = bool> + '_>>
+```
+
+Every implementation now returns the same pointer-shaped erased type. [`Pin`](https://doc.rust-lang.org/std/pin/struct.Pin.html) supports futures that may not be `Unpin`, and the borrowed lifetime says the future may refer to `self`.
+
+The method itself is no longer `async`; its implementation uses `Box::pin(async { ... })` to construct the erased future. This makes `dyn HealthCheck` possible.
+
+## Boxing has a real cost and benefit
+
+A boxed future usually adds heap allocation and dynamic dispatch while polling. In return, it gives one stable runtime type that heterogeneous implementations can share.
+
+At a plugin, dependency-injection, or service registry boundary, this trade can be reasonable. In a hot inner loop with known types, generics or an enum of concrete futures may be better.
+
+I measure where allocation matters. Avoiding every box can produce complicated types and large binaries; boxing every small operation can produce unnecessary allocator pressure.
+
+## Send is another explicit policy
+
+The repaired example does not require the future to be `Send`. If an executor may move tasks between threads, the returned object may need `+ Send`, and the implementation must hold only values compatible with that bound across awaits.
+
+Adding `Send` blindly can reject valid single-threaded implementations. Omitting it can surface later when a caller tries to spawn the future on a multi-threaded runtime.
+
+I place this requirement at the actual execution boundary and include it in the trait's public contract when callers rely on it.
+
+## The lifetime prevents accidental static promises
+
+The `+ '_` lifetime ties the returned future to the borrow of `self`. Writing `+ 'static` would require the future to own everything it uses or borrow only static data, which many service methods cannot satisfy.
+
+This is a frequent second compiler error after boxing. Type erasure removes the concrete future type; it does not erase borrowing relationships.
+
+When the operation should outlive the service borrow, I redesign ownership, perhaps using `Arc`, rather than extending a reference lifetime by assertion.
+
+## A macro can automate the transformation, not the decision
+
+Libraries can transform async trait syntax into boxed-future methods, reducing boilerplate and handling lifetime bounds. That is convenient, but the allocation, `Send` policy, and object-safety model remain real.
+
+I understand the generated signature before using such a macro in a public boundary. Compiler-native async trait syntax can be preferable for static dispatch, while a macro or manual erased method can serve dynamic dispatch.
+
+The two forms need not be forced into one trait if their consumers have different performance or compatibility needs.
+
+## Other dyn-compatibility rules still apply
+
+Replacing the async return does not cure generic methods, associated constants, disallowed uses of `Self`, or a `Sized` supertrait. The [Reference's dyn-compatibility list](https://doc.rust-lang.org/reference/items/traits.html#dyn-compatibility) applies to the complete trait and its supertraits.
+
+I read E0038's notes for the specific offending item. “The trait is not dyn compatible” is the summary; the method note identifies the design constraint.
+
+## Evidence can compile without an executor
+
+The repaired fixture creates the future through a trait object but does not poll it. This is enough to prove type erasure and vtable compatibility, so the evidence remains standard-library-only and deterministic.
+
+Application tests separately run the future under the chosen executor, test cancellation and timeouts, and verify borrowed resources remain valid. Those are runtime protocol questions beyond the compiler repair.
+
+## The core principle is that suspension state is part of a return type
+
+An async method's returned state machine contains real layout and borrowing information. Static dispatch can keep it opaque while knowing the implementor. Dynamic dispatch needs that varying type erased behind a stable representation.
+
+I choose generics when the concrete type can remain known and an explicit boxed future when runtime heterogeneity is worth the cost. E0038 is not a missing annotation; it is the compiler asking where type erasure should happen.

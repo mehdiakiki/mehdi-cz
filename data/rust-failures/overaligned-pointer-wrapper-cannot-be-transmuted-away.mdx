@@ -1,0 +1,109 @@
+---
+caseId: "RFA-712"
+title: "An Over-Aligned Pointer Wrapper Cannot Be Transmuted Away"
+date: "2026-09-07T10:48:00+01:00"
+lastmod: "2026-09-07T10:48:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "2402fc627222738a7ffad2f02122b0696a6e333939d9c6b663b57054100d29f9"
+area: "upgrades-compatibility"
+symptom: "Transmuting a repr(align(16)) wrapper around a generic raw pointer back into that pointer fails with E0512 on Rust 1.98."
+summary: "repr(align) can add padding, and a pointer to T: ?Sized may carry metadata. Rust 1.98 correctly refuses to prove that the generic wrapper and pointer always have equal sizes. Read the wrapper field normally."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets"]
+profiles: ["dev", "release"]
+searchTerms: ["Rust repr align pointer transmute E0512", "OverAligned raw pointer size Pointee Metadata transmute", "cannot transmute aligned wrapper to generic pointer Rust 1.98"]
+evidence: ["Rust 1.98.1 E0512 compile failure", "repr(align(16)) generic pointer wrapper has conditional size", "ordinary field extraction preserves fat-pointer metadata"]
+sources: ["https://doc.rust-lang.org/releases.html#version-1980-2026-08-20", "https://doc.rust-lang.org/std/mem/fn.transmute.html", "https://doc.rust-lang.org/reference/type-layout.html#the-alignment-modifiers", "https://doc.rust-lang.org/reference/dynamically-sized-types.html"]
+---
+
+This generic helper looks like it only removes a tuple wrapper:
+
+```rust
+use std::mem::transmute;
+
+#[repr(align(16))]
+struct OverAligned<T>(T);
+
+fn unwrap_pointer<T: ?Sized>(value: OverAligned<*const T>) -> *const T {
+    unsafe { transmute(value) }
+}
+```
+
+Rust 1.98 reports E0512. The source type's size can vary because of `<T as Pointee>::Metadata`, and the compiler cannot prove it has the same size as the target pointer for every allowed `T`.
+
+The direct repair needs no unsafe code:
+
+```rust
+fn unwrap_pointer<T: ?Sized>(value: OverAligned<*const T>) -> *const T {
+    value.0
+}
+```
+
+The [failing fixture](/rust-failure-atlas/evidence/RFA-712/fail.rs) records the corrected Rust 1.98 size check. The [repaired fixture](/rust-failure-atlas/evidence/RFA-712/fixed.rs) extracts the field and verifies the returned address.
+
+## A wrapper is not automatically representation-transparent
+
+A tuple struct with one field is a nominal Rust type. Without `repr(transparent)`, Rust does not promise that every ABI and layout property equals the field's. Adding `repr(align(16))` explicitly asks for a stronger minimum alignment, which can add padding to the total size.
+
+For a thin pointer on a 64-bit target, the field may be eight bytes while the wrapper rounds up to sixteen. A transmute consumes and reinterprets all source bits as a destination of exactly the same size. It cannot throw away wrapper padding.
+
+Even if one current instantiation prints equal sizes, the generic definition must be valid for all admitted instantiations. `T: ?Sized` includes dynamically sized pointees.
+
+## Raw pointers can be thin or carry metadata
+
+`*const u32` is normally a thin pointer: one data address. A pointer to `[u8]` also needs slice length. A pointer to a trait object also carries metadata used for dynamic dispatch. These are often called fat pointers, but I rely on Rust's documented dynamically sized type model rather than hard-coding a number of machine words.
+
+The pointer's layout can therefore depend on `T`. The over-aligned wrapper applies padding rules around that conditional layout. Rust 1.98's transmute check accounts for both instead of assuming that a one-field generic wrapper and its field must match.
+
+This failure is different from a generic `transmute<T, U>` where two unrelated type parameters have no equality proof. Here the source and destination visibly share the same pointer field. The extra representation attribute is the reason field containment does not imply equal total size.
+
+## Alignment and size are related but not identical
+
+`repr(align(16))` promises at least 16-byte alignment for the wrapper. Rust layouts make a type's size a multiple of its alignment so adjacent array elements remain correctly aligned. Padding can be added after the last visible field.
+
+That padding contains no logical pointer value, but it remains part of the source representation. `transmute` operates on representations, not on the logical idea “unwrap this field.”
+
+I use `size_of` and `align_of` to inspect concrete instances during debugging:
+
+```rust
+use std::mem::{align_of, size_of};
+
+println!("{} {}", size_of::<*const u8>(), align_of::<*const u8>());
+println!("{} {}", size_of::<OverAligned<*const u8>>(), align_of::<OverAligned<*const u8>>());
+```
+
+These observations explain a target. They do not create a generic guarantee for every DST metadata shape or supported platform.
+
+## Field extraction is the semantic operation
+
+The source says what I want: take ownership of the wrapper and return its pointer field. Rust already has that operation. `value.0` preserves the complete pointer value, including any metadata, and ignores layout padding through normal language semantics.
+
+Using transmute for ordinary field access weakens the code. It introduces equal-size and validity proof obligations, hides the intent from reviewers, and becomes sensitive to representation changes.
+
+Destructuring is equally clear when a wrapper has a named field:
+
+```rust
+let OverAligned(pointer) = value;
+pointer
+```
+
+No layout promise is required merely to move a field out of its owner.
+
+## repr(transparent) is not the repair here
+
+It may be tempting to add `repr(transparent)`, but a transparent type takes the layout and ABI of its one meaningful field. That goal conflicts with deliberately increasing the wrapper's alignment when the field itself has lower alignment.
+
+I first ask why the over-alignment exists. It may support cache-line placement, SIMD storage, DMA, an allocator contract, or an array layout. Removing it only to make transmute compile can break the actual system requirement.
+
+If the wrapper truly must be ABI-transparent, then over-alignment probably does not belong on that type. If over-alignment is essential, the wrapper is not transparent and normal field access is the correct unwrapping operation.
+
+## Equal size would still not justify arbitrary transmute
+
+Transmute also requires the produced bits to be valid for the destination type. For raw pointer to raw pointer in this narrow example, moving the existing field avoids inventing new validity questions. In other conversions, equal byte counts say nothing about valid enum discriminants, references, ownership, lifetimes, or provenance.
+
+I do not replace this with `transmute_copy`, pointer casts, or byte copies. Those operations can hide the compile-time rejection while preserving or enlarging the unsafe problem.
+
+My review rule is simple: if the operation can be expressed as field access, a safe conversion, or a documented pointer operation, I use that. `transmute` is reserved for cases where reinterpreting the whole representation is the real intent and every invariant is written down.
+
+The core principle is that a logical wrapper relationship does not guarantee representation equality. Alignment modifiers and DST metadata are exactly the details generic unsafe code must not guess away.

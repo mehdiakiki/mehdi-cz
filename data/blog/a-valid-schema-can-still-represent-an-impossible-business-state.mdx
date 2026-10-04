@@ -1,0 +1,202 @@
+---
+title: "A Valid Schema Can Still Represent an Impossible Business State"
+date: "2026-12-01T09:00:00+01:00"
+tags: ["schema validation", "business invariants", "data contracts", "database constraints", "concurrency"]
+draft: false
+reviewed: true
+reviewedHash: "39c627d4192a2253db163ea9b0594519d9439abaa1b37a7b98a78a59590bab48"
+cluster: "reliable-data-integrations"
+campaign: "authority-2026"
+opportunity: "DATA-072"
+summary: "Schema validation proves payload shape. Business validity may depend on cross-fields, stored rows, time, authorization, and external state, so each invariant needs an enforcing layer and race test."
+---
+
+This reservation is valid JSON and can satisfy a well-written structural schema:
+
+```json
+{
+  "room_id": "room-17",
+  "starts_at": "2026-12-01T10:00:00Z",
+  "ends_at": "2026-12-01T11:00:00Z",
+  "guest_count": 4
+}
+```
+
+It can still be impossible because the room fits two people, is closed that day, or already has another reservation.
+
+A schema proves representation. The business decision often depends on context the payload does not contain.
+
+## List invariants before choosing validators
+
+For this operation I might need:
+
+```text
+room_id is a non-empty string
+starts_at and ends_at are timestamps
+start is before end
+duration is within allowed range
+room exists and is active
+guest count does not exceed current capacity
+requested interval does not overlap another booking
+caller may book this room
+payment authorization is still valid
+```
+
+These rules belong to different layers.
+
+## Structural schemas still do important work
+
+JSON Schema can validate types, required properties, ranges, patterns, conditional structures, and many relationships inside one document. Its [validation specification](https://json-schema.org/draft/2020-12/json-schema-validation) gives these keywords precise meaning.
+
+I use it at the edge to reject malformed requests cheaply and consistently.
+
+```json
+{
+  "type": "object",
+  "required": ["room_id", "starts_at", "ends_at", "guest_count"],
+  "properties": {
+    "room_id": { "type": "string", "minLength": 1 },
+    "guest_count": { "type": "integer", "minimum": 1 }
+  },
+  "additionalProperties": false
+}
+```
+
+This is useful. It does not query the room or serialize concurrent bookings.
+
+## Cross-field rules may belong in domain code
+
+The end must follow the start. Maximum duration may depend on booking type. A cancellation reason may be required only for a cancelled state.
+
+I express these in a domain constructor or command handler with named errors:
+
+```text
+END_BEFORE_START
+DURATION_EXCEEDS_POLICY
+CANCELLATION_REASON_REQUIRED
+```
+
+Some can also be represented in a schema language. I still keep the domain rule where every entry path—HTTP, queue, batch import, and internal call—uses it.
+
+Duplicated validation is acceptable when the edge improves feedback and the authoritative rule remains clear.
+
+## Stored-state invariants need atomic enforcement
+
+Two requests can both observe a free room:
+
+```text
+request A: query -> no overlap
+request B: query -> no overlap
+request A: insert
+request B: insert
+```
+
+Both passed application validation. Together they violate the invariant.
+
+I use a database constraint or a transaction/locking strategy that makes check and write atomic. PostgreSQL, for example, documents [range exclusion constraints](https://www.postgresql.org/docs/current/rangetypes.html#RANGETYPES-CONSTRAINT) for preventing overlapping ranges.
+
+The exact mechanism depends on the store. The important property is that concurrent writers cannot both commit an impossible state.
+
+## Database constraints are durable documentation
+
+I use:
+
+```text
+NOT NULL for mandatory stored values
+CHECK for row-local invariants
+UNIQUE for identities
+FOREIGN KEY for governed relationships
+exclusion or specialized constraints for non-overlap
+transactions for multi-row transitions
+```
+
+PostgreSQL's [constraint documentation](https://www.postgresql.org/docs/current/ddl-constraints.html) also warns through its model that check constraints concern the row being written; cross-row assumptions need appropriate mechanisms.
+
+Constraints protect repair scripts and alternate writers that bypass the HTTP validator.
+
+## Authorization is part of validity
+
+A command can be structurally and semantically coherent while the caller cannot perform it.
+
+I evaluate authorization against trusted identity and current resource state. I do not accept `role` or `tenant_id` from the payload as proof.
+
+The decision records policy version and resource version when an audit requires reproducibility. A later role change should not rewrite what policy was evaluated at the time.
+
+## External state creates uncertain validity
+
+A provider may say inventory exists and become unavailable before commit. A payment may time out after being accepted. No local schema can prove the remote outcome.
+
+I model states such as:
+
+```text
+confirmed
+rejected
+pending reconciliation
+expired
+```
+
+Stable operation identity and reconciliation are stronger than pretending every timeout is failure.
+
+The product may reserve locally before calling the provider, use compensation, or expose a pending state. This is architecture, not payload validation.
+
+## Time-dependent rules need an evaluation instant
+
+“Offer is active” depends on when and often where it is evaluated.
+
+I pass a clock into domain logic and record the effective instant:
+
+```text
+offer.valid_from <= evaluated_at < offer.valid_to
+```
+
+Tests control the clock and cover exact boundaries. A validator that reads wall time invisibly is hard to reproduce.
+
+For retroactive corrections, valid time and recorded time may both matter, as described in [Valid Time and System Time: Two Histories a Data Product May Need](/blog/valid-time-and-system-time-two-histories-a-data-product-may-need).
+
+## My invariant placement table
+
+| Invariant | Primary enforcement | Additional evidence |
+| --- | --- | --- |
+| payload type/required fields | edge schema | validation error |
+| cross-field command rule | domain constructor | reason code |
+| unique or non-overlap state | database/serialized owner | constraint result |
+| caller permission | authorization policy | policy/version decision |
+| remote effect | idempotent protocol + reconciliation | operation status |
+| time window | domain rule with explicit clock | evaluated instant |
+| derived projection consistency | reconciler | source/projection versions |
+
+One rule can have defence in depth, but one layer is named as authoritative.
+
+## Test races and bypasses
+
+My test suite includes:
+
+- malformed payload rejected at the edge;
+- valid shape with end before start;
+- two concurrent overlapping reservations;
+- direct repository write that bypasses HTTP;
+- resource version changing between validation and commit;
+- caller losing permission during the operation;
+- provider timeout with later success;
+- exact time-window boundary;
+- old replay under a new policy version;
+- corrupted stored row detected by reconciliation.
+
+The concurrency test runs real transactions against the same constraint. Mocking both requests as sequential misses the problem.
+
+## Return the right kind of failure
+
+I distinguish:
+
+```text
+invalid input: caller can correct request
+conflict: state changed; caller may refresh or retry
+forbidden: identity lacks permission
+dependency unavailable: outcome known not to have happened
+ambiguous: effect may have happened; reconcile by identity
+internal invariant breach: alert and quarantine
+```
+
+Mapping every failure to “validation error” hides operational truth and can make clients retry unsafe operations.
+
+A schema is the first gate, not the definition of reality. I get reliable behaviour by naming every invariant, placing it where the required state can be checked atomically, and testing the races and failures that a valid payload cannot express.

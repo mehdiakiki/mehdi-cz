@@ -1,0 +1,75 @@
+---
+caseId: "RFA-672"
+title: "mem::replace Returns the Old Value Without Dropping It"
+date: "2026-09-06T08:32:00+01:00"
+lastmod: "2026-09-06T08:32:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "96f74433cb01b1ba395c36de1ed0c5211f196cc25e942cb6687cb79e09770dc0"
+area: "concurrency-memory"
+symptom: "After mem::replace, a destructor counter has not advanced because the previous value was returned rather than dropped."
+summary: "mem::replace moves a new value into a borrowed place and moves the old value out. The caller controls when the returned old value is destroyed."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust mem replace drop old value", "mem replace destructor timing", "move value out of mutable reference Rust"]
+evidence: ["Rust 1.98.1 runtime assertion", "Drop counter remains zero after replacement", "explicit drops establish both destructor points"]
+sources: ["https://doc.rust-lang.org/std/mem/fn.replace.html", "https://doc.rust-lang.org/std/mem/fn.take.html", "https://doc.rust-lang.org/std/ops/trait.Drop.html"]
+---
+
+`std::mem::replace(destination, source)` moves `source` into the borrowed destination and returns the previous destination value. Neither value is dropped by the replace operation itself. The [failing fixture](/rust-failure-atlas/evidence/RFA-672/fail.rs) expects one destructor call immediately and observes zero.
+
+## Replace performs two moves
+
+The [`mem::replace` documentation](https://doc.rust-lang.org/std/mem/fn.replace.html) describes moving the second argument into the referenced place and returning the old value. This solves a common ownership problem: safe code cannot normally move a non-Copy value directly out through `&mut T`, because the caller must always leave a valid `T` behind.
+
+Replacement preserves that invariant. At every observable safe point, the destination contains a valid value. The old value becomes owned by the caller.
+
+I picture it as a swap where only the old side is returned. This prevents me from treating it as assignment with immediate destruction.
+
+## Caller-owned old value means caller-owned cleanup timing
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-672/fixed.rs) first verifies zero drops, then explicitly drops the returned old value, then drops the new slot. The counter advances at those two deliberate points.
+
+This is useful for resource handover. Code can install a new connection before shutting down the old one, move an enum state out for transition logic, or extract a buffer while leaving an empty replacement.
+
+It also creates responsibility. Binding the result to `_old` still keeps it alive until its scope ends. Writing `let _ = mem::replace(...)` can cause immediate destruction according to temporary lifetime rules, but relying on subtle timing is less clear than `drop(old)` when order matters.
+
+## Assignment has different return behaviour
+
+Plain `slot = new_value` drops the previous value and gives the caller nothing. `mem::replace` returns it. `mem::swap` exchanges two existing places. [`mem::take`](https://doc.rust-lang.org/std/mem/fn.take.html) replaces with `T::default()` and returns the old value.
+
+These operations are not style variants. They encode what replacement value exists and who receives the old ownership. I choose the smallest one matching the lifecycle.
+
+For `Option<T>`, `take` and `replace` methods often express intent better than replacing the entire option manually. For collections, specialised methods may preserve capacity or expose additional guarantees.
+
+## Destructor work is not transactional work
+
+Rust's [`Drop`](https://doc.rust-lang.org/std/ops/trait.Drop.html) cannot return a recoverable error. If retiring the old resource can fail, I call an explicit close or commit method while I still own it. The destructor remains a fallback.
+
+Installing the new value before closing the old one may be correct for availability, but external systems can observe overlap. Closing first may create a gap and makes rollback harder. `mem::replace` supplies ownership mechanics; the application must define transition order.
+
+If a panic happens after replacement, unwinding will eventually drop owned values, but it will not reverse external effects. Critical handovers use guards or transaction objects that define rollback.
+
+## Pinning can forbid movement
+
+`mem::replace` moves values. It must not be used to move data whose pinning invariants forbid movement through a pinned reference. Safe pin APIs restrict access accordingly.
+
+Unsafe abstractions that expose an ordinary `&mut T` to pinned data have already broken the protection. I review replacement near self-referential or address-sensitive structures with special care.
+
+Tests use a destructor counter, not assumptions about printed order. They cover the old returned owner, the new destination, and panic paths where lifecycle matters.
+
+Replacement can also make state-machine code clearer when matching a borrowed enum would otherwise prevent moving its payload. I install a deliberate transitional variant, match the owned previous state, and finish in a valid final variant. The transitional value must itself be safe if an early return or panic leaves it behind.
+
+## My replacement checklist
+
+- Must the previous value be returned or dropped immediately?
+- What valid value remains in the destination?
+- When should cleanup of the old value occur?
+- Can explicit shutdown fail before Drop runs?
+- Is overlap or a gap allowed during resource handover?
+- Would swap, take, assignment, or an Option method express intent better?
+- Does pinning or address identity forbid moving this value?
+- Do tests observe ownership and destructor timing separately?
+
+The core principle is that replacement and destruction are independent ownership events. `mem::replace` keeps the old value alive by returning it. I use that returned ownership to make cleanup, rollback, and transition order explicit.

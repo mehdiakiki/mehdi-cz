@@ -1,0 +1,95 @@
+---
+caseId: "RFA-429"
+title: "A Thin Pointer Cannot Be Cast Directly to a Rust Slice Pointer"
+date: "2026-09-06T04:19:00+01:00"
+lastmod: "2026-09-06T04:19:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "78220e8db853656b29db0f9686725b1cc7cd311642d28dea06fe12faa86cbaf9"
+area: "concurrency-memory"
+symptom: "Casting *const u8 directly to *const [u8] fails with E0607 because the source address contains no slice-length metadata."
+summary: "A slice pointer is wide: it needs both a data address and a length. Construct it with slice_from_raw_parts only when the length, allocation, alignment, initialization, and lifetime invariants are independently proven."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust E0607 cannot cast thin pointer to wide pointer", "convert const u8 pointer to const slice", "slice_from_raw_parts pointer length metadata"]
+evidence: ["Rust 1.98.1 E0607 compile failure", "thin u8 pointer cast to wide slice pointer", "slice_from_raw_parts metadata construction"]
+sources: ["https://doc.rust-lang.org/error_codes/E0607.html", "https://doc.rust-lang.org/std/ptr/fn.slice_from_raw_parts.html", "https://doc.rust-lang.org/reference/expressions/operator-expr.html#type-cast-expressions"]
+---
+
+I had a raw pointer to the first byte of a buffer and tried to cast it to `*const [u8]`. Rust rejected the cast with E0607 because a thin pointer does not contain the metadata required by a slice pointer.
+
+The [failing fixture](/rust-failure-atlas/evidence/RFA-429/fail.rs) starts from `*const u8` and uses `as *const [u8]`. There is no length anywhere in that expression.
+
+## A slice pointer carries two facts
+
+A pointer to a sized value such as `*const u8` is thin: it identifies an address. A pointer to `[u8]` is wide because `[u8]` is dynamically sized. It needs the data address and the element count.
+
+The [E0607 explanation](https://doc.rust-lang.org/error_codes/E0607.html) uses this missing-metadata distinction. Trait-object pointers are also wide, although their metadata represents dynamic type dispatch rather than slice length.
+
+An `as` cast can reinterpret certain pointer addresses, but it cannot invent trustworthy metadata absent from the source.
+
+## Construct the metadata explicitly
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-429/fixed.rs) uses:
+
+```rust
+let slice = std::ptr::slice_from_raw_parts(thin, bytes.len());
+```
+
+This creates a raw slice pointer from an address and a length. The fixture only checks the pointer's metadata with `.len()` and keeps the original array alive.
+
+[`slice_from_raw_parts`](https://doc.rust-lang.org/std/ptr/fn.slice_from_raw_parts.html) is safe to call because producing a raw pointer alone does not dereference it. Using the resulting pointer to create a reference or read memory still requires all safety invariants.
+
+## A length is necessary but not sufficient
+
+Knowing “three bytes” does not prove that three readable bytes begin at the pointer. Before dereferencing, I must establish at least:
+
+- the memory belongs to one valid allocation for the whole range;
+- pointer arithmetic does not overflow and stays within allowed size limits;
+- the pointer has correct alignment for the element type;
+- the elements are initialized and valid for that type;
+- the memory remains alive for the reference lifetime;
+- aliasing rules permit the requested shared or mutable access.
+
+For `u8`, alignment and bit validity are simple. Lifetime, allocation extent, and aliasing are still real.
+
+## Prefer slices before crossing into raw pointers
+
+Inside safe Rust, I keep `&[u8]` or `&mut [u8]` whenever possible. A slice already couples address, length, lifetime, and borrowing permissions. Splitting it, indexing it, or passing it to parsing code preserves those relationships.
+
+Raw address-plus-length pairs usually appear at FFI, allocator, memory-mapped I/O, or custom container boundaries. I reconstruct one checked slice at that boundary and keep the unsafe region small.
+
+## FFI APIs must define ownership and duration
+
+C APIs commonly pass `(pointer, length)`. I verify whether length counts bytes or elements, whether null is allowed for zero length, who owns the memory, whether another thread may mutate it, and how long it remains valid.
+
+A non-null pointer with zero length and a null pointer with zero length can have different validity requirements when constructing Rust references. I follow the exact Rust API contract rather than assuming no bytes means no pointer rules.
+
+If foreign code can free or resize the allocation while Rust holds a slice, no cast can make the access safe.
+
+## Mutable slice pointers require stronger proof
+
+Creating `*mut [T]` adds the possibility of mutation. Turning it into `&mut [T]` requires exclusive access for the reference lifetime. Another pointer writing the same memory, or even another live mutable reference, can violate Rust's aliasing model.
+
+I do not treat a C function's non-const pointer as proof of exclusive ownership. The API protocol must establish it.
+
+## Trait-object metadata cannot be guessed either
+
+A data pointer alone cannot become `*const dyn Trait` by choosing an arbitrary vtable. Rust normally creates trait-object metadata through coercion from a pointer to a concrete implementing type.
+
+Although both slices and trait objects are called wide pointers, their metadata has different meaning. I use the type-specific construction or coercion path.
+
+## My boundary checklist
+
+When E0607 appears, I ask:
+
+- What metadata is missing: length or dynamic type information?
+- Where does that metadata come from authoritatively?
+- Is the complete range within one live allocation?
+- Are element alignment and validity proven?
+- Who may mutate the memory during access?
+- Can the API accept a safe slice earlier instead?
+- Is unsafe dereference isolated and documented?
+
+The core principle is that a pointer is more than an address when its referent is dynamically sized. A Rust slice pointer carries length metadata, and safe use also depends on provenance, lifetime, initialization, and aliasing. I construct those facts deliberately instead of asking a cast to fabricate them.

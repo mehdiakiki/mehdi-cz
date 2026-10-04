@@ -1,0 +1,80 @@
+---
+caseId: "RFA-315"
+title: "HashSet::intersection May Yield Either Equal Representative"
+date: "2026-09-06T01:35:00+01:00"
+lastmod: "2026-09-06T01:35:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "dcce5a11dd95c904b532acfc14b5bb7b5f28b58bb1a5a09c577c4d5be069157b"
+area: "concurrency-memory"
+symptom: "An intersection item has identity metadata from the other set even though the method was called on self and both stored values compare equal."
+summary: "HashSet intersection computes equality classes, not a left-biased record merge. For equal values with non-key fields, the iterator may borrow either stored representative; select the source explicitly when provenance matters."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust HashSet intersection which value returned", "intersection equal elements either set", "HashSet representative metadata intersection"]
+evidence: ["Rust 1.98.1 unequal-size sets", "equality based only on record id", "explicit left-representative filter"]
+sources: ["https://doc.rust-lang.org/std/collections/struct.HashSet.html#method.intersection", "https://doc.rust-lang.org/std/collections/struct.HashSet.html#method.get", "https://doc.rust-lang.org/std/collections/struct.HashSet.html#method.contains"]
+---
+
+I intersected two sets of records whose equality used only an ID. The left copy said its source was `left`; the equal right copy said `right`. I called `left.intersection(&right)` and expected the returned reference to come from `left`. It came from the other set in the pinned fixture.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-315/fail.rs) makes the left set larger than the right one. The implementation can inspect the smaller side efficiently, and the shared representative carries `right` metadata.
+
+## Intersection is about membership classes
+
+[`HashSet::intersection`](https://doc.rust-lang.org/std/collections/struct.HashSet.html#method.intersection) visits values that compare present in both sets. Its documentation explicitly warns that when equal elements exist on both sides, it may yield a reference to either one.
+
+This is observable when `T` contains fields ignored by `Eq` and `Hash`. Two records can represent the same set member while carrying different display labels, source annotations, timestamps, capacities, or cached data.
+
+The method answers “which equality classes occur in both sets?” It does not promise a left-biased merge policy for the complete records.
+
+## Performance freedom explains the API freedom
+
+A hash-set intersection can reduce work by iterating the smaller set and checking membership in the larger one. If the receiver is larger, this naturally exposes references from `other`. An implementation could make different choices without breaking the documented contract.
+
+I do not encode the exact Rust 1.98.1 choice into business logic. Set sizes, hasher implementations, and library changes may alter which stored object is returned.
+
+Even when both sets have the same length and an experiment appears left-biased, that is not a guarantee.
+
+## Choose the representative explicitly
+
+If I need values stored in the left set, I iterate the left set and filter using `right.contains(record)`. The repaired fixture does this and returns `(1, "left")`.
+
+If I start from an equality key, [`HashSet::get`](https://doc.rust-lang.org/std/collections/struct.HashSet.html#method.get) retrieves the equal value stored in one named set. This makes provenance part of the code rather than a side effect of an intersection implementation.
+
+When I need merged fields from both copies, a map keyed by stable identity is often clearer. I can fetch both values and apply an explicit policy: left wins, right wins, newest wins, combine, or report conflict.
+
+## Equality design controls what a set can preserve
+
+Custom `Eq` and `Hash` that ignore fields are legitimate, but they create representative questions throughout the collection API. Insert, replace, take, intersection, union, and serialization each need a policy for those ignored fields.
+
+The required invariant remains: values considered equal must hash equally. Violating it is a logic error. Ignoring `source` in equality is safe only if hashing ignores it too, as the fixture does.
+
+I document which fields form identity. Mutable or descriptive fields usually belong in a map value rather than inside a set element whose equality ignores them.
+
+## Set algebra is not record reconciliation
+
+The notation intersection, union, and difference comes from mathematical sets, where equal members are indistinguishable. Application records frequently are not. Two sources may disagree about attributes attached to the same key.
+
+Using set algebra first can discard that conflict before reconciliation sees it. I preserve both sides until the merge policy has executed. Only then do I reduce them to one canonical record.
+
+This becomes important in distributed inventories and caches, where provenance and freshness are not cosmetic. An arbitrary representative can make a stale record look authoritative.
+
+## Iteration order is independent
+
+HashSet iteration order is not stable sorted order. After selecting the desired representative, I still sort by an explicit key if deterministic output matters.
+
+Representative identity and iteration order are separate dimensions. Solving one does not solve the other. A test comparing a serialized list needs both an explicit source policy and an explicit ordering policy.
+
+I also avoid exposing randomized hash iteration as a pagination cursor because insertions and process restarts can rearrange it.
+
+## What I test
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-315/fixed.rs) uses left-side iteration plus right-side membership. It asserts the ID and source together so equality alone cannot hide the representative chosen.
+
+My merge tests include equal keys with different ignored fields, sets of unequal and equal sizes, missing keys, conflicting timestamps, and deterministic output order. I verify every policy by inspecting complete records rather than comparing only their IDs.
+
+When either-side selection is acceptable, I test only identity membership and say so. Tests should not accidentally make one implementation's representative a stronger promise than the product requires.
+
+The core principle is that equality collapses distinctions. `HashSet::intersection` is free to borrow either equal stored value because both represent the same set member. If the collapsed fields still matter to my system, I select or merge records explicitly before calling the result canonical.

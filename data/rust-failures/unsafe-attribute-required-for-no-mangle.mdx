@@ -1,0 +1,95 @@
+---
+caseId: "RFA-082"
+title: "Rust 2024: Why no_mangle Is Now an Unsafe Attribute"
+date: "2026-09-05T09:02:00+01:00"
+lastmod: "2026-09-05T09:02:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "bcd9e719ff6e70f12e8f103559fe163ae4cc11cea801578d2d0bde7e1bb20d5a"
+area: "upgrades-compatibility"
+symptom: "Rust 2024 rejects #[no_mangle] with unsafe attribute used without unsafe even though the function body is safe."
+summary: "no_mangle changes a process-wide symbol contract. Rust 2024 makes that obligation visible with #[unsafe(no_mangle)], but the wrapper is only correct after the symbol, ABI, and signature are audited."
+rustVersions: ["Rust 1.98.1"]
+targets: ["all targets"]
+profiles: ["dev", "release"]
+searchTerms:
+  [
+    "Rust unsafe attribute used without unsafe no_mangle",
+    "Rust 2024 unsafe no_mangle",
+    "#[unsafe(no_mangle)]",
+  ]
+evidence: ["Rust 1.98.1 edition-2024 failure", "symbol invariant", "unsafe-attribute repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-attributes.html",
+    "https://doc.rust-lang.org/reference/unsafe-keyword.html#unsafe-attributes",
+  ]
+---
+
+This function contains no pointer arithmetic and no unsafe block, yet Rust 2024 rejects it:
+
+```rust
+#[no_mangle]
+pub extern "C" fn atlas_status() -> i32 {
+    1
+}
+```
+
+Rust 1.98.1 reports `unsafe attribute used without unsafe` and suggests `#[unsafe(no_mangle)]`. The failure is captured in the [minimal program](/rust-failure-atlas/evidence/RFA-082/fail.rs).
+
+At first this can feel like unsafe syntax was added to a safe function. That reading misses the boundary. The body may be memory-safe, but `no_mangle` changes how the item enters the linker and process symbol namespace. The obligation belongs to the attribute, not necessarily to the statements inside the function.
+
+## A symbol name is shared outside Rust's type system
+
+Normally the compiler mangles a Rust function name with information that prevents common collisions and represents the item uniquely enough for linking. `no_mangle` requests an exact exported symbol. Another object file, static library, dynamic library, plugin, or crate can make a conflicting claim about that same name.
+
+The Rust type checker cannot compare every object that may be linked later. It also cannot prove that a foreign declaration of the symbol agrees with the implementation's calling convention and parameter layout. A wrong agreement can compile successfully and fail only at runtime, sometimes as memory corruption.
+
+Rust 2024 uses unsafe-attribute syntax to make this review obligation explicit. The [Edition Guide](https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-attributes.html) covers `no_mangle`, `export_name`, and `link_section`. The [Reference](https://doc.rust-lang.org/reference/unsafe-keyword.html#unsafe-attributes) describes an unsafe attribute as one carrying conditions the compiler cannot verify.
+
+## The syntax repair is the beginning
+
+The accepted form is:
+
+```rust
+// Safety: this crate owns this exported name and defines it exactly once.
+#[unsafe(no_mangle)]
+pub extern "C" fn atlas_status() -> i32 {
+    1
+}
+```
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-082/fixed.rs) compiles this form. The comment matters more than it first appears. `unsafe(...)` does not insert a runtime guard, reserve the symbol, or validate a C header. It says the author has checked the attribute's conditions.
+
+I want the comment to name the real evidence. “Required by Rust 2024” only explains syntax. A better statement says who owns the exported name, where its declaration lives, why the signature matches, and which targets use it.
+
+## What I audit before accepting it
+
+For an exported function I verify:
+
+1. The symbol name is intentionally part of an external interface.
+2. Exactly one linked definition owns that name for each target.
+3. The ABI matches the consumer declaration.
+4. Parameters and return values use FFI-safe representations.
+5. Unwinding behavior across the boundary is intentional.
+6. The function's visibility and lifetime match how the library is loaded.
+
+The same wrapper can be syntactically correct while any of these are wrong. That is why a mechanical migration needs review.
+
+## Why not export every convenient function
+
+An exact symbol becomes an interface that build systems and foreign programs can depend on. Renaming it later may be a breaking change even if Cargo semantic versioning sees only a private Rust function. Linker visibility can also affect binary size and symbol interposition.
+
+I keep the exported surface small and place it in a module where ABI types and safety rules are obvious. Internal Rust functions can keep normal mangling. A narrow wrapper can translate foreign inputs into stronger Rust types before calling the application logic.
+
+## Generated bindings need an ownership rule
+
+Code generators may emit `no_mangle` or `export_name` repeatedly. Simply teaching the template to add `unsafe(...)` is incomplete. The generator needs a collision policy, stable naming scheme, and target matrix. Two generated modules can otherwise export the same name while each local file looks reasonable.
+
+For plugins or embedded systems, the host may require fixed names. In that case exact spelling is the contract and the unsafe attribute is appropriate. For ordinary Rust-to-Rust calls, it usually is not needed.
+
+## My migration approach
+
+I first run the Rust 2024 compatibility lint, but I review unsafe attributes separately from formatting edits. I produce a symbol list for the final artifact when the interface matters, compare it to the expected exports, and keep a header or interface test near the build.
+
+The compiler error is useful because it interrupts a quiet assumption. The fix is not “make the compiler stop asking.” It is to turn an invisible linker promise into an explicit, reviewed one. Once the symbol ownership and ABI are real, `#[unsafe(no_mangle)]` accurately marks the boundary.

@@ -1,0 +1,96 @@
+---
+caseId: "RFA-270"
+title: "Which Side Gets the Boundary in Vec::split_off?"
+date: "2026-09-06T00:50:00+01:00"
+lastmod: "2026-09-06T00:50:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "556111cc5222a08dd7c89f572de44c86d4f0c373b997744301fbcd198b01a855"
+area: "concurrency-memory"
+symptom: "Vec::split_off at index two leaves only indices below two in the original vector and puts the boundary element in the returned vector."
+summary: "Vec::split_off partitions as [0, at) and [at, len), so the element at the supplied index starts the returned vector. Write the half-open ranges before using it for ownership or paging boundaries."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets with alloc"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust Vec split_off boundary element", "Vec split_off inclusive or exclusive index", "which vector contains split_off index Rust"]
+evidence: ["Rust 1.98.1 four-element vector", "split at index two", "two explicit half-open ranges"]
+sources: ["https://doc.rust-lang.org/std/vec/struct.Vec.html#method.split_off", "https://doc.rust-lang.org/std/primitive.slice.html#method.split_at", "https://doc.rust-lang.org/std/ops/struct.Range.html"]
+---
+
+I once read `split_off(2)` as “split after item two.” This sounds natural in a discussion, but it is not the index contract. My item at index two moved to the returned vector, and one ownership boundary was now on the wrong side.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-270/fail.rs) starts with `[10, 20, 30, 40]`. It calls [`Vec::split_off(2)`](https://doc.rust-lang.org/std/vec/struct.Vec.html#method.split_off) and expects `30` to remain in the original vector. The assertion fails because index two is the first index of the new suffix.
+
+## Write the two ranges first
+
+The standard-library contract is precise:
+
+```text
+original after split: [0, at)
+returned vector:      [at, len)
+```
+
+For `at = 2`, the original owns indices zero and one. The returned vector owns indices two and three. Rust uses half-open ranges throughout slices and collections, so this convention fits the wider language.
+
+The parameter is an index, not an element count described in ordinary one-based speech. Saying “the second item” and saying “index two” refer to different places. I keep the word `index` in reviews because it removes this ambiguity.
+
+## The operation transfers ownership
+
+`split_off` mutates the original `Vec<T>` and creates another owned `Vec<T>`. Elements in the returned range move; they are not cloned. This is why the method works without requiring `T: Clone`.
+
+After the call, both vectors are valid and independently owned. References into the original cannot be kept across its mutable borrow. Raw pointers held by unsafe code deserve more care because the returned suffix is newly allocated and elements may have new addresses.
+
+When I use the split for work queues, this ownership change is useful. A worker can receive the suffix without borrowing the first queue. But I must choose the boundary from the work policy, not from a vague reading of the method name.
+
+## The original keeps its previous capacity
+
+The documented behavior says the original vector retains its previous capacity. The returned vector is newly allocated for its elements. This can matter in a loop that repeatedly divides large batches: logical sizes become smaller, but the first vector can continue holding a large allocation.
+
+I do not treat that as a defect by default. Reuse can be efficient. When memory retention is operationally important, I measure capacity separately and choose an explicit shrinking or replacement policy.
+
+The boundary semantics should not be mixed with allocator speculation. My correctness test asserts elements and order. A performance test may record allocations, but it belongs to another claim.
+
+## Zero and length are valid boundaries
+
+Splitting at zero moves every element to the returned vector and leaves the original empty. Splitting at `len` returns an empty vector and leaves every element in the original.
+
+An index greater than `len` panics. If the boundary comes from a request, stored checkpoint, or arithmetic, I validate it before the call. Clamping may be suitable for a display window, but it can hide corrupt state in a protocol. The correct response depends on what the index means.
+
+I include all three edges in tests:
+
+```text
+at = 0
+0 < at < len
+at = len
+```
+
+Then I add `at > len` when panic or error policy matters.
+
+## It is related to split_at, but ownership differs
+
+[`slice::split_at`](https://doc.rust-lang.org/std/primitive.slice.html#method.split_at) uses the same `[0, mid)` and `[mid, len)` boundary, but returns two borrowed slices. `Vec::split_off` returns owned storage for the suffix.
+
+This difference guides my choice. If I only need to inspect or process two views temporarily, slices avoid a new vector. If the suffix must outlive the borrow or travel to another owner, `split_off` expresses that movement.
+
+Using an owned split only to iterate both sides immediately can add allocation without giving useful ownership. Using borrowed slices when a task needs ownership can instead create awkward lifetimes. The range is the same; the lifecycle is not.
+
+## Paging and checkpoints need named conventions
+
+The bug becomes more serious when the index is a resume point. Suppose indices below `at` are acknowledged and index `at` is the first unprocessed item. `split_off(at)` is perfect. If `at` names the last acknowledged item, the desired first unprocessed index is usually `at + 1`, with overflow and end checks.
+
+I write that meaning in the variable name:
+
+```text
+first_unprocessed_index
+last_completed_index
+```
+
+Both can have the same numeric value in different contexts and produce different splits. A type or helper function is useful when this convention crosses modules.
+
+## What I verify
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-270/fixed.rs) asserts `[10, 20]` in the original and `[30, 40]` in the suffix. In production tests I also verify order, zero and end boundaries, and non-`Clone` values when ownership is the reason for the operation.
+
+For a queue, I verify that each task appears exactly once across the two outputs. For a sorted collection, I assert that concatenating the outputs reconstructs the input. These properties catch dropped, duplicated, and misplaced boundary elements without depending on capacity.
+
+The core principle is that every partition needs an explicit interval convention. `Vec::split_off(at)` puts the boundary index in the returned `[at, len)` vector. Once I write those two ranges before coding, the API becomes simple and the surrounding ownership design becomes much easier to review.

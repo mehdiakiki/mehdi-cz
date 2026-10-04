@@ -1,0 +1,111 @@
+---
+caseId: "RFA-218"
+title: "slice::chunks_exact Leaves the Short Remainder Out"
+date: "2026-09-05T17:57:00+01:00"
+lastmod: "2026-09-05T17:57:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "5db1e81788df3b9fe4aeecfc7fd37fcd3270640f4ebc434c0046cf187c9347d4"
+area: "concurrency-memory"
+symptom: "Iterating over chunks_exact(2) for a five-element slice visits only four values and silently leaves the fifth outside the iterator."
+summary: "chunks_exact yields only complete fixed-size chunks. When the input length is not divisible by the chunk size, retrieve remainder explicitly or use chunks when a final short chunk is valid."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust chunks_exact missing remainder",
+    "slice chunks_exact last elements omitted",
+    "ChunksExact remainder Rust",
+  ]
+evidence: ["Rust 1.98.1 five-element slice", "one omitted tail value", "remainder-chain repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/std/primitive.slice.html#method.chunks_exact",
+    "https://doc.rust-lang.org/std/slice/struct.ChunksExact.html#method.remainder",
+    "https://doc.rust-lang.org/std/primitive.slice.html#method.chunks",
+  ]
+---
+
+I split five values into exact pairs and flattened the iterator. Only four values came back. Nothing panicked, because the final single value belongs to a separate remainder by design.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-218/fail.rs) visits `[1, 2, 3, 4]` from the input `[1, 2, 3, 4, 5]`.
+
+Exact chunk shape is purchased by excluding the short tail.
+
+## The iterator yields only full chunks
+
+[`slice::chunks_exact`](https://doc.rust-lang.org/std/primitive.slice.html#method.chunks_exact) returns non-overlapping slices whose length is exactly the requested chunk size. If the input is not evenly divisible, up to `chunk_size - 1` trailing elements are omitted from iteration.
+
+Those elements remain accessible through [`ChunksExact::remainder`](https://doc.rust-lang.org/std/slice/struct.ChunksExact.html#method.remainder). They are not dropped from the original slice; they are outside the iterator's item stream.
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-218/fixed.rs) saves the remainder and chains it after the full chunks when every input value must be visited.
+
+## `chunks` expresses a different contract
+
+[`slice::chunks`](https://doc.rust-lang.org/std/primitive.slice.html#method.chunks) yields a final shorter chunk when needed. For the five-value input and size two, its chunk lengths are two, two, and one.
+
+I choose based on whether a partial unit is valid:
+
+```text
+chunks        -> process the last short unit
+chunks_exact  -> process only complete units; inspect tail separately
+```
+
+For UI batches or rate-limited requests, a short final batch is normally valid. For RGB pixels, fixed binary records, or cryptographic blocks, a short remainder may be a malformed input that must produce an error.
+
+Silently chaining the remainder is not always the repair.
+
+## Conservation is the best first assertion
+
+I use this equation:
+
+```text
+input length = full chunk count * chunk size + remainder length
+```
+
+It detects lost tails without depending on the values. Then I assert the policy: remainder must be empty, must be processed, or must be buffered until more streaming input arrives.
+
+Checking only the number of full chunks can make truncation look like expected division.
+
+## Streaming makes the remainder stateful
+
+A network read boundary is not a record boundary. If one chunk of bytes ends with half a record, I must carry those bytes into the next read rather than reject every incomplete buffer.
+
+The remainder therefore becomes parser state:
+
+```text
+previous tail + new bytes -> complete records + next tail
+```
+
+I bound the tail by the maximum record size and define EOF behaviour. At true EOF, a non-empty fixed-record remainder may be an error; between reads it is normal.
+
+This connects the slice API to a larger systems principle: chunk boundaries chosen by I/O are not semantic boundaries.
+
+## Reverse exact chunks put the remainder elsewhere
+
+`rchunks_exact` starts at the end, so an indivisible remainder is at the beginning rather than the end. Replacing forward chunks with reverse chunks changes which values are excluded.
+
+I test the actual direction when parsing suffix-oriented formats. A function named only `groups` hides whether alignment begins from the front or back.
+
+The mutable variants expose the remainder through their corresponding API and retain the same shape decision.
+
+## Zero chunk size panics
+
+A chunk size of zero cannot make progress and is rejected with a panic. If size comes from configuration or input, I validate it before selecting the iterator.
+
+Using a non-zero integer type at the configuration boundary can remove this invalid state from later code. I still convert carefully to `usize` for platform width.
+
+## Exact chunks can help optimization and types
+
+Knowing every chunk has one runtime length can simplify loops. For compile-time sizes, APIs returning references to arrays can make the exact length part of the type, which helps parsing fixed headers and vectorized operations.
+
+Performance is not the only benefit. A function accepting `&[u8; 16]` cannot accidentally receive a fifteen-byte block. I prefer that representation after the remainder policy is resolved.
+
+I benchmark real workloads because conversion, bounds checks, and vectorization depend on surrounding code and compiler version.
+
+## My regression puts one value in the tail
+
+Divisible examples never execute the remainder rule. The fixture deliberately uses five values with size two. In application tests I cover remainder lengths from zero through `chunk_size - 1`, empty input, one full chunk, and invalid zero size at the validation layer.
+
+The core principle is that an iterator can preserve data outside its yielded items. `chunks_exact` guarantees exact item shapes by holding back the short tail. I retrieve or reject that remainder explicitly so no record disappears between the slice and the loop.

@@ -2,15 +2,16 @@
 const siteMetadata = {
   title: "mehdi.cz",
   author: "Mehdi Akiki",
-  headerTitle: "MEHDI>_",
+  headerTitle: "Mehdi Akiki",
   description:
-    "Software engineer building high-performance systems — from low-latency trading platforms to OSS contributions in Rust, Deno, and Mozilla.",
+    "Engineering work by Mehdi Akiki across startup products, financial systems, distributed infrastructure, and open-source systems including Rust, Deno, and rust-analyzer.",
   language: "en-us",
   theme: "system", // system, dark or light
   siteUrl: "https://www.mehdi.cz",
   siteRepo: "https://github.com/mehdiakiki/mehdi-cz",
-  siteLogo: `${process.env.BASE_PATH || ""}/static/images/logo.png`,
-  socialBanner: `${process.env.BASE_PATH || ""}/static/images/twitter-card.png`,
+  siteLogo: `${process.env.BASE_PATH || ""}/static/images/logo.webp`,
+  authorImage: `${process.env.BASE_PATH || ""}/static/images/mehdi_image_enhanced_square.webp`,
+  socialBanner: `${process.env.BASE_PATH || ""}/static/images/twitter-card.webp`,
   email: "hello@mehdi.cz",
   github: "https://github.com/mehdiakiki",
   x: "https://twitter.com/mehdiakiki",
@@ -25,7 +26,7 @@ const siteMetadata = {
     // supports Plausible, Simple Analytics, Umami, Posthog or Google Analytics.
     umamiAnalytics: {
       umamiWebsiteId: process.env.NEXT_UMAMI_ID,
-      src: 'https://analytics.mehdi.cz/script.js',
+      src: "https://analytics.mehdi.cz/script.js",
     },
     // plausibleAnalytics: {
     //   plausibleDataDomain: '', // e.g. tailwind-nextjs-starter-blog.vercel.app

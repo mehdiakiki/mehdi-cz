@@ -1,0 +1,113 @@
+---
+caseId: "RFA-210"
+title: "Why Iterator::flatten Can Silently Drop Result Errors"
+date: "2026-09-05T17:49:00+01:00"
+lastmod: "2026-09-05T17:49:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "42d8bd129793ab5e49cc577b10491e2e07a6510c559734a5e5b0ae650228632b"
+area: "concurrency-memory"
+symptom: "Flattening an iterator of Result values produces only successful values and silently removes every error from the output."
+summary: "A Result iterates as one item for Ok and zero items for Err, so Iterator::flatten intentionally filters errors away. Keep Result in the item type when failures must stop, accumulate, or remain observable."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets with alloc"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust iterator flatten Result drops errors",
+    "Result into_iter Err empty iterator",
+    "Rust flatten keep errors",
+  ]
+evidence: ["Rust 1.98.1 mixed outcomes", "error removed by flatten", "explicit outcome partition"]
+sources:
+  [
+    "https://doc.rust-lang.org/std/result/#iterating-over-result",
+    "https://doc.rust-lang.org/std/iter/trait.Iterator.html#method.flatten",
+    "https://doc.rust-lang.org/std/result/#collecting-into-result",
+  ]
+---
+
+I used `flatten` on parsed records because it made the iterator type simple. The valid values appeared, the code looked clean, and the invalid records disappeared with no error path left to inspect.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-210/fail.rs) starts with two `Ok` values and one `Err`. After `.flatten()`, the resulting vector contains only two values.
+
+The error was not converted. It became an empty inner iterator.
+
+## Result is a zero-or-one-item iterator
+
+The standard [`Result` iteration documentation](https://doc.rust-lang.org/std/result/#iterating-over-result) describes this directly. Iterating an `Ok(value)` yields that one value. Iterating an `Err(error)` yields no values.
+
+[`Iterator::flatten`](https://doc.rust-lang.org/std/iter/trait.Iterator.html#method.flatten) takes every item from each inner iterator. Applied to results, its shape is:
+
+```text
+Ok(value) -> once(value) -> value survives
+Err(error) -> empty()    -> nothing survives
+```
+
+There is no warning because ignoring errors can be intentional. The types fully support the operation.
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-210/fixed.rs) needs every outcome, so it matches each result and stores values and errors separately.
+
+## This is different from `Result::flatten`
+
+There are two APIs with similar names. `Iterator::flatten` flattens an iterator whose items can themselves be iterated. `Result::flatten` removes one nested `Result` layer from a value such as `Result<Result<T, E>, E>` and preserves failure.
+
+In this case, method resolution sees an iterator and chooses the iterator adapter. The output item becomes `T`, so `E` is no longer present in the type.
+
+I inspect the inferred item type when a chain seems too convenient. If the final collection is `Vec<T>`, it cannot contain the errors that existed earlier.
+
+## Ignoring failures should be visible
+
+Sometimes I really want successful values only. For example, a best-effort discovery pass may accept any parsable optional hints. I still prefer to make that policy visible:
+
+```rust
+results.filter_map(|result| result.ok())
+```
+
+This has the same loss of errors, but the word `ok` shows the conversion. Better, I attach a counter or log through an explicit match if discarded failures matter operationally.
+
+I avoid logging raw records automatically because parser errors can contain credentials or private data. Observability needs the same data-boundary review as normal output.
+
+## Fail-fast collection preserves one error
+
+If every item must succeed, collecting into `Result<Vec<T>, E>` preserves the first error. The standard [collection behaviour](https://doc.rust-lang.org/std/result/#collecting-into-result) stops at that `Err` and does not visit later items.
+
+This is stronger than flatten because failure remains visible, but it is not a collect-all-errors design. RFA-206 demonstrates the unvisited iterator remainder.
+
+I choose between three policies explicitly:
+
+```text
+best effort: keep successes, observe or count rejected items
+fail fast:   return the first error and stop
+validate all: visit every item and return a structured report
+```
+
+No single adapter implements all three.
+
+## Errors may own important resources
+
+Dropping an `Err(E)` drops its error value. Usually that releases memory. An error can also carry a response body, temporary file, retry token, or guard whose destructor changes state.
+
+Rust remains memory-safe, but flattening makes that lifecycle implicit. If cleanup or retry needs data from the error, I must extract it before the item becomes an empty iterator.
+
+The same issue applies to `Option`: flattening an iterator of options silently removes every `None`. For optional data that is often correct. For missing required fields it hides a contract violation.
+
+## A successful count can become misleading
+
+If I compare `output.len()` only with another successful batch, missing errors may look like low traffic rather than failed parsing. I track the conservation rule:
+
+```text
+input count = success count + error count
+```
+
+For streaming input, I increment these counts while consuming rather than storing everything. For user-facing validation, I keep stable record positions and cap detailed errors so one bad file cannot exhaust memory.
+
+I also distinguish skipped input from parser errors. Both produce no output value, but they need different metrics and recovery.
+
+## My regression includes a middle error
+
+An error at the end can be missed by a test that only checks the first successful values. The fixture places `Err` between two `Ok` values and asserts both collections in the repaired version.
+
+I add all-success, all-error, and empty inputs in application tests. If order matters, I verify that successful and failed records retain their source identities, not only their counts.
+
+The core principle is that changing an iterator's item type can erase states. `flatten` over `Result` turns `Err` into zero items. I use it only for deliberate best effort and keep an error-bearing type whenever failures must remain part of the system's evidence.

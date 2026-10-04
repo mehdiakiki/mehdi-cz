@@ -1,0 +1,109 @@
+---
+caseId: "RFA-176"
+title: "Why Slice binary_search Does Not Return the First Duplicate"
+date: "2026-09-05T17:15:00+01:00"
+lastmod: "2026-09-05T17:15:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "50b8b3e318803de3c076e54e6863026fe2e78908e17cade4e8e925c00597b9f9"
+area: "concurrency-memory"
+symptom: "A binary search over sorted duplicate values returns a later matching index although application code expected the first occurrence."
+summary: "Rust binary_search promises any matching duplicate, not the first one. Use partition_point to express lower and upper bounds when the position inside an equal run is part of the application contract."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust binary_search duplicate first occurrence",
+    "slice binary_search returns which duplicate",
+    "Rust partition_point lower bound equal values",
+  ]
+evidence:
+  [
+    "Rust 1.98.1 duplicate slice",
+    "returned index 3 instead of 1",
+    "partition_point lower-bound repair",
+  ]
+sources:
+  [
+    "https://doc.rust-lang.org/std/primitive.slice.html#method.binary_search",
+    "https://doc.rust-lang.org/std/primitive.slice.html#method.partition_point",
+  ]
+---
+
+Binary search answers a smaller question than I sometimes ask from it. It can tell me whether a sorted slice contains a value and give me one matching position. It does not promise which position inside a group of equal values.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-176/fail.rs) searches `[0, 1, 1, 1, 2]` for `1`. Rust 1.98.1 returns index 3. The program expected index 1 and fails.
+
+## Any equal match satisfies the contract
+
+The documentation for [`slice::binary_search`](https://doc.rust-lang.org/std/primitive.slice.html#method.binary_search) says that any matching index may be returned when duplicates exist. The choice is deterministic for one implementation, but it may change in a later Rust version.
+
+This is enough for membership:
+
+```rust
+if values.binary_search(&needle).is_ok() {
+    // at least one equal value exists
+}
+```
+
+It is also enough when every equal value is interchangeable. The problem starts when the index carries a second meaning: earliest timestamp, preferred record, beginning of a range, or insertion point before existing equals.
+
+I do not turn the index I happened to observe into an undocumented guarantee.
+
+## Lower and upper bounds are separate operations
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-176/fixed.rs) uses [`partition_point`](https://doc.rust-lang.org/std/primitive.slice.html#method.partition_point):
+
+```rust
+let first = values.partition_point(|value| value < &needle);
+```
+
+This finds the first position where values are not less than the needle—the lower bound. I then check `values.get(first) == Some(&needle)` because the lower bound is also a valid insertion point when no equal value exists.
+
+The end of the equal run is:
+
+```rust
+let after_last = values.partition_point(|value| value <= &needle);
+```
+
+The matching range is `first..after_last`. Its length gives the duplicate count, and the empty range means no match.
+
+These predicates require the slice to be partitioned according to the same ordering. If comparison logic used for sorting differs from comparison logic used for searching, the result becomes meaningless even though the code remains memory-safe.
+
+## Scanning backward from an arbitrary match can be acceptable
+
+Another repair is to call `binary_search` and scan left while the previous value is equal. This is simple and may be efficient when duplicate runs are known to be tiny.
+
+Its worst-case work is linear in the number of duplicates. A slice containing a million identical values turns the “binary” lookup into a long scan. Two partition-point searches keep logarithmic comparisons for both boundaries.
+
+I choose based on the data distribution and document the choice. A short scan is not automatically wrong; an unexamined assumption about duplicate length is.
+
+## Records make the representative problem visible
+
+Suppose records are sorted only by customer ID. Several entries can compare equal by that key while holding different payloads. `binary_search_by_key` may return any record in the group.
+
+If I need the newest record, finding the first duplicate is still not sufficient. I need either a secondary sort order that puts the chosen record at a known boundary or an aggregation step over the equal range.
+
+This connects to the Atlas cases about `HashMap` key retention and `Vec::dedup_by`: equality, storage identity, and representative selection are related but different policies.
+
+## The `Err` position has a precise use
+
+When no match exists, `binary_search` returns an insertion index that preserves sorted order. With duplicates, an `Ok` index is not promised to be the same lower-bound position I would receive for a missing value.
+
+Code that uses `result.unwrap_or_else(|index| index)` therefore produces “some match or insertion point,” not one consistent lower-bound operation. If later logic assumes all returned indexes are the first `>= needle`, it is subtly wrong only when duplicates are present.
+
+Using `partition_point(|x| x < needle)` states that requirement for both present and absent values.
+
+## My search review checklist
+
+When a sorted lookup returns a surprising record, I check:
+
+1. Is the input sorted under exactly the search comparison?
+2. Can several elements compare equal?
+3. Does the caller need membership, any match, first match, last match, or the complete range?
+4. Does equality by the search key hide different payloads?
+5. Is a linear scan across duplicates acceptable for the data distribution?
+6. Do tests contain several equal values with visibly different identities?
+
+The general principle is to encode the actual boundary I need. Binary search is not one operation but a family of questions. Rust's `binary_search` answers “give me any equal value.” `partition_point` lets me state where an ordered region begins or ends.

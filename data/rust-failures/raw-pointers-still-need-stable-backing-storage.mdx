@@ -1,0 +1,73 @@
+---
+caseId: "RFA-625"
+title: "Raw Pointers Still Need Stable Backing Storage"
+date: "2026-09-06T07:45:00+01:00"
+lastmod: "2026-09-06T07:45:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "7bdce77a177a9834d659aabab3e8fbf0b4e0a1c410a311b0d58fc6c2101dcefe"
+area: "concurrency-memory"
+symptom: "Taking a raw address of the temporary integer 2 fails with E0745 because the temporary has no storage lifetime suitable for the pointer."
+summary: "Raw pointers relax borrow-checker tracking; they do not create an allocation or extend a value's lifetime. Bind the owner, then prove validity at every later dereference."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust E0745 cannot take address temporary", "raw const pointer temporary value", "raw pointer backing storage lifetime Rust"]
+evidence: ["Rust 1.98.1 E0745 compile failure", "raw address taken from integer temporary", "named local backing storage repair"]
+sources: ["https://doc.rust-lang.org/error_codes/E0745.html", "https://doc.rust-lang.org/reference/expressions/operator-expr.html#raw-borrow-operators", "https://doc.rust-lang.org/std/ptr/index.html"]
+---
+
+Raw-pointer syntax can feel like an escape from borrowing rules. It is not an escape from storage. A pointer must still designate bytes that exist, have suitable alignment, and contain a valid value when an operation requires one. The [failing fixture](/rust-failure-atlas/evidence/RFA-625/fail.rs) takes the raw address of an integer temporary and receives E0745.
+
+## An address does not extend a lifetime
+
+The expression `2_u32` computes a value without creating a named local whose storage is available for later use. The [official E0745 explanation](https://doc.rust-lang.org/error_codes/E0745.html) repairs the problem by binding the value first and taking that local’s address.
+
+The Reference documents [raw borrow operators](https://doc.rust-lang.org/reference/expressions/operator-expr.html#raw-borrow-operators). They create a raw pointer without producing a reference. This is important for packed fields and uninitialised memory where forming a reference itself could violate requirements. It does not allocate, pin, or keep an owner alive.
+
+I ask two separate questions: was pointer creation legal, and will each future use be valid? E0745 answers only a narrow part of the first question.
+
+## A named local gives storage, not permanent stability
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-625/fixed.rs) binds the integer before taking its address. The pointer is usable only while that local remains alive and has not been invalidated by rules applying to the later operation.
+
+Returning such a pointer from the function would still be wrong because the stack slot disappears. Moving an owning allocation may keep its heap buffer stable, while moving an inline value changes where the value lives. A `Vec` reallocation can move its elements even though the `Vec` variable remains in the same scope.
+
+When an address must survive moves of its handle, I consider an owning allocation and, for address-sensitive invariants, pinning. `Pin` does not by itself extend lifetime or validate raw pointers. Each tool answers a different part of the proof.
+
+## Dereference is where the full obligation arrives
+
+The standard library’s [raw pointer module](https://doc.rust-lang.org/std/ptr/index.html) describes validity, alignment, provenance-related operations, and APIs for copying or reading. Creating a non-null pointer is not evidence that dereferencing is sound.
+
+Before a read I need sufficient allocation bounds, correct alignment, an initialized valid `T`, and permission under Rust’s aliasing model. Before a write I also need mutation permission and must handle destruction of any replaced value correctly.
+
+Integer-to-pointer casts are especially suspicious. An address observed from a device, shared memory region, or foreign API needs a contract beyond “the number is non-zero.” I keep such construction inside a narrow unsafe abstraction with documented preconditions.
+
+## FFI callbacks need explicit ownership windows
+
+C APIs often accept a data pointer and invoke a callback later. Passing the address of a stack local is safe only if the foreign function guarantees the callback finishes before the local leaves scope and does not retain the pointer. Asynchronous retention needs heap ownership and an explicit release protocol.
+
+I write down who allocates, who may access, on which thread, until which event, and who deallocates. A pointer plus vague comments is not an ownership protocol. Opaque handles with registration and unregister functions are usually easier to audit.
+
+For mutable callbacks I also prevent concurrent Rust access while foreign code may write. The borrow checker cannot track activity behind a raw pointer, so synchronization and state transitions become my responsibility.
+
+## Prefer references when their rules fit
+
+References communicate non-nullness, alignment, validity, and a tracked borrowing relationship. I use raw pointers only where references cannot express the operation: FFI, manual allocation, intrusive structures, packed access, or low-level algorithms.
+
+At the safe boundary I convert only after validating every prerequisite, and I keep the reference lifetime no longer than the established access window. I avoid converting a raw pointer once and storing an overlong reference.
+
+Compile-fail evidence protects temporary-address formation. Runtime tests, Miri, sanitizers, and foreign harnesses cover exercised pointer paths, but none replace a written safety invariant.
+
+## My E0745 checklist
+
+- What concrete allocation or local backs the pointer?
+- Does that storage remain alive for every possible later use?
+- Can a move, container growth, or deallocation change its address?
+- Are alignment, bounds, initialization, and type validity established?
+- What aliasing or synchronization rule permits reads and writes?
+- Does foreign code retain the pointer beyond the current call?
+- Would a reference, owning pointer, index, or opaque handle express the contract better?
+- Is every unsafe dereference adjacent to a documented proof?
+
+The core principle is that raw pointers remove automatic tracking, not physical lifetime requirements. E0745 stops a pointer from starting with ephemeral storage. I name or allocate the owner and then prove the complete access contract wherever the pointer is used.

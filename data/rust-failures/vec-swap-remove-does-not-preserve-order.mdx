@@ -1,0 +1,93 @@
+---
+caseId: "RFA-297"
+title: "Vec::swap_remove Does Not Preserve Element Order"
+date: "2026-09-06T01:17:00+01:00"
+lastmod: "2026-09-06T01:17:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "06692cd56964b585a811c0ffdd27ca100a8c5c6217f2e6cfbe62f2aecc9fe284"
+area: "concurrency-memory"
+symptom: "Removing beta at index one from a four-element Vec with swap_remove leaves delta in that position instead of shifting gamma left."
+summary: "Vec::swap_remove achieves constant-time removal by moving the final element into the hole. Use remove when sequence order is part of the contract, or update every external index when unordered dense storage is intentional."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets with alloc"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust Vec swap_remove changes order", "swap_remove last element moves to index", "Vec constant time removal preserve order"]
+evidence: ["Rust 1.98.1 four-element vector", "middle constant-time removal", "last element moved into hole"]
+sources: ["https://doc.rust-lang.org/std/vec/struct.Vec.html#method.swap_remove", "https://doc.rust-lang.org/std/vec/struct.Vec.html#method.remove", "https://doc.rust-lang.org/std/vec/struct.Vec.html#method.retain"]
+---
+
+I replaced `Vec::remove` with `swap_remove` during a performance pass. The selected element disappeared correctly, but a later test showed the remaining sequence in a different order. The speed improvement had changed the data contract.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-297/fail.rs) removes `beta` at index one. The last value, `delta`, moves into that hole, producing `alpha, delta, gamma`.
+
+## Constant time comes from filling the hole
+
+[`Vec::swap_remove`](https://doc.rust-lang.org/std/vec/struct.Vec.html#method.swap_remove) removes and returns the selected element, then replaces its slot with the vector's final element. Shortening the length removes the old final slot.
+
+Conceptually:
+
+```text
+before: [A, B, C, D]
+remove index 1
+after:  [A, D, C]
+```
+
+Only a small fixed amount of movement is required. The method does not shift every element after the removed index.
+
+That is why it is O(1), and also why it cannot promise stable order.
+
+## `remove` chooses the other tradeoff
+
+[`Vec::remove`](https://doc.rust-lang.org/std/vec/struct.Vec.html#method.remove) returns the selected value and shifts all following values one position left. The resulting sequence is `A, C, D`.
+
+For a removal near the front of a large vector, this movement can be expensive. For a user-visible queue, precedence list, source-order diagnostic list, or deterministic serialization, preserving order can be non-negotiable.
+
+I select the operation from the semantic requirement first, then measure whether the movement is actually a bottleneck.
+
+## External indexes must follow the moved element
+
+Unordered dense storage often pairs a vector with a map from stable IDs to vector indexes. `swap_remove` works well there, but the map entry for the moved last element becomes stale unless it is updated.
+
+The full operation is:
+
+1. remember the last element's stable ID;
+2. swap-remove the target;
+3. if an element moved into the target index, update its map entry;
+4. remove the deleted ID from the map.
+
+Forgetting step three can make a later lookup mutate or delete the wrong object. I wrap this protocol in one collection type instead of repeating it at callers.
+
+## Indexes are not stable identities
+
+Even ordinary `remove` changes the indexes of later elements. `swap_remove` changes fewer indexes, but the one change is less locally predictable because it comes from the end.
+
+I do not expose raw vector indexes as durable IDs across requests or persistence. A generation index, arena key, or domain ID can detect stale references. This is directly relevant to arena-style data structures, where dense storage and stable external handles solve different problems.
+
+If consumers hold references, Rust's borrowing rules already prevent safe mutation of the vector during those borrows. Numeric indexes stored elsewhere have no such automatic protection.
+
+## Removing several indexes needs an order policy
+
+Applying `swap_remove` to a list of indexes can invalidate later indexes in that same list. Sorting indexes descending avoids shifts for `remove`, but swap removal still moves tail elements into holes and may target entries scheduled for later removal.
+
+For predicate-based deletion where removed values are not needed, [`retain`](https://doc.rust-lang.org/std/vec/struct.Vec.html#method.retain) often expresses the goal better and preserves the relative order of retained elements. When removed ownership is needed, I may partition IDs first or use a dedicated dense set algorithm.
+
+Batch deletion deserves its own tested operation rather than a casual loop over stored indexes.
+
+## Determinism is part of observable behavior
+
+An internal collection may be logically unordered while tests, logs, snapshots, or serialized output accidentally expose its current order. Switching to `swap_remove` then looks like a regression.
+
+I either preserve order deliberately or canonicalize only at the external boundary. Pretending order does not matter while publishing it in JSON produces fragile consumers.
+
+For simulation and build systems, deterministic order can also make failures reproducible. I count that operational value before trading it for faster removal.
+
+## What I test
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-297/fixed.rs) uses `remove` and asserts the stable remaining order.
+
+For an unordered dense collection I would instead assert membership, the moved element's new index mapping, length, and stable-ID lookup. I test removal at the first, middle, and last indexes, a one-element vector, repeated removals, and an out-of-range request at the API boundary.
+
+Benchmarks use the real element size and removal distribution. Moving a large final element and updating indexes is not free, while shifting many small copyable elements can be faster than intuition on a modern CPU.
+
+The core principle is that complexity guarantees are purchased with semantics. `swap_remove` buys constant-time vector removal by giving up order and moving the final element into the hole. I use it when storage is intentionally unordered and every index relationship is repaired as part of the same operation.

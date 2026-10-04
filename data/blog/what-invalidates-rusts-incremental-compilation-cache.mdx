@@ -1,0 +1,157 @@
+---
+title: "What Invalidates Rust's Incremental Compilation Cache?"
+date: "2026-10-03T09:00:00+01:00"
+tags: ["rust", "rustc", "incremental compilation", "compile time", "cargo"]
+draft: false
+reviewed: true
+reviewedHash: "8c431a0494e5dce712780568e608f2f70060627bf4f786776e55c1cfe8a24a16"
+cluster: "rust-under-the-hood"
+campaign: "authority-2026"
+opportunity: "RUST-018"
+summary: "Rust's incremental cache is a dependency graph, not a saved compiler process. Learn what an edit dirties, how green nodes are recovered, and why Cargo may still run rustc."
+---
+
+An incremental Rust build is not simply “the compiler remembers the last binary.” Rustc saves a graph of earlier computations and some reusable work products. On the next compilation, it tries to prove which results are still valid.
+
+This explains a behaviour that can feel inconsistent: I change one private function and the build is quick, then I change a nearby public type and much more work happens.
+
+The useful question is not only “Did the file change?” It is “Which compiler facts can observe this change?”
+
+## There are two different reuse decisions
+
+Cargo and rustc operate at different levels.
+
+```text
+Cargo freshness
+  └─ Can I skip invoking rustc for this target?
+
+rustc incremental compilation
+  └─ If rustc runs, which compiler results and work products can I reuse?
+```
+
+Cargo may decide a crate target is fresh and avoid rustc completely. If an input makes the target stale, Cargo invokes rustc. That does not mean rustc starts every computation again.
+
+This distinction matters when reading `cargo build -vv`. Seeing a rustc command proves the crate was not Cargo-fresh. It does not prove every function was recompiled.
+
+## The dependency graph is the central idea
+
+Rustc models compilation as dependent pieces of work. A simplified graph for one function can look like:
+
+```text
+source owner
+   ├── type checking
+   ├── borrow checking
+   └── MIR
+          └── code generation unit
+```
+
+Real rustc queries are more numerous and the graph is not this tidy. The principle is still useful: if an input changes, nodes that read it may become dirty. Results outside that dependency path can remain reusable.
+
+The [rustc development guide](https://rustc-dev-guide.rust-lang.org/queries/incremental-compilation-in-detail.html) describes this as a red-green algorithm. A red node changed or depends on something that changed. A green node is still valid.
+
+## Rustc first tries to prove a node is green
+
+Suppose the current compilation asks for a result that existed last time. Rustc can compare stable fingerprints for the relevant input and dependencies.
+
+Conceptually:
+
+```text
+requested node
+   ├── input fingerprint unchanged?
+   ├── dependency A green?
+   └── dependency B green?
+
+all yes  -> mark green and reuse
+any no   -> recompute and compare the new result
+```
+
+The second comparison is important. A computation may run because one input changed, but produce the same value as before. Its dependants do not always need to become red merely because it ran.
+
+That is why “changed source line” and “invalidated machine code” are not equivalent statements.
+
+## A private body edit and a public contract edit differ
+
+Consider:
+
+```rust
+pub fn total(cents: u64, quantity: u64) -> u64 {
+    cents * quantity
+}
+```
+
+Changing the body to `cents.saturating_mul(quantity)` changes this function's behaviour and generated code. Its signature remains `fn(u64, u64) -> u64`.
+
+Compare that with:
+
+```rust
+pub fn total(cents: u64, quantity: u32) -> u64 {
+    cents * u64::from(quantity)
+}
+```
+
+Now the callable contract changed. Call sites, inferred types, trait obligations, and generated code can observe it. The invalidation path is normally wider.
+
+This is not a promise that every body-only edit is cheap. Inlining, generics, macros, constant evaluation, and code-generation partitioning can widen the effect. It is a way to predict the dependency shape.
+
+## What makes reuse unavailable
+
+There are two broad cases.
+
+First, the previous incremental session cannot be used as the starting point. Examples include deleting the incremental directory, selecting an incompatible compiler session, or changing compilation inputs in a way that requires a different cache session.
+
+Second, the session loads but some nodes become red. Common sources are:
+
+- changing an item's tokens or attributes;
+- changing a type, trait implementation, feature, or configuration used by other items;
+- changing generated code from a macro or build script;
+- changing a dependency's metadata;
+- changing code-generation settings that affect produced work.
+
+I avoid maintaining a folk list that says one flag “always clears the cache.” Compiler internals evolve. Instead, I separate session compatibility from dependency invalidation and measure the build I actually care about.
+
+## A small cache-loading experiment
+
+I compiled a tiny three-function program with nightly Rust 1.95 and an explicit directory:
+
+```bash
+rustc +nightly main.rs \
+  -C incremental=./incremental-cache \
+  -Z incremental-info
+```
+
+On a later invocation, rustc reported:
+
+```text
+[incremental] session directory: 26 files hard-linked
+[incremental] session directory: 0 files copied
+```
+
+After I changed only one function body, the following invocation again loaded files from the saved session. The diagnostic also printed thousands of dependency-graph nodes.
+
+This is a useful smoke test that an on-disk session was loaded. It is **not** proof that 26 functions were reused, and `-Z incremental-info` is an unstable internal diagnostic. I do not turn one line from it into a cache-hit percentage.
+
+## How I investigate a surprisingly slow edit-build cycle
+
+I use this order:
+
+1. Run the same command twice without editing. The second run should tell me whether Cargo freshness works.
+2. Use `cargo build -vv` to see which targets Cargo invokes.
+3. Confirm the same toolchain, target, profile, features, and relevant environment are used.
+4. Check build scripts. A broad or missing `rerun-if-changed` rule can make Cargo call rustc more often.
+5. Separate one slow crate from the whole workspace.
+6. Only then use nightly compiler profiling or incremental diagnostics for a controlled reproduction.
+
+The [Cargo profiles reference](https://doc.rust-lang.org/cargo/reference/profiles.html#incremental) notes that incremental compilation is configurable per profile and that the cache lives below the target directory. CI jobs that start with an empty target directory cannot benefit from a cache they never restore.
+
+## Cache reuse is not the same as a correct build
+
+Incremental compilation is a performance feature. Correctness must not depend on an old result remaining present.
+
+I still run clean builds at appropriate boundaries, especially before release. The daily edit loop and the release verification loop have different goals:
+
+```text
+edit loop:     fast feedback with safe reuse
+release loop:  independent evidence from a controlled build
+```
+
+When a build feels mysterious, the graph model helps. Cargo decides whether a target needs rustc. Rustc decides which dependent facts need new work. A small edit is fast when its observable consequences stay local—not merely because the changed text was small.

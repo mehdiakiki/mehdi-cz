@@ -1,0 +1,110 @@
+---
+caseId: "RFA-155"
+title: "Why Rust String::truncate Panics at a Non-UTF-8 Boundary"
+date: "2026-09-05T15:55:00+01:00"
+lastmod: "2026-09-05T15:55:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "e22f70d00b71f947af581dc6011747e7be2b5bf3a4189936653690720230e05b"
+area: "concurrency-memory"
+symptom: "String::truncate panics even though the requested index is below len, because the byte position cuts through a multi-byte UTF-8 character."
+summary: "Rust String offsets are bytes and every retained prefix must remain valid UTF-8. Choose a boundary from char_indices or validate a byte offset with is_char_boundary before truncating."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust String truncate panics char boundary", "truncate byte index inside UTF-8 character", "String is_char_boundary safe truncate"]
+evidence: ["Rust 1.98.1 runtime panic", "multi-byte leading character", "char_indices boundary repair"]
+sources: ["https://doc.rust-lang.org/std/string/struct.String.html#method.truncate", "https://doc.rust-lang.org/std/primitive.str.html#method.is_char_boundary", "https://doc.rust-lang.org/std/primitive.str.html#method.char_indices"]
+---
+
+The number `1` looks safe for a six-character word. For the UTF-8 string `"éclair"`, it is not a valid truncation point.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-155/fail.rs) calls `truncate(1)`. Rust 1.98.1 panics because byte offset 1 lies inside the two-byte encoding of `é`. The requested index is smaller than `String::len`, but range validity has two conditions, not one.
+
+## String length is measured in bytes
+
+Rust strings are valid UTF-8. [`String::len`](https://doc.rust-lang.org/std/string/struct.String.html) returns the number of bytes, not the number of Unicode scalar values and not the number of user-perceived characters.
+
+For `"éclair"`:
+
+```text
+Unicode scalar values: 6
+UTF-8 bytes:           7
+first scalar `é`:      bytes at offsets 0 and 1
+next boundary:         byte offset 2
+```
+
+Offset 1 is inside one encoding. Keeping only the first byte would produce invalid UTF-8, which a safe `String` cannot contain.
+
+[`String::truncate`](https://doc.rust-lang.org/std/string/struct.String.html#method.truncate) therefore requires the new length to be on a character boundary. It does nothing if the requested length is greater than the current length, but it panics for an in-range non-boundary.
+
+## Bounds and boundaries are different checks
+
+Many bugs check only this:
+
+```rust
+if limit < text.len() {
+    text.truncate(limit);
+}
+```
+
+That proves the byte offset is in bounds. It does not prove the prefix ends between UTF-8 code points.
+
+[`str::is_char_boundary`](https://doc.rust-lang.org/std/primitive.str.html#method.is_char_boundary) answers the missing question. Index `0`, `len`, and the start byte of every encoded Unicode scalar value are boundaries.
+
+For a byte-oriented limit received from a protocol, I validate before mutation:
+
+```rust
+if text.is_char_boundary(limit) {
+    text.truncate(limit);
+}
+```
+
+If any arbitrary byte limit must be accepted, I need a rounding policy: move backward, move forward, reject it, or truncate encoded bytes instead of text. The right choice belongs to the application contract.
+
+## Choose the index in the unit I mean
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-155/fixed.rs) wants the first Unicode scalar value. It uses [`char_indices`](https://doc.rust-lang.org/std/primitive.str.html#method.char_indices) to find the byte offset where the second scalar begins, then truncates there. The result is `"é"`.
+
+This pattern keeps the final mutation byte-based while deriving its index from character iteration:
+
+```rust
+let boundary = text
+    .char_indices()
+    .nth(character_limit)
+    .map_or(text.len(), |(index, _)| index);
+text.truncate(boundary);
+```
+
+Iteration is linear because UTF-8 is variable-width. Rust does not offer constant-time indexing by character number, and `String` does not support `text[0]`. These choices prevent an apparently cheap operation from hiding an expensive scan or returning an invalid partial encoding.
+
+## A char still is not a visible character
+
+Rust `char` represents a Unicode scalar value. What a person sees as one character can contain several scalar values: a base letter plus combining marks, an emoji plus a skin-tone modifier, or a family emoji joined from multiple symbols.
+
+So `char_indices` repairs UTF-8 safety but may still cut a grapheme cluster in a visually awkward place. If the product means “first ten visible characters,” I use Unicode text segmentation with a suitable library and versioned Unicode data.
+
+If the product means “at most 20 bytes on the wire,” I choose a valid boundary at or below 20. If it means “20 Unicode scalar values,” `char_indices` is appropriate. Naming the unit is more important than choosing a clever expression.
+
+## Byte protocols may need `Vec<u8>`, not `String`
+
+Some limits are truly byte-oriented: packet fields, binary records, hashes, compressed data, or storage quotas over encoded size. For arbitrary bytes, `Vec<u8>` is the honest type. Truncating it at any in-range byte index is valid for the byte sequence, though it may make a higher-level encoding incomplete.
+
+I convert to `String` only when UTF-8 validity is an invariant I want Rust to maintain. That invariant is why `truncate` panics rather than silently leaving a broken string.
+
+At external boundaries I also clarify whether a size limit applies before or after normalization. Unicode normalization can change byte and scalar counts. Two visually similar inputs need not consume the same bytes.
+
+## My debugging sequence
+
+For a string-boundary panic, I reduce the case and inspect units:
+
+1. Print `text.len()` and the requested byte index.
+2. Collect `text.char_indices()` to show all safe boundaries.
+3. Check `is_char_boundary(index)` before slicing, inserting, removing, or truncating.
+4. State whether the requirement counts bytes, scalar values, or grapheme clusters.
+5. Derive the index using the matching abstraction.
+6. Test ASCII, accented text, combining marks, emoji, empty input, and limits past the end.
+
+ASCII-only tests hide the issue because every ASCII byte is also a character boundary. I use a multi-byte first character in the fixture so the smallest non-zero index already fails.
+
+The core principle is not “Unicode is complicated,” though it is. It is that indexes have units and invariants. `String::truncate` accepts a byte offset while preserving UTF-8. Being smaller than `len` proves only the first half. A character boundary proves the second, and the application's definition of length tells me how to find the right one.

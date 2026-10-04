@@ -1,0 +1,113 @@
+---
+caseId: "RFA-053"
+title: "Why `HashMap::get_mut` Then `insert` Still Conflicts Across Branches"
+date: "2026-09-05T08:30:00+01:00"
+lastmod: "2026-09-05T08:30:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "4235937b1023e9690150ed89db3b6ab838de9c64369d0d19b2eec7a4dd1462c3"
+area: "diagnostics-macros"
+symptom: "A function returning HashMap::get_mut from one branch cannot insert and borrow the map again in the other branch."
+summary: "Returning a mutable reference gives the successful lookup the function's output lifetime. The Entry API represents lookup and insertion as one borrow instead of asking the checker to reconnect two branches."
+rustVersions: ["Rust 1.98.1"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "HashMap get_mut then insert E0499 Rust",
+    "cannot borrow map mutable more than once return",
+    "Rust get or insert mutable reference borrow checker",
+  ]
+evidence: ["Rust 1.98.1 compile failure", "borrow-lifetime trace", "Entry API repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/error_codes/E0499.html",
+    "https://doc.rust-lang.org/std/collections/hash_map/enum.Entry.html",
+  ]
+---
+
+The control flow in this function looks exclusive: either a key exists and the function returns, or it does not exist and the function inserts it.
+
+```rust
+use std::collections::HashMap;
+
+fn get_or_insert<'a>(
+    values: &'a mut HashMap<String, String>,
+    key: &str,
+) -> &'a mut String {
+    if let Some(value) = values.get_mut(key) {
+        return value;
+    }
+
+    values.insert(key.to_owned(), String::new());
+    values.get_mut(key).unwrap()
+}
+```
+
+Rust 1.98.1 nevertheless reports E0499 at both later map operations. The diagnostic says that `*values` cannot be borrowed as mutable more than once at a time. The [exact failing program](/rust-failure-atlas/evidence/RFA-053/fail.rs) records the behavior.
+
+This is not the ordinary case where a guard or reference is accidentally used two lines later. The return type is what makes the first borrow special.
+
+## The returned reference determines the borrow lifetime
+
+`get_mut` borrows the map and can produce a reference into its storage. When the function returns that reference, it promises the reference can live for `'a`, the lifetime connected to the caller's map borrow:
+
+```rust
+return value;
+```
+
+For that return to be valid, the successful lookup borrow must be treated as an output borrow. The later branch looks disjoint to a human, but the borrow checker does not turn the failed `Option` result into a general proof that the earlier map borrow can never contribute to the returned value on that path.
+
+This is one reason I avoid explaining E0499 as only “the first reference is still used later.” Here the first reference is returned on another path. The function signature makes its lifetime extend to the caller.
+
+## Use an operation designed around one map borrow
+
+`HashMap` provides the [`Entry` API](https://doc.rust-lang.org/std/collections/hash_map/enum.Entry.html) for exactly this lookup-or-create operation:
+
+```rust
+fn get_or_insert<'a>(
+    values: &'a mut HashMap<String, String>,
+    key: &str,
+) -> &'a mut String {
+    values.entry(key.to_owned()).or_default()
+}
+```
+
+`entry` performs the lookup while owning one representation of the occupied-or-vacant state. `or_default` either reaches the existing value or inserts a default, then returns one mutable reference tied to the original borrow. There is no first borrow that the function must later abandon and reconstruct.
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-053/fixed.rs) compiles, runs, and asserts the inserted value on Rust 1.98.1.
+
+## Why `contains_key` is normally the wrong repair
+
+Another rewrite is possible:
+
+```rust
+if !values.contains_key(key) {
+    values.insert(key.to_owned(), String::new());
+}
+values.get_mut(key).unwrap()
+```
+
+This can satisfy the borrow checker because `contains_key` returns a Boolean rather than a reference into the map. Its borrow ends before insertion. However, it performs an additional lookup and spreads one logical operation across several calls. It also invites the code to diverge later: the condition and the final lookup must keep using equivalent keys.
+
+I use this version as a discriminating experiment, not as my default production design. If it compiles, it confirms that retaining a possible reference from `get_mut` was the important difference. The `Entry` version expresses the final intent better.
+
+## Unsafe shortcuts miss a deeper invariant
+
+It can be tempting to keep a raw pointer from the first lookup, insert, and then reconstruct a mutable reference. That is dangerous. Insertion can grow and reallocate the hash table, invalidating addresses into its storage. Even if one observed insertion does not move storage, the API does not grant a stable-address promise for map values across arbitrary mutation.
+
+The borrow error is therefore aligned with a real container invariant. It prevents a design that could retain an interior reference while an operation changes the container holding it.
+
+## A useful debugging sequence
+
+When I meet this family of errors in a larger generic function, I reduce it in this order:
+
+1. Confirm that the return type contains a reference tied to the input collection.
+2. Replace the early returned reference with a Boolean temporarily.
+3. Check whether the later mutation then compiles.
+4. Find a collection API, like `entry`, that represents the compound operation with one borrow.
+5. Add a test for both occupied and vacant cases.
+
+The official [E0499 explanation](https://doc.rust-lang.org/error_codes/E0499.html) states the single-mutable-borrow rule. The missing practical connection is that a reference returned from a function is not a short local observation. It becomes part of the function's public lifetime contract.
+
+Once I model it this way, `Entry` is not a compiler appeasement. It is the operation whose ownership structure matches the problem I was trying to solve.

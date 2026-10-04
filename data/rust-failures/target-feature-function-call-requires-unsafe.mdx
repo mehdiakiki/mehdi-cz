@@ -1,0 +1,96 @@
+---
+caseId: "RFA-116"
+title: "Why Calling a #[target_feature] Function Requires unsafe"
+date: "2026-09-05T10:16:00+01:00"
+lastmod: "2026-09-05T10:16:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "18187100b9bb8513bcf07a6a7f3b7d2f72f16f055fbaf890e022db18061f9f83"
+area: "ffi-targets"
+symptom: "Calling a function compiled with an additional CPU target feature fails E0133 because the caller has not proved that feature is available."
+summary: "A target_feature function may contain instructions unsupported by the current CPU, so an ordinary call is unsafe. Dispatch through runtime detection or a caller compiled with the same guaranteed feature."
+rustVersions: ["Rust 1.98.1"]
+targets: ["x86_64 with AVX2 runtime detection"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust target_feature call unsafe E0133", "call function with target_feature requires unsafe", "is_x86_feature_detected AVX2 dispatch"]
+evidence: ["Rust 1.98.1 E0133 compile failure", "AVX2 target-feature boundary", "runtime detection repair"]
+sources: ["https://doc.rust-lang.org/reference/attributes/codegen.html#the-target_feature-attribute", "https://doc.rust-lang.org/std/macro.is_x86_feature_detected.html"]
+---
+
+The [failing program](/rust-failure-atlas/evidence/RFA-116/fail.rs) defines a normal-looking function with `#[target_feature(enable = "avx2")]` and calls it. Rust 1.98.1 reports E0133: the call is unsafe and requires an unsafe block.
+
+The body only adds one integer in this reduced fixture. The attribute still changes the function's compilation contract. rustc may generate instructions that require AVX2, and the ordinary caller has not proved the running processor supports them.
+
+## Compilation target and runtime CPU are different
+
+The [target_feature attribute reference](https://doc.rust-lang.org/reference/attributes/codegen.html#the-target_feature-attribute) permits enabling architecture features for a function. This allows optimized specialized code without compiling the whole binary for that CPU level.
+
+A binary built for generic `x86_64` can run on many processors. A specialized function may run only where its enabled features exist. Calling it on an unsupported processor can execute an illegal instruction. Rust therefore makes the call an explicit safety boundary.
+
+I separate these questions:
+
+```text
+Can rustc compile AVX2 instructions for this target?  compile-time capability
+Does this machine have AVX2 right now?                runtime capability
+May this call enter the AVX2 function?                safety proof
+```
+
+Answering the first does not answer the second.
+
+## Detect, then call in a narrow unsafe block
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-116/fixed.rs) uses [`is_x86_feature_detected!`](https://doc.rust-lang.org/std/macro.is_x86_feature_detected.html). Only after the macro confirms AVX2 does it call the specialized function in an unsafe block.
+
+I put the safety comment beside that call:
+
+```rust
+if std::arch::is_x86_feature_detected!("avx2") {
+    // SAFETY: the runtime check proves AVX2 for this process.
+    unsafe { process_with_avx2(input) }
+}
+```
+
+Production code also needs a fallback for processors without the feature. The dispatch function can return the generic implementation rather than omit work as the tiny fixture does.
+
+## Global compiler flags change the assumption
+
+Compiling the entire binary with a target CPU or explicit feature can make the feature available throughout relevant code. This may be suitable for a controlled fleet where every machine meets the baseline.
+
+It is dangerous for a distributable binary. Building with `-C target-cpu=native` on a new developer machine can produce an executable that fails on an older production host. Container images do not emulate a CPU feature; the host processor still executes the instructions.
+
+I record the minimum CPU contract beside deployment requirements and test on that baseline. Compiler flags are part of the artifact identity.
+
+## Dispatch has performance costs too
+
+Runtime feature detection on every small call can cost more than the specialized operation. I often detect once and store a function pointer or enum-selected strategy. The selected function still has the same safety precondition; the initialization path proves it once and preserves that invariant.
+
+Inlining, code size, and instruction-cache effects also matter. A specialized implementation is not automatically faster for every input size. I benchmark the generic path, the specialized body, and dispatch overhead separately.
+
+This connects directly to streaming search and SIMD prefilters: faster byte scanning depends not only on writing vector code, but on selecting it safely and measuring the path actually executed.
+
+## Tests must include the fallback
+
+A CI machine with AVX2 can leave the generic branch untested. I keep functional tests for both implementation functions where possible and a dispatch test for observed hardware.
+
+Cross-compiling does not let the build machine execute the target-specific path. Emulator or target hardware testing may be needed for architectures such as AArch64. Architecture cfg guards keep x86-only detection code from being compiled on unrelated targets.
+
+I also verify that the specialized and generic paths agree on edge cases. SIMD bugs often appear at short tails, alignment boundaries, or empty inputs rather than the large benchmark case.
+
+## unsafe proves availability, not correctness
+
+The unsafe call asserts that required CPU features are present. It does not prove the specialized algorithm handles pointers, lengths, or alignment correctly. Intrinsics can introduce additional safety contracts.
+
+I keep the feature dispatch and memory-safety invariants separate in code review. A large unsafe block containing detection, pointer arithmetic, and result processing makes it hard to see which fact justifies which operation.
+
+## My debugging sequence
+
+When E0133 points at a target-feature call, I do this:
+
+1. List every feature enabled on the callee.
+2. Check the deployment CPU baseline and artifact compiler flags.
+3. Add architecture-appropriate runtime detection for portable binaries.
+4. Provide and test a generic fallback.
+5. Keep the unsafe call narrow with a comment naming the detection proof.
+6. Benchmark body and dispatch separately on representative CPUs.
+
+The unsafe marker is not ceremony. It is where the program promises that code generation assumptions match the processor executing the function. Making that promise through a visible dispatch boundary keeps optimization from becoming a deployment lottery.

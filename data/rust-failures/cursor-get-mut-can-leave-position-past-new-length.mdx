@@ -1,0 +1,90 @@
+---
+caseId: "RFA-275"
+title: "Cursor::get_mut Can Leave the Position Past the Buffer"
+date: "2026-09-06T00:55:00+01:00"
+lastmod: "2026-09-06T00:55:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "bd88b83890b4b490f79cc194a74340a951c813ef7c1a7cdbfe1c0fdb7bd0b191"
+area: "ffi-targets"
+symptom: "Truncating a Cursor's backing Vec through get_mut changes its length from three to one but leaves the independent cursor position at three."
+summary: "Cursor stores position separately from its underlying value. Mutating the buffer through get_mut does not rebase or clamp that position, so repair both states together when buffer structure changes."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust Cursor get_mut position after truncate", "Cursor position past buffer after get_mut", "mutate Cursor Vec reset position Rust"]
+evidence: ["Rust 1.98.1 Vec-backed Cursor", "buffer truncated through get_mut", "explicit position clamp repair"]
+sources: ["https://doc.rust-lang.org/std/io/struct.Cursor.html#method.get_mut", "https://doc.rust-lang.org/std/io/struct.Cursor.html#method.set_position", "https://doc.rust-lang.org/std/io/struct.Cursor.html#method.position"]
+---
+
+I treated a `Cursor<Vec<u8>>` like one object whose position would follow its buffer. After truncating the vector through `get_mut`, the buffer length became one but the cursor stayed at position three.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-275/fail.rs) makes exactly this state. It expects the position to clamp automatically and fails.
+
+## A cursor combines two states
+
+[`Cursor`](https://doc.rust-lang.org/std/io/struct.Cursor.html) wraps an in-memory value and adds a seek position. These parts are related by I/O operations, but they are stored as separate state:
+
+```text
+underlying bytes or collection
+current u64 position
+```
+
+[`Cursor::get_mut`](https://doc.rust-lang.org/std/io/struct.Cursor.html#method.get_mut) returns a mutable reference to the underlying value. Mutating that value does not tell the cursor how its position should change.
+
+The documentation warns that changing internal I/O state can corrupt the cursor's position. In this context, “corrupt” does not mean memory unsafety. It means the two valid pieces of state may no longer express the relationship the application expects.
+
+## Position can legally exceed length
+
+A `Cursor` position is a `u64`; it is not constrained to the current buffer length. Reading while positioned past the end returns EOF rather than clamping the offset. Writing to some growable backing types can extend data and fill a gap.
+
+Therefore the library cannot always infer that shortening the buffer should move the position. A caller may intentionally preserve an absolute offset before growing or replacing the contents later.
+
+Automatic clamping would be a policy choice and could destroy that intent. Rust leaves the choice to the code that performs the structural mutation.
+
+## Repair buffer and position in one operation
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-275/fixed.rs) truncates the backing vector, obtains the new length, and sets the position to the smaller of old position and new length.
+
+This policy is suitable when the cursor represents a normal editing position that must remain inside or directly after the data. Other operations may need different rules:
+
+```text
+replace whole buffer -> reset to zero
+truncate suffix -> clamp to new length
+insert before cursor -> add inserted byte length
+remove prefix -> subtract removed length with a floor at zero
+```
+
+I put this logic in one helper so callers cannot update the collection while forgetting the offset.
+
+## Byte position is not a text character position
+
+Cursor positions are byte offsets. If the backing bytes contain UTF-8, moving the position to a character count can land inside a multibyte scalar.
+
+`Cursor` itself operates on bytes and does not validate text boundaries. A higher-level text editor must preserve both byte validity and its own character or grapheme model.
+
+When I remove a prefix from UTF-8 data, I calculate its byte length before adjusting the cursor. The number of displayed characters can differ from bytes and from grapheme clusters.
+
+## get_ref cannot create the same mismatch
+
+`get_ref` offers shared access, so normal safe code cannot structurally modify a `Vec` through it. `get_mut` is the point where the wrapper deliberately exposes lower-level mutation.
+
+This is a useful review signal. Every call to `get_mut` on a stateful adapter deserves a nearby check of wrapper invariants. The same idea applies to buffered I/O wrappers, encoders, and caches that expose their inner object.
+
+The mutable borrow prevents simultaneous access to the cursor while the inner value is borrowed, but the borrow checker cannot invent the application rule needed after the borrow ends.
+
+## into_inner has a different lifecycle
+
+If I am finished using the cursor, consuming it with `into_inner` returns the underlying value and removes the need to synchronize its position. This is simpler than mutating through `get_mut` and continuing with the adapter when no further I/O is required.
+
+I choose `get_mut` only when the cursor must remain in use. Otherwise, consuming ownership makes the state transition clearer.
+
+## What I test
+
+My test matrix changes the buffer while the position is before, at, and after the new end. It covers empty replacement, shorter content, longer content, and edits before the current offset.
+
+I then exercise the next actual operation: read, write, or seek. Asserting only `position()` proves the bookkeeping value, but the user-visible failure often appears during the following I/O.
+
+For helpers that clamp, I assert `position <= len`. For helpers preserving an absolute offset, I name that behavior and verify the expected EOF or gap semantics.
+
+The core principle is that wrappers often contain state not owned by their inner value. `Cursor::get_mut` lets me change the buffer, but it cannot know how to transform the independent byte position. Structural edits and position repair must be one deliberate application-level transition.

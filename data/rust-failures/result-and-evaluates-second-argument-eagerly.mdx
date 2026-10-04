@@ -1,0 +1,101 @@
+---
+caseId: "RFA-254"
+title: "Why Result::and Evaluates the Second Operation After an Error"
+date: "2026-09-06T00:34:00+01:00"
+lastmod: "2026-09-06T00:34:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "2c1e0e6da04a0c6ac029b233179e948b89ea858f40055f41c0e7a8f7cecde1c1"
+area: "diagnostics-macros"
+symptom: "Result::and runs the expression producing its second Result even when the first Result is already Err."
+summary: "and receives an already-evaluated Result, so Rust performs the second operation before preserving the first error. Pass a closure to and_then when execution itself must short-circuit."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust Result and evaluates second argument on Err", "Result and vs and_then eager", "short circuit fallible operations Rust"]
+evidence: ["Rust 1.98.1 initial Err", "atomic second-operation count", "and_then repair"]
+sources: ["https://doc.rust-lang.org/std/result/enum.Result.html#method.and", "https://doc.rust-lang.org/std/result/enum.Result.html#method.and_then", "https://doc.rust-lang.org/std/result/#boolean-operators"]
+---
+
+This expression looks like a fallible sequence:
+
+```rust
+first().and(second())
+```
+
+The returned `Result` short-circuits, but evaluation of the expressions does not. `second()` runs before `and` can inspect the first result.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-254/fail.rs) starts with `Err("first failed")` and counts calls to the second operation. [`Result::and`](https://doc.rust-lang.org/std/result/enum.Result.html#method.and) preserves the first error, yet the count becomes one.
+
+## and combines values already produced
+
+The method receives `self` and another `Result<U, E>`. Rust evaluates the second call to obtain that argument. Only then can `and` return the second result for `Ok` or preserve the first error for `Err`.
+
+This is different from language-level `&&`, whose right expression is conditionally evaluated. A familiar name does not override ordinary call evaluation.
+
+`and` is useful when both results already exist and I only need to combine them. It is not a lazy sequencing primitive.
+
+## and_then receives deferred work
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-254/fixed.rs) passes the second operation as a closure/function to [`and_then`](https://doc.rust-lang.org/std/result/enum.Result.html#method.and_then). The function runs only when the first value is `Ok`, and it receives that success value.
+
+This makes data dependency and execution dependency agree:
+
+```rust
+first().and_then(second)
+```
+
+The returned error and the performed side effects now short-circuit together.
+
+## A correct final error can hide incorrect work
+
+Tests that assert only `Err("first failed")` pass for both versions. They do not reveal that `second()` sent a request, wrote a file, incremented a counter, or consumed input.
+
+The Atlas fixture counts calls rather than timing them. In application tests I use a fake dependency recording exact invocations. Outcome assertions and trajectory assertions protect different properties.
+
+This matters most for irreversible actions. A preserved first error does not undo a payment attempt or an external message created while evaluating the argument.
+
+## Independent validation can intentionally be eager
+
+Sometimes I want to run several validations to collect all errors rather than stop at the first. `Result::and` still does not collect errors automatically; it follows its documented result table and can discard one outcome.
+
+For error accumulation I use a validation structure designed to retain multiple failures. For sequential dependency I use `and_then` or `?`. I avoid using eager evaluation accidentally as a substitute for an explicit parallel or aggregate policy.
+
+## Async code makes the boundary more visible
+
+Creating a future is not always the same as executing it, but an async function call can still evaluate arguments and construct state. Awaiting or spawning determines when the operation runs.
+
+`first.await.and(second.await)` necessarily awaits the second before calling `and`, even when the first result is an error. The usual sequential form is:
+
+```rust
+let value = first().await?;
+let next = second(value).await?;
+```
+
+If operations are independent and should overlap, that concurrency choice deserves an explicit join and error policy.
+
+## Error type equality is part of and
+
+`and` can change the success type from `T` to `U`, but both results use the same error type `E`. `and_then` has the same error constraint.
+
+When layers produce different errors, I map them into a meaningful domain error rather than erasing details only to make a combinator type-check. Good sequencing keeps both execution and diagnostics legible.
+
+## Related eager pairs
+
+`Result::or` also receives an eager result, while `or_else` defers fallback work. `map_or` receives an eager default, while `map_or_else` receives closures. The repeated review question is simple: am I passing completed work or a callable description of work?
+
+I still use the eager forms for constants and already-computed values. Laziness is not automatically better; it is necessary when work must be conditional.
+
+## What I test
+
+The regression covers first `Ok` and first `Err`, counts second calls, and asserts which error survives when both operations fail. For side-effecting code it checks the recorded action log, not just the returned variant.
+
+## Construction can be observable before the function body
+
+Even if the second function immediately returns a constant `Result`, evaluating its arguments may clone data, borrow locks, allocate buffers, or move values. Deferring only an inner network call while eagerly constructing all of its inputs can still create unwanted work.
+
+With `and_then`, captures are created when the closure is built, but the body is conditional. I inspect which expressions live outside and inside the closure. Moving an expensive preparation inside is often required for true laziness; moving ownership into the closure is still cheap but changes later availability.
+
+This makes the execution boundary visible enough to review instead of assuming the combinator moves it automatically.
+
+The core principle is that value-level short-circuiting does not imply evaluation-level short-circuiting. `Result::and` selects between two `Result` values after both expressions exist. `and_then` controls whether the second operation executes. Choosing between them requires looking at work, not only return types.

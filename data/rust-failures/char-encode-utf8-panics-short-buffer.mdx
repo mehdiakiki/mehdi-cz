@@ -1,0 +1,86 @@
+---
+caseId: "RFA-256"
+title: "Why char::encode_utf8 Panics with a One-Byte Buffer"
+date: "2026-09-06T00:36:00+01:00"
+lastmod: "2026-09-06T00:36:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "606871e2545e586e622b7dd832b4948486e68fcd5801edc542637ab541b463f1"
+area: "ffi-targets"
+symptom: "char::encode_utf8 panics when encoding é into a one-byte destination although the buffer can hold one Rust u8."
+summary: "encode_utf8 needs enough bytes for the scalar's UTF-8 representation, from one through four. Size with len_utf8 or use char::MAX_LEN_UTF8, then consume only the returned encoded subslice."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust char encode_utf8 buffer too small panic", "how large buffer for encode_utf8", "char MAX_LEN_UTF8 Rust"]
+evidence: ["Rust 1.98.1 accented scalar", "captured short-buffer panic", "maximum-width buffer repair"]
+sources: ["https://doc.rust-lang.org/std/primitive.char.html#method.encode_utf8", "https://doc.rust-lang.org/std/primitive.char.html#method.len_utf8", "https://doc.rust-lang.org/std/primitive.char.html#associatedconstant.MAX_LEN_UTF8"]
+---
+
+A Rust `char` is one Unicode scalar value, but its UTF-8 encoding is not always one byte.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-256/fail.rs) supplies a one-byte array to [`char::encode_utf8`](https://doc.rust-lang.org/std/primitive.char.html#method.encode_utf8) for `é`. The method panics because this scalar needs two UTF-8 bytes.
+
+## Element count and encoded width are different
+
+`char` is a four-byte Rust scalar type in memory. UTF-8 represents each scalar using one to four bytes. ASCII uses one; `é` uses two; many other scalars use three or four.
+
+A buffer containing one `u8` has one byte of capacity. The fact that the input contains one `char` says nothing more precise than a maximum of four output bytes.
+
+This is another place where a variable named `length` is dangerous. I use `scalar_count` and `utf8_bytes` when both appear in one function.
+
+## The method cannot partially encode a scalar
+
+Writing only the first byte of a multi-byte sequence would leave invalid UTF-8. `encode_utf8` promises to return a valid `&mut str` referring to the encoded bytes, so it must have enough space for the complete scalar.
+
+The operation panics rather than returning partial progress or a `Result`. Its intended usage is with a caller-proven local buffer.
+
+For fallible external buffering, I check available capacity before calling or use a writer whose error model fits the boundary.
+
+## Exact and maximum sizing are both available
+
+[`char::len_utf8`](https://doc.rust-lang.org/std/primitive.char.html#method.len_utf8) returns the exact encoded width for one scalar. This is useful when packing into an existing buffer.
+
+[`char::MAX_LEN_UTF8`](https://doc.rust-lang.org/std/primitive.char.html#associatedconstant.MAX_LEN_UTF8) is four and can size a small stack scratch buffer that accepts every valid `char`. The [repaired program](/rust-failure-atlas/evidence/RFA-256/fixed.rs) uses this maximum, encodes `é`, and confirms the returned slice has exact length two.
+
+The unused remainder of the array is not part of the encoded text.
+
+## Use the returned subslice
+
+`encode_utf8` returns the portion of the destination containing valid encoded bytes. Reading or writing the entire four-byte scratch array would include old or zero-filled tail bytes.
+
+That can introduce NUL bytes into a protocol or make a downstream UTF-8 validation fail even though the encoded scalar itself is correct. I pass the returned `&str` or its bytes onward, not the whole backing array.
+
+When reusing a buffer, this rule also avoids disclosing stale bytes from a prior longer scalar.
+
+## String push is simpler for owned text
+
+If I am building a `String`, `String::push(char)` already handles UTF-8 encoding and capacity growth. A manual scratch buffer adds value mainly at a byte-oriented I/O or FFI boundary.
+
+I do not use low-level encoding only because it appears allocation-free. `String` can reserve capacity and reuse its allocation, while repeated tiny writes can cost more at the I/O layer. Measurement should include the consumer.
+
+## UTF-16 has another width model
+
+`encode_utf16` writes one or two `u16` code units and similarly panics when its destination is too small. Two code units are not two bytes, and surrogate pairs belong to this encoding layer.
+
+I choose the encoding required by the boundary and test its units directly. Reusing UTF-8 buffer arithmetic for UTF-16 produces both size and offset errors.
+
+## Panic catching is only for the fixture
+
+The evidence catches the panic to emit a stable assertion. Production code should normally size correctly before calling. Repeatedly catching unwinds around encoding adds complexity, still triggers the panic hook, and may not work with aborting panic configuration.
+
+Because every valid `char` fits in four bytes, a fixed scratch buffer makes the precondition easy to prove.
+
+## What I test
+
+My width table includes ASCII, a two-byte scalar, a three-byte scalar, and a four-byte emoji. It asserts `len_utf8`, returned content, returned byte length, and untouched handling of the backing tail.
+
+For a streaming boundary I also test short destination capacity before mutation and ensure the caller does not advance its output cursor on failure.
+
+## Preflight and commit should use the same scalar
+
+When a loop peeks at one scalar to calculate `len_utf8` and later advances the iterator again to encode, another item can accidentally be written. I bind the scalar once, measure that value, verify space, encode it, and only then commit the output position. This small transaction shape becomes important when a destination can fill halfway through an input stream.
+
+For an API returning “buffer full,” I leave the unencoded scalar available for the next call. Dropping it or advancing the source before capacity is proven turns ordinary backpressure into missing text.
+
+The core principle is that one logical value can occupy a variable number of encoded units. `char::encode_utf8` preserves valid UTF-8 by requiring the complete one-to-four-byte representation. Size from `len_utf8` or the maximum, and treat only the returned subslice as initialized text.

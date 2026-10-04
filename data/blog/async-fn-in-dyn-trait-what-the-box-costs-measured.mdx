@@ -1,0 +1,120 @@
+---
+title: "Async fn in a dyn Trait: What the Box Costs, Measured"
+date: "2026-09-09T07:00:00+01:00"
+lastmod: "2026-09-09T07:00:00+01:00"
+tags: ["rust", "async rust", "trait objects", "dynamic dispatch", "performance"]
+draft: false
+reviewed: true
+reviewedHash: "f45b342062f6799191b6069ad68848be15d46f45734b67682e6edfae4795fed4"
+cluster: "rust-under-the-hood"
+campaign: "editorial"
+summary: "Calling an async method through dyn Trait needs a boxed future. I measured what that box costs per call, with an allocation counter and a million calls, and where it actually matters."
+---
+
+Calling an async trait method through `dyn Trait` costs one heap allocation per call plus a dynamic dispatch. On my machine that was about 8 to 10 extra nanoseconds and exactly one allocation for every call, against zero allocations for the static version. For a method called once per request this does not matter. For a method called once per byte or per row, it can be the whole budget.
+
+The part that is not measured in nanoseconds, and that hurts more in practice, is the `Send` bound and the lifetime you must write by hand.
+
+This article is a spoke of [How Async Rust Works Under the Hood](/blog/how-async-rust-works-under-the-hood). There I showed that an async function is compiled into a struct. Here I follow that fact to its consequence for trait objects.
+
+## Why dyn cannot use a native async fn
+
+Since Rust 1.75 a trait can declare `async fn` directly:
+
+```rust
+trait Store {
+    async fn get(&self, key: u64) -> u64;
+}
+```
+
+With static dispatch this is free. The compiler knows the concrete implementation, so it knows the concrete future struct, its size, and its `poll` function.
+
+With `dyn Store` it does not. Every implementation of `get` produces a different future struct, with a different size and a different `poll`. A vtable needs one function signature with one return type. So the compiler refuses to make `dyn Store` for this trait, and the idiom everybody ends up writing is a second trait that returns a boxed future:
+
+```rust
+trait DynStore {
+    fn get<'a>(&'a self, key: u64)
+        -> Pin<Box<dyn Future<Output = u64> + Send + 'a>>;
+}
+```
+
+The `async-trait` crate generates this same boxed shape for you, and the `dynosaur` crate generates a dyn wrapper of this shape around a native async trait. The `trait-variant` crate is different: it only adds the `Send` bound and keeps static dispatch, with no box. The box is not a library choice, it is what makes one return type possible for all implementations.
+
+## The experiment
+
+I wrote one `Memory` store that implements both traits with the same body: add the key to a base value, and yield to the runtime every 64 calls so the future is not trivially ready.
+
+To count allocations I installed a global allocator that increments a counter and forwards to the system allocator. Then I called each version one million times on a current-thread runtime, after a warm-up:
+
+```rust
+async fn run_static<S: Store>(s: &S, n: u64) -> u64 {
+    let mut acc = 0u64;
+    for k in 0..n { acc = acc.wrapping_add(s.get(k).await); }
+    acc
+}
+
+async fn run_dyn(s: &dyn DynStore, n: u64) -> u64 {
+    let mut acc = 0u64;
+    for k in 0..n { acc = acc.wrapping_add(s.get(k).await); }
+    acc
+}
+```
+
+Output with rustc 1.95 nightly and tokio 1.53, release build, Linux:
+
+```text
+static  async fn in trait :    8.7 ns/call,        0 allocations for 1000000 calls
+dyn     Pin<Box<dyn Future>>:   17.1 ns/call,  1000000 allocations for 1000000 calls
+future size, static path: 56 bytes
+future size, dyn path   : 40 bytes on the heap, 16 bytes handle
+```
+
+A second run gave 6.7 and 15.3 nanoseconds. Over six runs the gap stayed between 8 and 10 nanoseconds per call. The allocation count did not move at all: one box per call, released when the future completes.
+
+## Where the 8 nanoseconds go
+
+Three things happen on the dyn path that do not happen on the static path.
+
+First, the allocation. The future is 40 bytes here, so this is a small-object allocation, which is the fast path of the system allocator. A larger future costs more to allocate and to free, and the size of the future is decided by the locals alive across its awaits, exactly as in [Why Rust Async Futures Get So Large](/blog/rust-async-future-size).
+
+Second, the dispatch. `get` is called through a vtable, and then `poll` is called through a second vtable on the boxed future. The static version inlines both.
+
+Third, what inlining would have removed. In the static version the compiler can see the whole body and fold the arithmetic into the loop. In the dyn version it cannot. So part of the difference is not the box itself, it is the optimisation the box prevents.
+
+I want to be honest about the scale. Ten nanoseconds is roughly the cost of one L2 cache access. A database round trip is four to six orders of magnitude larger. The box only matters when the call sits inside a loop that runs millions of times per second.
+
+## The cost that is not in nanoseconds
+
+The signature above has two things the native `async fn` did not force me to write.
+
+The `Send` bound. A native `async fn` in a trait is `Send` when its implementation happens to be `Send`. The boxed version must decide at the trait definition.
+
+If I write `+ Send`, every implementation must produce a `Send` future, and a single `Rc` or `MutexGuard` across an await breaks the build in the same way as in [Why a Rust Future Is Not Send Across .await](/blog/rust-future-send-across-await). If I do not write it, the trait object cannot be used with `tokio::spawn` at all.
+
+The lifetime. The future borrows `self`, so the box carries `'a`. This is fine until the caller wants to store the future somewhere longer than the borrow, and then the only way out is to clone data into the future, which changes the design.
+
+Both costs are decided once, at the trait, and paid by every implementation forever. This is the real reason I avoid `dyn` for async traits by default, not the allocation.
+
+## What I do instead, in order
+
+1. Generics. `fn run<S: Store>(s: &S)` keeps everything static. Most code that reaches for `dyn` only needs to be generic over one type at a time.
+2. An enum of the known implementations. If there are three stores, a three-variant enum with a match in each method gives dynamic behaviour with no allocation and no vtable.
+3. Box at the boundary, not in the loop. A `Box<dyn DynStore>` chosen once at startup is fine. The problem is `Pin<Box<dyn Future>>` created once per element inside a hot loop.
+4. `dyn` with the boxed future, when the set of implementations is open, such as a plugin interface. Then I write the `Send` bound explicitly and test one implementation that is deliberately not `Send`, so the build breaks where I expect.
+
+For callbacks rather than trait methods, the `AsyncFn` traits remove a similar box, and I cover that case in [Lending Async Callbacks With Rust's AsyncFn Traits](/blog/rust-asyncfn-lending-callbacks).
+
+## What I check in review
+
+- Is this `dyn` on an async trait needed, or is it a generic that someone made dynamic by habit?
+- Is the boxed future created per request, per row, or per byte? Only the last two justify measuring.
+- Does the trait carry `+ Send`? Was that a decision or a copy from a snippet?
+- Does any implementation clone data into the future only to satisfy the lifetime? That is a sign the borrow was wrong, not the box.
+
+## Sources
+
+- [Announcing Rust 1.75.0: async fn and return-position impl Trait in traits](https://blog.rust-lang.org/2023/12/28/Rust-1.75.0/)
+- [Async fn in dyn trait, async fundamentals initiative](https://rust-lang.github.io/async-fundamentals-initiative/explainer/async_fn_in_dyn_trait.html)
+- [Dyn async traits, part 8: the soul of Rust, by Niko Matsakis](https://smallcultfollowing.com/babysteps/blog/2022/09/18/dyn-async-traits-part-8-the-soul-of-rust/)
+- [trait-variant crate documentation](https://docs.rs/trait-variant/latest/trait_variant/)
+- [dynosaur crate documentation](https://docs.rs/dynosaur/latest/dynosaur/)

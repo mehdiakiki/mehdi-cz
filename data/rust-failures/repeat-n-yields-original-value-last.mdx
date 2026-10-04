@@ -1,0 +1,76 @@
+---
+caseId: "RFA-303"
+title: "repeat_n Clones First and Yields the Original Value Last"
+date: "2026-09-06T01:23:00+01:00"
+lastmod: "2026-09-06T01:23:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "0563cd4fc4248329788b27c97ba8ad8d6bbeb00e563a01fcb4407e94ac0bb98b"
+area: "upgrades-compatibility"
+symptom: "A type with an observable Clone implementation produces cloned identities before its original identity when consumed through iter::repeat_n."
+summary: "repeat_n(value, n) yields n values efficiently by cloning for the first n minus one outputs and moving the original as the final output. Clone is allowed to be observably different from identity."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust repeat_n clone order original last", "iter repeat_n Clone side effects", "repeat_n value cloning semantics"]
+evidence: ["Rust 1.98.1 stateful Clone fixture", "three requested values", "clone identities one and two before original zero"]
+sources: ["https://doc.rust-lang.org/std/iter/fn.repeat_n.html", "https://doc.rust-lang.org/std/clone/trait.Clone.html", "https://doc.rust-lang.org/std/iter/fn.repeat_with.html"]
+---
+
+I used `repeat_n(value, 3)` with a type whose clone operation assigned a fresh diagnostic identity. I expected the original first and two clones afterward. The observed order was clone, clone, original.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-303/fail.rs) gives the original identity zero and consecutive clones identities one and two. Collecting `repeat_n` produces `[1, 2, 0]`, not `[0, 1, 2]`.
+
+## The final item can be moved instead of cloned
+
+[`std::iter::repeat_n`](https://doc.rust-lang.org/std/iter/fn.repeat_n.html) owns one value and yields it exactly `n` times. The documentation explains its useful optimization: the iterator clones the value for the first `n - 1` outputs, then yields the original value last.
+
+If it cloned all `n` outputs, it would perform one unnecessary clone and still have to drop the owned original. Moving that original into the final output avoids both costs.
+
+For ordinary values such as an integer or immutable shared handle, the order is usually invisible. It becomes visible when `Clone` creates new identity, increments a counter, allocates, records metrics, or returns a semantically related but non-identical object.
+
+## Clone means duplication, not bitwise identity
+
+The [`Clone` trait](https://doc.rust-lang.org/std/clone/trait.Clone.html) supports explicit duplication. It does not require every observation of the clone to equal every observation of the source unless the type's own contract establishes that relationship.
+
+A cloned `Rc` shares an allocation while being a new owning handle. A file-like abstraction might duplicate a handle with shared or independent state according to its contract. A tracing token might intentionally receive a new identifier. Clone order can therefore become program behavior.
+
+I try to keep surprising side effects out of `Clone`, but generic code cannot assume they are absent. When exact construction order matters, I choose an API that names construction rather than one that promises repetition through cloning.
+
+## Use repeat_with for freshly constructed values
+
+[`repeat_with`](https://doc.rust-lang.org/std/iter/fn.repeat_with.html) invokes a closure for each item. Combined with `take(n)`, it makes generation order explicit:
+
+```rust
+let values = std::iter::repeat_with(|| make_value()).take(3);
+```
+
+This does not mean `repeat_with` is universally better. It may run a fallible or expensive factory several times, and the closure owns whatever state it captures. It is the clearer fit when every output should be freshly produced rather than cloned from one stored seed.
+
+For a single shared resource, `repeat_n(Arc::clone(&resource), n)` may be exactly right. I simply do not attach meaning to which handle is the initially supplied clone.
+
+## Zero and one have useful edge semantics
+
+With zero requested outputs, the stored value is never yielded. It is dropped when the iterator is consumed or dropped. With one output, no clone is needed; the original can be moved directly.
+
+These edges matter for resource-owning or side-effectful types. A factory-based iterator invoked with `take(0)` may construct nothing if the closure is never called, while `repeat_n(make_value(), 0)` evaluates `make_value()` before the iterator function receives its argument. Iterator laziness does not undo eager argument evaluation.
+
+I include zero, one, and several values in tests whenever construction or destruction has visible cost.
+
+## Avoid making identifier order an accidental API
+
+The failure often starts in a test rather than production. A snapshot expects generated IDs in one order, and the implementation later switches from a loop to `repeat_n`. The values remain valid but the test encoded an order the API never intended.
+
+I decide whether identity order is part of the domain contract. If it is, I build values through a numbered range or stateful factory. If it is not, I compare the properties that matter and avoid asserting incidental IDs.
+
+This is also relevant to deterministic simulations. “Clone this seed” and “derive the next seed” are different operations even if both create three values.
+
+## What I test
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-303/fixed.rs) uses the same observable `Clone` implementation and asserts the documented `[1, 2, 0]` sequence. The fixture is intentionally unusual so the otherwise invisible optimization has evidence.
+
+For code choosing `repeat_n`, I test output count, zero and one, clone failures expressed by surrounding logic, destructor counts, and any promised order. If consumers may stop early, I test dropping a partially consumed iterator because the retained original or remaining state must also be dropped correctly.
+
+When I need fresh ordinal identities, I normally write `(0..n).map(make_with_id)`. It communicates the requirement immediately and does not depend on clone placement.
+
+The core principle is that an iterator may satisfy its value-count contract while choosing an important ownership order. `repeat_n` clones the first `n - 1` outputs and moves the original last. If original-versus-clone identity matters, repetition is the wrong abstraction to leave that distinction implicit.

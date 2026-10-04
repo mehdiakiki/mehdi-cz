@@ -1,0 +1,81 @@
+---
+caseId: "RFA-691"
+title: "Arc::try_unwrap Can Succeed While Weak Pointers Exist"
+date: "2026-09-06T08:51:00+01:00"
+lastmod: "2026-09-06T08:51:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "22b7d6b70a9bc9b52dc13af657d61785f65874d7c30d4fcdaaf70876f19c0d7e"
+area: "concurrency-memory"
+symptom: "Arc::try_unwrap returns the inner value despite a live Weak pointer because no other strong owner keeps that value alive."
+summary: "Weak pointers retain allocation metadata, not ownership of T. try_unwrap can move T out when the caller holds the only strong Arc, after which weak upgrades fail."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["targets supporting atomic pointer operations"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust Arc try_unwrap with Weak", "does Weak prevent Arc try_unwrap", "Arc weak pointer after inner value moved"]
+evidence: ["Rust 1.98.1 runtime assertion", "one strong owner plus live Weak", "inner value recovered and later upgrade returns None"]
+sources: ["https://doc.rust-lang.org/std/sync/struct.Arc.html#method.try_unwrap", "https://doc.rust-lang.org/std/sync/struct.Arc.html#method.into_inner", "https://doc.rust-lang.org/std/sync/struct.Weak.html#method.upgrade"]
+---
+
+`Arc::try_unwrap(owner)` can return the inner `T` while weak pointers to the allocation still exist. Weak pointers do not own `T`. The [failing fixture](/rust-failure-atlas/evidence/RFA-691/fail.rs) expects a live Weak to block extraction, but `try_unwrap` succeeds because only one strong Arc remains.
+
+## Strong count decides ownership of T
+
+The [`Arc::try_unwrap` documentation](https://doc.rust-lang.org/std/sync/struct.Arc.html#method.try_unwrap) returns `Ok(T)` when the supplied Arc is the only strong reference. Otherwise it returns the original Arc in `Err`.
+
+Weak pointers keep enough allocation metadata alive for their own bookkeeping. They do not keep the contained value alive and do not prevent successful unwrapping. After T is moved out, [`Weak::upgrade`](https://doc.rust-lang.org/std/sync/struct.Weak.html#method.upgrade) returns None.
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-691/fixed.rs) asserts both facts: it recovers the String and then observes failed upgrade.
+
+## Allocation lifetime and value lifetime differ
+
+Reference-counted storage conceptually tracks strong ownership of the value separately from weak references to the allocation control block. When strong ownership reaches zero, T is dropped or moved out. Metadata may remain until weak pointers disappear.
+
+This distinction supports caches and back-references that can ask whether an object remains live without extending its life. It also explains why memory accounting can show some allocation overhead after the inner resource is gone.
+
+I avoid describing Weak as “keeping the Arc alive.” It keeps a non-owning allocation handle, not the inner value.
+
+## try_unwrap failure returns ownership
+
+When another strong Arc exists, `Err(arc)` returns the caller's owner. Ignoring that Err drops this strong reference. The other owners remain valid.
+
+Code can retry only if its lifecycle makes other strong references disappear, but checking `strong_count == 1` before `try_unwrap` is racy across threads. Another clone can be created from an existing owner. The consuming operation is the actual atomic ownership decision.
+
+I match its result and continue with either owned T or returned Arc. Count methods are useful diagnostics, not synchronization preconditions.
+
+## into_inner differs in concurrent guarantees
+
+[`Arc::into_inner`](https://doc.rust-lang.org/std/sync/struct.Arc.html#method.into_inner) also attempts to obtain T, returning `Option<T>`. Its documentation gives an important guarantee when called on every clone: exactly one call returns the inner value.
+
+The docs warn against replacing that pattern casually with `Arc::try_unwrap(this).ok()`, because simultaneous failures followed by dropping returned Arcs can result in nobody receiving T. Similar-looking APIs can carry different coordination guarantees.
+
+I select the method from the multi-owner protocol, not only the preferred return type.
+
+## Extracting T ends weak liveness
+
+A weak registry may still contain entries after successful unwrapping. Their upgrade returns None and cleanup can remove them lazily. If the registry expects explicit deregistration, extraction should perform it before or after according to a defined lifecycle.
+
+The inner value's destructor is now controlled by the returned T owner. It does not run during successful try_unwrap. Dropping that returned value later performs cleanup. As with mem::replace, ownership extraction separates state transition from destruction timing.
+
+Weak handles must never use raw allocation addresses as permanent identities without generation protection. Allocators can reuse addresses after all weak metadata is gone.
+
+## Arc does not make T mutable
+
+Shared Arc ownership provides thread-safe reference counting when T satisfies the required traits. It does not permit mutation of T. Shared updates need a Mutex, RwLock, atomics, message ownership, or immutable snapshot replacement.
+
+Once unwrapped, T has ordinary unique ownership and can be mutated directly. Designing a shutdown phase that gathers all strong owners can therefore simplify finalization, but hidden clones may make it fail.
+
+Tests cover one strong owner with Weak, two strong owners, concurrent into_inner calls when relevant, and weak upgrade after extraction. They avoid count-check races as correctness logic.
+
+## My Arc extraction checklist
+
+- Does any other strong Arc still own T?
+- Are Weak pointers correctly treated as non-owning liveness observers?
+- Is the returned Arc from failure preserved or intentionally dropped?
+- Does the multi-owner protocol require into_inner's exactly-one result guarantee?
+- When should the extracted T be explicitly closed or dropped?
+- How are stale weak registry entries removed?
+- Is strong_count being misused as a race-free precondition?
+- Do tests assert weak upgrade after successful extraction?
+
+The core principle is that shared allocation identity and ownership of the contained value are different lifetimes. `Arc::try_unwrap` needs exclusive strong ownership, not absence of weak observers. I use the resulting transition to make shutdown and cleanup explicit.

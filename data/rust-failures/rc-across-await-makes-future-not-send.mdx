@@ -1,0 +1,104 @@
+---
+caseId: "RFA-086"
+title: "Why Rc Across await Makes a Rust Future Not Send"
+date: "2026-09-05T09:06:00+01:00"
+lastmod: "2026-09-05T09:06:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "67192f8c6bda56be5afcb26706631d7185b028b24bc64bd7c40783320c1c9091"
+area: "async-runtime"
+symptom: "An async function becomes a non-Send future because an Rc value remains live across an await point."
+summary: "A suspended future stores values needed after await. If that state contains Rc, a multi-thread executor cannot move the future safely; often the cleanest repair is shortening the Rc scope."
+rustVersions: ["Rust 1.98.1"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust future cannot be sent Rc across await",
+    "future not Send value used across await",
+    "Tokio spawn Rc not Send",
+  ]
+evidence: ["Rust 1.98.1 compile failure", "future-state boundary", "scope-shortening repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/std/marker/trait.Send.html",
+    "https://doc.rust-lang.org/reference/expressions/await-expr.html",
+  ]
+---
+
+An `Rc` can be perfectly local to one async function and still make its returned future fail a `Send` requirement:
+
+```rust
+use std::rc::Rc;
+
+async fn load() -> usize {
+    let local = Rc::new(41);
+    std::future::ready(()).await;
+    *local + 1
+}
+
+fn require_send<T: Send>(_: T) {}
+```
+
+Passing `load()` to `require_send` fails. Rust 1.98.1 reports that the future is not `Send`, identifies `Rc<usize>`, and points to the await where `local` remains live. The [failing fixture](/rust-failure-atlas/evidence/RFA-086/fail.rs) reproduces this without depending on a particular async runtime.
+
+## An async function returns stored state
+
+Calling an async function does not immediately run its body to completion. It creates a future. When that future reaches an await that is not ready, it returns control to the executor and keeps the state required to resume later.
+
+In this example, the future needs `local` after the await, so `Rc` becomes a field of the suspended state machine. A work-stealing executor may poll the future on one worker thread, suspend it, move it through a queue, and poll it on another. Such an executor requires the future to implement `Send`.
+
+The standard-library [`Send` documentation](https://doc.rust-lang.org/std/marker/trait.Send.html) explains that values implementing the marker can be transferred safely between threads. `Rc` intentionally does not implement it because its reference count is not updated atomically. The [await expression reference](https://doc.rust-lang.org/reference/expressions/await-expr.html) describes polling and suspension behavior.
+
+## First ask whether Rc must cross the await
+
+The common reflex is to replace every `Rc` with `Arc`. Sometimes this is correct. It can also hide the smaller design mistake: a thread-local helper value remained live longer than needed.
+
+The verified repair extracts ordinary data before suspension:
+
+```rust
+async fn load() -> usize {
+    let copied = {
+        let local = Rc::new(41);
+        *local
+    };
+
+    std::future::ready(()).await;
+    copied + 1
+}
+```
+
+The [fixed program](/rust-failure-atlas/evidence/RFA-086/fixed.rs) proves that the returned future is now `Send`. The lexical block is deliberate. It tells both the compiler and the reader that `Rc` cannot become suspended state.
+
+For a non-Copy value, I may transform it into an owned Send representation, finish all local graph traversal first, or move only a stable identifier across the await and look up data afterward.
+
+## drop is not always the clearest boundary
+
+An explicit `drop(local)` before await can work when the compiler's liveness analysis sees that the value is gone. A lexical scope tends to communicate the invariant more clearly and behaves predictably across refactors. A later debug log cannot accidentally use `local` after the supposed drop boundary without producing an obvious scope error.
+
+I use scopes when the absence of a value from future state is part of the design.
+
+## Arc solves transfer, not the whole design
+
+`Arc<T>` uses atomic reference counting and can be Send and Sync when `T` has the required properties. Replacing `Rc` with `Arc` is appropriate when the same owned allocation really must be shared across worker threads.
+
+But `Arc` does not make interior mutation safe, and it has a different cost model. `Arc<RefCell<T>>` still cannot be shared safely. Concurrent mutation may need `Mutex`, `RwLock`, atomics, message passing, or a single-owner task. The correct repair follows the ownership architecture, not just the nearest trait error.
+
+## Send may be unnecessary on a local executor
+
+Some runtimes support local tasks that stay on one thread. A non-Send future can be valid there. The important point is to make that execution constraint explicit. Passing a local future to an API that may schedule across threads must fail.
+
+Libraries should also avoid adding `Send` bounds only because one current application uses a multi-thread runtime. A library future can remain general, while the spawning boundary states whether Send is required.
+
+## How I diagnose this error
+
+I begin at the last note in the compiler diagnostic, not the first trait stack. I find the value named as non-Send and the await where it stays live. Then I ask:
+
+1. Is the value actually used after this await?
+2. Can I compute a Send result before suspending?
+3. Must ownership be shared across worker threads?
+4. Is this task intentionally local instead?
+
+I also add a small `require_send` assertion near important future factories. It produces a focused compiler error before a large runtime's spawn signature adds several layers of generic types.
+
+The durable mental model is simple: the question is not whether an async function mentions `Rc`. The question is whether the generated future stores `Rc` at a suspension point and whether that future may move between threads. Once those two boundaries are separated, the smallest honest repair is usually visible.

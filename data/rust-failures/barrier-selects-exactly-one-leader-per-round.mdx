@@ -1,0 +1,81 @@
+---
+caseId: "RFA-686"
+title: "Barrier Selects Exactly One Leader Per Round"
+date: "2026-09-06T08:46:00+01:00"
+lastmod: "2026-09-06T08:46:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "94ea708cd6e6cf2406d589fdbbed4f1a46331e70bd572ef963f2f7445ff8d7d1"
+area: "concurrency-memory"
+symptom: "Four threads pass a Barrier together, but only one BarrierWaitResult reports is_leader true."
+summary: "A barrier releases every participant after the count arrives and designates one unspecified leader. Use that result for one-per-round coordination, never identity assumptions."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["targets supporting std threads"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust Barrier is_leader exactly one", "BarrierWaitResult leader thread", "reusable Barrier rounds Rust"]
+evidence: ["Rust 1.98.1 four-thread runtime assertion", "all participants complete one wait", "leader count equals one"]
+sources: ["https://doc.rust-lang.org/std/sync/struct.Barrier.html#method.wait", "https://doc.rust-lang.org/std/sync/struct.BarrierWaitResult.html#method.is_leader", "https://doc.rust-lang.org/std/thread/fn.scope.html"]
+---
+
+When the configured number of threads reach `Barrier::wait`, all can continue and exactly one receives a wait result whose `is_leader()` is true. The [failing fixture](/rust-failure-atlas/evidence/RFA-686/fail.rs) expects all four to be leaders and measures one.
+
+## Arrival releases a cohort
+
+A barrier is constructed with a participant count. Each wait blocks until that many threads have arrived in the current round. It is then reusable for another round.
+
+[`BarrierWaitResult::is_leader`](https://doc.rust-lang.org/std/sync/struct.BarrierWaitResult.html#method.is_leader) marks one thread from the released cohort. The identity is not specified. It is a one-per-round token, not a stable coordinator election.
+
+I use it for small actions that any participant can perform after the phase boundary, such as updating a round counter or swapping a prepared buffer.
+
+## Leader does not mean first or last by contract
+
+It is tempting to infer that the last arriving thread becomes leader. Even if an implementation behaves that way, application correctness cannot depend on it without a documented guarantee.
+
+If a specific thread must coordinate, I assign that role outside the barrier through an ID or separate channel. If leadership needs to survive failures or span machines, a local barrier result is far too weak.
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-686/fixed.rs) counts leaders rather than checking which thread won. This makes the test scheduler-independent.
+
+## Every participant must reach every round
+
+If one worker returns early, panics, or skips a conditional wait, the others can block forever. Barriers do not automatically reduce their count when a participant disappears.
+
+I keep barrier participation structurally obvious: the same worker set executes the same number of waits. Fallible work is arranged before joining the phase or communicates failure so blocked peers can terminate through another mechanism.
+
+Conditional barriers need exceptional care. A branch based on local data can split the cohort. Phase numbers in logs help diagnose which wait was missed.
+
+## Memory visibility follows synchronization
+
+The barrier provides synchronization for work before and after the phase according to its documented primitive semantics. Data still needs safe shared access through atomics, locks, disjoint scoped borrows, or message ownership.
+
+A barrier does not make unsynchronised mutable globals safe. Rust's types prevent many such mistakes, but unsafe code must establish exact happens-before and aliasing rules.
+
+Often scoped threads can borrow disjoint portions of a buffer, work independently, and join without a reusable barrier. I choose the simpler lifetime structure when only one phase exists.
+
+## Leader work can delay the next phase
+
+All threads are released from `wait`; the leader's following work is not automatically completed before others proceed. If the leader must update state before everyone begins the next phase, a second barrier or another synchronization event is needed.
+
+This is a frequent phase bug: one barrier chooses a leader, peers immediately read state that leader has not written yet. I model “all finished phase A” and “leader finished transition” as two different events.
+
+Leader work should be bounded. A long I/O operation assigned to an unspecified worker can create unpredictable latency and resource affinity.
+
+## Tests need deterministic membership
+
+The fixture spawns exactly four workers, shares a barrier count of four, joins every handle, and counts results. It does not sleep or infer arrival order.
+
+Multi-round tests collect one leader per round and ensure every worker reaches the same number. Failure tests use a harness timeout to reveal deadlock but do not make timing the protocol.
+
+I attach a generation number to results produced in each round. This prevents a fast worker from accidentally mixing data prepared before one barrier with data from the next. The barrier synchronizes participation, while the generation makes the application-level phase visible in messages, metrics, and assertions.
+
+## My barrier checklist
+
+- Does exactly the configured cohort reach every wait?
+- Can panic, error, or cancellation make one worker skip a round?
+- Is leader identity incorrectly assumed from arrival order?
+- Is the one-per-round action safe for any participant?
+- Do peers need a second synchronization after leader work?
+- Is shared data protected beyond merely sharing the barrier?
+- Would scoped join or message passing express a one-phase job better?
+- Do tests count leaders without scheduler assumptions?
+
+The core principle is that a barrier creates a phase boundary and one temporary token. It does not create a permanent leader or recover missing participants. I use its leader result for scheduler-neutral one-per-round work and model every later dependency explicitly.

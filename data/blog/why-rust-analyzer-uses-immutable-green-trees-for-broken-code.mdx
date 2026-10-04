@@ -1,0 +1,195 @@
+---
+title: "Why rust-analyzer Uses Immutable Green Trees for Broken Code"
+date: "2026-10-12T09:00:00+01:00"
+tags: ["rust-analyzer", "syntax tree", "green tree", "parser", "compiler tooling"]
+draft: false
+reviewed: true
+reviewedHash: "13a649f73abfdde9a53ad38d8e8198168b0eb95b64c37257315c853e7f5d458e"
+cluster: "rust-under-the-hood"
+campaign: "authority-2026"
+opportunity: "RUST-021"
+summary: "rust-analyzer keeps whitespace, represents incomplete programs, and shares unchanged immutable syntax subtrees. See a real broken-code parse and the green/red tree split."
+---
+
+An IDE mostly sees invalid programs. Between typing `(` and `)`, the file is broken. During a rename, several references may be temporarily inconsistent. The parser cannot refuse to build a tree until `cargo check` succeeds.
+
+rust-analyzer uses a lossless, error-tolerant syntax tree that can represent these intermediate states. Its immutable green nodes also make edited trees cheap to share.
+
+## A compiler parser and an editor parser have different pressure
+
+A batch compiler can report a syntax error and stop later phases for the affected code. An editor still needs to provide:
+
+- syntax highlighting;
+- indentation and bracket assistance;
+- a document outline;
+- selection expansion;
+- partial completion;
+- diagnostics near the error;
+- edits and refactoring around valid neighbours.
+
+It therefore needs the best structural tree available, including error nodes and missing pieces.
+
+The [rust-analyzer syntax documentation](https://rust-analyzer.github.io/book/contributing/syntax.html) lists three central properties: the tree is lossless, syntax-only, and resilient to errors.
+
+## A real parse of incomplete Rust
+
+I passed this unfinished text to `rust-analyzer parse` using rust-analyzer 1.95 nightly:
+
+```rust
+fn total(x: u64
+    x + 1
+```
+
+The parser did not return “no AST.” It produced, in shortened form:
+
+```text
+SOURCE_FILE
+  FN
+    FN_KW "fn"
+    NAME
+      IDENT "total"
+    PARAM_LIST
+      L_PAREN "("
+      PARAM
+        IDENT_PAT "x"
+        COLON ":"
+        PATH_TYPE
+          NAME_REF "u64"
+      PARAM
+        IDENT_PAT "x"
+  ERROR
+    PLUS "+"
+  ERROR
+    INT_NUMBER "1"
+```
+
+The recovery is not what the author intended: without `)` and `{`, the second `x` was interpreted inside the parameter list and `+ 1` became error nodes. That is honest and useful. The tree preserves recognised structure without inventing a valid function that is not in the text.
+
+## Lossless means trivia is data too
+
+A traditional semantic AST may discard spaces and comments because they do not affect execution. An editor needs them to reproduce and edit the exact document.
+
+In a lossless syntax tree, tokens include:
+
+```text
+keywords and identifiers
+punctuation
+whitespace and newlines
+comments
+invalid or unexpected tokens
+```
+
+If I take the tokens in order, I can recover the original source text. Formatting and refactoring tools can replace one syntax region without regenerating unrelated comments.
+
+## Green nodes store immutable structure
+
+The underlying green tree stores syntax kinds, tokens, and child structure without parent pointers or absolute positions. Green nodes are immutable.
+
+Conceptually:
+
+```text
+GreenNode(FN)
+  ├── GreenToken(FN_KW, "fn")
+  ├── GreenToken(WHITESPACE, " ")
+  ├── GreenNode(NAME, ...)
+  └── GreenNode(PARAM_LIST, ...)
+```
+
+Because a green subtree never changes, different tree versions can safely share it. An edit builds new nodes along the changed path while reusing unchanged subtrees.
+
+This is persistent-data-structure thinking applied to syntax.
+
+## Red nodes add context as a view
+
+Editor features need parent traversal and text offsets: “What node contains byte 83?” or “What function owns this expression?”
+
+A red syntax node is a contextual view over green data. It knows where the green subtree appears in this tree and can navigate parents or siblings.
+
+```text
+green: immutable content and children
+red:   location, parent context, navigation
+AST:   typed wrappers such as ast::Fn over syntax nodes
+```
+
+The word “red” may not appear in every public API name, but the green-data/contextual-view distinction is the useful model.
+
+## One edit rebuilds a path, not every byte
+
+Suppose the complete function is:
+
+```rust
+fn total(x: u64) -> u64 {
+    x + 1
+}
+```
+
+Changing `1` to `2` changes one token. A simplified persistent-tree update is:
+
+```text
+new INT_NUMBER "2"
+  -> new LITERAL
+     -> new BIN_EXPR
+        -> new BLOCK_EXPR
+           -> new FN
+              -> new SOURCE_FILE
+
+unchanged NAME, PARAM_LIST, RET_TYPE, and other tokens are shared
+```
+
+The exact reparsing boundary is an implementation choice and may be larger than this illustration. Immutability makes sharing safe wherever the parser can reuse structure.
+
+The rust-analyzer guide explains that replacing a subtree has cost proportional to the tree depth rather than requiring a mutable rewrite of every node.
+
+## Syntax trees intentionally know little about meaning
+
+At the syntax layer, `u64` is a path-shaped piece of syntax. Whether it resolves to the primitive type, an alias, or an error belongs to semantic analysis.
+
+This separation lets parsing remain local and robust:
+
+```text
+syntax:   “this looks like a path in a type position”
+semantics: “this path resolves to this type in this crate and cfg”
+```
+
+Mixing name resolution into the parser would make the tree depend on project loading, imports, macros, and conditional compilation. An editor needs a syntax result even when those systems are incomplete.
+
+## Typed AST wrappers do not create another copied tree
+
+Code often uses typed nodes such as a function, parameter list, or expression. These wrappers provide methods appropriate to a syntax kind:
+
+```rust
+fn name(function: &ast::Fn) -> Option<ast::Name> {
+    function.name()
+}
+```
+
+They are views over the same syntax representation, not a fully separate mutable object graph. Optional children matter because broken code may not contain a name, body, or closing token.
+
+When writing editor logic, I avoid `unwrap()` merely because valid Rust requires a child. The editor may be called one keystroke before the child exists.
+
+## Error tolerance has a budget
+
+Recovery should preserve nearby useful structure without consuming the rest of the file into one incorrect node. A parser chooses synchronisation points such as braces, commas, item keywords, or line structure.
+
+Too little recovery produces no useful tree after the first error. Too aggressive recovery can create a confident but misleading structure.
+
+I test incomplete cases explicitly:
+
+```text
+missing closing delimiter
+unfinished path `foo::`
+attribute with incomplete arguments
+function without body
+macro call with partial token tree
+two valid items around one broken item
+```
+
+The last case is important: one broken function should not erase the outline for everything below it.
+
+## Syntax reuse and semantic reuse are separate
+
+An unchanged green subtree is valuable, but it does not automatically prove every semantic answer is unchanged. A new import or macro definition elsewhere can change what a name inside that subtree resolves to.
+
+Syntax identity is one input to the wider incremental analysis. Semantic queries track their other dependencies too. See [How rust-analyzer Recomputes Only What an Edit Invalidates](/blog/how-rust-analyzer-recomputes-only-what-an-edit-invalidates) for that layer.
+
+The green tree solves a precise editor problem: preserve exact, possibly broken syntax in immutable shareable structure. It gives later features something stable to inspect while the programmer is still in the middle of making the code valid.

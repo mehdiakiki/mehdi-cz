@@ -1,0 +1,95 @@
+---
+caseId: "RFA-366"
+title: "env::vars Panics on a Non-Unicode Unix Environment Value"
+date: "2026-09-06T02:23:00+01:00"
+lastmod: "2026-09-06T02:23:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "579b5d78d0c1b10c9b6210a360c8ed97f62285009182250144f729f2393804b7"
+area: "ffi-targets"
+symptom: "Collecting env::vars panics after the process environment contains a Unix byte sequence that is not valid Unicode."
+summary: "Unix environment entries are OS strings, not guaranteed UTF-8 Strings. env::vars performs Unicode conversion during iteration and panics on failure; vars_os preserves platform-native values for explicit validation."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["unix"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust env vars panic invalid Unicode", "environment variable non UTF-8 Rust", "env vars vs vars_os"]
+evidence: ["Rust 1.98.1 Unix OsString", "value bytes 6f 6b ff", "vars panic and vars_os byte recovery"]
+sources: ["https://doc.rust-lang.org/std/env/fn.vars.html", "https://doc.rust-lang.org/std/env/fn.vars_os.html", "https://doc.rust-lang.org/std/ffi/struct.OsString.html"]
+---
+
+I used [`env::vars`](https://doc.rust-lang.org/std/env/fn.vars.html) because environment variables looked like text. On Unix, one value contained a byte that was not UTF-8, and iteration panicked. The environment boundary stores OS strings, not guaranteed Rust `String` values.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-366/fail.rs) installs the bytes `ok FF` under a test key. `env::vars().collect()` encounters the entry and panics. A surrounding unwind catcher proves the behavior before the fixture fails with its own explanation.
+
+## The conversion happens while iterating
+
+`env::vars()` returns an iterator of `(String, String)`. To produce each pair, Rust must convert both the environment key and value into Unicode text.
+
+The documentation states that the iterator panics when it reaches any key or value that is not valid Unicode. Creating the iterator alone may therefore appear fine; a later `next`, `find`, `collect`, or `for` loop exposes the failure.
+
+This deferred point matters in debugging. The panic can appear far from the function that chose the text-only API.
+
+## Unix environment data is byte-oriented
+
+On Unix, [`OsString`](https://doc.rust-lang.org/std/ffi/struct.OsString.html) can represent platform strings that are not UTF-8. A process can inherit such entries from a parent program written in another language or from a launcher that treats the environment as arbitrary non-NUL bytes.
+
+My application may prefer UTF-8, but that preference is a validation policy. It does not change what the operating system can supply.
+
+Other platforms have different native encodings and restrictions. I avoid assuming that Unix byte access is portable; the case file marks its target explicitly.
+
+## vars_os preserves the boundary value
+
+[`env::vars_os`](https://doc.rust-lang.org/std/env/fn.vars_os.html) yields `(OsString, OsString)` without forcing Unicode conversion. The [repaired program](/rust-failure-atlas/evidence/RFA-366/fixed.rs) finds the test key and, using Unix's `OsStrExt`, confirms the original bytes exactly.
+
+From there I can choose a policy:
+
+- accept only valid UTF-8 and return a structured configuration error;
+- compare specific keys as `OsStr` and pass native values to path APIs;
+- display a lossy form while retaining raw data for diagnosis;
+- reject the complete environment when a security boundary requires canonical text.
+
+The key is that conversion failure becomes data, not an unexpected panic.
+
+## Lossy text is not stable identity
+
+`to_string_lossy` is convenient for logs, but invalid byte sequences become the Unicode replacement character. Different raw inputs can collapse to the same visible string.
+
+I do not use lossy output as a cache key, authorization identity, exact file path round trip, or cryptographic input. I keep the `OsString` for operations that need native identity and use lossy text only as an explicitly approximate display.
+
+Logs can include a safe encoded byte form when operators need exact diagnosis, with secrets redacted before any representation is emitted.
+
+## Environment access has concurrency constraints too
+
+In Rust 2024, mutating process environment variables is unsafe because other threads or foreign libraries may access the process-global environment through APIs with platform hazards. The evidence fixture is a single-threaded process and contains a narrow unsafe block for deterministic setup and cleanup.
+
+This does not make runtime environment mutation a good production configuration mechanism. I normally read configuration at startup, validate it into owned application types, and avoid later mutation.
+
+Tests that change environment state must be serialized or isolated in child processes. Otherwise unrelated tests can observe temporary values and become flaky.
+
+## One bad unrelated entry can break full enumeration
+
+Code may want only `DATABASE_URL` but enumerate every variable and then filter. With `env::vars`, an invalid unrelated value can panic before or after the desired key is found, depending on platform enumeration order.
+
+For a known key, `env::var` returns a `VarError` that can distinguish absence from non-Unicode data. For complete enumeration, `vars_os` lets each entry be handled explicitly.
+
+I minimize the boundary I read. This reduces accidental dependence on unrelated launcher state and makes error messages more specific.
+
+## Panic catching is not the production repair
+
+The fixture uses `catch_unwind` to turn a documented panic into observable evidence. Catching does not suppress the panic hook, and panic strategy can be configured to abort. It also loses which entry failed unless more context is added.
+
+Using the non-panicking OS-string API is simpler. I validate before conversion and return ordinary application errors. This keeps malformed configuration inside the request or startup error channel.
+
+## Tests need bytes that Unicode cannot represent
+
+An ordinary ASCII or UTF-8 environment produces no distinction between `vars` and `vars_os`. The fixture creates an `OsString` from raw Unix bytes containing `0xFF`, which cannot appear alone in valid UTF-8.
+
+It removes the key after observation to limit global state. A production test suite should still run this evidence in its own process, as the Atlas verifier does.
+
+I test invalid keys as well as values when the platform permits them, missing keys, empty values, and redaction of secrets in error output.
+
+## The core principle is to preserve native data until validation
+
+Crossing an operating-system boundary often yields a wider representation than application text. Converting immediately to `String` silently chooses “panic on anything else” when using `env::vars`.
+
+I start with `OsString`, validate the exact fields whose contracts require Unicode, and keep errors explicit. The environment can then be strange without making the program's control flow surprising.

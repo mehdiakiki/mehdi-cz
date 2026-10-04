@@ -1,0 +1,239 @@
+---
+title: "Evaluate Retrieval Separately From Answer Generation"
+date: "2026-09-13T14:00:00+01:00"
+tags: ["RAG", "retrieval evaluation", "LLM evaluation", "precision and recall", "search"]
+draft: false
+reviewed: true
+reviewedHash: "8312e86a54a9517e5f69d16595fb82b1b034ddf77ed56e7b2cbfdbe80957588e"
+cluster: "reliable-ai-systems"
+campaign: "authority-2026"
+opportunity: "AI-006"
+summary: "A retrieval benchmark for separating missing evidence from generation failures using Recall@k, Precision@k, MRR, unanswerable questions, and controlled oracle context."
+---
+
+When a retrieval-augmented generation system gives a wrong answer, people often say, “The RAG is bad.” This diagnosis is too broad to help me fix it.
+
+The retriever may have missed the necessary document. It may have found the document but selected the wrong chunk. The generator may have received perfect evidence and ignored it. Or the question may not be answerable from the indexed corpus at all.
+
+I evaluate retrieval before answer generation because these failures need different changes. Better prompting cannot recover a document that never entered the context, and a better embedding model cannot make the generator respect a clear limitation.
+
+## The pipeline has at least two contracts
+
+I begin with a simple separation:
+
+```text
+question
+   ↓
+retriever → ranked evidence IDs
+   ↓
+generator → answer and citations
+```
+
+The retrieval contract asks:
+
+> Did the system place enough relevant evidence inside the available context budget?
+
+The generation contract asks:
+
+> Given that evidence, did the system produce a supported and useful answer?
+
+An end-to-end score mixes both questions. I still need it because users experience the complete system, but I cannot use it alone for debugging.
+
+## Build relevance labels around evidence, not wording
+
+For every benchmark query, I store the source identities needed to answer it:
+
+```text
+query: When does the enterprise cancellation take effect?
+relevant documents: [contract-policy-v3]
+relevant passages: [contract-policy-v3#termination]
+required facts: [end_of_current_billing_period]
+answerable: true
+```
+
+The reference is not one perfect generated paragraph. It is an evidence set and a small fact contract.
+
+Sometimes several passages are valid alternatives. Sometimes the question needs two documents together, such as a general policy plus an account-specific amendment. I represent both cases instead of pretending relevance is always one chunk.
+
+I label at document and passage level when useful. Document-level recall tells me whether retrieval reached the correct source. Passage-level recall tells me whether chunking and ranking exposed the useful section.
+
+## The retrieval metrics I actually read
+
+Suppose the top five results contain two relevant passages.
+
+### Recall@k
+
+```text
+relevant passages retrieved in top k / all known relevant passages
+```
+
+If two of four required passages appear in the top five, Recall@5 is 0.5. Recall answers whether the evidence set is complete.
+
+This is often my first metric for multi-document questions. If one necessary piece is absent, the generator may have no valid path to a complete answer.
+
+### Precision@k
+
+```text
+relevant passages retrieved in top k / k
+```
+
+If two of five passages are relevant, Precision@5 is 0.4. Low precision means irrelevant text consumes context and may distract generation.
+
+Precision and recall trade against each other as `k` changes. Retrieving fifty chunks can improve recall while creating an unusable context.
+
+### Hit Rate@k
+
+This is one when at least one relevant result appears in the top k, otherwise zero. It is easy to understand but weak for questions that require several pieces of evidence.
+
+### Mean Reciprocal Rank
+
+For each query, reciprocal rank is `1 / rank` of the first relevant result. A relevant item at rank one scores 1; at rank five it scores 0.2. The mean across queries rewards placing the first useful result early.
+
+MRR does not measure whether every required item was found.
+
+### nDCG@k
+
+Normalized discounted cumulative gain is useful when relevance has levels. An exact policy paragraph can receive higher relevance than a page that only mentions the topic. The score rewards highly relevant results near the top.
+
+I do not put every metric in the release gate. I choose the one that represents the product's evidence need, then keep the others for diagnosis.
+
+The classic definitions are explained in the Stanford Introduction to Information Retrieval chapter on [evaluation of ranked retrieval results](https://nlp.stanford.edu/IR-book/html/htmledition/evaluation-of-ranked-retrieval-results-1.html). The [BEIR benchmark](https://arxiv.org/abs/2104.08663) is also useful for understanding evaluation across different retrieval tasks rather than one convenient dataset.
+
+## A small benchmark table is more useful than one score
+
+I compare retrieval configurations with the same corpus snapshot and query set:
+
+| Query slice | Cases | Recall@5 | MRR@5 | Empty results | Context tokens |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Exact identifiers | 40 | — | — | — | — |
+| Natural-language policy | 60 | — | — | — | — |
+| Two-document joins | 35 | — | — | — | — |
+| Acronyms and aliases | 30 | — | — | — | — |
+| Unanswerable questions | 35 | n/a | n/a | — | — |
+
+The dashes are filled by the benchmark run; they are not invented results. I keep slices because an average can hide that exact identifiers work while multi-document questions fail.
+
+For unanswerable questions, retrieval has another contract: it should not confidently return unrelated documents only because the API must fill `k` positions. I measure the distribution of top scores and whether the pipeline can return “no adequate evidence.”
+
+## Keep the benchmark reproducible
+
+Retrieval results depend on more than the embedding model. I version:
+
+- the raw corpus snapshot;
+- parsing and cleaning code;
+- chunk boundaries and overlap;
+- document and passage IDs;
+- embedding model and dimensions;
+- sparse index settings;
+- filters and tenant rules;
+- query rewriting;
+- fusion and reranking parameters;
+- top-k and context-token budget.
+
+If I change chunk size and embedding model together, I may know the new pipeline is better but not why. For exploration this can be fine. For a useful engineering record, I change one dimension at a time or run a small matrix.
+
+Stable source IDs are important. If a re-index generates every passage ID again, old relevance labels become impossible to compare. I keep document identity stable and map new chunks back to source ranges.
+
+## Use oracle context to isolate generation
+
+The most useful diagnostic experiment is to bypass retrieval.
+
+For every answerable query, I run the generator twice:
+
+```text
+normal run: retrieved top-k context → generator
+oracle run: human-labelled evidence → same generator
+```
+
+The comparison gives four broad states:
+
+| Normal retrieval | Oracle answer | Likely first problem |
+| --- | --- | --- |
+| Evidence missing, oracle succeeds | Correct | Retrieval or chunking |
+| Evidence present, oracle also fails | Wrong | Generation, prompt, or answer rubric |
+| Evidence present, normal fails, oracle succeeds | Mixed | Ordering, noise, or context assembly |
+| Evidence missing, oracle fails | Wrong | More than one layer is weak |
+
+Oracle context is not a production solution. It is a controlled experiment that tells me whether better retrieval would be enough.
+
+I also run a no-context baseline. If the model answers equally well without retrieval, the benchmark may be testing memorized public knowledge rather than the private corpus.
+
+## Retrieval labels need review too
+
+Relevance is not always objective. A passage can be useful but incomplete. A newer policy can supersede an older one. Two reviewers can disagree about whether background context is necessary.
+
+I record graded relevance and reasons:
+
+```text
+3 = directly contains required evidence
+2 = useful supporting evidence
+1 = related but insufficient
+0 = not relevant
+```
+
+For important cases, two people label independently and resolve disagreements. I also rerun labels when the product policy changes. A stale golden set can make an improved retriever look worse for finding the current document.
+
+## Test filters before semantic quality
+
+In multi-tenant systems, a semantically relevant document from the wrong tenant is a security failure, not a good retrieval result.
+
+I run deterministic assertions before relevance metrics:
+
+- every result belongs to the authenticated tenant;
+- access-control filters were applied before or during retrieval;
+- deleted or expired documents are absent;
+- index generation matches the expected corpus;
+- citations resolve to a source the user may open.
+
+I never allow strong Recall@k to compensate for one unauthorized result.
+
+## Diagnose by changing one stage
+
+When recall is low, I inspect:
+
+1. **Corpus coverage:** Was the source indexed at all?
+2. **Parsing:** Did extraction preserve the useful text and table structure?
+3. **Chunking:** Did a boundary split the evidence from its heading or qualifier?
+4. **Query representation:** Were product aliases, identifiers, and acronyms preserved?
+5. **Candidate retrieval:** Did sparse or dense search find the source anywhere?
+6. **Reranking:** Was a relevant candidate pushed below the context cut?
+7. **Filtering:** Did metadata exclude the correct document?
+8. **Packing:** Did token-budget logic remove the evidence after ranking?
+
+“Try another vector database” is rarely the first complete diagnosis.
+
+## Evaluate freshness and deletion
+
+A retrieval benchmark should include lifecycle cases:
+
+- a document is updated and the old passage must disappear;
+- a document is deleted and cannot be retrieved from a stale index;
+- two versions exist and only the active one should win;
+- indexing is delayed and the product must communicate freshness;
+- a source moves but keeps its identity.
+
+This is where ordinary data engineering meets AI evaluation. The quality of an answer depends on ingestion checkpoints, identity, tombstones, and permissions before the model sees one token.
+
+## My practical release gate
+
+I use a layered gate:
+
+```text
+authorization and lifecycle invariants must have zero violations
+core-query Recall@k may not regress beyond an agreed margin
+critical evidence sets must remain complete
+unanswerable false-positive rate stays within budget
+oracle-context generation quality stays stable
+end-to-end answer quality and citations pass their own rubric
+latency and context-token cost stay within budget
+```
+
+Then I inspect individual regressions, not only aggregate numbers. A one-point gain across easy queries does not justify losing one critical policy document.
+
+## The main lesson
+
+I evaluate retrieval as an information-retrieval system and generation as a conditional answer system. I join the scores only after I can inspect them separately.
+
+This makes RAG work less mysterious. A missing passage becomes a corpus, parsing, chunking, filtering, or ranking problem. A wrong answer with perfect evidence becomes a generation problem. An unauthorized result becomes a security incident regardless of answer quality.
+
+The end-to-end product still matters, but separate measurements tell me where to apply engineering effort. The evaluation structure builds naturally on [Golden Tests for Non-Deterministic AI Outputs](/blog/golden-tests-for-non-deterministic-ai-outputs) and the privacy-safe case construction in [Turning Production Traces Into an Evaluation Set](/blog/turn-production-traces-into-an-evaluation-set-without-copying-user-data).

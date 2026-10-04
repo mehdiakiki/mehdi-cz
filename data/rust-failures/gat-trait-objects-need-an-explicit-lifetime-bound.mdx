@@ -1,0 +1,90 @@
+---
+caseId: "RFA-716"
+title: "Why a Trait Object Inside a GAT May Need an Explicit Lifetime in Rust 1.98"
+date: "2026-09-07T11:20:00+01:00"
+lastmod: "2026-09-07T11:20:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "4d75b1f8ac16a97d96f5ff08e69c745e882f9ef3b025a1eec2dc2176f85f1e6d"
+area: "upgrades-compatibility"
+symptom: "A function signature using T::Ty<'r, dyn Inner> fails with E0228 because Rust cannot deduce the trait object's lifetime bound from that associated-type context."
+summary: "Rust 1.98 no longer silently gives every fully elided trait object inside a generic associated type the item-level static fallback. Write the intended dyn Trait lifetime explicitly."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets"]
+profiles: ["dev", "release"]
+searchTerms: ["Rust E0228 GAT dyn Trait lifetime bound", "cannot deduce lifetime bound associated type trait object", "T associated type dyn Trait explicit lifetime Rust 1.98"]
+evidence: ["Rust 1.98.1 E0228 compile failure", "fully elided dyn Inner inside a GAT projection", "explicit dyn Inner plus 'r repair"]
+sources: ["https://doc.rust-lang.org/releases.html#version-1980-2026-08-20", "https://doc.rust-lang.org/reference/lifetime-elision.html#default-trait-object-lifetimes", "https://doc.rust-lang.org/error_codes/E0228.html"]
+---
+
+I usually read `dyn Trait` as a type with one detail omitted for convenience. The hidden detail is important: a trait object also has a lifetime bound. Depending on its context, `dyn Inner` can mean something like `dyn Inner + 'static`, `dyn Inner + 'a`, or a lifetime inferred inside a function body.
+
+Rust 1.98 makes one difficult corner more honest. In an item signature such as this one, the compiler cannot safely choose the omitted lifetime:
+
+```rust
+trait Outer {
+    type Ty<'a, T: 'a + ?Sized>;
+}
+
+trait Inner {}
+
+fn inspect<'r, T: Outer>(_: T::Ty<'r, dyn Inner>) {}
+```
+
+The error is E0228: Rust cannot deduce the lifetime bound for the trait object from this context. The repair is small when the design is known:
+
+```rust
+fn inspect<'r, T: Outer>(_: T::Ty<'r, dyn Inner + 'r>) {}
+```
+
+The [failing reduction](/rust-failure-atlas/evidence/RFA-716/fail.rs) and [repaired reduction](/rust-failure-atlas/evidence/RFA-716/fixed.rs) are compiled by the Atlas with Rust 1.98.1. They show a signature problem, not a value which happens to borrow for too long at runtime.
+
+## There are two lifetime-elision systems to remember
+
+References use the familiar lifetime-elision rules. In `fn first(value: &str) -> &str`, the output lifetime can be connected to the single input reference. These rules are designed around function inputs and outputs.
+
+Trait objects have another set of defaults. The [Rust Reference rule for default trait-object lifetimes](https://doc.rust-lang.org/reference/lifetime-elision.html#default-trait-object-lifetimes) examines the containing type and its bounds. For example, a reference can provide the lifetime for `&'a dyn Trait`. A generic container can also impose an outlives requirement on its type parameter.
+
+This means `dyn Trait` is not automatically `dyn Trait + 'static` in every place. The static fallback is common in item types, so it is easy to learn it as a universal rule. It is not universal.
+
+The distinction matters more with a generic associated type, or GAT. `T::Ty<'r, dyn Inner>` is a projection selected through the unknown implementation `T`. The associated type accepts both a lifetime and a type, and its declaration says that the type must outlive the supplied lifetime. An omitted object bound here cannot always be resolved by the older fallback without making a choice Rust may need to interpret differently.
+
+## Why Rust rejects instead of guessing
+
+If Rust guessed `'static`, the function would accept only an object whose erased value can satisfy that long bound. This may be much stronger than the API author intended. A borrowed adapter tied to one request would not fit even though the request lifetime is already written as `'r`.
+
+If Rust guessed `'r`, it would connect the object to that lifetime. This often looks natural, but it is still a public API decision. Other associated-type contexts may have different bounds, or the author may truly require a static object.
+
+In a function body, ordinary inference has values, uses, and scopes to constrain such a choice. An item signature is a contract before any body is considered. Rust 1.98 reserves ambiguous associated-type positions instead of freezing an accidental default into that contract.
+
+I find this safer during compiler upgrades. A loud error asks me to state the relationship once. A silent lifetime choice can remain hidden until a downstream implementation or caller needs a shorter borrow.
+
+## The explicit bound is documentation
+
+I repair the example with `dyn Inner + 'r` because `Outer::Ty` already says its second argument must outlive `'r`. The signature now tells a reader that the erased object may contain data borrowed for the same request lifetime.
+
+If the API instead stores a process-wide service, I can write `dyn Inner + 'static`. The compiler error does not say that `'r` is always correct. It says that the source must make the choice.
+
+There is also `dyn Inner + '_`, which asks for inference where inference is available. I do not use it as a way to hide a public relationship. In a reusable item signature I prefer naming the lifetime that owns the contract.
+
+This is especially useful for callbacks, repositories, parsers, and request contexts. These designs often erase a concrete type behind a trait object while the concrete value still borrows configuration or input. The object bound determines whether those borrowed implementations remain possible.
+
+## A practical way to diagnose E0228
+
+When I meet this error, I do not begin by adding `'static`. I follow the types from the outside toward the object:
+
+1. I write the full associated-type projection and identify every supplied lifetime.
+2. I read the associated type declaration, including bounds on its type parameters.
+3. I decide which owner actually limits the erased value.
+4. I write that relationship on the trait object and compile the smallest signature again.
+5. I test at least one implementation containing a non-static borrow if the API promises to support one.
+
+That last test prevents a convenient `'static` annotation from solving only the compiler message while narrowing the useful API.
+
+I also separate E0228 from the later borrow-checker errors E0597 or E0515. E0228 says the type-level default is indeterminate. A borrow-checker error says a selected lifetime cannot be satisfied by particular values. They may appear near the same code, but the first check is different.
+
+## The broader principle
+
+Elision should remove noise, not remove a design decision. It works best when one relationship is clear from stable surrounding rules. A GAT projection behind an unknown implementation can have more than one plausible lifetime story.
+
+When the compiler stops guessing in such a place, the robust repair is not to search for the annotation that makes one build green. I state who owns the trait object, then let the explicit lifetime become part of the API review. The extra `+ 'r` is small, but it preserves an important fact: type erasure hides the concrete type, not the lifetime of the data inside it.

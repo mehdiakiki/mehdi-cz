@@ -1,0 +1,110 @@
+---
+caseId: "RFA-091"
+title: "E0277: Why Cell Cannot Be Stored in a Shared static"
+date: "2026-09-05T09:11:00+01:00"
+lastmod: "2026-09-05T09:11:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "1db37237bb96c51c41e30f9489c565d106510fccdbdaa1a011880f06603dc6da"
+area: "concurrency-memory"
+symptom: "A global static Cell<u64> fails because Cell cannot be shared between threads safely."
+summary: "Shared statics require Sync, while Cell provides unsynchronized interior mutation. Choose an atomic only when one atomic value models the invariant; otherwise use a lock or remove the global."
+rustVersions: ["Rust 1.98.1"]
+targets: ["targets with atomic u64 support for the shown repair"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust static Cell cannot be shared between threads E0277",
+    "shared static must implement Sync",
+    "Cell static AtomicU64",
+  ]
+evidence: ["Rust 1.98.1 compile failure", "Sync requirement", "atomic counter repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/reference/items/static-items.html",
+    "https://doc.rust-lang.org/std/cell/struct.Cell.html",
+  ]
+---
+
+`Cell` is designed for interior mutation, but that does not make it a global counter:
+
+```rust
+use std::cell::Cell;
+
+static REQUESTS: Cell<u64> = Cell::new(0);
+```
+
+Rust 1.98.1 reports E0277: `Cell<u64>` cannot be shared between threads safely, and shared static variables must have a type implementing `Sync`. The [failing fixture](/rust-failure-atlas/evidence/RFA-091/fail.rs) captures this diagnostic.
+
+The initializer is a valid constant and the program may currently call it from one thread. The declaration nevertheless makes the same value globally reachable for the entire process. Rust checks the capability created by the static, not only today's call graph.
+
+## Shared statics require Sync
+
+An immutable `static` has one fixed address and can be accessed from multiple threads. The [Reference](https://doc.rust-lang.org/reference/items/static-items.html) therefore requires its type to implement `Sync`.
+
+`Sync` means a shared reference to the type can itself be used safely across threads. [`Cell`](https://doc.rust-lang.org/std/cell/struct.Cell.html) intentionally does not implement Sync. Its get-and-set operations provide no synchronization. Two threads could read and write the same storage concurrently, creating a data race.
+
+Interior mutability answers “can mutation occur through a shared reference?” It does not answer “is concurrent mutation coordinated?” `Cell` solves the first problem for single-threaded contexts.
+
+## An atomic counter is one possible repair
+
+For an independent numeric counter, an atomic can express the operation directly:
+
+```rust
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static REQUESTS: AtomicU64 = AtomicU64::new(0);
+
+fn record_request() {
+    REQUESTS.fetch_add(1, Ordering::Relaxed);
+}
+```
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-091/fixed.rs) increments and checks the counter. `AtomicU64` provides indivisible updates when the target supports them.
+
+The choice of `Relaxed` is not a speed decoration. It is correct here only because the counter does not publish or protect other memory. Every thread needs atomic increments, but no thread uses the counter value to infer that another write became visible.
+
+If observing the count is part of a handoff protocol, the ordering and entire protocol need separate proof.
+
+## One atomic cannot preserve a multi-field invariant
+
+Suppose the global state contains a count and a timestamp that must correspond. Putting each in a separate atomic prevents data races but allows readers to observe a mixed pair. A mutex around a struct may be the simpler correct representation.
+
+I choose based on the invariant:
+
+- One independent flag or counter may fit an atomic.
+- Several values that change together often need a lock.
+- High-volume metrics may use sharded counters or a metrics library.
+- Request-specific state should usually be owned and passed, not global.
+
+Making the type Sync is only the entrance requirement. It does not prove the program observes a meaningful state.
+
+## `Mutex<Cell<T>>` is usually redundant
+
+A mutex already provides interior mutability and exclusive access to its `T`. Storing `Cell<T>` inside it normally adds confusion. `Mutex<u64>` is clearer than `Mutex<Cell<u64>>` unless Cell serves a separate single-threaded purpose inside a larger protected structure.
+
+Similarly, writing an unsafe Sync implementation around Cell is not a repair. It suppresses the exact marker preventing a data race unless the wrapper implements real synchronization and proves all access uses it.
+
+## Global state changes testing and lifecycle
+
+A static counter survives between tests in the same process. Parallel tests can observe one another, and reset operations introduce more synchronization questions. An owned counter injected into a service is easier to isolate.
+
+For global metrics the process lifetime may be intentional. I then expose operations rather than the static itself, document whether values are approximate, and avoid tests depending on a particular global total.
+
+## Target support matters
+
+Not every target provides native atomic operations for every integer width. Portable libraries can use a smaller supported atomic, conditional compilation, a lock where available, or a platform abstraction. The repaired fixture states its target assumption instead of presenting AtomicU64 as universal.
+
+## My diagnosis sequence
+
+When a static fails Sync, I ask:
+
+1. Does this value need to be global?
+2. Can it be reached from multiple threads now or later?
+3. What exact update and observation invariant is required?
+4. Does one atomic operation express that invariant?
+5. How will tests and process shutdown handle the state?
+
+Then I choose ownership, atomics, or a lock. I do not search for the smallest wrapper that happens to implement Sync.
+
+E0277 protects more than this line of code. It prevents a globally reachable, unsynchronized mutation cell from entering the program. The durable fix describes how concurrency is coordinated and why the observed values mean what their readers think they mean.

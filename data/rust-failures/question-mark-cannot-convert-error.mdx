@@ -1,0 +1,144 @@
+---
+caseId: "RFA-056"
+title: "Why Rust's `?` Cannot Convert Between Two Result Error Types"
+date: "2026-09-05T08:30:00+01:00"
+lastmod: "2026-09-05T08:30:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "3cec6193b84cff524107a8acf149d746ca90cffb089929339cfe14c7b8d7f832"
+area: "diagnostics-macros"
+symptom: "The question-mark operator rejects an inner error even though both the called function and its caller return Result."
+summary: "The question-mark operator propagates control flow and converts the inner error into the caller's error type. Make that conversion explicit instead of assuming all Result errors are interchangeable."
+rustVersions: ["Rust 1.98.1"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust question mark couldn't convert error E0277",
+    "trait From error not implemented question mark",
+    "Rust Result different error types question mark",
+  ]
+evidence: ["Rust 1.98.1 compile failure", "desugared propagation", "From implementation repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/error_codes/E0277.html",
+    "https://doc.rust-lang.org/book/ch09-02-recoverable-errors-with-result.html#the--operator-a-shortcut-for-propagating-errors",
+  ]
+---
+
+Two functions can both return `Result` and still have incompatible error paths. This reduced example makes the difference visible:
+
+```rust
+#[derive(Debug)]
+struct DecodeError;
+
+#[derive(Debug)]
+struct ServiceError;
+
+fn decode() -> Result<u32, DecodeError> {
+    Err(DecodeError)
+}
+
+fn load() -> Result<u32, ServiceError> {
+    let value = decode()?;
+    Ok(value)
+}
+```
+
+Rust 1.98.1 reports E0277 at the question mark:
+
+```text
+`?` couldn't convert the error to `ServiceError`
+the trait `From<DecodeError>` is not implemented for `ServiceError`
+```
+
+The [failing fixture](/rust-failure-atlas/evidence/RFA-056/fail.rs) contains the complete program. The useful word in the diagnostic is **convert**. The `?` operator is not simply an early `return`. It must make the inner error fit the surrounding function's return type.
+
+## Expand the hidden control flow
+
+For ordinary `Result` code, I reason about this simplified expansion:
+
+```rust
+let value = match decode() {
+    Ok(value) => value,
+    Err(error) => return Err(ServiceError::from(error)),
+};
+```
+
+The real language mechanism is expressed through the `Try` and residual machinery, but this expansion exposes the application decision. Success gives a `u32`. Failure gives a `DecodeError`, while `load` promised `Result<u32, ServiceError>`. Rust looks for a conversion into the promised error and cannot find one.
+
+The [Rust book section on `?`](https://doc.rust-lang.org/book/ch09-02-recoverable-errors-with-result.html#the--operator-a-shortcut-for-propagating-errors) explains that the error passes through `From::from`. This is why two types with identical display text are still not interchangeable. Their type identity and conversion policy matter.
+
+## Add a conversion that preserves meaning
+
+For this example, `ServiceError` can retain the lower-level cause:
+
+```rust
+#[derive(Debug)]
+struct ServiceError {
+    source: DecodeError,
+}
+
+impl From<DecodeError> for ServiceError {
+    fn from(source: DecodeError) -> Self {
+        Self { source }
+    }
+}
+```
+
+Now `decode()?` can construct the outer error without losing the original value. The [repaired fixture](/rust-failure-atlas/evidence/RFA-056/fixed.rs) compiles, runs, and checks the retained source under Rust 1.98.1.
+
+In a real service I usually use an enum rather than one wrapper for every source:
+
+```rust
+enum ServiceError {
+    Decode(DecodeError),
+    Storage(StorageError),
+}
+```
+
+Each `From` implementation then records which subsystem failed. The variants become part of the service boundary and can drive retry, status, or observability policy.
+
+## `map_err` is better when conversion depends on context
+
+A global `From<DecodeError>` says there is one natural conversion everywhere a `ServiceError` is expected. Sometimes the call site needs additional information:
+
+```rust
+let value = decode().map_err(|source| ServiceError::DecodeAt {
+    source,
+    field: "worker_count",
+})?;
+```
+
+This is slightly longer but preserves context which would otherwise disappear. I choose `From` for stable, unsurprising conversions and `map_err` when the current operation contributes important meaning.
+
+## Why converting everything to text is weak
+
+This repair compiles:
+
+```rust
+.map_err(|error| error.to_string())?
+```
+
+It also throws away the concrete type, structured fields, error chain, and often the ability to decide whether a failure is retryable. Text is valuable for display, but it is a poor internal error protocol.
+
+Similarly, `unwrap` removes the conversion problem by turning ordinary failure into a panic. That changes the function's contract instead of repairing it. A boxed dynamic error can be a good boundary for a command-line program, but library and service APIs often benefit from explicit variants.
+
+## The conversion direction is easy to reverse
+
+The required implementation is based on the error we have and the error we need:
+
+```text
+have DecodeError -> need ServiceError
+impl From<DecodeError> for ServiceError
+```
+
+Implementing `From<ServiceError> for DecodeError` does not help this `?`. When diagnostics become long because several nested calls exist, I write this arrow beside the failing line. It prevents guessing at trait implementations.
+
+## More than one `?` can hide the first boundary
+
+In production code, one function may propagate I/O, parsing, database, and domain errors. The compiler normally points to the first conversion that is missing. After repairing it, another `?` can reveal the next boundary. I do not respond by adding unrelated blanket conversions. I list the function's possible failures and decide which ones its public error type should represent.
+
+The official [E0277 explanation](https://doc.rust-lang.org/error_codes/E0277.html) covers unsatisfied trait bounds generally. In this case the missing trait is carrying architectural information: it asks how an inner subsystem failure becomes an error promised by the outer layer.
+
+Once I expand `?` into the error return, the diagnostic becomes useful design feedback. Rust is not objecting that both functions can fail. It is asking me to define what one kind of failure means at the next boundary.

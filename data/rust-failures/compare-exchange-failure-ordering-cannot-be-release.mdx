@@ -1,0 +1,136 @@
+---
+caseId: "RFA-161"
+title: "Why compare_exchange Failure Ordering Cannot Be Release"
+date: "2026-09-05T16:51:00+01:00"
+lastmod: "2026-09-05T16:51:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "0c3dc2759adf5dad4d006779cb4cec305cba1e16b57de1539ff51a81f0c943df"
+area: "concurrency-memory"
+symptom: "An atomic compare_exchange accepts release semantics for success but rejects Ordering::Release as its failure ordering."
+summary: "compare_exchange has two memory-ordering contracts because success performs a read-modify-write while failure performs only a load. The failure path can be Relaxed, Acquire, or SeqCst, never Release or AcqRel."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["targets supporting AtomicUsize"]
+profiles: ["check", "dev", "release", "test"]
+searchTerms: ["Rust compare_exchange failure ordering Release error", "failed compare exchange no write ordering", "invalid_atomic_ordering compare_exchange failure"]
+evidence: ["Rust 1.98.1 compiler diagnostic", "failed-path load semantics", "Acquire failure repair"]
+sources: ["https://doc.rust-lang.org/std/sync/atomic/struct.Atomic.html#method.compare_exchange", "https://doc.rust-lang.org/std/sync/atomic/enum.Ordering.html", "https://doc.rust-lang.org/std/sync/atomic/struct.Atomic.html#method.load"]
+---
+
+`compare_exchange` asks for two orderings because it can perform two different operations. Treating them as “strong ordering” and “fallback ordering” hides the important distinction.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-161/fail.rs) calls an atomic compare-exchange with `AcqRel` on success and `Release` on failure. Rust 1.98.1 rejects the second argument:
+
+```text
+failure ordering may not be `Release` or `AcqRel`,
+since a failed `compare_exchange` does not result in a write
+```
+
+That last clause contains the complete mechanical reason.
+
+## Success and failure are different atomic shapes
+
+[`compare_exchange`](https://doc.rust-lang.org/std/sync/atomic/struct.Atomic.html#method.compare_exchange) reads the current atomic value and compares it with an expected value.
+
+On success, it writes the replacement. This path is a read-modify-write operation:
+
+```text
+read current -> comparison succeeds -> write new
+```
+
+On failure, it returns the observed current value without changing the atomic:
+
+```text
+read current -> comparison fails -> no write
+```
+
+The success ordering can describe both read and write effects. The failure ordering describes only a load. Release is a write-side ordering, so it has nothing to attach to on failure.
+
+## Valid failure orderings are load orderings
+
+The standard documentation limits failure ordering to:
+
+- `Relaxed`;
+- `Acquire`;
+- `SeqCst`.
+
+These are the same categories available to an atomic load. The related Atlas case, [Why an atomic load cannot use Release](/rust/failures/atomic-load-cannot-use-release-ordering), explains the direction directly.
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-161/fixed.rs) uses `Acquire` for failure. The comparison deliberately fails and returns `Err(1)`, verifying the load-only path.
+
+This makes the code compile, but `Acquire` is correct only if the value observed on failure must synchronize with a compatible release publication. If the caller merely retries and uses no protected data, `Relaxed` may be enough.
+
+## Failure is often part of the algorithm
+
+It is tempting to treat compare-exchange failure like an exceptional case. In lock-free loops, failure is ordinary contention. The returned value becomes the next expected value or informs another branch.
+
+For example:
+
+```rust
+let mut current = counter.load(Ordering::Relaxed);
+loop {
+    let next = current + 1;
+    match counter.compare_exchange_weak(
+        current,
+        next,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => break,
+        Err(observed) => current = observed,
+    }
+}
+```
+
+The failure ordering controls what can be assumed after reading `observed`. It is not an ordering applied to a write that did not happen.
+
+I reason about that returned value like any other atomic load result.
+
+## Success ordering also splits into read and write parts
+
+The [`Ordering` documentation](https://doc.rust-lang.org/std/sync/atomic/enum.Ordering.html) notes an important detail for read-modify-write operations:
+
+- success `Acquire` makes the store part Relaxed;
+- success `Release` makes the load part Relaxed;
+- success `AcqRel` supplies both directions;
+- success `SeqCst` adds the strongest global-order contract.
+
+So even the success argument is not one undivided strength. I choose it based on whether the operation must receive previous publication, publish earlier writes, or both.
+
+This connects to the site's deeper explanation of [release sequences](/blog/release-sequences-in-rust-the-rule-behind-a-surprising-acquire-load), where the load and store sides of an atomic update matter separately.
+
+## A stronger failure ordering can be invalid relative to success
+
+Beyond excluding Release and AcqRel, the failure ordering cannot demand a stronger memory guarantee than the success ordering permits. Rust's API documentation defines the allowed combinations.
+
+I avoid memorizing only a matrix. I write two sentences:
+
+```text
+If replacement succeeds, this operation must ...
+If comparison fails and observes another value, this thread must ...
+```
+
+Those statements produce the pair. If I cannot finish them, choosing `SeqCst` for both may avoid one compiler error but does not provide an understandable algorithm.
+
+## Do not hide the pair behind vague parameters
+
+A helper that accepts arbitrary `success: Ordering` and `failure: Ordering` pushes an expert invariant onto every caller. For a domain operation, I prefer a function whose implementation owns the chosen pair.
+
+If configurability is truly needed, I validate supported combinations or use a smaller enum representing meaningful strategies. That makes impossible combinations unrepresentable before they reach the atomic method.
+
+I also keep orderings close to the data-invariant comment. A future reviewer needs to know which ordinary writes are published and which observed state is acquired.
+
+## My failure-path review
+
+For each compare-exchange, I check:
+
+1. What exact operation occurs on success?
+2. What exact operation occurs on failure?
+3. Is the failure value only compared or used to read other memory?
+4. Which release operation, if any, does an Acquire failure observe?
+5. Is failure a retry, a state transition, or a terminal result?
+6. Are success and failure both exercised in tests?
+
+A test that always succeeds never checks the second ordering's application logic. The fixture deliberately starts from the wrong expected value so failure is guaranteed.
+
+The core principle is outcome-specific reasoning. A successful compare-exchange reads and writes; a failed one only reads. Release cannot describe the failed path because that path publishes nothing. Once I model both operations separately, the two ordering arguments stop looking redundant and the compiler restriction becomes inevitable.

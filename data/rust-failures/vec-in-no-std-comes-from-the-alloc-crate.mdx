@@ -1,0 +1,102 @@
+---
+caseId: "RFA-696"
+title: "Vec in no_std Comes from alloc, Not core"
+date: "2026-09-07T10:18:00+01:00"
+lastmod: "2026-09-07T10:18:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "3947576698cabccb33228076e817e68dbcdda5a62fe8ee03b01233bed35bb7a6"
+area: "ffi-targets"
+symptom: "Vec is unavailable in a no_std library even though slices, Option, and other core types still compile."
+summary: "no_std selects core, whose APIs need no heap. Vec belongs to the separate alloc crate. Importing alloc is enough for a library to type-check, but a final allocating binary must still provide an allocator."
+rustVersions: ["Rust 1.98.1", "Cargo 1.98.1", "edition 2024"]
+targets: ["all targets shipping core and alloc"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["cannot find Vec no_std Rust alloc crate", "use alloc Vec without std", "no_std collections global allocator boundary"]
+evidence: ["Rust 1.98.1 no_std library", "Vec missing from core prelude", "extern crate alloc and explicit Vec import"]
+sources: ["https://doc.rust-lang.org/stable/embedded-book/intro/no-std.html", "https://doc.rust-lang.org/alloc/vec/struct.Vec.html", "https://doc.rust-lang.org/reference/names/preludes.html#the-no_std-attribute"]
+---
+
+`#![no_std]` still gives Rust slices, `Option`, `Result`, iterators, and many language primitives. Then one ordinary `Vec<u8>` produces “cannot find type Vec in this scope.” The difference is not an arbitrary list of allowed types. It is resource ownership.
+
+The [failing library](/rust-failure-atlas/evidence/RFA-696/fail/Cargo.toml) uses `Vec` without importing another crate. The [repaired library](/rust-failure-atlas/evidence/RFA-696/fixed/Cargo.toml) declares `extern crate alloc` and imports `alloc::vec::Vec`.
+
+That repair makes the library type-check. It does not magically create heap memory on every final target.
+
+## core makes no heap promise
+
+The [Embedded Rust Book's no_std overview](https://doc.rust-lang.org/stable/embedded-book/intro/no-std.html) separates the platform-agnostic `core` library from facilities normally provided by `std`. `core` can work where there is no operating system and no global allocator.
+
+A slice borrows storage owned somewhere else. An array owns a fixed amount known in its type. `Option` can live inline. A `Vec` may request a new allocation and grow later, so it needs an allocation interface.
+
+That is why [`Vec`](https://doc.rust-lang.org/alloc/vec/struct.Vec.html) lives in `alloc`, together with `Box`, `String`, `Rc`, and allocation-backed collections. These types are useful on many `no_std` systems, but not on every one.
+
+## no_std changes the prelude
+
+The standard prelude normally brings common names such as `Vec` into scope. With `no_std`, Rust uses the core prelude instead. The [Reference prelude documentation](https://doc.rust-lang.org/reference/names/preludes.html#the-no_std-attribute) describes this selection.
+
+Therefore two things change:
+
+1. `std` is not linked automatically;
+2. allocation-backed names are not imported by the core prelude.
+
+For a library that intentionally supports allocation, I write the dependency plainly:
+
+```rust
+#![no_std]
+
+extern crate alloc;
+use alloc::vec::Vec;
+```
+
+Explicit paths are helpful in boundary code because reviewers can see where heap requirements enter.
+
+## A library can compile before an allocator exists
+
+The fixture is a library and Cargo checks it without linking a final executable. Its functions may mention and operate on `Vec`; the eventual application is responsible for providing a working global allocator when those operations allocate.
+
+This often surprises people after the import fix: the library passes `cargo check`, but a final binary reports that no global memory allocator was found. These are different verification stages.
+
+The library established a type-level dependency on allocation. The final binary must connect that dependency to a target-specific implementation. On an embedded device this may be a fixed heap region; in a kernel it may be a subsystem initialized after boot; in WebAssembly it may be provided by the selected runtime and allocator crate.
+
+I document whether callers must initialize an allocator before invoking an API. A function accepting an already-created `Vec` may still reallocate when it pushes, reserves, clones, or formats.
+
+## Avoid alloc when ownership can stay outside
+
+Adding `alloc` is not always the right repair. On constrained targets, a caller-owned buffer can provide clearer memory bounds:
+
+```rust
+fn encode(message: &Message, output: &mut [u8]) -> Result<usize, EncodeError>
+```
+
+This makes capacity failure explicit and lets the application decide whether storage lives on the stack, in static memory, in a pool, or on a heap.
+
+Other useful shapes include fixed arrays, ring buffers with known capacity, iterators that stream output, and generic adapters implemented for both borrowed storage and `Vec`.
+
+I do not avoid allocation as a ritual. `Vec` can simplify code and reduce fixed worst-case reservations. I choose after measuring maximum sizes, fragmentation risk, failure policy, latency, and who owns memory reclamation.
+
+## Feature design should expose the resource boundary
+
+A common library pattern is `#![cfg_attr(not(feature = "std"), no_std)]` with a separate `alloc` capability. I avoid assuming that “not std” means “no allocation.” Those are distinct promises.
+
+APIs can be arranged in layers:
+
+- a `core` layer using borrowed and fixed storage;
+- an `alloc` layer adding owned growable values;
+- a `std` layer adding files, sockets, threads, and operating-system integration.
+
+CI then checks the actual combinations. A default `std` build alone cannot prove the `no_std` imports, and a library-only check cannot prove the final allocator and panic runtime.
+
+## My resource check
+
+When a familiar type disappears under `no_std`, I ask:
+
+1. Does the type require allocation or operating-system integration?
+2. Is it provided by `core`, `alloc`, or only `std`?
+3. Does this target ship the relevant library component?
+4. Who provides and initializes the allocator in the final binary?
+5. Can the API accept caller-owned storage instead?
+6. Do feature names expose `alloc` separately from `std`?
+7. Does CI link at least one real final target rather than checking only the library?
+
+The core principle is to make resource assumptions visible. `core` avoids a heap contract. `alloc` introduces one. `std` adds a much larger platform contract. Once I choose the smallest honest layer, the imports, features, tests, and final runtime responsibilities become easier to explain.

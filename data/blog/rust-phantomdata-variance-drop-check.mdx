@@ -1,0 +1,247 @@
+---
+title: "PhantomData: Variance, Auto Traits, and Drop Check in One Type"
+date: "2026-09-12T09:00:00+01:00"
+tags: ["rust", "phantomdata", "variance", "drop check", "unsafe rust"]
+draft: false
+reviewed: true
+reviewedHash: "3a1fe040ef0c501a49af42a1c4d69d26d6c9115c4ffaf80f10e653f2e1f7cc6f"
+cluster: "rust-under-the-hood"
+campaign: "authority-2026"
+opportunity: "RUST-046"
+summary: "PhantomData stores no value, yet changes variance, Send, Sync, ownership, and drop checking. Learn to choose a marker from the real contract."
+---
+
+`PhantomData<T>` has size zero. It stores no `T`. Still, replacing it with `PhantomData<&'a T>` or `PhantomData<fn(T)>` can change whether a type compiles, whether it is `Send`, and which borrowed values must remain alive when it is dropped.
+
+This is why copying a `PhantomData` spelling from another crate is risky. The spelling is a message to the compiler about a relationship. First I state which relationship the type really has.
+
+## The missing relationship in a raw-pointer type
+
+I will build a read-only slice view manually:
+
+```rust
+use std::marker::PhantomData;
+
+struct Slice<'a, T> {
+    pointer: *const T,
+    length: usize,
+    marker: PhantomData<&'a T>,
+}
+```
+
+The raw pointer itself does not express that values of type `T` are borrowed for `'a`. `PhantomData<&'a T>` supplies this type-level relationship without adding a runtime field.
+
+The intended contract now reads:
+
+> `Slice<'a, T>` behaves, for static analysis, as if it contains a shared reference `&'a T`.
+
+That affects several compiler analyses at once.
+
+## One marker has four jobs
+
+A phantom field may influence:
+
+1. whether a generic lifetime or type parameter is considered used;
+2. variance over that parameter;
+3. automatic implementation of traits such as `Send` and `Sync`;
+4. drop checking and the type's claim to own or borrow a value.
+
+These effects are connected because Rust analyses a phantom field much like a real field of the written type. The field has no storage, but its type semantics remain.
+
+This also explains why there is no universal "neutral" phantom marker.
+
+## Variance is about safe substitution
+
+For lifetimes, covariance allows a longer-lived reference to be used where a shorter one is required:
+
+```text
+&'static T  can be shortened to  &'short T
+```
+
+A read-only view should normally allow this. `PhantomData<&'a T>` is covariant over `'a` and over `T`, matching a shared reference.
+
+Mutable access needs more caution. `&'a mut T` is covariant over `'a` but invariant over `T`. It must not freely substitute a different `T`, because mutation could write a value that violates the original type's requirements.
+
+Function parameters go in the opposite direction. `PhantomData<fn(T)>` makes the containing type contravariant over `T`. Function return values, as in `PhantomData<fn() -> T>`, are covariant.
+
+If this vocabulary feels abstract, use the operational question:
+
+> If the compiler substitutes a shorter lifetime or a related type here, could safe code write or return something invalid?
+
+The marker should answer like the conceptual field your type represents.
+
+## Common patterns, with their meaning
+
+| Marker                   | Variance over `T` | Ownership / borrow story       | Auto-trait effect                      |
+| ------------------------ | ----------------- | ------------------------------ | -------------------------------------- |
+| `PhantomData<T>`         | Covariant         | Acts like owning `T`           | Inherits from `T`                      |
+| `PhantomData<&'a T>`     | Covariant         | Shared borrow for `'a`         | Like a shared reference                |
+| `PhantomData<&'a mut T>` | Invariant         | Exclusive borrow for `'a`      | Like a mutable reference               |
+| `PhantomData<*const T>`  | Covariant         | Non-owning raw pointer         | Raw pointers are not `Send` or `Sync`  |
+| `PhantomData<*mut T>`    | Invariant         | Non-owning mutable raw pointer | Raw pointers are not `Send` or `Sync`  |
+| `PhantomData<fn(T)>`     | Contravariant     | Does not own `T`               | Does not inherit `T`'s `Send` / `Sync` |
+| `PhantomData<fn() -> T>` | Covariant         | Does not own `T`               | Does not inherit `T`'s `Send` / `Sync` |
+
+This table is a starting point, not a menu of tricks. Choosing `fn(T)` only to force a desired auto trait while the type really owns `T` would tell the compiler a false story.
+
+## Auto traits can change silently
+
+Suppose a handle contains only an integer ID:
+
+```rust
+use std::marker::PhantomData;
+use std::rc::Rc;
+
+struct Handle<T> {
+    id: u64,
+    marker: PhantomData<T>,
+}
+
+fn assert_send<T: Send>() {}
+
+fn main() {
+    assert_send::<Handle<u64>>();
+
+    // This does not compile because Rc<()> is not Send, and the marker says
+    // Handle<Rc<()>> behaves as if it owns an Rc<()>.
+    // assert_send::<Handle<Rc<()>>>();
+}
+```
+
+There is no `Rc` at runtime inside `Handle`. The compiler still withholds `Send` because `PhantomData<T>` says the handle has the semantic responsibilities of owning a `T`.
+
+Maybe that is exactly right. For example, the external resource represented by the ID may only be usable on one thread. Or it may be wrong, and the handle is only typed by `T` for namespace separation.
+
+If `T` is only a type-level label, a function-shaped marker can avoid inheriting ownership and auto traits:
+
+```rust
+struct TypedId<T> {
+    value: u64,
+    marker: PhantomData<fn() -> T>,
+}
+```
+
+But make this choice from the resource contract. Do not use it to silence an error around a hidden thread-affine resource.
+
+## Drop check asks what may be used during destruction
+
+Rust must ensure that references a destructor might access are still valid when the destructor runs.
+
+`PhantomData<T>` can tell drop checking that the containing type owns values of `T`. `PhantomData<&'a T>` tells it about a borrow lasting for `'a`.
+
+There is one historical detail that causes confusion. If a generic type has its own `Drop` implementation, Rust already assumes that its destructor may use its generic parameters. Adding `PhantomData<T>` is not required only to make that particular assumption. The marker can still be necessary for variance, auto traits, or because the fields must express real ownership and transitive drop glue.
+
+The standard library has an unstable escape hatch named `#[may_dangle]` for carefully reviewed container implementations. It lets a destructor promise not to access a generic parameter that may already be invalid.
+
+This is unsafe and subtle. It has an important exception when the container truly owns values that themselves need dropping. It is not a normal application-level fix for a borrow-checker error.
+
+## A raw pointer does not say "I own this"
+
+Consider the rough shape of a custom vector:
+
+```rust
+use std::marker::PhantomData;
+use std::ptr::NonNull;
+
+struct RawVec<T> {
+    pointer: NonNull<T>,
+    length: usize,
+    capacity: usize,
+    owns: PhantomData<T>,
+}
+```
+
+The allocation address is present, but `NonNull<T>` alone is a pointer relationship. The phantom field says the container semantically owns initialized `T` values and may run their destructors.
+
+This affects drop checking and auto traits. It is part of the type's safety proof, even though it costs zero bytes.
+
+Of course this struct is not a complete vector. Allocation, initialization, panic safety, zero-sized types, and deallocation all need separate invariants.
+
+## A borrowed iterator wants a different marker
+
+A slice iterator does not own the elements. It borrows them:
+
+```rust
+struct Iter<'a, T> {
+    current: *const T,
+    end: *const T,
+    borrow: PhantomData<&'a T>,
+}
+```
+
+Using `PhantomData<T>` here would claim ownership rather than a shared borrow. It would also impose different auto-trait and drop-check behavior.
+
+The correct marker is not selected from the raw pointer's mutability. It is selected from the safe API's promise. A raw `*mut T` might back exclusive borrowed access, ownership, shared interior-mutability access, or a non-dereferenceable handle. These require different stories.
+
+## `PhantomPinned` is the marker for `!Unpin`
+
+`PhantomData` should not be used as an improvised way to opt out of `Unpin`. Rust provides `PhantomPinned` for this explicit purpose:
+
+```rust
+use std::marker::PhantomPinned;
+
+struct SelfReferential {
+    data: String,
+    _pin: PhantomPinned,
+}
+```
+
+The two marker types answer different questions:
+
+- `PhantomData<X>` describes a relationship with `X`;
+- `PhantomPinned` says the containing type must not automatically implement `Unpin`.
+
+Neither makes unsafe self-references correct by itself.
+
+## Build the marker from a sentence
+
+Before writing the field, complete one sentence:
+
+- "This type owns values of `T`."
+- "This type provides shared access to `T` for `'a`."
+- "This type provides exclusive access to `T` for `'a`."
+- "This type is only covariantly labelled by `T` and stores no value."
+- "This type accepts `T` in a type-level function role."
+- "This type contains a raw pointer relationship and must not auto-derive thread safety."
+
+Then choose the phantom type that expresses that sentence and test the consequences.
+
+Useful compile-time checks include:
+
+```rust
+fn assert_send<T: Send>() {}
+fn assert_sync<T: Sync>() {}
+
+assert_send::<YourType<u64>>();
+assert_sync::<YourType<u64>>();
+```
+
+For cases that must _not_ compile, a UI test framework such as `trybuild` can lock in the expected compiler rejection.
+
+## Review all four axes
+
+When a phantom marker changes, review this small matrix:
+
+| Axis        | Question                                                                         |
+| ----------- | -------------------------------------------------------------------------------- |
+| Usage       | Are every lifetime and type parameter represented?                               |
+| Variance    | Which substitutions should safe callers be allowed to make?                      |
+| Auto traits | Should `Send`, `Sync`, and `Unpin` depend on the parameter?                      |
+| Drop check  | Does the type own, borrow, or possibly inspect the parameter during destruction? |
+
+If a proposed marker gives the wanted answer on one row but lies on another, it is not the right marker.
+
+## Choose meaning before spelling
+
+`PhantomData` is zero-sized, not zero-meaning. It lets a type express a relationship that its runtime fields cannot show.
+
+The safe method is direct: describe the ownership or borrowing contract in plain language, select the conceptual field that matches, and verify variance, auto traits, and destruction together.
+
+The unsafe way is to keep changing spellings until the compiler becomes quiet.
+
+## Further reading
+
+- [`PhantomData` in the Rust standard library](https://doc.rust-lang.org/std/marker/struct.PhantomData.html)
+- [`PhantomData` patterns in the Rustonomicon](https://doc.rust-lang.org/nomicon/phantom-data.html)
+- [Subtyping and variance in the Rustonomicon](https://doc.rust-lang.org/nomicon/subtyping.html)
+- [Drop check in the Rustonomicon](https://doc.rust-lang.org/nomicon/dropck.html)

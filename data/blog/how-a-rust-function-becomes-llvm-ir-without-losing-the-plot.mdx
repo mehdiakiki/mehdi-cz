@@ -1,0 +1,203 @@
+---
+title: "How a Rust Function Becomes LLVM IR Without Losing the Plot"
+date: "2026-10-18T09:00:00+01:00"
+tags: ["rust", "LLVM IR", "rustc", "code generation", "compiler"]
+draft: false
+reviewed: true
+reviewedHash: "afeb2dce851e8969a8567a3653cf0fd59f06da253ea00d815e9fc5ed160f776e"
+cluster: "rust-under-the-hood"
+campaign: "authority-2026"
+opportunity: "RUST-023"
+summary: "Trace one wrapping-add Rust function through MIR-facing code generation into LLVM IR, then learn which flags, ABI choices, attributes, and optimizations explain what you see."
+---
+
+LLVM IR looks intimidating when I open a full Rust crate. There are mangled symbols, panic paths, metadata, attributes, and hundreds of functions I did not write directly.
+
+The easiest way to learn it is to keep one source function recognisable and compare controlled compiler outputs.
+
+## Start with a function that has one clear operation
+
+I used:
+
+```rust
+#[unsafe(no_mangle)]
+pub extern "C" fn add_wrapping(left: u64, right: u64) -> u64 {
+    left.wrapping_add(right)
+}
+```
+
+This example makes three choices explicit.
+
+`wrapping_add` avoids debug overflow-check branches. `extern "C"` gives a familiar ABI for these scalar arguments. `#[unsafe(no_mangle)]` keeps the exported name readable as `add_wrapping` in Rust 2024 syntax.
+
+The unsafe attribute does not make the function body unsafe. It acknowledges that exporting a chosen global symbol name has a link-time safety obligation: another object must not define an incompatible symbol with the same name.
+
+## Emit IR directly
+
+I compiled the function with nightly Rust 1.95, although `--emit=llvm-ir` itself is available without using nightly-only `-Z` flags:
+
+```bash
+rustc lib.rs \
+  --edition 2024 \
+  --crate-type lib \
+  --emit llvm-ir \
+  -C opt-level=3 \
+  -o add-wrapping.ll
+```
+
+The relevant output was:
+
+```llvm
+define noundef i64 @add_wrapping(
+  i64 noundef %left,
+  i64 noundef %right
+) unnamed_addr #0 {
+start:
+  %_0 = add i64 %right, %left
+  ret i64 %_0
+}
+```
+
+The source operation is still visible: LLVM integer `add`, then `ret`.
+
+The [rustc command-line documentation](https://doc.rust-lang.org/rustc/command-line-arguments.html#--emit-specifies-the-types-of-output-files-to-generate) lists `llvm-ir` among the supported emission types.
+
+## Read the function from outside towards inside
+
+I use this order:
+
+```text
+define ... @name(parameters) attributes {
+basic-block-label:
+  instructions
+  terminator
+}
+```
+
+For the example:
+
+- `define` means this module provides a function body;
+- `i64` is the return type;
+- `@add_wrapping` is the global symbol;
+- each parameter is an LLVM `i64` value;
+- `start:` names the first basic block;
+- `%_0` is a single-assignment temporary;
+- `ret i64 %_0` terminates the block.
+
+LLVM values use static single assignment form: one `%name` is assigned once. Control-flow merges use mechanisms such as `phi` nodes or block parameters in other IRs, rather than repeatedly mutating one source variable.
+
+## Rust does not lower source syntax straight to this text
+
+A useful simplified pipeline is:
+
+```text
+Rust tokens and AST
+    -> HIR and type checking
+    -> THIR/MIR construction
+    -> monomorphized codegen instances
+    -> codegen units
+    -> LLVM IR
+    -> optimized LLVM IR
+    -> machine object
+    -> linked binary
+```
+
+MIR has already made control flow and moves explicit before the LLVM backend receives code-generation work. Generic Rust functions also need concrete monomorphized instances before LLVM can optimise their machine-level types.
+
+The [rustc code-generation chapter](https://rustc-dev-guide.rust-lang.org/backend/codegen.html) describes the backend boundary, and [Where Rust Monomorphization Happens and Why Codegen Units Matter](/blog/where-rust-monomorphization-happens-and-why-codegen-units-matter) covers instance collection in more detail.
+
+## Optimization changes the story's level of detail
+
+I emitted the same function at `-C opt-level=0 -C debuginfo=1`. Its IR still contained the integer addition, but also included:
+
+```llvm
+%_0.i = add i64 %left, %right, !dbg !12
+br label %bb1
+
+bb1:
+  ret i64 %_0.i, !dbg !21
+```
+
+It also had an unwind personality, an unreachable panic-on-unwind path for the C ABI, and source debug metadata.
+
+At optimization level 3, LLVM reduced the visible body to an add and return and attached stronger inferred attributes such as `memory(none)` and `norecurse` on this toolchain.
+
+This does not mean debug Rust executes a different wrapping addition. It means the unoptimised IR preserves more scaffolding and mapping information.
+
+## Attributes are part of the optimizer's contract
+
+The optimized function had attributes including:
+
+```text
+nofree
+norecurse
+nosync
+nounwind
+willreturn
+memory(none)
+```
+
+These describe facts LLVM can use: the function does not access memory, recurse, or unwind through the C boundary in this generated form.
+
+I do not copy such attributes by hand into an FFI declaration. They are promises. An incorrect attribute can permit transformations that make the program wrong.
+
+When comparing compiler versions, I expect inferred attributes to evolve even if the one-line function still returns the same value.
+
+## ABI lowering can hide source types
+
+Our scalar C ABI maps cleanly to two `i64` parameters. More interesting Rust types do not necessarily appear as one obvious LLVM type.
+
+Examples include:
+
+- slices, which carry a pointer and length;
+- trait objects, which carry data and vtable metadata;
+- Rust enums, whose layout can use niches;
+- aggregates passed indirectly according to the target ABI;
+- `Result`, which has Rust layout and error semantics, not an automatic C contract.
+
+LLVM IR is target-specific. The emitted module declares a target triple and data layout, so the same Rust signature can lower differently on another architecture.
+
+I use `extern "C"` only with FFI-safe types. Making a symbol readable does not make arbitrary Rust layout stable for another language.
+
+## Inlining can make the function disappear
+
+A normal Rust function can be inlined into callers or removed when no externally required symbol remains. If I cannot find it, I check:
+
+```text
+Was the function instantiated?
+Was it eliminated as unused?
+Was it inlined into a caller?
+Is the name mangled?
+Did several equivalent functions merge?
+Am I looking in the right codegen-unit file?
+```
+
+For learning, an exported no-mangle example is useful. For performance conclusions, I inspect the real build without forcing attributes that change optimisation.
+
+## Debug metadata reconnects instructions to source
+
+With debug information, instructions carry references such as `!dbg !12`. Other metadata nodes map them to files, lines, columns, scopes, and inlined call sites.
+
+In my unoptimised output, the `add` location pointed first into the standard library's `wrapping_add` implementation and included an `inlinedAt` location for my call. This is why a debugger or profiler can attribute an instruction through inline frames.
+
+Optimisation can move, merge, or delete instructions, so source mapping is evidence with limits. One source line can produce several instruction ranges, and one optimized instruction can represent combined work.
+
+## A repeatable inspection routine
+
+I keep two outputs:
+
+```bash
+rustc lib.rs --crate-type lib --emit llvm-ir -C opt-level=0 -o debug.ll
+rustc lib.rs --crate-type lib --emit llvm-ir -C opt-level=3 -o release.ll
+```
+
+Then I:
+
+1. locate the symbol or a caller that contains its inlined work;
+2. confirm target triple and compiler flags;
+3. identify parameters, basic blocks, and terminators;
+4. map the source operation to IR instructions;
+5. compare control flow and attributes across optimisation;
+6. inspect assembly only after I understand the IR-level change.
+
+LLVM IR is not a stable interface promised by Rust, and it is not the final CPU instruction stream. It is a very useful observation point. By controlling the symbol, ABI, operation, target, and optimization level, I can follow one Rust idea through the backend without losing it in the entire crate.

@@ -1,0 +1,92 @@
+---
+caseId: "RFA-415"
+title: "LineWriter Forwards Complete Lines but Buffers the Tail"
+date: "2026-09-06T03:55:00+01:00"
+lastmod: "2026-09-06T03:55:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "153d749a014e7836902de5588cd7ab88aba9c2d28d6cab1b13e10f1313ed0085"
+area: "ffi-targets"
+symptom: "LineWriter keeps abc away from its inner Vec until a newline arrives, then forwards abc plus newline while a later unterminated tail remains buffered."
+summary: "LineWriter provides line buffering: newline-terminated output is sent to the inner writer promptly, while an incomplete final line may stay buffered. Explicitly flush when an unterminated tail must become visible or report errors."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust LineWriter flush newline behavior", "LineWriter buffers partial line", "line buffered writer newline inner output Rust"]
+evidence: ["Rust 1.98.1 Vec inner writer", "partial line remains buffered", "newline forwards complete line"]
+sources: ["https://doc.rust-lang.org/std/io/struct.LineWriter.html", "https://doc.rust-lang.org/std/io/trait.Write.html#tymethod.flush", "https://doc.rust-lang.org/std/io/struct.BufWriter.html"]
+---
+
+I expected a buffered writer either to retain everything until full or flush everything after every call. `LineWriter` follows a third policy: it forwards complete lines promptly and may retain the incomplete tail.
+
+The [failing fixture](/rust-failure-atlas/evidence/RFA-415/fail.rs) writes `abc`. The inner Vec remains empty. After writing newline, the inner Vec contains `abc\n`.
+
+## Newline is the visibility boundary
+
+[`LineWriter`](https://doc.rust-lang.org/std/io/struct.LineWriter.html) wraps a writer and uses line buffering. It attempts to send output through the most recent newline to the inner writer.
+
+This is useful for interactive output and logs. Complete records become visible without forcing every small partial fragment through separately.
+
+The policy is based on byte `\n`. It does not know the semantics of a terminal, log collector, network protocol, or Unicode grapheme. The caller defines whether newline truly marks a complete record.
+
+## An incomplete tail remains buffered
+
+After `abc\n`, the repaired fixture writes `tail`. The inner Vec still contains only `abc\n` until an explicit flush.
+
+This lets several small writes build one incomplete line efficiently. It also means a prompt without a newline may not become visible when expected.
+
+For a command-line prompt, I call [`Write::flush`](https://doc.rust-lang.org/std/io/trait.Write.html#tymethod.flush) after writing the prompt. For ordinary line logs, I include the terminator and still handle write errors.
+
+## Forwarding a line is not durable storage
+
+The word “flush” can describe several layers. LineWriter forwards completed line bytes from its Rust-side buffer to the wrapped writer. That wrapped writer, operating system, filesystem, or device may buffer again.
+
+A Vec inner writer makes the Atlas state easy to observe, but a file can require separate synchronization for durability. A socket can accept bytes before a peer processes them. A terminal may transform output.
+
+I name the guarantee precisely: left LineWriter, accepted by the file handle, synchronized to storage, or acknowledged by a remote protocol.
+
+## Newline inside one write can leave a tail
+
+One call may contain multiple complete lines plus an incomplete suffix:
+
+```text
+first\nsecond\ntail
+```
+
+The complete prefix can be forwarded while `tail` remains buffered. Application code should not use write-call boundaries as record boundaries. A record can span calls, and one call can contain several records.
+
+This is exactly why the wrapper searches for newline rather than treating `write` as one message operation.
+
+## Errors can appear at surprising calls
+
+Writing a partial line may succeed by copying into the buffer. A later newline write can trigger the underlying I/O and report an error associated with bytes supplied by earlier calls.
+
+I retain context about the logical record being built and do not assume the newest fragment alone caused the failure. The stream may have accepted only partial output according to the underlying `Write` contract.
+
+For structured logs where losing a record is unacceptable, I define retry and duplication behavior above raw writes. Line buffering is not transactional delivery.
+
+## Drop cannot report a final tail error
+
+If a LineWriter is dropped with an unterminated tail, cleanup may attempt to flush internal state, but Drop cannot return an `io::Error` to normal caller code.
+
+I explicitly flush before success is reported. This is especially important for files, generated artifacts, and protocol messages where the final line may intentionally omit newline.
+
+An explicit finish function can consume the writer, flush, and propagate failure as part of the application's result.
+
+## BufWriter solves another workload
+
+[`BufWriter`](https://doc.rust-lang.org/std/io/struct.BufWriter.html) batches writes based mainly on buffer capacity and explicit flush boundaries, not line endings. It fits binary output and sequential data where newline has no special meaning.
+
+LineWriter fits human-facing or line-framed output requiring prompt visibility. Neither is universally faster: frequent newlines force frequent forwarding, while long unterminated lines may fill capacity and trigger ordinary buffering behavior.
+
+I benchmark the real record size and destination.
+
+## The test observes the inner layer without consuming the writer
+
+The evidence uses `get_ref()` only to inspect the Vec. Mutating an inner writer behind a buffering wrapper can break ordering, so production code should not use inner access as a second write channel.
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-415/fixed.rs) checks three moments: partial line hidden, completed line forwarded, new tail hidden until explicit flush. This timeline proves the policy better than only checking final bytes.
+
+## The core principle
+
+Buffering is a visibility schedule. LineWriter schedules complete newline-terminated prefixes for prompt forwarding and retains the unfinished suffix. I include newlines when they are real record terminators, flush explicit incomplete output, and keep durability or remote acknowledgement as separate higher-level contracts.

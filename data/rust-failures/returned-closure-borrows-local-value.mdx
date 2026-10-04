@@ -1,0 +1,110 @@
+---
+caseId: "RFA-061"
+title: "E0373: Why a Returned Rust Closure Must Own Its Local Capture"
+date: "2026-09-05T08:35:00+01:00"
+lastmod: "2026-09-05T08:35:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "45ac5b5e20b18aa1a2b918c1646146a9bc4ae3f5b0aba4b52b3542e0f7f40f81"
+area: "diagnostics-macros"
+symptom: "A returned closure receives E0373 because it borrows a local value owned by the function that creates it."
+summary: "A closure borrows captures when that is enough inside its original scope. Returning it changes the required lifetime; use move to transfer the captured state and then inspect which Fn trait remains available."
+rustVersions: ["Rust 1.98.1"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust E0373 closure may outlive current function",
+    "return closure borrows local variable",
+    "move closure owned value Rust",
+  ]
+evidence: ["Rust 1.98.1 compile failure", "capture-mode comparison", "move closure repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/error_codes/E0373.html",
+    "https://doc.rust-lang.org/book/ch13-01-closures.html#moving-captured-values-out-of-closures-and-the-fn-traits",
+  ]
+---
+
+A closure can hide a reference without showing `&` anywhere. This becomes visible when I try to return it:
+
+```rust
+fn make_printer() -> impl Fn() {
+    let message = String::from("ready");
+    || println!("{message}")
+}
+```
+
+Rust 1.98.1 emits E0373:
+
+```text
+closure may outlive the current function, but it borrows `message`
+```
+
+The [failing fixture](/rust-failure-atlas/evidence/RFA-061/fail.rs) includes the call as well as the factory. The call is not the problem. The returned closure would contain a reference to a local `String` destroyed when `make_printer` returns.
+
+## Closure capture is inferred from use
+
+Inside a closure, `println!("{message}")` only needs a shared reference. Rust therefore chooses a shared borrow when the closure stays in the same scope. This keeps `message` available to surrounding code and is normally the least restrictive capture.
+
+The environment is conceptually similar to a compiler-generated struct:
+
+```rust
+struct Printer<'a> {
+    message: &'a String,
+}
+```
+
+Returning `Printer` would require the referenced `String` to outlive the function. It does not. The closure syntax is compact, but the storage rule remains the same.
+
+The [Rust book closure chapter](https://doc.rust-lang.org/book/ch13-01-closures.html#moving-captured-values-out-of-closures-and-the-fn-traits) separates capture modes from the `Fn`, `FnMut`, and `FnOnce` call traits. Keeping those two decisions separate avoids a common misunderstanding.
+
+## `move` transfers the environment
+
+The direct repair is:
+
+```rust
+fn make_printer() -> impl Fn() {
+    let message = String::from("ready");
+    move || println!("{message}")
+}
+```
+
+Now the closure environment owns `message`. Moving the closure to the caller also moves the captured `String` handle, so the bytes stay alive with the returned value. The [repaired fixture](/rust-failure-atlas/evidence/RFA-061/fixed.rs) compiles and invokes the returned closure on Rust 1.98.1.
+
+The `move` keyword changes how values enter the closure. It does not automatically make the closure callable only once. This closure only borrows its owned `message` when invoked, so it still implements `Fn` and can be called repeatedly.
+
+By contrast, this closure consumes the captured value:
+
+```rust
+move || drop(message)
+```
+
+Calling it moves `message` out of the environment, so it implements only `FnOnce`. If adding `move` produces a later “expected Fn, found FnOnce” failure, I inspect what the body does with the captured value rather than blaming `move` alone.
+
+## Copy captures can disguise the ownership transfer
+
+For a `u32`, a move closure copies the number into its environment because the type implements `Copy`. The original local remains usable. For a `String`, the original binding becomes unavailable after closure construction. Both are move captures; their source behavior differs because the captured types differ.
+
+This distinction matters when a closure captures a struct with both Copy and non-Copy fields. Modern capture analysis can capture only the fields the closure uses. I check the exact place named by the compiler instead of assuming the entire outer struct moved.
+
+## Threads and tasks expose the same boundary
+
+`std::thread::spawn` requires a `'static` closure because the new thread can outlive the caller's stack frame. `move` is therefore common:
+
+```rust
+let message = String::from("ready");
+std::thread::spawn(move || println!("{message}"));
+```
+
+Ownership removes the stack reference, but it does not make every capture thread-safe. The captured types must still satisfy the required `Send` and sometimes `Sync` bounds. For shared mutable state, moving an `Arc<Mutex<T>>` clone expresses a different design from trying to borrow a local mutex.
+
+Async blocks have a similar capture boundary. `async move` owns captured values in the generated future. Whether the future is `Send` then depends on which values remain live across suspension points.
+
+## Weak repairs
+
+Leaking the string to obtain a static reference makes E0373 disappear but permanently retains memory. Storing everything in a global also changes isolation and concurrency. Cloning every capture before understanding its owner can add unnecessary work and still leave the wrong value in the closure.
+
+I ask who should own the captured state after the factory returns. If the returned closure owns it, `move` is exact. If several closures share it, an explicit shared owner may be appropriate. If the closure should borrow caller data, the factory must accept that data and return a closure carrying the caller's lifetime rather than borrowing a local.
+
+The official [E0373 explanation](https://doc.rust-lang.org/error_codes/E0373.html) uses closures and async blocks. My discriminating step is to imagine the generated environment fields. A reference field cannot point into the ended factory frame; an owned field can cross the return boundary. That model explains both the error and the later call-trait consequences.

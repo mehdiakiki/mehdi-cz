@@ -1,0 +1,80 @@
+---
+caseId: "RFA-231"
+title: "VecDeque::rotate_left Panics When the Amount Exceeds Its Length"
+date: "2026-09-06T00:11:00+01:00"
+lastmod: "2026-09-06T00:11:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "65e1c74749d91f93fe9319392e4e2666b75a6f7b2c2524cce818f5da67d63c83"
+area: "concurrency-memory"
+symptom: "Rotating a three-item VecDeque left by four panics instead of wrapping around by one position."
+summary: "VecDeque rotation requires n no greater than len; it does not apply modulo automatically. Normalize deliberate cyclic input while handling the empty deque before remainder arithmetic."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets with alloc"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["VecDeque rotate_left panics amount greater length", "Rust deque rotate modulo length", "rotate empty VecDeque safely"]
+evidence: ["Rust 1.98.1 three-item deque", "out-of-range rotation panic", "explicit modulo repair"]
+sources: ["https://doc.rust-lang.org/std/collections/struct.VecDeque.html#method.rotate_left", "https://doc.rust-lang.org/std/collections/struct.VecDeque.html#method.rotate_right", "https://doc.rust-lang.org/std/primitive.usize.html#method.checked_rem"]
+---
+
+Rotation feels cyclic, so I expected rotating three values by four places to mean the same thing as rotating by one. `VecDeque::rotate_left(4)` panics when the deque length is three.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-231/fail.rs) catches that original panic and turns it into a stable diagnostic. The input is mathematically reducible, but the collection API requires a bounded amount.
+
+## The method accepts a position inside one cycle
+
+[`VecDeque::rotate_left`](https://doc.rust-lang.org/std/collections/struct.VecDeque.html#method.rotate_left) rotates `n` places and panics if `n` is greater than the length. An amount exactly equal to the length is accepted and is a no-op.
+
+The corresponding [`rotate_right`](https://doc.rust-lang.org/std/collections/struct.VecDeque.html#method.rotate_right) has the same bound. Neither method silently applies `% len` to arbitrary caller input.
+
+This API shape makes accidental huge values fail instead of being normalized into a plausible but possibly wrong result. A value of `usize::MAX` caused by underflow should not quietly become a small rotation.
+
+## Modulo is a domain decision
+
+For a circular schedule, arbitrary turn counts may be valid. The [repaired program](/rust-failure-atlas/evidence/RFA-231/fixed.rs) explicitly applies `amount % len` before rotating.
+
+That code first checks for an empty deque. Remainder by zero panics, so this apparently simple repair has its own boundary:
+
+```rust
+if !queue.is_empty() {
+    queue.rotate_left(amount % queue.len());
+}
+```
+
+For an empty cyclic schedule I define rotation as a no-op. Another application might treat it as invalid state and return an error. The standard collection cannot choose this policy for me.
+
+## Normalize only values that are genuinely cyclic
+
+Suppose `amount` means “number of workers completed since the last checkpoint.” Reducing a surprisingly large amount modulo the current worker count may hide a stale checkpoint or changed membership.
+
+Before normalizing, I ask whether whole cycles are information-free. In a game board they may be. In a retry queue, passing a task several times can affect fairness and deadlines even if the final visual order matches.
+
+I often keep two values: the original movement count for metrics and validation, and the normalized position for the collection operation.
+
+## Length changes can invalidate a previously checked amount
+
+Code can validate `n <= queue.len()` and then mutate the deque before rotation. Under single mutable ownership the sequence is visible, but helper functions can make it hard to notice. Under a mutex, releasing the guard between check and action allows another actor to change the length.
+
+I calculate and apply the rotation while holding the same ownership boundary. If `n` came from a position identified before removals, I revisit whether it still names the same logical item.
+
+This is another case where a numeric index carries no automatic relationship to the collection version that produced it.
+
+## Rotation cost is already aware of the shorter direction
+
+The documented complexity is proportional to the smaller of `n` and `len - n`. I do not need to rewrite a left rotation near the end into a right rotation for basic efficiency. The implementation already reasons about the shorter movement.
+
+Modulo normalization still matters for validity, not for teaching the method about cycles it already accepts.
+
+## Physical ring layout is not the visible contract
+
+`VecDeque` uses a ring buffer and may store values in two slices. Rotation changes logical order. It may also rearrange or reinterpret internal positions, but no code should depend on the physical wrap point unless it uses the documented slice APIs at that moment.
+
+After rotation, I verify iteration or pop order, not addresses or assumed backing-array segments. If contiguous storage is required for FFI, I call `make_contiguous` after the logical operation and take the returned slice.
+
+## My tests include zero, length, and empty input
+
+The repaired fixture rotates three values by four after normalization and obtains the one-step result. It separately proves that an empty deque does not attempt modulo zero.
+
+Application tests cover amount zero, amount equal to length, one above length, several complete cycles, and very large input. When large values indicate corruption rather than valid cycles, the test expects a validation error instead of a wrapped result.
+
+The core principle is that cyclic mathematics and API preconditions are different layers. `rotate_left` accepts one bounded cycle. If my domain accepts arbitrary turns, I normalize them explicitly, decide what emptiness means, and keep validation close enough that collection length cannot change between the decision and operation.

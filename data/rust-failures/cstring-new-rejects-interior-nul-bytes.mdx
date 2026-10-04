@@ -1,0 +1,75 @@
+---
+caseId: "RFA-676"
+title: "CString::new Rejects Interior NUL Bytes"
+date: "2026-09-06T08:36:00+01:00"
+lastmod: "2026-09-06T08:36:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "21f679b75d09dc7077771000654b91590248f6e93a690244d6bdbb8ef72e9cfc"
+area: "ffi-targets"
+symptom: "CString::new returns NulError for bytes containing zero before the end instead of preserving the complete Rust byte sequence."
+summary: "C strings use the first NUL as their terminator. CString rejects interior zeros so safe conversion cannot silently truncate data at an FFI boundary."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["targets with C-compatible FFI"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust CString new interior nul error", "convert bytes with zero to C string", "NulError CString FFI Rust"]
+evidence: ["Rust 1.98.1 runtime assertion", "embedded zero between alpha and omega", "valid CString has one trailing terminator"]
+sources: ["https://doc.rust-lang.org/std/ffi/struct.CString.html#method.new", "https://doc.rust-lang.org/std/ffi/struct.NulError.html", "https://doc.rust-lang.org/std/ffi/struct.CStr.html#method.to_bytes_with_nul"]
+---
+
+`CString::new` adds a terminating NUL byte and rejects input that already contains NUL inside it. The [failing fixture](/rust-failure-atlas/evidence/RFA-676/fail.rs) passes `alpha\0omega` and receives an error because a C consumer would stop at the embedded zero.
+
+## C string length is sentinel-based
+
+Many C APIs receive a pointer and discover string length by scanning until byte zero. They cannot represent an interior NUL as part of one ordinary C string. If Rust passed the complete allocation without validation, C would observe only `alpha` while Rust-side code might believe it sent `alpha\0omega`.
+
+The [`CString::new` contract](https://doc.rust-lang.org/std/ffi/struct.CString.html#method.new) prevents this boundary mismatch. It returns `NulError`, including information about the zero position and original bytes.
+
+I treat that error as input validation, not something to bypass automatically.
+
+## Truncation can become a security issue
+
+An embedded zero can make two layers validate different names, paths, certificates, commands, or identifiers. Rust may compare the complete byte sequence while a C library uses only the prefix. This class of disagreement has caused real vulnerabilities across language boundaries.
+
+The safe response depends on the domain. Rejecting the value is usually correct. Replacing NUL with another character changes data and should be an explicit product rule. Splitting into several C strings works only when the foreign API expects an array, not one string.
+
+Using an unchecked constructor merely removes validation. It does not teach the C function to understand embedded zeros.
+
+## CString owns the terminator
+
+Callers normally pass bytes without a trailing zero. `CString::new` provides exactly one. The [repaired fixture](/rust-failure-atlas/evidence/RFA-676/fixed.rs) verifies that `as_bytes()` excludes it while `as_bytes_with_nul()` includes it.
+
+This prevents double-terminator confusion and keeps the pointer valid for the lifetime of the `CString`. I bind the CString to a variable before calling FFI so a temporary is not dropped too early.
+
+The pointer from `as_ptr` is read-only from Rust's contract. A C function that writes requires a different owned mutable buffer and a carefully matched API declaration.
+
+## C strings are bytes, not necessarily UTF-8
+
+`CString` validates NUL placement, not Unicode. It can hold non-UTF-8 bytes where the platform API permits them. Converting a returned `CStr` with `to_str` performs UTF-8 validation; lossy conversion changes invalid sequences.
+
+I separate three questions: is the pointer valid, is there one reachable terminator, and what encoding does the foreign API use? Locale encodings, platform paths, and binary blobs do not become UTF-8 because Rust is calling them.
+
+For data that may contain any byte, the C API should accept a pointer plus explicit length. I use that interface instead of forcing binary data into a sentinel string.
+
+## Ownership across FFI must be paired
+
+`CString::into_raw` transfers ownership to foreign code or a later Rust recovery. The pointer must eventually return through `CString::from_raw` exactly once, and the foreign side must not use the wrong allocator to free it.
+
+Borrowing through `as_ptr` does not transfer ownership. The CString must outlive the call and any asynchronous foreign retention. Function signatures cannot express every C lifetime, so wrapper types document and enforce it.
+
+Tests include empty input, interior zero, ordinary text, non-UTF-8 bytes when supported, and foreign functions that retain pointers if relevant. The fixture's deterministic error protects the most basic representation rule.
+
+Generated bindings do not remove this policy question. They can reproduce pointer types and calling conventions, but they cannot decide whether truncating a user name or rejecting it matches the product. I keep a small safe wrapper around the raw call, validate CString construction there, and return an error carrying useful field context without echoing sensitive bytes.
+
+## My CString checklist
+
+- Can input contain zero bytes, and what policy handles them?
+- Does the foreign API accept sentinel strings or pointer plus length?
+- Who owns and frees the allocation?
+- How long may foreign code retain the pointer?
+- Is the pointer read-only or writable by the declaration?
+- What encoding does the foreign API actually require?
+- Is an unchecked constructor hiding a cross-layer truncation?
+- Do tests compare bytes seen on the foreign side?
+
+The core principle is that an FFI type represents the foreign contract, not only Rust memory. `CString` rejects bytes that a C string cannot represent unambiguously. I preserve that check and choose a length-carrying interface for arbitrary binary data.

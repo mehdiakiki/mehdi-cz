@@ -1,0 +1,119 @@
+---
+caseId: "RFA-152"
+title: "Why let _ Drops a Rust MutexGuard Immediately"
+date: "2026-09-05T15:52:00+01:00"
+lastmod: "2026-09-05T15:52:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "7926df2e3380722169b9e6818e4796320aac067dd349f6fd887857a56618b799"
+area: "concurrency-memory"
+symptom: "let _ = mutex.lock() triggers let_underscore_lock or leaves the following statements outside the critical section because the guard has no binding."
+summary: "The wildcard pattern discards its value immediately; it does not create an anonymous binding that lives to the end of scope. Name the guard to hold the lock, or call drop explicitly when immediate release is intended."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["targets with std::sync"]
+profiles: ["check", "dev", "release", "test"]
+searchTerms: ["Rust let underscore lock immediately dropped", "let_underscore_lock lint MutexGuard", "non-binding let synchronization lock error"]
+evidence: ["Rust 1.98.1 deny-by-default lint", "immediate guard drop", "named-binding repair"]
+sources: ["https://doc.rust-lang.org/rustc/lints/listing/deny-by-default.html#let-underscore-lock", "https://doc.rust-lang.org/std/sync/struct.MutexGuard.html", "https://doc.rust-lang.org/reference/patterns.html#wildcard-pattern"]
+---
+
+`let _ = expression;` looks like “keep the result but do not give it a useful name.” For ownership, that reading is wrong. The underscore is a wildcard pattern, not a hidden local variable.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-152/fail.rs) writes:
+
+```rust
+let _ = state.lock().unwrap();
+println!("critical section has already ended");
+```
+
+Rust 1.98.1 rejects it with the deny-by-default `let_underscore_lock` lint: the lock is not assigned to a binding and is immediately dropped.
+
+## The guard is the lock lifetime
+
+`Mutex::lock` returns a [`MutexGuard`](https://doc.rust-lang.org/std/sync/struct.MutexGuard.html). Acquiring the platform lock is only the beginning. The guard's destructor releases it.
+
+The guard therefore represents a capability over time:
+
+```text
+guard exists -> protected access is held
+guard drops  -> protected access is released
+```
+
+With `let _`, no local owns the result after that statement. The temporary guard is destroyed immediately, so later statements run unlocked.
+
+This can be worse than a visible compiler error. If the lint is allowed, the program compiles and may appear protected in review because the lock call is present. The real critical section has zero useful statements.
+
+## Underscore and underscore-prefixed names differ
+
+The [wildcard pattern](https://doc.rust-lang.org/reference/patterns.html#wildcard-pattern) matches a value without binding it. By contrast, `_guard` is an ordinary identifier. Its leading underscore only suppresses an unused-variable warning.
+
+Compare:
+
+```rust
+let _ = mutex.lock().unwrap();       // drop now
+let _guard = mutex.lock().unwrap();  // drop at end of scope
+```
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-152/fixed.rs) uses `_guard`, and the print remains inside the critical section.
+
+I often choose a more descriptive name such as `state_guard` when the function contains several resources. The name makes the lifetime easier to locate and avoids accidentally shadowing it.
+
+## Use drop when immediate release is the intention
+
+Sometimes I really want to acquire and release immediately—for example, waiting until another holder exits without reading the value. The lint recommends an explicit form:
+
+```rust
+drop(mutex.lock().unwrap());
+```
+
+This is clearer because destruction is named. A reader does not assume a critical section follows.
+
+I still question whether acquiring only to drop is the best synchronization protocol. A condition variable, channel, atomic state, or explicit readiness operation may express the intention better. But `drop(...)` at least makes the lifecycle truthful.
+
+## The same trap affects other RAII guards
+
+The lint is focused on synchronization locks, but the language behaviour is general. `let _` immediately disposes any temporary result. That matters for:
+
+- read and write lock guards;
+- condition-variable guards returned from waits;
+- tracing span guards;
+- transaction or rollback guards;
+- temporary-directory guards;
+- scope guards that restore process or thread state.
+
+Whether immediate destruction is harmful depends on the type's `Drop` behaviour. I inspect the returned type rather than treating every ignored result equally.
+
+The nearby syntax `let _result = operation();` does bind and retain the value. But using a name only to silence `must_use` can hide an ignored error. For `Result`, I prefer an explicit policy: handle it, propagate it, log it, or write `let _ =` with a comment explaining intentional disregard. For a guard, retention is usually the point.
+
+## Scope should show the critical section
+
+I like to put the guard and protected statements in a small block:
+
+```rust
+{
+    let mut state = shared.lock().unwrap();
+    state.apply(update);
+    state.verify();
+}
+
+publish_after_unlock();
+```
+
+This makes both acquisition and release reviewable. It also prevents expensive work, callbacks, or I/O from accidentally staying under the lock.
+
+An explicit `drop(state)` can end the section earlier, but a block is harder to invalidate during later edits. Either is much clearer than depending on a temporary's subtle drop point.
+
+## My review checks
+
+When I review synchronization code, I search for more than `lock()`:
+
+1. Which value owns release?
+2. Is that value bound, discarded, returned, or stored?
+3. What exact statements execute before it drops?
+4. Could shadowing make the original guard drop later than expected?
+5. Is any blocking I/O, callback, or `.await` inside the guard lifetime?
+6. Does a lint catch accidental immediate destruction in CI?
+
+For a regression test, I prefer deterministic coordination or `try_lock` over sleeps. The compile-fail fixture here is even stronger: it proves the suspicious syntax is rejected before scheduling becomes involved.
+
+The core principle is RAII literacy. The method call does not define how long a resource remains active; the returned value does. `_` says there will be no owner, so cleanup happens immediately. Giving the guard a real name gives the critical section a real lifetime.

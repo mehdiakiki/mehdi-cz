@@ -1,0 +1,84 @@
+---
+caseId: "RFA-333"
+title: "Reversed Instant::duration_since Saturates to Zero"
+date: "2026-09-06T01:53:00+01:00"
+lastmod: "2026-09-06T01:53:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "68646121d01473468e6f231fa55c347c668027dc9c2f1b2ad7eae18e7ccf6b7c"
+area: "upgrades-compatibility"
+symptom: "Subtracting a later Instant from an earlier one returns zero, making an argument-order bug look like an operation that took no time."
+summary: "Current Rust Instant subtraction and duration_since saturate reversed order to zero. checked_duration_since preserves the distinction as None; the documentation warns future behaviour may change."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["targets with std::time::Instant"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust Instant duration_since reversed zero", "Instant subtraction wrong order no panic", "checked_duration_since None Rust"]
+evidence: ["Rust 1.98.1 derived later instant", "reversed saturating zero", "checked direction-sensitive repair"]
+sources: ["https://doc.rust-lang.org/std/time/struct.Instant.html#method.duration_since", "https://doc.rust-lang.org/std/time/struct.Instant.html#method.checked_duration_since", "https://doc.rust-lang.org/std/time/struct.Instant.html#method.saturating_duration_since"]
+---
+
+I reviewed a latency metric that reported many zero-duration operations. The operations were not that fast. One call site had reversed `start` and `end`, and the time API was deliberately saturating the negative direction.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-333/fail.rs) constructs two instants exactly one second apart without sleeping. It asks the earlier instant for its duration since the later one. Rust 1.98.1 returns zero.
+
+## Current duration_since is saturating
+
+[`Instant::duration_since`](https://doc.rust-lang.org/std/time/struct.Instant.html#method.duration_since) returns the elapsed amount from an earlier instant, or zero if the supplied instant is later than `self`.
+
+This behaviour also works around rare monotonic-clock violations from platforms, virtualisation, or hardware. Older Rust versions panicked for reversed order, and the current documentation says future versions may reintroduce panics in some circumstances.
+
+That warning makes this an especially poor place to rely on accidental saturation as application policy.
+
+## Zero has two meanings in the direct API
+
+A zero result may mean the instants are equal at available precision. It may mean they were supplied in the wrong order. It may also reflect the monotonicity workaround described by the standard library.
+
+If my metric treats zero as a valid fast operation, these states collapse. Dashboards stay green while an instrumentation bug removes useful latency data.
+
+The failure is not memory unsafety. It is lost diagnostic information at a boundary where direction matters.
+
+## checked_duration_since preserves the mismatch
+
+[`checked_duration_since`](https://doc.rust-lang.org/std/time/struct.Instant.html#method.checked_duration_since) returns `None` when the argument is later. The [repaired fixture](/rust-failure-atlas/evidence/RFA-333/fixed.rs) verifies `None` for reversed order and exactly one second for the correct order.
+
+I use this checked form when reversed order indicates a bug or exceptional clock observation. I can increment a separate counter, attach context, and avoid recording a false zero.
+
+The documentation notes that `None` can still occur under a platform monotonicity violation even when program logic is correct. Error reporting should allow that possibility without hiding the call-site order.
+
+## Saturation is useful when selected deliberately
+
+[`saturating_duration_since`](https://doc.rust-lang.org/std/time/struct.Instant.html#method.saturating_duration_since) names the zero-floor policy directly. It is helpful for best-effort remaining budgets or UI progress where a negative logical interval should become zero.
+
+I prefer the named saturating method when saturation is intended. It tells a reviewer that information loss is policy, not an overlooked method behaviour.
+
+For deadline checks, comparing `now >= deadline` can be clearer than subtracting in whichever direction happens to be convenient.
+
+## Name time variables by role
+
+Names such as `a` and `b` make reversal easy. I use `started_at`, `finished_at`, `deadline`, and `now`, and put the later receiver on the left: `finished_at.checked_duration_since(started_at)`.
+
+Small domain wrappers can prevent mixing wall-clock timestamps with monotonic instants or confusing a duration with a deadline. Both may be opaque Rust values, but they carry different meaning.
+
+I keep `SystemTime` for externally meaningful wall-clock coordinates and `Instant` for local elapsed measurement.
+
+## Monotonic does not mean steady or portable forever
+
+The `Instant` documentation guarantees monotonically nondecreasing observations subject to documented platform bugs, but not a perfectly steady rate. Suspend time can count differently across platforms and Rust versions.
+
+A benchmark should record its environment and avoid assuming an instant maps to a Unix timestamp. Distributed systems cannot compare `Instant` values across processes or machines.
+
+These limitations do not make `Instant` unsuitable. They define the promise it can keep.
+
+## Tests should make direction deterministic
+
+Sleeping to create ordered instants makes tests slow and can still interact with scheduling. The fixture uses `checked_add` to derive a later representable instant, then checks both orders.
+
+My application tests cover equal instants, correct positive order, reversed order, deadline already passed, and conversion into metric units. I assert that the reversed case is counted separately rather than recorded as zero latency.
+
+I also avoid exact nanosecond assumptions for real clock readings because platform precision varies.
+
+## What RFA-333 establishes
+
+The evidence is pinned to Rust 1.98.1 because the standard documentation explicitly describes historical and possible future behaviour. It proves current saturation and the stable information carried by the checked API.
+
+The core principle is that saturation trades error visibility for a bounded answer. That can be a good policy, but it should be chosen where the domain owns it. For measurements and diagnostics I preserve reversed order as data instead of letting it masquerade as zero work.

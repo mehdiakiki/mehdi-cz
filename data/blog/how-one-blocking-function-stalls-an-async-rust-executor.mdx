@@ -1,0 +1,201 @@
+---
+title: "How One Blocking Function Stalls an Async Rust Executor"
+date: "2026-11-12T09:00:00+01:00"
+tags: ["rust", "Tokio", "async", "spawn_blocking", "latency"]
+draft: false
+reviewed: true
+reviewedHash: "3e5d356efb6f626ec091bf5b0553e8f28e27b267201ced10ba1b68ecb64d2d95"
+cluster: "rust-under-the-hood"
+campaign: "authority-2026"
+opportunity: "RUST-043"
+summary: "A synchronous function inside async Rust occupies an executor worker until it returns. A one-worker timer trace makes the delay visible and shows where spawn_blocking helps—and where it does not."
+---
+
+A blocking call inside an async function does not block only that function. It occupies the executor worker that is polling it. Every unrelated task assigned to this worker must wait.
+
+The difficult part is that the code may still look asynchronous because it sits between two `.await` points.
+
+```rust
+async fn handle() {
+    fetch().await;
+    std::thread::sleep(Duration::from_millis(150));
+    save().await;
+}
+```
+
+The middle line gives Tokio no place to take control back. On a busy service, one such line can appear as slow timers, late health checks, and long request tails elsewhere.
+
+## A small latency trace shows the stall
+
+I use a current-thread runtime to remove work-stealing from this experiment. One task expects a 20 ms timer. Another starts after 10 ms and blocks for 150 ms.
+
+```rust
+use std::time::{Duration, Instant};
+
+async fn measure(offload: bool) -> Duration {
+    let observer = tokio::spawn(async {
+        let started = Instant::now();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        started.elapsed()
+    });
+
+    let blocker = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        if offload {
+            tokio::task::spawn_blocking(|| {
+                std::thread::sleep(Duration::from_millis(150));
+            })
+            .await
+            .unwrap();
+        } else {
+            std::thread::sleep(Duration::from_millis(150));
+        }
+    });
+
+    let observed = observer.await.unwrap();
+    blocker.await.unwrap();
+    observed
+}
+
+#[tokio::main(flavor = "current_thread")]
+async fn main() {
+    println!("on worker: {:?}", measure(false).await);
+    println!("offloaded: {:?}", measure(true).await);
+}
+```
+
+The exact numbers depend on the machine, so I do not publish one magic benchmark result. The important shape is stable: the first timer cannot complete until the synchronous sleep returns, while the offloaded version remains close to its requested duration.
+
+Tokio states the same condition in its [runtime fairness guarantee](https://docs.rs/tokio/latest/tokio/runtime/#detailed-runtime-behavior): a scheduled task must return from `poll` within a bounded time. A blocking function violates that assumption.
+
+## An `.await` before or after does not help
+
+An executor can switch tasks when the current future returns `Poll::Pending`. Usually this happens through `.await`. Synchronous work after an await is still synchronous work:
+
+```text
+task A: await socket -> Pending       worker runs task B
+task A: socket wakes -> poll again
+task A: blocking decode for 150 ms    worker cannot poll task B
+task A: await database -> Pending     worker is free again
+```
+
+I therefore review the work _between_ await points. Function signatures alone do not tell me whether the body cooperates.
+
+## Blocking and slow are not the same
+
+An asynchronous network request may take ten seconds while its future returns `Pending` quickly. It is slow for the caller but does not occupy a worker while the socket waits.
+
+A 20 ms synchronous parser can be blocking even though it finishes much sooner. During those 20 ms, the worker cannot poll another future.
+
+I look for:
+
+- filesystem APIs from `std` inside async paths;
+- synchronous DNS, database, and HTTP clients;
+- compression, image processing, parsing, hashing, or large serialization loops;
+- mutexes and condition variables that park the OS thread;
+- subprocess functions that wait synchronously;
+- hidden blocking inside third-party callbacks.
+
+Latency profiles and runtime metrics are more reliable than guessing by function name.
+
+## `spawn_blocking` moves the boundary
+
+Tokio provides a separate pool for blocking operations:
+
+```rust
+let parsed = tokio::task::spawn_blocking(move || parse_large_document(bytes))
+    .await
+    .map_err(|join_error| Error::Worker(join_error))??;
+```
+
+The async worker can now poll other tasks while the closure runs. Tokio's [CPU-bound and blocking guidance](https://docs.rs/tokio/latest/tokio/#cpu-bound-tasks-and-blocking-code) recommends this boundary for blocking work.
+
+It does not turn the operation into async I/O. It moves it to another thread and gives me a `JoinHandle` to observe completion.
+
+Moving very small work can cost more than doing it inline. I use measured poll duration and tail latency to decide, not a rule that every ordinary calculation must be spawned.
+
+## The blocking pool is not infinite capacity
+
+`spawn_blocking` can create many blocking threads, and queued calls do not by themselves provide the product's overload policy. Sending unbounded CPU-heavy jobs there can move starvation from executor workers to the machine.
+
+I add an application limit:
+
+```rust
+let permit = cpu_limit.clone().acquire_owned().await?;
+
+let result = tokio::task::spawn_blocking(move || {
+    let _permit = permit;
+    expensive_transform(input)
+})
+.await??;
+```
+
+The limit should reflect CPU, memory, downstream capacity, and acceptable queue delay. For sustained CPU-bound work, Tokio also suggests a dedicated pool such as Rayon rather than treating the blocking pool as a compute scheduler.
+
+The bounded-channel article, [Bounded Channels Are a Capacity Contract, Not Just a Queue Size](/blog/bounded-channels-are-a-capacity-contract-not-just-a-queue-size), explains why the waiting work must be included in this calculation.
+
+## Cancellation stops waiting, not necessarily the function
+
+Once a `spawn_blocking` closure has started, aborting its handle does not preempt arbitrary synchronous code. A timeout around the handle can stop the async caller from waiting while the underlying function continues.
+
+That matters for shutdown and for effects:
+
+```text
+request times out
+blocking database driver may still be writing
+caller retries
+first operation may later succeed
+```
+
+I use a driver-specific cancellation mechanism when available, stable idempotency keys for remote effects, and cooperative cancellation checks in long CPU loops. I never describe dropping the `JoinHandle` as cancelling the work.
+
+## Never carry an async lock into blocking work
+
+This shape is dangerous:
+
+```rust
+let guard = state.lock().await;
+tokio::task::spawn_blocking(move || slow_call(&guard)).await?;
+```
+
+The async mutex remains held while another thread runs. Tasks needing the lock queue behind work they cannot influence, and shutdown may also wait for it.
+
+I copy or move the smallest owned input across the boundary, release the guard, and apply the result with an explicit version check later.
+
+```text
+lock -> snapshot input and version -> unlock
+run blocking work
+lock -> verify version -> commit or retry -> unlock
+```
+
+## What I measure in production
+
+I record executor symptoms and boundary symptoms separately:
+
+```text
+timer lateness and event-loop lag
+task poll-duration outliers
+request p95/p99 latency
+blocking jobs active and queued
+blocking queue wait and execution duration
+CPU saturation and runnable thread count
+shutdown time with blocking jobs outstanding
+```
+
+A trace span around only the synchronous function is not enough. I correlate it with a heartbeat task so I can see the delay imposed on unrelated work.
+
+## My verification checklist
+
+For each synchronous dependency used from async Rust, I ask:
+
+- Can it wait on I/O or a lock?
+- How long can one call keep the thread?
+- Does its library provide a real asynchronous API?
+- If I offload it, what bounds admission?
+- What data and locks cross the boundary?
+- Can running work be cancelled, or only abandoned?
+- What happens during runtime shutdown?
+- How will I see executor latency before users report it?
+
+Async Rust gives concurrency only while futures return control. `spawn_blocking` is useful because it makes the synchronous boundary explicit, but senior design work starts one step later: bounding that work, preserving cancellation semantics, and proving that unrelated tasks remain responsive under load.

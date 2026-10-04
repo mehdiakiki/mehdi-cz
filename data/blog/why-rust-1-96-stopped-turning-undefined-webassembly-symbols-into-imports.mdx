@@ -1,0 +1,146 @@
+---
+title: "Why Rust 1.96 Stopped Turning Undefined WebAssembly Symbols Into Imports"
+date: "2026-12-27T09:00:00+01:00"
+tags: ["Rust 1.96", "WebAssembly", "wasm-ld", "linker", "FFI"]
+draft: false
+reviewed: true
+reviewedHash: "bc12ee58794e9e5d61e5ba5cd2ebf2305b4122ddf3dc26195e9ae181496af2fd"
+cluster: "rust-under-the-hood"
+campaign: "authority-2026"
+opportunity: "RUST-069"
+summary: "Rust 1.96 stopped passing --allow-undefined to WebAssembly linkers. Missing symbols now fail at link time unless they are declared as intentional host imports."
+---
+
+An undefined symbol in a native build usually means the linker stops me. Before Rust 1.96, a WebAssembly target could behave differently: the Rust compiler passed `--allow-undefined`, and a missing function could quietly become a host import.
+
+That sounds flexible until the missing symbol is a typo or a native library that was never linked. The error moves from build time to instantiation or runtime, where it is harder to understand.
+
+Rust 1.96 removes that default permission.
+
+## The old accidental import
+
+Consider an external function with no import module:
+
+```rust
+unsafe extern "C" {
+    fn calculate(value: i32) -> i32;
+}
+
+fn main() {
+    let answer = unsafe { calculate(41) };
+    println!("{answer}");
+}
+```
+
+There is no Rust implementation and no linked object defining `calculate`. Historically, the WebAssembly linker could allow the symbol and produce an import, commonly under an environment module. The module might build successfully and then fail when the host did not provide that accidental import.
+
+From Rust 1.96, this should fail during linking. The [official release notes](https://doc.rust-lang.org/releases.html#version-1960-2026-05-28) describe the compatibility change as stopping rustc from passing `--allow-undefined` on WebAssembly targets.
+
+## An intentional host import remains supported
+
+If the function is part of the host contract, I declare the module:
+
+```rust
+#[link(wasm_import_module = "host")]
+unsafe extern "C" {
+    fn calculate(value: i32) -> i32;
+}
+
+fn main() {
+    let answer = unsafe { calculate(41) };
+    println!("{answer}");
+}
+```
+
+The Rust change that removed `--allow-undefined` explicitly preserves this form. The module now says that `host.calculate` is a required import rather than relying on linker tolerance.
+
+That difference is valuable in review. I can search for host imports and compare them with the runtime's capability list.
+
+## Why allowing every undefined symbol was risky
+
+There are at least three stories behind a missing symbol:
+
+```text
+intentional host capability
+native/static dependency was not linked
+mistyped or conditionally missing function
+```
+
+A blanket linker flag treats all three as the first story. The build succeeds even when the correct action was to add a library or fix configuration.
+
+The upstream [Rust change discussion](https://github.com/rust-lang/rust/pull/149868) gives a particularly sharp example involving an undefined external static. The program linked and produced a null address instead of a useful build failure. Moving detection earlier is not reduced capability; explicit imports still cover real host functions.
+
+## The reproduction I keep
+
+I use two tiny files and the same target:
+
+```bash
+rustup target add wasm32-unknown-unknown --toolchain 1.98.1
+rustc +1.98.1 --target wasm32-unknown-unknown accidental.rs
+rustc +1.98.1 --target wasm32-unknown-unknown intentional.rs
+```
+
+The accidental file must fail with an undefined-symbol linker error. The intentional import must link.
+
+Then I inspect the result with a WebAssembly-aware tool:
+
+```bash
+wasm-tools print intentional.wasm
+```
+
+I expect an import whose module and name match the declared host ABI. If the project uses component-model tooling or a generated interface, I inspect through that contract instead.
+
+The exact error text can change across linker versions, so the test asserts failure and the symbol name rather than snapshotting the full message.
+
+## Do not fix the migration globally
+
+The quickest reaction is to pass `--allow-undefined` manually. That restores the same ambiguity Rust removed.
+
+I classify every linker failure:
+
+| Missing symbol | Correct direction |
+| --- | --- |
+| real host function | add explicit import module/interface |
+| function from C library | compile and link the correct object/archive |
+| target-specific code leaked into build | repair `cfg` selection |
+| typo or removed function | fix caller |
+| generated binding mismatch | regenerate and version both sides |
+
+If a specialized toolchain truly needs permissive linking, I scope the flag to that audited target and verify the final import list. It is not a workspace-wide default.
+
+## Host imports are an authority boundary
+
+An imported function gives the host power inside the guest's execution. I treat its contract like FFI:
+
+```text
+module and function name
+parameter/result representation
+memory ownership
+error and trap behaviour
+reentrancy
+side effects and permissions
+versioning
+```
+
+An explicit import name is only the first step. Generated WIT bindings or another typed interface may express more of the boundary than raw `extern "C"`.
+
+I also test the negative runtime case: instantiate the module without one required import and confirm the host reports the missing capability clearly.
+
+## CI must link the final artifact
+
+`cargo check` does not always perform the final link that exposes undefined symbols. For WebAssembly targets, I include a build job that produces the actual module and inspects imports.
+
+```text
+cargo check target              fast type coverage
+cargo build target              final linker behavior
+import allowlist comparison     capability review
+runtime instantiation test      host/guest agreement
+```
+
+If C or C++ archives participate, the CI image uses the same linker and target tools as release builds.
+
+## What the change means to me
+
+Rust 1.96 makes WebAssembly linking more like the failure model I expect elsewhere: an unexplained symbol is an error. Intentional host imports still work when I name the module and therefore the boundary.
+
+This is a compatibility break for builds that depended on accidental imports. It is also a useful upgrade signal. Each failure asks a concrete question: is this symbol a declared capability, a missing dependency, or a mistake? I would rather answer that during the build than ask a user why a module cannot instantiate later.

@@ -1,0 +1,189 @@
+---
+title: "A Dead-Letter Queue Is Evidence, Not a Disposal Bin"
+date: "2026-10-06T09:00:00+01:00"
+tags: ["dead letter queue", "message processing", "incident response", "distributed systems", "data reliability"]
+draft: false
+reviewed: true
+reviewedHash: "29eef209777bcb8b39c43c210d4ba705eabffbecb2f482fb63b7e5966756922a"
+cluster: "reliable-data-integrations"
+campaign: "authority-2026"
+opportunity: "DATA-043"
+summary: "A useful dead-letter queue preserves failure evidence and has an owned repair workflow. Design its envelope, redrive rules, and closure signal before messages fail."
+---
+
+A dead-letter queue can make a broken pipeline look healthy. The main consumer stops retrying a poison message, lag falls, and the dashboard becomes green. The business record is still missing.
+
+I do not treat a DLQ as a place where bad messages go away. I treat it as a case queue for data failures that still need an outcome.
+
+## Moving a message is not resolving it
+
+The ordinary flow is:
+
+```text
+source -> consumer -> business effect -> acknowledge
+```
+
+After repeated failure, a DLQ adds another branch:
+
+```text
+source -> consumer -> dead-letter record -> acknowledge source
+                              |
+                              v
+                    investigate and recover
+```
+
+If the lower branch has no owner, service-level objective, tooling, or completion signal, it is only delayed data loss.
+
+This distinction matters in integrations. One rejected customer record may not create visible system downtime, but it can create a missing invoice, stale entitlement, or incomplete ontology later.
+
+## Decide which failures belong there
+
+I classify failures before choosing a retry count.
+
+| Failure | Example | First response |
+| --- | --- | --- |
+| transient dependency | database unavailable | bounded retry with backoff |
+| throttling | provider returns `429` | respect provider delay and retry budget |
+| malformed envelope | required identity absent | quarantine immediately |
+| unsupported schema | producer sends version 7 | route to compatibility investigation |
+| business rejection | transition is not allowed | record a domain outcome, not infrastructure retry |
+| deterministic handler bug | same payload always panics | stop the hot loop and preserve evidence |
+
+Ten fast retries do not make invalid JSON valid. One immediate dead letter is also wrong for a database timeout that will recover in seconds.
+
+The DLQ policy should say **why** a record enters, not only “after five attempts.”
+
+## Preserve an investigation envelope
+
+Copying only the original payload is not enough. I keep a structured envelope like:
+
+```json
+{
+  "dead_letter_id": "orders/12/417",
+  "source": {
+    "stream": "orders",
+    "partition": 12,
+    "position": 417,
+    "message_id": "evt_01J...",
+    "payload_sha256": "62af..."
+  },
+  "failure": {
+    "stage": "validate-v3",
+    "code": "UNKNOWN_CURRENCY",
+    "attempts": 4,
+    "first_failed_at": "2026-10-06T08:02:12Z",
+    "last_failed_at": "2026-10-06T08:09:48Z"
+  },
+  "runtime": {
+    "consumer": "billing-projection",
+    "handler_version": "git:4c2e...",
+    "schema_version": 3
+  }
+}
+```
+
+The deterministic `dead_letter_id` makes publishing the same failure idempotent. The source location permits a precise comparison with the original log. The payload hash detects accidental mutation during repair.
+
+I do not dump credentials, authorization headers, or an unrestricted exception object into this envelope. Failure evidence also needs a data classification and retention policy.
+
+## The handoff to the DLQ can fail too
+
+There is a dangerous crash point:
+
+```text
+consumer decides to dead-letter
+publish to DLQ
+commit source position
+```
+
+If the process commits the source before the DLQ publish is durable, the record disappears from both workflows. If it publishes and crashes before committing, it may publish the dead-letter record again.
+
+I handle this using one of the mechanisms the platform can truly support:
+
+- a broker transaction that couples the produced DLQ record and consumed position;
+- a durable local inbox/outbox transaction;
+- a deterministic DLQ identity plus an idempotent write, followed by the source acknowledgement.
+
+“The client normally sends both” is not a crash guarantee.
+
+## A repair workflow needs states
+
+My minimum lifecycle is:
+
+```text
+open
+  -> classified
+  -> fix_available
+  -> replay_approved
+  -> replayed
+  -> verified
+  -> closed
+```
+
+Some records close as `not_replayable` with an explicit business decision. They should not quietly expire.
+
+Each transition needs an owner and evidence. For example, `replayed` means a replay request was accepted. `verified` means the intended downstream state is present or the consumer produced the expected terminal outcome.
+
+This prevents a common false success: deleting the DLQ item immediately after sending it back to the source.
+
+## Redrive is production work
+
+The repaired handler may be correct, but redriving 400,000 old messages can overload a database, exhaust an API quota, or produce notifications people no longer expect.
+
+Before redrive I define:
+
+```text
+scope:          exact IDs or source range
+handler:        version that contains the repair
+rate:           records and bytes per second
+idempotency:    duplicate-effect protection
+ordering:       whether replay may overtake live traffic
+observation:    success, rejection, and lag metrics
+stop rule:      error rate or downstream saturation threshold
+```
+
+AWS explicitly warns that attaching a dead-letter queue to an SQS FIFO queue can break exact ordering for workloads where sequence must remain unchanged. The [SQS dead-letter documentation](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-dead-letter-queues.html) is product-specific, but the design question is general: removing and later returning one message changes its place in the sequence.
+
+## Do not mutate the only evidence
+
+Sometimes a schema or data repair is required. I keep the original payload immutable and create a repair record:
+
+```json
+{
+  "dead_letter_id": "orders/12/417",
+  "repair_id": "repair_902",
+  "original_sha256": "62af...",
+  "transform": "currency-alias-v2",
+  "repaired_sha256": "9bb1...",
+  "approved_by": "data-on-call"
+}
+```
+
+This gives me an audit trail and a reproducible transformation. Editing the message in place destroys the reason the failure happened.
+
+For personal data, immutable does not mean kept forever. Erasure and retention rules still apply; the repair log can preserve hashes and decisions without preserving unrestricted sensitive content.
+
+## The metrics I want
+
+Queue depth alone cannot tell whether cases are becoming older. I monitor:
+
+- new dead letters by failure code and handler version;
+- age of the oldest open case;
+- time from first failure to classification;
+- replay success and repeat-failure rate;
+- cases closed without replay, by reason;
+- estimated business objects missing or delayed;
+- records approaching retention expiry.
+
+I page on a sudden arrival rate. I create an operational backlog signal from age and unresolved business impact.
+
+## A DLQ must have an exit before it has an entrance
+
+Before enabling the route, I test four paths:
+
+1. A poison record reaches the DLQ once even if the consumer crashes during handoff.
+2. The envelope is sufficient to reproduce the failure without containing secrets.
+3. A repaired record can be redriven with rate limits and duplicate protection.
+4. Closure verifies the business effect rather than only the replay command.
+
+A dead-letter queue is valuable because it stops one failure from stopping unrelated work. It is safe only when the failed record stays visible as evidence and has a controlled path to resolution.

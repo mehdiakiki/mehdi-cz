@@ -1,0 +1,94 @@
+---
+caseId: "RFA-281"
+title: "Why Cursor<&mut [u8]> Cannot Grow for write_all"
+date: "2026-09-06T01:01:00+01:00"
+lastmod: "2026-09-06T01:01:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "fd4d5319f2745ff2a473b949482599785178dccd69b63eb61b87276e46ecf276"
+area: "ffi-targets"
+symptom: "Writing three bytes with write_all through a Cursor over a two-byte mutable slice ends with ErrorKind::WriteZero after filling available storage."
+summary: "A Cursor over &mut [u8] has fixed capacity. Writes can make partial progress but cannot extend it; write_all eventually returns WriteZero. Use a growable Vec backing or validate exact capacity first."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust Cursor mutable slice write_all WriteZero", "Cursor fixed buffer cannot grow Rust", "Cursor Vec versus slice Write behavior"]
+evidence: ["Rust 1.98.1 two-byte backing slice", "three-byte write_all failure", "Vec-backed growth repair"]
+sources: ["https://doc.rust-lang.org/std/io/struct.Cursor.html", "https://doc.rust-lang.org/std/io/trait.Write.html#method.write_all", "https://doc.rust-lang.org/std/io/enum.ErrorKind.html#variant.WriteZero"]
+---
+
+I changed a `Cursor<Vec<u8>>` to use a borrowed buffer so I could avoid allocation. The code still implemented `Write`, but a larger `write_all` now failed with `WriteZero`.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-281/fail.rs) places a cursor over a two-byte mutable slice and asks it to write `abc`. Two bytes fit. The third has nowhere to go.
+
+## Cursor does not define the capacity policy alone
+
+[`Cursor`](https://doc.rust-lang.org/std/io/struct.Cursor.html) adds position and I/O traits to an in-memory value. The behavior depends on that inner type.
+
+For a growable `Vec<u8>`, writing can extend the vector. For `&mut [u8]`, the length is fixed. A slice is a view over existing elements; it cannot allocate another element because a caller wrote beyond its end.
+
+The same wrapper name can therefore have different growth behavior:
+
+```text
+Cursor<Vec<u8>>      -> owned, growable backing
+Cursor<&mut [u8]>    -> borrowed, fixed backing
+```
+
+The type parameter is part of the I/O contract.
+
+## write may return a successful prefix
+
+The `Write` trait allows one call to accept fewer bytes than supplied. With two bytes remaining and a three-byte input, a writer may return `Ok(2)`.
+
+That is successful progress, not a complete record. Callers using `write` must advance by the returned count and decide what to do next.
+
+After the fixed slice is full, another non-empty write cannot progress and returns `Ok(0)`. A manual retry loop that ignores zero would spin forever.
+
+## write_all converts no progress into WriteZero
+
+[`write_all`](https://doc.rust-lang.org/std/io/trait.Write.html#method.write_all) repeats writes until every byte is accepted or an error occurs. When the writer returns zero for remaining data, completion is impossible under the current state.
+
+The helper reports [`ErrorKind::WriteZero`](https://doc.rust-lang.org/std/io/enum.ErrorKind.html#variant.WriteZero). It does not roll back the two bytes already written. This is important: an error from `write_all` is not transactional output.
+
+The fixture panics through `expect` so the failure is visible, but production code should propagate the error and know that the destination contains a prefix.
+
+## Choose a repair from the ownership requirement
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-281/fixed.rs) uses `Cursor<Vec<u8>>`, because its requirement is to accept arbitrary output and grow storage.
+
+For an embedded protocol or caller-provided packet buffer, fixed storage may be intentional. Then I validate remaining capacity before beginning an indivisible record:
+
+```text
+remaining = buffer length - current position
+required  = encoded record length
+```
+
+If `required > remaining`, I return a domain error before changing bytes. This gives an all-or-nothing policy at the application layer.
+
+## Position changes the remaining capacity
+
+A two-byte slice does not always have two writable bytes. If the cursor position is one, only one remains. If it is at or beyond the end, no non-empty write can progress.
+
+Seeking backward can make earlier positions writable again and overwrites existing bytes. It does not insert or shift them.
+
+I include position in diagnostics because “buffer length two” is insufficient evidence. The relevant quantity is the writable region from the current byte offset.
+
+## Borrowed storage can still be the best design
+
+Fixed slices avoid growth, make maximum memory visible, and can map naturally to packet buffers or FFI-provided regions. Failure at capacity is often safer than surprising allocation.
+
+The design becomes wrong only when callers assume an unbounded sink. I expose the limit in the API or return an error that names required and available bytes.
+
+A generic function accepting `impl Write` cannot assume growth. Files, sockets, bounded buffers, compressors, and cursors have different progress and durability behavior behind the same trait.
+
+I also record how many bytes may already have changed when a surrounding protocol allows recovery. An arbitrary writer can make partial progress before returning an error. Retrying the whole logical message without accounting for that prefix can duplicate data.
+
+## What I test
+
+My tests write less than, exactly, and more than the remaining capacity. They start at zero, the middle, the end, and beyond the end.
+
+For `write`, I assert the count and initialized prefix. For `write_all`, I assert `WriteZero` and inspect partial bytes. For preflight validation, I assert that insufficient space leaves the whole destination unchanged.
+
+When using a vector repair, I test whether gaps are allowed if position exceeds length, because growable cursor writes can zero-fill before new bytes. Growth policy and gap policy are separate.
+
+The core principle is that an I/O trait does not erase storage geometry. `Cursor<&mut [u8]>` can write only into its fixed borrowed slice. Partial progress is valid, and `write_all` reports `WriteZero` when no space remains. Choose fixed validation or growable ownership explicitly.

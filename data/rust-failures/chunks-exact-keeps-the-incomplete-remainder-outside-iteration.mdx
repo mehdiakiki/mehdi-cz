@@ -1,0 +1,73 @@
+---
+caseId: "RFA-665"
+title: "chunks_exact_mut Leaves a Mutable Tail for into_remainder"
+date: "2026-09-06T08:25:00+01:00"
+lastmod: "2026-09-06T08:25:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "0a6b3160f3d0f8eceaacf9e206201f2ae3f4879e6120d52dc3afffd1d1a1fe1f"
+area: "concurrency-memory"
+symptom: "chunks_exact_mut updates every full chunk but leaves the final mutable elements unchanged unless its remainder is recovered."
+summary: "chunks_exact_mut keeps yielded slices fixed-width by separating the incomplete mutable tail. Consume into_remainder after the loop when those final elements must be updated, rejected, or carried forward."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust chunks_exact_mut into_remainder unchanged tail", "mutate incomplete chunk remainder Rust", "ChunksExactMut recover mutable remainder"]
+evidence: ["Rust 1.98.1 runtime assertion", "four of five values mutated through exact chunks", "into_remainder repairs the mutable tail"]
+sources: ["https://doc.rust-lang.org/std/primitive.slice.html#method.chunks_exact_mut", "https://doc.rust-lang.org/std/slice/struct.ChunksExactMut.html#method.into_remainder", "https://doc.rust-lang.org/std/primitive.slice.html#method.chunks_mut"]
+---
+
+`chunks_exact_mut(width)` yields mutable slices whose length is exactly `width`. Any incomplete tail is available separately through `into_remainder`; it is not another iterator item. The [failing fixture](/rust-failure-atlas/evidence/RFA-665/fail.rs) adds ten through two full pairs and then discovers that the fifth integer was not changed.
+
+## Exact mutable chunks split one borrow into two phases
+
+The [`chunks_exact_mut` documentation](https://doc.rust-lang.org/std/primitive.slice.html#method.chunks_exact_mut) separates complete chunks from a remainder. This is useful for RGB pixels, binary words, fixed-size headers, SIMD lanes, and protocol records. The loop body can rely on one width every time and mutate without overlapping another yielded chunk.
+
+The tail is not necessarily an error. The API cannot know whether it is padding, a truncated record, or data reserved for another parser. It exposes the remainder so application code can decide.
+
+I never use `chunks_exact_mut` only because the loop looks convenient. I first write the tail policy and whether partial mutation is acceptable.
+
+## There are three honest tail policies
+
+If a partial final unit is valid, [`chunks_mut`](https://doc.rust-lang.org/std/primitive.slice.html#method.chunks_mut) includes it as the last item. The [repaired fixture](/rust-failure-atlas/evidence/RFA-665/fixed.rs) instead keeps fixed-width processing and calls [`ChunksExactMut::into_remainder`](https://doc.rust-lang.org/std/slice/struct.ChunksExactMut.html#method.into_remainder) to update the fifth value deliberately.
+
+If the format requires exact records, I validate divisibility before mutation and reject a non-empty tail before committing changes. This turns truncation into a visible parse error instead of partial in-place modification.
+
+If the tail belongs to another stage, I process full records and pass the remainder forward deliberately. Streaming decoders often combine it with the beginning of the next network chunk. The lifetime and ownership of that carried tail then need an explicit buffer strategy.
+
+Ignoring the remainder is a fourth behaviour, but it should be named as dropping padding or truncating, not happen by accident.
+
+## Network chunks are not record boundaries
+
+A common systems mistake is applying `chunks_exact(record_width)` independently to each buffer received from I/O. TCP, files, and async readers do not promise that one read ends at an application record boundary. A record may be split across two reads.
+
+The incomplete remainder must be retained and prefixed to later bytes, or the decoder must operate on a buffer that accumulates until a record is complete. Otherwise valid traffic is discarded depending on packetisation and timing.
+
+This principle is wider than Rust: transport segmentation and message framing are separate layers. The iterator makes the local leftover visible, but the surrounding state machine must preserve it.
+
+## Exact width can move into the type
+
+Within each yielded slice, converting `chunk.try_into()` to `&[u8; N]` can make width available to called functions. It removes repeated runtime length checks and documents that a decoder consumes exactly one record.
+
+I still validate the global remainder. Successfully converting every yielded item says nothing about bytes that were never yielded. This is why tests must check consumed length as well as decoded values.
+
+For mutable chunks, the corresponding APIs permit in-place processing. The same remainder question applies. Mutating complete records and then discovering an invalid tail may leave partial changes, so validation before mutation is preferable when atomic behaviour matters.
+
+## Width zero is rejected
+
+Chunk iterators panic when the chunk size is zero. If width comes from configuration or a file, I validate it before constructing the iterator. A nonzero integer type or a format-specific enum can make impossible widths harder to represent.
+
+Arithmetic such as `records * width` may overflow for untrusted sizes. I use checked arithmetic before allocation or slicing. Exactness is not only about the final remainder; it includes safe size calculations.
+
+## My chunking checklist
+
+- Are records fixed-width, or is a shorter final unit valid?
+- Is a non-empty remainder rejected, preserved, or intentionally discarded?
+- Can one logical record cross an I/O buffer boundary?
+- Is chunk width validated as nonzero?
+- Should complete slices become array references for stronger typing?
+- Can mutation occur before a remainder error is discovered?
+- Do consumed-byte metrics include or expose the tail?
+- Do tests vary input fragmentation rather than use one convenient buffer?
+
+The core principle is that mutable iteration can deliberately cover only part of the input. `chunks_exact_mut` gives strong shape to yielded items by moving uncertainty and ownership of the tail into `into_remainder`. I account for both phases before claiming that an input was completely updated.

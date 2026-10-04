@@ -1,0 +1,111 @@
+---
+title: "Where a Type Becomes a Layout: Fields, Padding, and Reordering"
+date: "2026-09-11T06:10:00+01:00"
+lastmod: "2026-09-11T06:10:00+01:00"
+tags: ["types", "rust", "c", "memory layout", "types under the hood"]
+draft: false
+reviewed: true
+reviewedHash: "b298d35fe7cdc9a39c5135a377dfb828b718a8f9d27a612cba45d0a819902f54"
+cluster: "rust-under-the-hood"
+campaign: "editorial"
+summary: "The same three fields take 8 bytes in Rust and 12 in C, because rustc reorders them and C does not. I measured both, plus repr(C) and repr(packed), and this is the one place where a type leaves a physical trace the processor can touch."
+---
+
+Layout is the only part of a type the processor ever touches. Everywhere else in this series the type disappeared. Here it leaves something behind: a size, an alignment, and a position for each field. I put the same three fields in a struct in Rust and in C, and got 8 bytes on one side and 12 on the other.
+
+This is a spoke of [What Is a Type?](/blog/what-is-a-type-a-set-of-values-a-promise-about-operations-or-both). The opinion I want to argue here is that Rust reordering fields by default is the right decision, and that the C rule, keep the declaration order, quietly costs memory in most C code I have read.
+
+The programs and a script that reproduces every output are in the `types-under-the-hood` fixture of the site repository. I used rustc 1.95 nightly and GCC 15.2 on x86-64 Linux.
+
+## Three fields, seven bytes of data
+
+The struct is deliberately awkward:
+
+```rust
+struct Mixed { a: u8, b: u32, c: u16 }
+```
+
+One byte, four bytes, two bytes. Seven bytes of data in total. Nobody can store this in seven bytes, and the reason is alignment: a `u32` must sit at an address that divides by four, because that is what the language and the ABI require, and what some processors require. So the fields cannot simply be packed one after another.
+
+Here is what rustc did, and what the same declaration does under `repr(C)`:
+
+```text
+Mixed        size  8  align  4  offsets a=6 b=0 c=4
+MixedC       size 12  align  4  offsets a=0 b=4 c=8
+Ordered      size  8  align  4  offsets a=6 b=0 c=4
+Packed       size  7  align  1  offsets a=0 b=1 c=5
+sum of field sizes: 7
+```
+
+The first two rows are the ones that matter.
+
+With the default representation, rustc put `b` first at offset 0, `c` at 4, and `a` at 6. The struct is 8 bytes, and every byte is used. I declared `a` first and it ended up last, so the declaration order is clearly not what the compiler followed. It sorted the fields so that the big one starts at zero and the small one fills the gap at the end.
+
+With `repr(C)`, which means "lay this out the way C would", the fields stay in declaration order: `a` at 0, then three wasted bytes so that `b` can start at 4, then `c` at 8, then two more wasted bytes so the total is a multiple of four. Twelve bytes for seven bytes of data.
+
+The third row confirms it from the other side. `Ordered` has the same three fields declared as `b, c, a`, also with the default representation, and it lands on exactly the same layout as `Mixed`. Two different source orders, one layout. The compiler is not following my order in either case.
+
+The fourth row is `repr(packed)`, which removes the padding completely and gives 7 bytes with alignment 1. It looks like the best of the three, and it is a trap. Every access to `b` is now potentially unaligned, which is slower on x86-64, a fault on some other targets, and taking a reference to a packed field is refused by the compiler. I use it for parsing a wire format, never for a type I compute with.
+
+## The same struct in C
+
+C has no choice to make, because the standard requires the fields to be in declaration order:
+
+```text
+struct mixed   size 12  align 4  offsets a=0 b=4 c=8
+struct ordered size 8  align 4  offsets a=6 b=0 c=4
+```
+
+The first line matches Rust's `repr(C)` exactly, which is the point of that name. The second line is the same struct with the fields reordered by hand, and it gives 8 bytes, the same as what rustc found on its own.
+
+So the saving is available in C too. It is just my job instead of the compiler's job. I have to notice, and then I have to keep the order correct when someone adds a field two years later.
+
+## Why I think reordering by default is right
+
+Here is the number that convinced me. A thousand of these structs in an array:
+
+```text
+an array of 1000 Mixed:  8000 bytes
+an array of 1000 MixedC: 12000 bytes
+```
+
+Four thousand bytes, on a struct with three fields, per thousand elements, spent on nothing. In a real program these are rows in a table, nodes in a graph, particles, packets.
+
+The more interesting cost is cache lines. A cache line is 64 bytes, so eight of the 8 byte version fit exactly in one line. At 12 bytes only five fit whole and the sixth is split across two lines, which means more lines touched for the same number of elements.
+
+The argument for the C rule is stronger than "it is simpler". A fixed layout is an ABI guarantee: a struct compiled by one compiler version can be passed to a library compiled by another, and that is a real property C sells deliberately, not an oversight.
+
+My answer is that the guarantee is only needed where a type crosses a boundary, and that is a minority of the types in a program. In Rust that minority says so with `repr(C)`. For everything that stays inside the program, predictability buys nothing and costs padding.
+
+C applies that guarantee to every struct, including the ones that never leave the program. In the C code I have read, the result is that most structs are bigger than they need to be, not because anyone decided that, but because nobody looked. I have reordered fields in C code and watched a struct drop by a third.
+
+The honest cost of the Rust default is real, though. Two structs with the same fields are not guaranteed to have the same layout, which I measured in [Shape Without Behavior](/blog/shape-without-behavior-two-structs-with-the-same-fields). The layout can change between compiler versions. And when I do need the C layout, I must remember to ask, and then I pay the padding, which is why `repr(C)` on a hot internal type is a mistake I have made more than once.
+
+## What the processor actually sees
+
+There is no struct at the machine level. There is an address, and the compiler adds a number to it. Reading `m.c` when `c` sits at offset 4 is a load from the address of `m` plus 4. The offset is baked into the instruction, and the name `c` is gone, exactly like every other part of a type in this series.
+
+This is why layout is the one part that has to be decided. The compiler cannot postpone it, cannot erase it, and cannot ask at runtime. It must pick a number for every field before it can emit a single load, and once it has picked, that number is what the program is.
+
+## The model I take from this
+
+1. Alignment, not size, is what forces padding. A field must start at an address that divides by its alignment, and the struct's size must be a multiple of its own alignment so that arrays work.
+2. Rust reorders fields by default and usually finds the smallest layout. C keeps declaration order and leaves the saving to the programmer.
+3. `repr(C)` buys a predictable layout and pays for it in bytes. It belongs on types that cross a boundary, not on internal types.
+4. `repr(packed)` removes padding and introduces unaligned access. It is for wire formats, not for computation.
+5. Layout is the one part of a type that cannot disappear, because the compiler needs a number before it can emit a load.
+
+## What I check when a struct is hot
+
+- What does `size_of` say, and what is the sum of the field sizes? The difference is padding.
+- Is this type crossing a boundary? If not, why does it have `repr(C)`?
+- In C, are the fields ordered from the largest alignment to the smallest? That is the free version of what rustc does automatically, and it is safe to do only if nothing outside the program depends on the order.
+- How many of these fit in a 64 byte cache line, and does that number change if I split the struct in two?
+
+## Sources
+
+- [The Rust Reference: type layout](https://doc.rust-lang.org/reference/type-layout.html)
+- [The Rust Reference: the C representation](https://doc.rust-lang.org/reference/type-layout.html#the-c-representation)
+- [The Rustonomicon: repr(Rust)](https://doc.rust-lang.org/nomicon/repr-rust.html)
+- [Rust standard library: std::mem::offset_of](https://doc.rust-lang.org/std/mem/macro.offset_of.html)
+- [cppreference: C struct declaration and padding](https://en.cppreference.com/w/c/language/struct)

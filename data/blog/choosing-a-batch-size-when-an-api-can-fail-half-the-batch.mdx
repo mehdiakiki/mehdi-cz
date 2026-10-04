@@ -1,0 +1,172 @@
+---
+title: "Choosing a Batch Size When an API Can Fail Half the Batch"
+date: "2026-09-27T09:00:00+01:00"
+tags: ["api integration", "batch processing", "retries", "performance", "distributed systems"]
+draft: false
+reviewed: true
+reviewedHash: "71f36709393e601ae5cc09ddc422930ade7d465d957eeb45a177f82e934db769"
+cluster: "reliable-data-integrations"
+campaign: "authority-2026"
+opportunity: "DATA-028"
+summary: "Large API batches reduce request overhead until one bad record makes good records fail with it. A measured way to find the useful batch size and retry unit."
+---
+
+“Use the largest batch the API allows” sounds like obvious performance advice. It is correct only when the batch is also the provider's failure unit.
+
+I have worked on integrations where one invalid record rejected a complete request. A batch of 100 then meant that 99 valid records travelled again because one record was bad. The first benchmark looked fast because it measured only successful test data. Production had a different cost curve.
+
+I now choose batch size from three things together:
+
+1. fixed cost per request;
+2. probability and shape of failure;
+3. amount of work repeated after failure.
+
+The API limit is only a boundary, not the answer.
+
+## First discover the real failure contract
+
+Batch endpoints usually have one of these contracts:
+
+| Contract | A bad item does what? | Safe retry unit |
+| --- | --- | --- |
+| atomic batch | rejects every item | the batch, then a smaller split |
+| partial result | returns status per item | failed items only |
+| stop on first error | accepts an unknown prefix | only after reconciling accepted items |
+| asynchronous job | accepts a job, reports later | the job ID, not a new upload |
+| ambiguous timeout | outcome is unknown | same idempotency key or read-before-retry |
+
+I verify this with an invalid item in the first, middle, and final position. I also force a client timeout after the server receives the request. Documentation is useful, but a contract test catches what the endpoint really does.
+
+If the response does not identify each accepted and rejected item, I never infer success from HTTP status alone.
+
+## The benchmark that changed my intuition
+
+I built a deterministic model with 100,000 records. Each request has 40 ms of fixed cost and 0.4 ms per submitted item. When an invalid item rejects the complete batch, the client divides that batch in half and retries each half until it isolates the bad record.
+
+These are the useful accepted records per second from that run:
+
+| Invalid records | batch 1 | batch 10 | batch 25 | batch 50 | batch 100 |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 0% | 25 | 227 | 500 | 833 | 1,250 |
+| 0.1% | 25 | 213 | 413 | 579 | 691 |
+| 1% | 24 | 136 | 166 | 165 | 155 |
+| 5% | 24 | 57 | 53 | 50 | 48 |
+
+This is not a universal performance table. It is a demonstration of the curve. With clean data, larger batches win. At 1% invalid data, the useful optimum in this model is around 25–50, not 100. At 5%, small batches win because recursive isolation resubmits too much good work.
+
+The simple simulator is enough to reproduce the idea:
+
+```ts
+function sendWithSplit(records: Record[]): void {
+  requests += 1;
+  submittedItems += records.length;
+
+  if (providerAccepts(records)) {
+    acceptedItems += records.length;
+    return;
+  }
+
+  if (records.length === 1) {
+    quarantine(records[0]);
+    return;
+  }
+
+  const middle = Math.floor(records.length / 2);
+  sendWithSplit(records.slice(0, middle));
+  sendWithSplit(records.slice(middle));
+}
+```
+
+I seed the generated failures so every batch-size candidate sees the same records. Otherwise random variation can make one candidate look better by accident.
+
+## Model useful throughput, not request throughput
+
+The metric I care about is:
+
+```text
+useful throughput = durable valid records / wall-clock time
+```
+
+Requests per second can improve while useful throughput gets worse. Average latency can also hide the long tail created by splitting and retrying failed batches.
+
+My benchmark records:
+
+- valid records committed;
+- submitted records, including repeats;
+- provider calls and rate-limit units;
+- p50, p95, and p99 completion time per original record;
+- batches split or retried;
+- poison records isolated;
+- uncertain outcomes reconciled;
+- cost per 1,000 useful records.
+
+The ratio `submitted / committed` is especially revealing. It measures work amplification.
+
+## Validate before spending the remote request
+
+Local validation reduces failure probability cheaply. I validate required fields, size limits, encodings, known enum values, and cross-field rules before batching.
+
+But I do not pretend local validation can reproduce every provider rule. Accounts can be disabled, remote state can change, and undocumented limits exist. Provider rejections remain normal integration events with their own reason codes.
+
+I keep invalid local records in a visible quarantine flow. Silently dropping them makes throughput look excellent while losing data.
+
+## Split only the kind of failure that splitting can solve
+
+A binary split helps isolate record-specific validation failures. It is a poor response to a `429`, `503`, or network timeout. Dividing a throttled batch into more requests can amplify overload.
+
+My decision table is:
+
+```text
+item validation error  -> split or retry named failed items
+request too large      -> reduce batch size
+rate limit             -> honor retry time, reduce concurrency
+transient service error-> retry same idempotent request with backoff
+ambiguous write        -> reconcile by request key before retry
+authorization error    -> stop; configuration must change
+```
+
+Microsoft's [retry pattern guidance](https://learn.microsoft.com/en-us/azure/architecture/patterns/retry) makes the same important distinction: retry policy must match the failure, and aggressive retries can reduce system stability. The retry unit should not be larger than necessary, but it should not multiply calls during an outage either.
+
+## Partial success needs a durable item ledger
+
+When the provider returns per-item status, I store it by my stable record ID and the provider's result ID:
+
+```sql
+create table batch_item_attempt (
+  operation_id text not null,
+  item_id text not null,
+  attempt integer not null,
+  provider_request_id text,
+  outcome text not null,
+  provider_code text,
+  primary key (operation_id, item_id, attempt)
+);
+```
+
+I retry only explicit retryable failures. Unknown outcomes go through reconciliation. Permanent validation failures go to repair, not an infinite retry queue.
+
+This is also why I keep an idempotency key per logical item or operation, even if transport batches change. A retry of batch 25 may be split into batches 12 and 13. The identity of the business operation must survive that change.
+
+## Adapt slowly, within tested bounds
+
+An adaptive controller can improve throughput, but it needs guardrails. I use a small set of proven sizes, for example 10, 25, 50, and 100.
+
+Every measurement window, the controller may move one step:
+
+```text
+low rejection + low tail latency + spare quota -> one size larger
+item rejection or high tail latency             -> one size smaller
+rate limiting                                   -> reduce concurrency first
+```
+
+I add hysteresis so one bad batch does not cause constant movement. I also cap retry work with a budget. [Sharing One Provider Quota Across Many Customers](/blog/sharing-one-provider-quota-across-many-customers) explains why batch size and global concurrency must be controlled together.
+
+## My practical selection process
+
+I start below the provider maximum and run the same recorded workload through candidate sizes. The workload includes valid records, realistic invalid records, transient errors, throttling, and timeouts after acceptance.
+
+Then I choose the smallest size near the useful-throughput plateau. If 50 is only 3% faster than 25 but doubles p99 latency and failure amplification, I choose 25. A little unused theoretical throughput is often cheaper than an integration that is painful to recover.
+
+Finally, I keep the batch size configurable and monitor its real production curve. Input quality and provider behaviour change.
+
+The right batch size is not the largest number accepted by an API. It is the size that delivers useful records quickly while keeping one failure small, diagnosable, and cheap to replay.

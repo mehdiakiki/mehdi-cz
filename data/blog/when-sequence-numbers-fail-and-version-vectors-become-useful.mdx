@@ -1,0 +1,183 @@
+---
+title: "When Sequence Numbers Fail and Version Vectors Become Useful"
+date: "2026-11-01T09:00:00+01:00"
+tags: ["version vectors", "distributed systems", "conflict detection", "data synchronization", "causality"]
+draft: false
+reviewed: true
+reviewedHash: "fb23e3e27bc6e00f7d33f5edf26cd2ad44414ab49dc6b9e515f7b617262a3ead"
+cluster: "reliable-data-integrations"
+campaign: "authority-2026"
+opportunity: "DATA-055"
+summary: "One sequence number orders one authority. With independent writers, a version vector can distinguish later state from concurrent state—but conflict resolution still belongs to the data model."
+---
+
+A sequence number is excellent when one authority assigns every version:
+
+```text
+41 -> 42 -> 43
+```
+
+Version 43 is later than 42. A consumer can reject stale writes with a numeric comparison.
+
+The model fails when two replicas accept updates independently while disconnected. Both can start from 41 and call their next state 42. The number says equal; the values are different and concurrent.
+
+## A vector records knowledge by replica
+
+A version vector maps each stable replica identity to the greatest counter included in this state:
+
+```text
+{A: 2, B: 1}
+```
+
+This means the state includes A's updates through counter 2 and B's updates through counter 1.
+
+When replica A makes a local update, it increments its own component:
+
+```text
+before: {A: 2, B: 1}
+after:  {A: 3, B: 1}
+```
+
+It does not increment B because it has not observed another B update.
+
+## Compare component by component
+
+For vectors `X` and `Y`, missing components count as zero for the comparison.
+
+`X` dominates `Y` when:
+
+```text
+for every replica r: X[r] >= Y[r]
+and for at least one r: X[r] > Y[r]
+```
+
+Examples:
+
+| X | Y | Relation |
+| --- | --- | --- |
+| `{A:2, B:1}` | `{A:1, B:1}` | X dominates Y |
+| `{A:2, B:1}` | `{A:2, B:1}` | equal |
+| `{A:2, B:1}` | `{A:1, B:2}` | concurrent |
+
+In the concurrent row, X knows a newer A update and Y knows a newer B update. Neither contains the whole history of the other.
+
+This is the information one scalar sequence cannot express.
+
+## Follow an offline edit
+
+Both replicas first synchronize at:
+
+```text
+value = "draft"
+vector = {A:1, B:1}
+```
+
+A goes offline and changes the title:
+
+```text
+A value = "Launch plan"
+A vector = {A:2, B:1}
+```
+
+B independently changes the title:
+
+```text
+B value = "Release plan"
+B vector = {A:1, B:2}
+```
+
+When they reconnect, vector comparison says `concurrent`. The system has detected a real conflict rather than allowing network arrival order to choose a winner silently.
+
+Amazon's [Dynamo paper](https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf) is a primary practical reference for using vector clocks to preserve causality and expose concurrent versions in an eventually consistent store.
+
+## Merging vectors does not merge values
+
+The merged causal context takes the component-wise maximum:
+
+```text
+max({A:2, B:1}, {A:1, B:2}) = {A:2, B:2}
+```
+
+But what is the title?
+
+```text
+"Launch plan"
+or
+"Release plan"
+or both
+or a human-edited third value
+```
+
+The vector detects and tracks concurrency. It does not know the business merge policy.
+
+For a set, union may be correct. For account balance, naive last-write-wins may lose money. For a document title, human review may be acceptable. Resolution belongs to the data type and product contract.
+
+## After resolution, include both histories
+
+Suppose a user resolves the conflict to “Launch and release plan.” The new write should descend from both concurrent versions:
+
+```text
+merged context: {A:2, B:2}
+A creates resolution: {A:3, B:2}
+```
+
+Now the resolution dominates both earlier branches. A replica receiving an old branch can safely recognise it as already incorporated.
+
+If the resolution increments from only one parent, the other conflict can reappear because its history was forgotten.
+
+## Replica identity is a system decision
+
+A vector component should represent a stable writer domain, not an ephemeral process that changes after every restart. Otherwise the vector grows without bound:
+
+```text
+worker-uuid-1: 1
+worker-uuid-2: 1
+worker-uuid-3: 1
+...
+```
+
+Possible identities are a data centre, durable device, database replica, or controlled writer node. The correct choice depends on which actors can create concurrent histories.
+
+Reassigning or retiring identities requires a membership and compaction protocol. Deleting a component because its replica is currently offline can erase causality needed by a later message.
+
+## Tombstones need causal context
+
+If A deletes an object while B edits it offline, later synchronization sees concurrent delete and update.
+
+Dropping the deleted record and its vector immediately makes B's old copy look like a new live value. I retain a tombstone with its causal context until every supported replica or replay horizon has observed it, or use a stronger domain-specific deletion protocol.
+
+The product must decide whether delete wins, update wins, or the conflict requires review. The vector only proves they were concurrent.
+
+## When not to use vectors
+
+Version vectors add metadata and operational complexity. I prefer a scalar version when:
+
+- one database or leader serializes all writes;
+- offline or multi-primary writes are forbidden;
+- a central compare-and-set can reject stale updates;
+- the domain accepts a documented last-writer policy;
+- only total log order matters, not causal concurrency.
+
+I use vectors when independent writers must continue and the difference between “newer” and “concurrent” changes the correct outcome.
+
+Physical timestamps do not provide this proof. Clock skew can invert them, and two timestamps do not show whether one writer observed the other.
+
+## A test matrix
+
+I test:
+
+```text
+equal vectors with equal value
+equal vectors with different value -> corruption signal
+one vector dominates the other
+concurrent updates to mergeable fields
+concurrent updates to non-mergeable fields
+delete concurrent with update
+resolution that includes both parent contexts
+retired replica returning with old state
+duplicate delivery of one version
+```
+
+For each case, the result includes the value decision, merged causal context, and audit evidence.
+
+A sequence number answers “which version did one authority assign later?” A version vector answers “which replicas' updates does this state include?” The vector becomes useful exactly when independent progress makes one line of version numbers dishonest.

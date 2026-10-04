@@ -1,0 +1,115 @@
+---
+caseId: "RFA-063"
+title: "E0700: An `impl Iterator` Hidden Type Captures an Input Lifetime"
+date: "2026-09-05T08:35:00+01:00"
+lastmod: "2026-09-05T08:35:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "35b38e6a71d4d7bb7ac1f09c36d2947d127977f062ec094ee18b346a8979874d"
+area: "diagnostics-macros"
+symptom: "An impl Iterator return gets E0700 because its hidden iterator type captures an input lifetime not named in the return bounds."
+summary: "The iterator yields owned indices but its hidden state still contains a borrowed slice iterator. Make the capture explicit with a precise use bound and distinguish item ownership from iterator ownership."
+rustVersions: ["Rust 1.98.1"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust E0700 hidden type captures lifetime impl Iterator",
+    "impl Trait lifetime does not appear in bounds",
+    "Rust use lifetime precise capture iterator",
+  ]
+evidence: ["Rust 1.98.1 compile failure", "hidden-type expansion", "precise-capture repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/error_codes/E0700.html",
+    "https://doc.rust-lang.org/reference/types/impl-trait.html#precise-capturing",
+  ]
+---
+
+An iterator can yield owned values and still borrow its input internally. This function shows the difference under Rust 2021 edition rules:
+
+```rust
+fn indices<'a>(slice: &'a [u8]) -> impl Iterator<Item = usize> {
+    slice.iter().enumerate().map(|(index, _)| index)
+}
+```
+
+Every item is a plain `usize`, but Rust 1.98.1 emits E0700:
+
+```text
+hidden type for `impl Iterator<Item = usize>` captures lifetime that does not appear in bounds
+```
+
+The [failing fixture](/rust-failure-atlas/evidence/RFA-063/fail.rs) is compiled with edition 2021 because opaque lifetime capture rules are edition-sensitive. Recording the edition is part of the evidence, not incidental metadata.
+
+## Expand the hidden concrete type
+
+The returned value is conceptually close to:
+
+```text
+Map<Enumerate<std::slice::Iter<'a, u8>>, Closure>
+```
+
+`map` changes each yielded item from a pair containing `&u8` into an owned index. It does not materialize all results or remove the slice iterator stored inside the adapter. The returned iterator advances by reading the original slice, so the iterator value itself cannot outlive `slice`.
+
+Return-position `impl Trait` hides this adapter type from callers, but hiding a type cannot hide a safety-relevant lifetime relationship from the function signature.
+
+## State the capture precisely
+
+Rust supports a `use<...>` bound for explicit opaque-type capture:
+
+```rust
+fn indices<'a>(
+    slice: &'a [u8],
+) -> impl Iterator<Item = usize> + use<'a> {
+    slice.iter().enumerate().map(|(index, _)| index)
+}
+```
+
+The return type now says that its hidden type is allowed to capture `'a`. The caller still cannot name the adapter, but the borrow relationship is preserved. The [repaired fixture](/rust-failure-atlas/evidence/RFA-063/fixed.rs) compiles, consumes the iterator while the array remains alive, and checks the indices on Rust 1.98.1.
+
+The [Reference section on precise capturing](https://doc.rust-lang.org/reference/types/impl-trait.html#precise-capturing) defines the syntax and the allowed ordering of captured parameters.
+
+## Why `Item = usize` does not imply independence
+
+Iterator item types describe values produced by `next`. They do not describe storage kept by the iterator. Many adapters yield owned values while retaining references:
+
+- `slice.iter().copied()` yields copied elements but stores a slice iterator.
+- `text.lines().map(str::len)` yields lengths but still scans borrowed text.
+- `map.keys().cloned()` yields owned keys but reads the borrowed map lazily.
+
+To make the return independent from the input, I must eagerly collect owned results or move owned input into the iterator. Merely converting each item does not remove lazy access to the source.
+
+## `+ 'a` and `use<'a>` express related but different constraints
+
+Historically, a common repair was:
+
+```rust
+-> impl Iterator<Item = usize> + 'a
+```
+
+This says the returned hidden type outlives `'a` and also permits capturing it. For many simple functions it works. A precise `use<'a>` bound states the capture set directly and avoids adding broader outlives implications to other generic parameters captured by the hidden type.
+
+When an API has generic element types, choosing capture rather than adding an outlives bound can prevent unnecessary `T: 'a` requirements. I follow the compiler's precise-capture suggestion on modern Rust when it matches the intended relationship.
+
+## Edition changes are part of the diagnosis
+
+Rust 2024 adjusted automatic lifetime capture for return-position opaque types. Code can therefore behave differently when migrated even if the function body is identical. I record both the Rust version and edition, then compile the minimal fixture under each edition before editing several lifetime bounds.
+
+Explicit `use<...>` is valuable when I want the API contract to remain clear across those defaults. It also lets a review see which generic parameters the hidden type is intended to retain.
+
+That visibility matters in public libraries: a capture is part of what callers may keep alive, even when the adapter's concrete name stays private.
+
+## An eager alternative changes behavior
+
+This version owns its results:
+
+```rust
+fn indices(slice: &[u8]) -> Vec<usize> {
+    (0..slice.len()).collect()
+}
+```
+
+The vector can outlive the slice, but it allocates and computes every index immediately. The iterator version is lazy and allocation-free. Eager collection is correct only when that behavioral change is acceptable.
+
+The official [E0700 explanation](https://doc.rust-lang.org/error_codes/E0700.html) focuses on the hidden capture. My first check is to write the concrete adapter stack and look for a reference, even when the yielded item is owned. This normally reveals the missing relationship faster than adding lifetime bounds at random.

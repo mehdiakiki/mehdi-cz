@@ -1,0 +1,136 @@
+---
+caseId: "RFA-044"
+title: "A Rust Enum Crossed C Safely Until a New Variant Was Added"
+date: "2026-09-04T21:00:00+01:00"
+lastmod: "2026-09-07T11:25:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "3acb46bfb14f201fb4fe43518da9d0a2769150f4961090823e13fafe04eb718c"
+area: "ffi-targets"
+symptom: "A Rust enum passed through C works until a new variant is added or another compiler chooses a different representation."
+summary: "C enums can hold unknown integers while Rust enums require valid discriminants. Use an explicit integer wire type and validate before constructing a Rust domain enum."
+rustVersions: ["stable Rust"]
+targets: ["all supported FFI targets"]
+profiles: ["dev", "release"]
+searchTerms:
+  [
+    "Rust enum C FFI new variant break",
+    "repr C enum ABI Rust",
+    "Rust FFI invalid enum discriminant",
+  ]
+evidence: ["two-language ABI fixture", "size and discriminant table", "unknown-value test"]
+sources:
+  [
+    "https://doc.rust-lang.org/reference/type-layout.html#reprc-field-less-enums",
+    "https://doc.rust-lang.org/nomicon/other-reprs.html#reprc",
+  ]
+---
+
+Rust and C use the word enum for types with different validity rules. A C enum is close to an integer type plus named constants and may contain an integer without a named enumerator. A Rust fieldless enum may contain only one of its declared discriminants. Constructing another discriminant as that Rust enum is invalid.
+
+This difference makes “just add `#[repr(C)]`” an incomplete FFI design.
+
+## The fragile boundary
+
+Suppose version one exports:
+
+```rust
+#[repr(C)]
+pub enum Status {
+    Ready = 0,
+    Busy = 1,
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn consume(status: Status) {
+    match status {
+        Status::Ready => ready(),
+        Status::Busy => busy(),
+    }
+}
+```
+
+A newer C caller sends `2` for a new `Stopped` value before the Rust library adds that variant. The bits can fit in the ABI representation, but they do not form a valid Rust `Status`. The invalid value exists as soon as it enters the typed parameter; a wildcard match cannot repair that.
+
+## Use an integer at the untrusted boundary
+
+I make the foreign input a fixed-width integer and validate it:
+
+```rust
+#[repr(u32)]
+enum Status {
+    Ready = 0,
+    Busy = 1,
+}
+
+impl TryFrom<u32> for Status {
+    type Error = u32;
+
+    fn try_from(raw: u32) -> Result<Self, Self::Error> {
+        match raw {
+            0 => Ok(Self::Ready),
+            1 => Ok(Self::Busy),
+            other => Err(other),
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn consume_status(raw: u32) -> i32 {
+    match Status::try_from(raw) {
+        Ok(Status::Ready) => 0,
+        Ok(Status::Busy) => 1,
+        Err(_) => -1,
+    }
+}
+```
+
+The C header uses `uint32_t`, not a compiler-selected C enum representation. The boundary accepts every `u32`; the conversion decides which values this library version understands.
+
+The Atlas makes this a real two-language boundary. The [C producer](/rust-failure-atlas/evidence/RFA-044/fail/native/status.c) returns the newly added value `2` through a four-byte integer, and the [failing Rust consumer](/rust-failure-atlas/evidence/RFA-044/fail/src/main.rs) rejects it before constructing `Status`. The failure is therefore a controlled panic about an unsupported value, not undefined behavior from an invalid enum. The [repaired consumer](/rust-failure-atlas/evidence/RFA-044/fixed/src/main.rs) preserves `Unknown(2)`. Its build script compiles and links the C archive with the host C toolchain, while the [lockfile](/rust-failure-atlas/evidence/RFA-044/fixed/Cargo.lock) keeps the Rust side fixed.
+
+## `repr(C)` is target-dependent for fieldless enums
+
+The Rust Reference explains that a fieldless `repr(C)` enum uses the default enum size and alignment for the target C ABI. C enum representation is implementation-defined and can change with compiler flags. This is a best guess for the target, not a universal wire format.
+
+An explicit integer representation such as `repr(u32)` fixes Rust's layout, but it still does not make unknown integers valid values of the enum. It is useful for a closed boundary where both sides guarantee the exact variant set. For versioned or untrusted input, raw integer plus validation is stronger.
+
+## Adding a variant changes compatibility
+
+If Rust returns a newly added variant, an older C caller may enter a switch with no default or index a table sized for the old maximum. Even when binary width is unchanged, semantic compatibility is not.
+
+I define a forward-compatibility policy:
+
+- reject unknown input with an error;
+- preserve unknown numeric values in an `Unknown(u32)` domain wrapper;
+- negotiate protocol/API version before using new values;
+- or declare the enum closed and require lockstep deployment.
+
+The header and documentation must say which policy applies.
+
+## Data-carrying Rust enums need a specified C shape
+
+A Rust enum with payloads does not map to a plain C enum. With an explicit representation it can have a defined tagged-union layout, but both languages need matching tag, union, padding, alignment, and ownership definitions.
+
+For public FFI I often choose a hand-written `repr(C)` struct containing a fixed integer tag and a union or opaque handle. Binding generators can reduce transcription mistakes, but they do not choose the versioning policy.
+
+## The first discriminating test
+
+I compile a C fixture with the production compiler flags and compare:
+
+- size and alignment of the boundary type;
+- numeric values for every known constant;
+- calling convention and parameter width;
+- behavior for `0`, each known value, the next unknown value, and the maximum integer.
+
+Sending an unknown value is essential. A test containing only existing variants cannot reveal the Rust validity mismatch.
+
+## False repairs
+
+Adding `_ =>` to a match over a Rust enum does not make an invalid discriminant legal. Transmuting the incoming integer has the same problem. `repr(C)` addresses representation, not open-ended validity. Matching C's current `sizeof(enum)` on one compiler is not a cross-target guarantee.
+
+## The regression proof
+
+The boundary test is built from both Rust and C and runs for every supported target ABI. It asserts fixed integer widths and preserves the unknown-value behavior. When a variant is added, old-consumer and new-consumer fixtures run together.
+
+The safe design validates foreign bits before they become a Rust enum. That one boundary keeps Rust's exhaustiveness guarantee without pretending the foreign world has the same closed set.

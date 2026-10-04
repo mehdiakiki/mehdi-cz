@@ -1,0 +1,227 @@
+---
+title: "Validate Model-Generated Tool Arguments at the Boundary"
+date: "2026-09-28T17:00:00+01:00"
+tags: ["ai agents", "tool calling", "validation", "security", "software engineering"]
+draft: false
+reviewed: true
+reviewedHash: "44560bc93bf09615fcdcbed665ab77666b755b735d1ba7c38028cc69f64022ee"
+cluster: "reliable-ai-systems"
+campaign: "authority-2026"
+opportunity: "AI-017"
+summary: "Structured model output is not trusted application input. Validate syntax, semantics, authorization, and effect policy again at the tool execution boundary."
+---
+
+A model produces a tool call that matches the JSON schema. The application executes it. This can still be a serious bug.
+
+Schema-valid arguments may name a customer the user cannot access. A quantity can fit the integer type and exceed the business limit. A path can be a string and escape its allowed directory. A retry can repeat a valid payment.
+
+I treat model-generated arguments like input from an untrusted client. The model may help choose an action, but the tool boundary owns whether that action is valid now.
+
+## Structured output solves only one layer
+
+Strong schema generation is valuable. It reduces malformed JSON, missing properties, and wrong primitive types. It does not prove business meaning or authority.
+
+I separate six gates:
+
+```text
+parse -> structural schema -> semantic rules -> resolve resources
+      -> authorize resolved resources -> effect and concurrency policy
+```
+
+Only after these gates can execution begin.
+
+The [OpenAI tool API](https://platform.openai.com/docs/api-reference/responses-streaming/response/custom_tool_call_input/delta) can enforce strict parameter schemas. I still validate in the executor because models, providers, stored calls, and application versions can differ. More importantly, JSON Schema cannot know the authenticated user's current permissions or the current state of a business object.
+
+## Gate one: parse into data, never executable text
+
+I do not ask a model to produce shell commands, SQL fragments, URLs to fetch freely, or code that is passed to `eval`.
+
+A tool call is a named operation with data arguments:
+
+```json
+{
+  "tool": "schedule_export",
+  "arguments": {
+    "account_ref": "acct_42",
+    "format": "csv",
+    "columns": ["id", "status"]
+  }
+}
+```
+
+The executor owns the SQL, filesystem operation, HTTP destination, and credentials. The model never assembles them as executable strings.
+
+OWASP describes insufficient handling of model output as an [improper output handling](https://genai.owasp.org/llmrisk/llm052025-improper-output-handling/) risk. The useful principle is simple: model output crosses a trust boundary before it reaches a backend function.
+
+## Gate two: close the structural schema
+
+I require every important property and reject unknown ones. In JSON Schema, merely listing `properties` does not make them required and does not reject extra keys.
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "account_ref": {
+      "type": "string",
+      "pattern": "^acct_[a-zA-Z0-9]+$"
+    },
+    "format": {
+      "enum": ["csv", "jsonl"]
+    },
+    "columns": {
+      "type": "array",
+      "items": { "enum": ["id", "status", "created_at"] },
+      "minItems": 1,
+      "maxItems": 3,
+      "uniqueItems": true
+    }
+  },
+  "required": ["account_ref", "format", "columns"],
+  "additionalProperties": false
+}
+```
+
+The [JSON Schema object reference](https://json-schema.org/understanding-json-schema/reference/object) documents these behaviours. Closing the schema also catches arguments from an older tool version instead of ignoring them silently.
+
+I version the tool contract. A stored call created for version 2 must not execute accidentally against version 3.
+
+## Gate three: apply semantic invariants
+
+Some invalid states fit the schema:
+
+```text
+start_at is after end_at
+currency does not match the account
+the export includes a forbidden field combination
+the requested quantity exceeds a tenant limit
+the operation is not allowed in the current status
+```
+
+These rules live in normal application code and share the same domain functions used by non-AI callers.
+
+```ts
+function validateExport(command: ExportCommand, account: Account): Violation[] {
+  const violations: Violation[] = [];
+
+  if (!account.exportsEnabled) violations.push({ code: "EXPORTS_DISABLED" });
+  if (command.columns.includes("email") && !account.piiExportEnabled) {
+    violations.push({ code: "PII_EXPORT_DISABLED" });
+  }
+  if (command.estimatedRows > account.exportRowLimit) {
+    violations.push({ code: "ROW_LIMIT_EXCEEDED" });
+  }
+
+  return violations;
+}
+```
+
+The model can be told about these constraints to improve its choice. Enforcement remains server-side.
+
+## Resolve first, then authorize the real object
+
+The model may provide a friendly reference such as a project name. Authorization must use the resolved canonical resource, not the text.
+
+```text
+model says: "Northwind"
+resolver finds: tenant_b/project_17
+authenticated user belongs to: tenant_a
+result: deny
+```
+
+I pass authenticated identity and tenant context outside model-controlled arguments:
+
+```ts
+type ToolContext = {
+  actorId: string;
+  tenantId: string;
+  grantedScopes: string[];
+  requestId: string;
+};
+
+async function executeExport(raw: unknown, context: ToolContext) {
+  const command = exportSchema.parse(raw);
+  const account = await accounts.resolveWithinTenant(
+    context.tenantId,
+    command.account_ref
+  );
+  await policy.require(context.actorId, "export:create", account);
+  // semantic and effect checks continue here
+}
+```
+
+There is no `tenantId` field for the model to override. [Carry User Authorization Through Every AI Tool Call](/blog/carry-user-authorization-through-every-ai-tool-call) covers this boundary in more depth.
+
+## Effect policy is stricter than argument validity
+
+A valid and authorized operation may still require confirmation. I classify tools by effect:
+
+| Effect | Example | Boundary policy |
+| --- | --- | --- |
+| read-only, low sensitivity | list public templates | execute with limits |
+| sensitive read | export customer data | explicit scope and audit |
+| reversible write | create a draft | show result and undo path |
+| external communication | send an email | preview and confirmation |
+| financial or irreversible | charge, delete, publish | strong confirmation and idempotency |
+
+The policy evaluates resolved target, estimated cost, data sensitivity, and reversibility. It does not trust the model's description that an action is “safe.”
+
+## Re-check state at execution time
+
+Validation and confirmation can become stale. A record may change between preview and execution.
+
+I include an expected version in the confirmed command:
+
+```json
+{
+  "resource_id": "invoice_42",
+  "expected_version": 7,
+  "operation": "send"
+}
+```
+
+The write uses a compare-and-set. If the current version is 8, execution stops and produces a new preview. This closes the time-of-check/time-of-use gap.
+
+Every mutating call also has an idempotency key derived from the logical approved action, not generated again for each retry.
+
+## Invalid arguments return a bounded error
+
+When validation fails, I do not dump stack traces, database errors, or hidden policy details back into the model context.
+
+I return a small typed result:
+
+```json
+{
+  "status": "rejected",
+  "code": "ROW_LIMIT_EXCEEDED",
+  "safe_message": "Choose a narrower date range before creating this export.",
+  "retryable": false
+}
+```
+
+The system can ask the user for a narrower range or let the model propose one. It cannot retry the identical invalid call indefinitely.
+
+## My validation harness
+
+For each tool, I test more than happy JSON:
+
+| Case | Expected result |
+| --- | --- |
+| missing required field | schema rejection |
+| extra field resembling an instruction | schema rejection |
+| valid type, invalid business combination | semantic rejection |
+| valid resource owned by another tenant | authorization rejection |
+| permitted resource changed after preview | version conflict |
+| same confirmed write delivered twice | one durable effect |
+| malicious URL or path | allowlist rejection |
+| dependency timeout after effect | reconcile, do not invent a new action |
+| old tool contract replayed | version rejection or explicit migration |
+
+I assert that no rejected case reaches the side-effect adapter. This is more important than asserting only the returned error text.
+
+## The ownership rule
+
+The model can propose. The boundary parses, validates, resolves, authorizes, confirms, and commits.
+
+This design is not a lack of confidence in AI. It is the same engineering discipline I use for public APIs and message consumers. Typed model output makes the normal path cleaner; independent enforcement makes the abnormal path safe.
+
+If a tool call can spend money, expose data, or change external state, schema-valid is where validation begins—not where it ends.

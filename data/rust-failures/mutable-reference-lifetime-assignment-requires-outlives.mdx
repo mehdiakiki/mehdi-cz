@@ -1,0 +1,92 @@
+---
+caseId: "RFA-120"
+title: "Why Assigning Through &mut Requires the New Reference to Live Longer"
+date: "2026-09-05T10:20:00+01:00"
+lastmod: "2026-09-05T10:20:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "5542a54b2f657c00958947aa4d5a0d7cb610fc4098b9ba3008708f878b5ee3d0"
+area: "diagnostics-macros"
+symptom: "Assigning an incoming string reference into a mutable slot fails because the incoming lifetime is not proven to outlive the lifetime stored by the slot."
+summary: "A &mut to a reference can replace the stored reference, so Rust must prove the replacement satisfies the slot's full lifetime. Add the real outlives relation or change the ownership model; do not shorten by wishful annotation."
+rustVersions: ["Rust 1.98.1"]
+targets: ["all targets"]
+profiles: ["check", "dev", "release", "test"]
+searchTerms: ["Rust assignment requires lifetime must outlive mutable reference", "replace reference through &mut lifetime", "lifetime may not live long enough incoming stored"]
+evidence: ["Rust 1.98.1 lifetime compile failure", "mutable reference replacement model", "same-lifetime repair"]
+sources: ["https://doc.rust-lang.org/reference/subtyping.html#variance", "https://doc.rust-lang.org/nomicon/subtyping.html"]
+---
+
+The [failing program](/rust-failure-atlas/evidence/RFA-120/fail.rs) receives a mutable slot holding `&'stored str` and tries to put an `&'incoming str` into it. rustc says the incoming lifetime must outlive the stored lifetime.
+
+This is not caused by reading the slot. The function can replace what future callers will read, so the replacement must keep the slot's declared promise.
+
+## A slot has a lifetime contract
+
+Consider this signature:
+
+```rust
+fn replace<'stored, 'incoming>(
+    slot: &mut &'stored str,
+    incoming: &'incoming str,
+) {
+    *slot = incoming;
+}
+```
+
+After the assignment, `slot` contains `incoming` but its type still promises `&'stored str`. Therefore `'incoming` must outlive `'stored`.
+
+The compiler suggests the bound `'incoming: 'stored`. This reads “incoming outlives stored.” Using one shared lifetime, as the [repaired program](/rust-failure-atlas/evidence/RFA-120/fixed.rs) does, is a stricter but simple form when both strings really belong to the same surrounding scope.
+
+## &mut prevents unsafe lifetime substitution
+
+The [Rust Reference variance section](https://doc.rust-lang.org/reference/subtyping.html#variance) lists mutable references as covariant over their own borrow lifetime but invariant over the value type they contain. Here the contained type is itself `&'stored str`, so casually substituting another inner lifetime through `&mut` would be unsafe.
+
+Why? If a function could accept a short reference as though it were a long stored reference, the caller could later use the slot after the short referent had been dropped.
+
+The failing fixture demonstrates this shape: a long-lived slot exists outside an inner block, and the attempted replacement points into a `String` destroyed at that block's end. Rust stops the dangling reference before it exists.
+
+The [Nomicon subtyping chapter](https://doc.rust-lang.org/nomicon/subtyping.html) gives the deeper variance model and examples around mutable references.
+
+## Adding a bound is a claim, not a repair spell
+
+If the actual caller can prove `'incoming: 'stored`, adding that bound documents the correct relationship. In the fixture's inner-block call, it cannot prove it, so the caller still fails. This is desirable.
+
+Lifetime annotations do not extend how long a value lives. They relate already existing regions. Writing `'static` on the desired type cannot make a local `String` permanent.
+
+I choose among real ownership changes:
+
+- require the incoming borrow to last for the slot's use;
+- store an owned `String` instead of a borrowed `str`;
+- copy into storage owned by the containing object;
+- shorten the slot's entire lifetime and all later uses;
+- perform work with the incoming reference without storing it.
+
+Each option changes a real lifecycle.
+
+## APIs that replace borrowed values deserve care
+
+A setter like `set_name(&mut self, name: &str)` cannot store `name` in `self` unless the type carries an appropriate lifetime tied to the caller. This often surprises when a method begins by only inspecting input and later starts caching it.
+
+For long-lived service state, owning strings is usually simpler. Borrowed fields work well when the containing value is a view into a stable input buffer with a clear shared lifetime.
+
+I avoid making every type generic over a lifetime to save one allocation. The added coupling can spread through traits, collections, async tasks, and public APIs.
+
+## Reborrowing does not change the referent lifetime
+
+Rust can create shorter reborrows of references for calls. That shortens how long a particular borrow is active, not how long the underlying referenced data remains valid.
+
+The outer `&mut` borrow of the slot may be brief, while the inner reference stored in the slot promises a much longer `'stored`. These two lifetimes are distinct. Error messages become clearer when I name them `slot_borrow`, `stored`, and `incoming` on paper, even though source syntax may elide one.
+
+## My debugging sequence
+
+When an assignment says one lifetime must outlive another, I do this:
+
+1. Identify the place being mutated and the exact type it promises after the call.
+2. Name the outer mutable-borrow lifetime separately from the inner stored-reference lifetime.
+3. Follow the incoming referent to its destruction point.
+4. Add an outlives bound only if the caller can truthfully satisfy it.
+5. Prefer owned storage when the receiver must outlive arbitrary inputs.
+6. Keep a regression example where the too-short inner value is rejected.
+
+The compiler is protecting the future reader of the slot. Because `&mut` permits replacement, it must require the replacement to honor the same lifetime. Once I reason from that post-call promise, the diagnostic stops looking abstract.

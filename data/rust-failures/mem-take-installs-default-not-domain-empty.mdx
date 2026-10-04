@@ -1,0 +1,84 @@
+---
+caseId: "RFA-350"
+title: "mem::take Installs Default, Not a Domain-Empty Value"
+date: "2026-09-06T02:10:00+01:00"
+lastmod: "2026-09-06T02:10:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "ed469117d6e82686230a4d3966ad85d143a5788fc521942581f4af0e6003537e"
+area: "concurrency-memory"
+symptom: "After mem::take returns the previous value, the destination contains a valid custom default state rather than the domain-empty state the caller expected."
+summary: "mem::take is a concise replacement with T::default(), but Rust does not define Default as empty, zero, inactive, or neutral. When the replacement has business meaning, mem::replace makes it explicit."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust mem take uses Default", "mem take value not empty", "mem take vs mem replace Rust"]
+evidence: ["Rust 1.98.1 custom Default implementation", "ready value replaced by warming", "explicit empty value installed with mem::replace"]
+sources: ["https://doc.rust-lang.org/std/mem/fn.take.html", "https://doc.rust-lang.org/std/mem/fn.replace.html", "https://doc.rust-lang.org/std/default/trait.Default.html"]
+---
+
+I like [`mem::take`](https://doc.rust-lang.org/std/mem/fn.take.html) because it solves a common ownership problem with one small expression. I can move a field out through a mutable reference and leave another valid value behind. The mistake begins when I read “default” as “empty.” Rust never makes that promise.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-350/fail.rs) takes a session whose state is `ready`. It correctly receives that old session, but the value left behind is `warming`, because this is what its `Default` implementation returns. The assertion expects `empty` and exposes the hidden domain assumption.
+
+## What mem::take actually performs
+
+The contract is simple: `mem::take(&mut destination)` replaces the destination with `T::default()` and returns the previous value. This is conceptually the same operation as:
+
+```rust
+mem::replace(destination, T::default())
+```
+
+There is no extra rule for collection-like or zero-like values. The meaning comes entirely from the implementation of [`Default`](https://doc.rust-lang.org/std/default/trait.Default.html) for that type.
+
+For `Vec<T>`, `String`, and `Option<T>`, the defaults happen to be empty or absent. Familiarity with these types can train an unsafe intuition. A custom type can validly default to `Pending`, a retry count of three, a standard network port, or a non-empty configuration.
+
+## Valid is not the same as neutral
+
+`Default` is normally a convenient, sensible value when context does not provide one. It does not have an algebraic contract. It need not be an identity element, and applying an operation to it need not leave another value unchanged.
+
+This matters when the destination remains visible after `take`. Other code can observe it before I install the next state. If `warming` means that initialization is in progress, replacing `ready` with `warming` can trigger behavior that an “empty slot” was never supposed to trigger.
+
+The type remains valid in Rust's memory-safety sense. The application invariant may still be wrong.
+
+## Why this appears around ownership boundaries
+
+I often reach for `take` inside state machines, builders, parsers, and `Drop` implementations. A direct move such as `let value = self.field` is rejected through `&mut self`, because it would leave the field uninitialized. `take` solves that by performing the replacement and move as one safe operation.
+
+The compiler checks that a value remains present. It cannot decide which replacement state my protocol needs. That decision belongs to the domain model.
+
+In a parser, a default buffer may be empty and exactly right. In a connection state machine, a derived or hand-written default can mean `Disconnected`, `Connecting`, or merely “use normal settings.” These have different consequences.
+
+## Use replace when the new state is part of the story
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-350/fixed.rs) demonstrates both choices. It first accepts the actual `take` contract and checks for `warming`. It then uses [`mem::replace`](https://doc.rust-lang.org/std/mem/fn.replace.html) to install `Session { state: "empty" }` explicitly.
+
+I use `take` when the default value is genuinely the postcondition I want. I use `replace` when the replacement has a name in the business flow. The second form costs a few more characters but lets a reviewer see the transition without opening the `Default` implementation.
+
+For enum state machines, I prefer a named variant such as `State::Transitioning` over a vaguely meaningful default. That also makes unexpected re-entrancy easier to diagnose.
+
+## Deriving Default does not strengthen the meaning
+
+Derived `Default` follows defaults of fields, or a chosen `#[default]` enum variant. It is still only a construction policy. Changing a field default can therefore change what `mem::take` leaves behind, even if no call site changes.
+
+This can become an upgrade trap in a large codebase. A maintainer changes the default retry policy for ordinary construction, while a distant state transition was relying on the old default as a sentinel.
+
+When `take` participates in a protocol, I test its post-state or replace it with an explicit value. I do not depend on the current implementation by accident.
+
+## Panic behavior also belongs to the contract
+
+To call `take`, Rust must evaluate `T::default()`. A custom `Default` implementation can allocate or run arbitrary safe code, and it can panic. It is bad style for a default to be surprising, but the trait does not make construction infallible at the process level.
+
+I avoid using a complicated default as an invisible step during delicate recovery. If constructing the replacement can fail through a domain error, `Default` cannot express that error anyway; a fallible constructor and an explicit state transition are clearer.
+
+## Tests should use a non-empty custom default
+
+A test with `String` proves almost nothing about this boundary because its default matches the common empty assumption. I use a tiny custom type whose default is deliberately recognizable. The fixture's `warming` state makes the result impossible to confuse with the old `ready` value or the imagined `empty` value.
+
+For real state holders, I test three facts separately: the returned value is the previous one, the destination is immediately valid, and the replacement state is the one required by the protocol. This catches changes in `Default` as well as mistakes at the call site.
+
+## The core principle is to make semantic replacement visible
+
+Rust's ownership rules require a valid replacement before a value can move out of a borrowed place. `mem::take` selects `Default` as that replacement. It does not certify that the result means empty, cleared, reset, or safe for the next application step.
+
+I now treat `take` as an exact phrase: “move the old value out and install this type's default.” If I would describe the transition with any other word, I write the replacement explicitly.

@@ -1,0 +1,126 @@
+---
+caseId: "RFA-045"
+title: "What Happens When a Rust Panic Reaches an extern Boundary"
+date: "2026-09-04T21:00:00+01:00"
+lastmod: "2026-09-07T10:45:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "ab367926c1efcc9d66b5b4b1bc1f4a79a6d28082926d39b0b1847d23fd358c58"
+area: "ffi-targets"
+symptom: "A panic reaches an extern boundary and the process aborts or enters behavior the caller cannot safely recover from."
+summary: "Whether unwinding may cross FFI depends on the ABI and panic strategy. Contain ordinary Rust panics at non-unwinding boundaries and return an explicit error."
+rustVersions: ["stable Rust"]
+targets: ["all FFI targets; native unwinding remains target-dependent"]
+profiles: ["panic=unwind", "panic=abort"]
+searchTerms:
+  ["Rust panic across extern C boundary", "panic in FFI callback abort", "catch_unwind Rust C ABI"]
+evidence: ["ABI and panic matrix", "forced-panic fixture", "explicit error-channel repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/reference/items/functions.html#unwinding",
+    "https://doc.rust-lang.org/std/panic/fn.catch_unwind.html",
+  ]
+---
+
+An FFI boundary needs an unwinding policy as well as a calling convention. Rust distinguishes non-unwinding ABIs such as `"C"` from unwinding ABIs such as `"C-unwind"`. The build's panic strategy also matters.
+
+For `panic=unwind`, a Rust panic reaching a non-unwinding ABI boundary causes the process to abort. With `panic=abort`, the panic aborts without unwinding regardless of an `-unwind` ABI.
+
+This is safer than letting an ordinary Rust panic silently unwind through C frames which did not agree to it, but it may surprise a library caller expecting an error code.
+
+## Reproduce the boundary deliberately
+
+I create a small exported function:
+
+```rust
+#[unsafe(no_mangle)]
+pub extern "C" fn parse_record(data: *const u8, len: usize) -> i32 {
+    assert!(!data.is_null());
+    parse(unsafe { std::slice::from_raw_parts(data, len) });
+    0
+}
+```
+
+A null pointer triggers a panic before the unsafe slice call, but because the function uses non-unwinding `extern "C"`, the process can abort. The caller never receives `-1`.
+
+I test this in a child process. An abort terminates the process and cannot be asserted inside the same test runner as a normal returned error.
+
+The [failing child program](/rust-failure-atlas/evidence/RFA-045/fail.rs) forces that abort and must report that a function which cannot unwind received a panic. The [repaired child program](/rust-failure-atlas/evidence/RFA-045/fixed.rs) catches the unwind before the `extern "C"` function returns and converts it to status `2`. The fixture is pinned to `panic=unwind`; it does not claim that `catch_unwind` can repair a `panic=abort` build.
+
+The first check records ABI, Cargo `panic` profile setting, and whether the failure is a Rust panic or a foreign exception. These cases have different rules.
+
+## Convert panic into an explicit boundary result
+
+For a C API which must not abort on recoverable Rust panics, I catch ordinary unwind panics inside the Rust frame:
+
+```rust
+use std::panic::{catch_unwind, AssertUnwindSafe};
+
+#[unsafe(no_mangle)]
+pub extern "C" fn parse_record(data: *const u8, len: usize) -> i32 {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        if data.is_null() {
+            return Err(ParseError::Null);
+        }
+
+        let bytes = unsafe { std::slice::from_raw_parts(data, len) };
+        parse(bytes)
+    }));
+
+    match result {
+        Ok(Ok(())) => 0,
+        Ok(Err(_)) => 1,
+        Err(_) => 2,
+    }
+}
+```
+
+`AssertUnwindSafe` is a promise that captured state remains safe to use after an unwind. I do not add it automatically. A better boundary often owns or validates state so the closure is naturally unwind-safe.
+
+`catch_unwind` catches unwinding Rust panics. It cannot catch a build configured with `panic=abort`. It is also not a general mechanism for catching foreign exceptions.
+
+## Do not let panic be normal error handling
+
+Parsing invalid input should normally return `Result` before it reaches the exported function. The catch is containment for programming errors or unexpected panics, not the primary validation strategy.
+
+The foreign error channel can be:
+
+- an integer status with out parameters;
+- a nullable opaque handle plus a separate error function;
+- a caller-provided error buffer;
+- or a versioned result struct with fixed-width fields.
+
+I document whether thread-local error state is used and who owns any returned message.
+
+## `C-unwind` is an explicit different contract
+
+`extern "C-unwind"` permits supported unwinding to cross that ABI boundary. It can be appropriate when Rust and a native caller deliberately participate in one target's unwinding system.
+
+It is not a portable way to turn Rust panics into C errors. The foreign frames must support unwinding, every declaration must agree on the ABI, and Rust's documentation describes restrictions around foreign exceptions and panic payloads.
+
+If C++ is involved, I decide whether the boundary translates exceptions on the C++ side or permits a documented unwind path. Plain C compiled without exception support should normally use a non-unwinding boundary with errors translated before return.
+
+## Callbacks are the same boundary in reverse
+
+A foreign library may call a Rust callback. If that callback panics, it is still an extern boundary:
+
+```rust
+pub extern "C" fn visitor(context: *mut Context, value: i32) -> i32 {
+    // Catch or avoid panics here too.
+    0
+}
+```
+
+Iterator adapters, indexing, user closures, and lock poisoning can all panic below a callback. I contain the whole Rust call tree which is allowed to unwind, not only the obvious line.
+
+## Destructors and partially changed state
+
+With unwinding, Rust destructors normally run until the catch point. This provides memory cleanup, not application rollback. A callback may already have modified foreign state before panicking.
+
+I make boundary operations commit in small stages and return explicit failure before publishing partial changes. When rollback is required, it is designed as part of the protocol.
+
+## The regression proof
+
+My two-language fixture tests success, expected Rust error, forced Rust panic, null and malformed input, and the configured panic strategy. Abort cases run in child processes. Callback tests force a panic below the callback wrapper.
+
+The exported API should produce one documented result for every case. No Rust panic crosses a boundary accidentally, and choosing `C-unwind` happens only with an end-to-end native unwinding contract.

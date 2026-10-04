@@ -1,0 +1,78 @@
+---
+caseId: "RFA-237"
+title: "An IPv4-Mapped Loopback Is Not Ipv6Addr::is_loopback"
+date: "2026-09-06T00:17:00+01:00"
+lastmod: "2026-09-06T00:17:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "c2af555042d8c7a40d0b821e5a6eb5379f691d06ea043e738dc2d61f9f93f838"
+area: "ffi-targets"
+symptom: "The mapped address ::ffff:127.0.0.1 returns false from Ipv6Addr::is_loopback even though its embedded IPv4 address is loopback."
+summary: "Ipv6Addr::is_loopback recognizes the IPv6 loopback ::1, not semantic properties of embedded IPv4 addresses. Canonicalize mapped addresses before applying cross-family allowlists and identity rules."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust IPv4 mapped IPv6 loopback false", "ffff 127.0.0.1 is_loopback Rust", "canonicalize IpAddr mapped address"]
+evidence: ["Rust 1.98.1 mapped localhost", "family-specific loopback predicate", "to_canonical repair"]
+sources: ["https://doc.rust-lang.org/std/net/struct.Ipv6Addr.html#method.is_loopback", "https://doc.rust-lang.org/std/net/struct.Ipv6Addr.html#method.to_ipv4_mapped", "https://doc.rust-lang.org/std/net/struct.Ipv6Addr.html#method.to_canonical"]
+---
+
+I wrote an allowlist that accepted loopback addresses and rejected external ones. A connection represented as `::ffff:127.0.0.1` failed the IPv6 loopback check even though the embedded IPv4 address was localhost.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-237/fail.rs) constructs this address through `Ipv4Addr::LOCALHOST.to_ipv6_mapped()`. Calling `Ipv6Addr::is_loopback` returns false.
+
+## The IPv6 loopback address is specifically `::1`
+
+[`Ipv6Addr::is_loopback`](https://doc.rust-lang.org/std/net/struct.Ipv6Addr.html#method.is_loopback) asks whether an address is the IPv6 loopback address. Only `::1` satisfies that definition.
+
+An IPv4-mapped address uses an IPv6 representation containing an IPv4 address. `::ffff:127.0.0.1` represents IPv4 loopback for transition and socket APIs, but it is not itself the IPv6 loopback address.
+
+The distinction is intentional and documented. Family-specific predicates do not recursively interpret every embedded address property.
+
+## Canonicalization belongs before policy
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-237/fixed.rs) uses [`to_ipv4_mapped`](https://doc.rust-lang.org/std/net/struct.Ipv6Addr.html#method.to_ipv4_mapped) to expose the embedded `Ipv4Addr`, and [`to_canonical`](https://doc.rust-lang.org/std/net/struct.Ipv6Addr.html#method.to_canonical) to obtain `IpAddr::V4` for mapped values. The canonical address then passes the ordinary loopback predicate.
+
+For access control, rate limiting, and identity grouping, I normalize the supported representations before applying policy. Otherwise one endpoint can appear under both an IPv4 key and a mapped IPv6 key.
+
+I preserve the original address separately when diagnostics or wire fidelity needs it. Canonical identity and observed representation are useful for different jobs.
+
+## Not every embedded-looking address should be converted
+
+Rust offers `to_ipv4` and the narrower `to_ipv4_mapped`. The broader method also recognizes deprecated IPv4-compatible forms and maps `::1` to `0.0.0.1`, which is not IPv4 loopback.
+
+For a policy specifically about IPv4-mapped addresses, I use `to_ipv4_mapped` or `to_canonical`. This avoids converting native IPv6 loopback into a surprising IPv4 value.
+
+Method names that both contain “to IPv4” still encode different accepted input sets. My regression includes `::1` to keep the chosen boundary visible.
+
+## String normalization is not address canonicalization
+
+IPv6 text permits several spellings through zero compression and hexadecimal formatting. Parsing into `IpAddr` already removes textual spelling differences. It does not merge IPv4 and IPv4-mapped IPv6 variants automatically in every operation.
+
+Lowercasing strings or comparing formatted addresses is not a reliable policy. I parse once, canonicalize according to the protocol, and use the structured address as the key.
+
+Ports are another identity dimension. A socket address allowlist may care only about IP; a connection pool normally cares about IP plus port. I name which one is canonicalized.
+
+## Proxy boundaries change which address is trustworthy
+
+Canonicalizing an address does not prove it identifies the original client. Behind a trusted proxy, the socket peer is the proxy and forwarded headers require a separate trust model. Accepting arbitrary forwarded addresses lets external callers claim loopback.
+
+I first establish which hop supplied the address, then parse and canonicalize it. A mathematically correct loopback classification applied to attacker-controlled text is still an authorization bug.
+
+Dual-stack listeners also vary by operating system and socket configuration, so I test the representations actually emitted on supported deployments.
+
+## Canonicalization must happen consistently
+
+Normalizing only at authorization time but not in rate-limit or session keys leaves two identities for the same peer. An attacker may pass one check under a mapped form and consume another quota under IPv4 form. Logs then split one actor across two labels.
+
+I put canonicalization in a small boundary type used by every downstream policy. The type can retain the observed address for auditing while exposing one canonical key. Database migrations and cache keys need the same rule; changing it later can merge records that were previously distinct.
+
+The canonical form is not automatically the best display form. I usually show what the socket reported and attach the normalized identity as structured metadata, which keeps debugging honest without weakening comparisons.
+
+## My regression uses both families
+
+The fixture asserts that mapped localhost is not native IPv6 loopback, converts it to `127.0.0.1`, and proves that the canonical `IpAddr` is loopback. It also proves native `::1` remains loopback.
+
+Application tests include ordinary IPv4, mapped IPv4, native IPv6, unspecified addresses, private ranges, and proxy-derived input. For allowlists I test equivalent representations against the same decision, while keeping unsupported compatibility forms explicit.
+
+The core principle is that representation families shape predicate meaning. `Ipv6Addr::is_loopback` correctly answers an IPv6-specific question. Cross-family security policy must canonicalize accepted embeddings first, retain provenance, and only then decide whether the resulting endpoint belongs to a trusted class.

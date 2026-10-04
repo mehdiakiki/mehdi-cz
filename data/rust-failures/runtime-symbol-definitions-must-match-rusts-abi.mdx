@@ -1,0 +1,96 @@
+---
+caseId: "RFA-707"
+title: "A Rust Runtime Symbol Is More Than an Exported Name"
+date: "2026-09-07T10:08:00+01:00"
+lastmod: "2026-09-07T10:08:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "8a8f242e180ed8529d305f5cf7c3e62d0d04671e55a776fd72a56c22a0e174e4"
+area: "ffi-targets"
+symptom: "A no_mangle function named memset is rejected even though the Rust function itself is syntactically valid and has an extern C ABI."
+summary: "Names such as memset are runtime contracts that rustc-generated code may call with fixed signatures and semantics. Rust 1.98 rejects incompatible definitions before a linker collision becomes a runtime failure."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["targets using compiler runtime symbols"]
+profiles: ["dev", "release"]
+searchTerms: ["Rust invalid_runtime_symbol_definitions memset", "invalid definition runtime memset symbol Rust", "no_mangle memset wrong signature rustc lint"]
+evidence: ["Rust 1.98.1 deny-by-default runtime-symbol lint", "zero-argument memset export conflicts with required ABI", "application-specific symbol name compiles without collision"]
+sources: ["https://doc.rust-lang.org/releases.html#version-1980-2026-08-20", "https://doc.rust-lang.org/rustc/lints/listing/deny-by-default.html#invalid-runtime-symbol-definitions", "https://doc.rust-lang.org/reference/abi.html"]
+---
+
+An exported symbol is not only a string placed in an object file. Sometimes the name belongs to a runtime contract which the compiler itself may use.
+
+This tiny function demonstrates the boundary:
+
+```rust
+#[unsafe(no_mangle)]
+pub extern "C" fn memset() {}
+```
+
+There is nothing mysterious in the Rust body. It accepts no values and returns unit. The problem is that the final exported name is exactly `memset`. Rust-generated code and the standard library can refer to that runtime primitive as if it had this shape:
+
+```text
+unsafe extern "C" fn(*mut c_void, i32, usize) -> *mut c_void
+```
+
+My definition has a different ABI. If a generated call resolves to it, arguments and the return value are interpreted under incompatible contracts. Rust 1.98's deny-by-default `invalid_runtime_symbol_definitions` lint stops this at compilation.
+
+The [failing reduction](/rust-failure-atlas/evidence/RFA-707/fail.rs) records the complete diagnostic and expected signature. The [repair](/rust-failure-atlas/evidence/RFA-707/fixed.rs) gives an ordinary application export an application-specific name instead.
+
+## Why `no_mangle` changes the risk
+
+Rust normally mangles function symbols. The source name participates in a longer encoded identity, so a Rust function called `memset` is not automatically the global runtime symbol named `memset`.
+
+`#[unsafe(no_mangle)]` asks the compiler to publish the chosen name directly. That is useful for FFI, loaders, plugins, embedded entry points, and native callbacks. It also moves name ownership into a global namespace shared with native objects and compiler support code.
+
+The `unsafe(...)` wrapper acknowledges that exporting a chosen name creates obligations Rust cannot prove. It does not certify that I selected a harmless name or implemented the right ABI. Syntax and contract are separate checks.
+
+`#[unsafe(export_name = "memset")]` can create the same collision even when the Rust function has another source-level name. When diagnosing this failure, I inspect the final symbol, not only the identifier beside `fn`.
+
+## Why this can be worse than a duplicate-symbol error
+
+A normal linker collision is noisy. Two strong definitions of the same symbol often stop the link. That is inconvenient but visible.
+
+Runtime resolution is more complicated. Static archives are extracted on demand. Weak definitions, builtins, LTO, link order, target libraries, and dynamic interposition can influence which implementation is kept. A wrong definition may appear only in one profile or target. It may even link and fail later when compiler-generated code calls it.
+
+That later failure is hard to read. A memory operation can corrupt data even though my source never explicitly called `memset`. The relevant call may have been introduced while lowering an aggregate initialization or optimizing a copy. A crash can point far away from the exported function which stole the symbol.
+
+The compiler lint moves that discovery back to the declaration, where the cause is understandable.
+
+## Renaming is the repair for an accidental collision
+
+If this is an application callback or plugin function, I choose a specific exported name:
+
+```rust
+#[unsafe(no_mangle)]
+pub extern "C" fn rfa_runtime_status() -> i32 {
+    0
+}
+```
+
+In real code I often include a project prefix, component, operation, and sometimes an ABI version. A name such as `acme_parser_v2_create` is easier to own than `create`, and far safer than borrowing a familiar C runtime name.
+
+Removing `no_mangle` is also correct when no foreign consumer needs a stable symbol. I do not add an exported ABI merely to make a function easier to find with a debugger.
+
+## Implementing the runtime primitive is a different task
+
+There are legitimate environments where a Rust program supplies low-level runtime functions: kernels, firmware, freestanding targets, custom libc work, or carefully controlled platform layers. In that situation, renaming may not be possible because providing the exact symbol is the objective.
+
+Matching the signature is necessary, but it is not enough. A `memset` replacement must implement the expected byte-writing semantics for every allowed pointer, value, length, overlap rule, alignment, and target ABI. It must be safe to call at the points where compiler-generated code uses it. Its implementation must not recursively compile into another call to itself. Startup state, panic behavior, instrumentation, and optimization can matter.
+
+That is system-runtime work, not a convenient FFI export. I isolate it, inspect generated code, test it without the normal runtime assumptions, and verify every supported target. I would not silence the lint globally to get past the first build.
+
+## A practical investigation sequence
+
+When I see this diagnostic, I use four steps.
+
+First, I record the exact exported name and where it came from: `no_mangle`, `export_name`, a native object, generated bindings, or a linker script.
+
+Second, I decide who owns the name. Is it a project API, an operating-system entry point, or a compiler/runtime primitive? Familiar names such as `memcpy`, `memmove`, `memset`, `memcmp`, and `strlen` deserve immediate suspicion.
+
+Third, I compare the complete ABI: safety, calling convention, parameter count, widths, pointer mutability, and return type. A source-level resemblance is not proof.
+
+Fourth, I choose between two honest repairs. Accidental owners rename or stop exporting. Deliberate runtime providers implement and verify the entire platform contract.
+
+I also test debug and release builds because optimization changes how often runtime primitives are introduced and which calls remain visible. Symbol-table inspection can confirm the export, but it does not prove semantics.
+
+The reusable principle is simple: link names have owners. Once I bypass Rust's mangling, I am joining a global ABI namespace. A name used by the runtime brings its existing signature and behavior with it; my function body does not get to redefine that contract by coincidence.

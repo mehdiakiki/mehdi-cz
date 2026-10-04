@@ -1,0 +1,89 @@
+---
+caseId: "RFA-224"
+title: "Writing Past the End of Cursor<Vec<u8>> Zero-Fills the Gap"
+date: "2026-09-06T00:04:00+01:00"
+lastmod: "2026-09-06T00:04:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "7c77b599d42b987a4349c19ac4b66b1b8c47a8b3df8354ad145a69c594620dce"
+area: "ffi-targets"
+symptom: "Writing one byte at cursor position five over a two-byte Vec creates three zero bytes before the new byte."
+summary: "Cursor permits a position beyond a growable Vec's current end. A later write extends the Vec and pads the hole with zeros; append code should seek to the actual length, while sparse layout should be explicit."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets with std"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust Cursor write past end zero fills",
+    "Cursor Vec set_position beyond length",
+    "Rust in memory sparse write zeros",
+  ]
+evidence: ["Rust 1.98.1 in-memory cursor", "position beyond Vec length", "append-position repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/std/io/struct.Cursor.html#method.set_position",
+    "https://doc.rust-lang.org/std/io/struct.Cursor.html",
+    "https://doc.rust-lang.org/std/io/trait.Write.html#method.write_all",
+  ]
+---
+
+After reserving a header position in an in-memory encoder, I moved a `Cursor<Vec<u8>>` farther than the current buffer length and wrote one byte. I expected either an error or an append. The vector grew, and the missing region became zeros.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-224/fail.rs) begins with `ab`, sets the cursor position to five, and writes `X`. Its final bytes are `ab\0\0\0X`.
+
+## Position and length are independent state
+
+[`Cursor::set_position`](https://doc.rust-lang.org/std/io/struct.Cursor.html#method.set_position) sets a `u64` position. It does not constrain that position to the current length of the wrapped object.
+
+For a fixed-size backing slice, a write past the available range cannot extend storage. For a growable `Vec<u8>`, the cursor's `Write` implementation can extend it. When the position is beyond the old end, the implementation pads the region before the write with zero bytes.
+
+The cursor position answers “where will the next operation begin?” The vector length answers “which bytes exist now?” Treating them as the same value hides the sparse gap.
+
+## The cursor is not a seekable file in every detail
+
+`Cursor` deliberately gives in-memory values implementations of I/O traits. This is useful for testing encoders and for APIs expecting `Read`, `Write`, or `Seek`. It does not mean every wrapped type behaves exactly like every filesystem.
+
+A real file can represent holes sparsely depending on filesystem and operation. A `Vec<u8>` represents every byte in memory, including the zeros used to fill this gap. Moving to a very large position and writing can therefore request a large allocation.
+
+I validate untrusted offsets before applying them to an in-memory cursor. Memory safety remains intact, but memory exhaustion is still an application failure.
+
+## Appending requires the actual end
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-224/fixed.rs) captures the vector length and sets the cursor to exactly that position before writing. The output becomes `abX`.
+
+This case is related to another cursor trap: [`Cursor::new`](https://doc.rust-lang.org/std/io/struct.Cursor.html) starts at position zero even when its vector is populated. Solving that by setting a guessed future offset creates a new problem. Append means the current length, not an expected length from an earlier protocol calculation.
+
+If the vector can change through `get_mut`, I recalculate the end and consider whether that mutation invalidated the cursor's position assumptions. The documentation warns that changing the underlying value can corrupt the cursor's internal position model.
+
+## Zero padding can be valid protocol data
+
+Some formats reserve fixed-width headers, alignment regions, or blocks. In that setting, zero-filled gaps may be exactly the desired encoding. I make it explicit by resizing the vector or by asserting the intended layout before the write.
+
+An explicit resize communicates ownership of padding:
+
+```rust
+bytes.resize(offset, 0);
+bytes.extend_from_slice(payload);
+```
+
+Using a cursor remains useful when later code needs `Write`, but the layout test should assert every range: header, padding, and payload.
+
+## A successful write proves little about the earlier bytes
+
+[`write_all`](https://doc.rust-lang.org/std/io/trait.Write.html#method.write_all) guarantees that the supplied buffer was fully written or an error was returned. It does not guarantee that the destination previously ended at the write position, nor that no padding was created.
+
+Checking only the returned `Result` misses the failure. I inspect the resulting length and exact bytes in encoder tests. For large output, I assert structural ranges and a digest rather than logging the whole buffer.
+
+## Integer conversion needs attention
+
+Cursor positions are `u64`, while vector lengths and allocation sizes use `usize`. A position representable as `u64` may not be a feasible or representable allocation on the target. Platform width and resource limits are part of the boundary.
+
+I use checked conversions for calculated offsets, cap them against a protocol maximum, and reject overlap or wraparound before writing. A trusted format offset is still not a trusted allocation request when the input is external.
+
+## My regression proves append and sparse modes separately
+
+The repaired fixture contains two assertions. One sets the position to the real length and proves append output. The other deliberately sets position five and proves the exact zero-filled form.
+
+This keeps a future standard-library or application refactor from making the sparse behaviour accidental again. In production encoding tests I add empty input, exact-end writes, overwrites inside the buffer, large rejected offsets, and multi-write position advancement.
+
+The core principle is that a cursor's location is independent from its storage extent. Moving beyond the end is allowed; the next operation decides what that means for the backing type. I name append and sparse modes separately, validate offsets, and test the complete byte layout rather than only write success.

@@ -1,0 +1,247 @@
+---
+title: "Sharing One Provider Quota Across Many Customers"
+date: "2026-09-26T09:00:00+01:00"
+tags: ["api rate limits", "multi tenancy", "token bucket", "data integration", "distributed systems"]
+draft: false
+reviewed: true
+reviewedHash: "6990477bf9cf692027905f28e3b2f18f46cd95199b0890b3b375de3b6a661437"
+cluster: "reliable-data-integrations"
+campaign: "authority-2026"
+opportunity: "DATA-027"
+summary: "When all tenants consume one provider quota, local retries and per-worker limits are not enough. Use a global budget with fair tenant admission and feedback."
+---
+
+Many integration platforms connect several customers through one provider application or one shared API account. The provider sees one quota. The product sees many tenants.
+
+If every worker independently sends requests “below the limit,” their sum can still exceed it. When the provider returns `429`, each worker backs off and later wakes at roughly the same time. One busy customer can spend most of the recovered quota before smaller customers make progress.
+
+I treat provider quota as a shared resource with an explicit allocator.
+
+> Backoff reacts after capacity is exceeded. Admission control decides who may spend capacity before the request starts.
+
+## Identify the actual quota dimensions
+
+“100 requests per second” is rarely the whole contract. A provider may enforce several limits:
+
+- application-wide requests per second;
+- per-customer or connected-account rate;
+- endpoint-specific rate;
+- concurrent in-flight requests;
+- resource-specific update count;
+- daily cost, records, or compute units.
+
+Stripe's [rate-limit documentation](https://docs.stripe.com/rate-limits), for example, distinguishes global rate, global concurrency, endpoint rate, endpoint concurrency, and resource-specific limits. Other providers expose different signals or none at all.
+
+I model each known bottleneck separately. A single “remaining requests” integer cannot represent an endpoint limit and a concurrency limit at the same time.
+
+## One process-local limiter is not global
+
+Suppose the provider allows 100 requests per second and the service runs four worker processes. A limiter set to 100 in each process permits 400 requests per second.
+
+Dividing the configured limit by the current worker count is fragile. Autoscaling changes the divisor, workers disagree during rollout, and a restarted process begins with a fresh burst.
+
+The budget needs one logical authority for every worker sharing the provider identity:
+
+```text
+worker A ─┐
+worker B ─┼─> shared quota coordinator ─> provider
+worker C ─┘
+```
+
+The coordinator can be a dedicated service, a strongly consistent data-store operation, or broker-side scheduling. The implementation depends on latency and scale. The invariant is that two workers cannot spend the same token.
+
+## Token bucket gives rate and burst a clear meaning
+
+For a provider budget with refill rate `r` and capacity `b`:
+
+```text
+tokens(t) = min(b, tokens(previous) + elapsed × r)
+admit request only when tokens >= request_cost
+```
+
+Capacity permits a bounded burst. Refill controls the long-term rate.
+
+A request may cost more than one token when the provider assigns endpoint weights or when measured cost differs greatly. I keep the unit named: `request_token`, `record_unit`, or `compute_credit` is clearer than an abstract `quota`.
+
+Here is a simplified atomic decision:
+
+```ts
+type Bucket = {
+  available: number;
+  capacity: number;
+  refillPerMs: number;
+  updatedAtMs: number;
+};
+
+function refill(bucket: Bucket, nowMs: number): Bucket {
+  const elapsed = Math.max(0, nowMs - bucket.updatedAtMs);
+  return {
+    ...bucket,
+    available: Math.min(
+      bucket.capacity,
+      bucket.available + elapsed * bucket.refillPerMs
+    ),
+    updatedAtMs: nowMs,
+  };
+}
+```
+
+In a distributed implementation, refill and spend must happen in one atomic operation. Otherwise concurrent workers read the same balance and both admit themselves.
+
+## A global bucket alone is still unfair
+
+Consider a bucket that refills ten tokens each second. Tenant A always has 1,000 queued requests. Tenants B and C each have one.
+
+If workers race for global tokens, A is likely to consume each refill because it has more contenders.
+
+| Second | Race on global bucket | Fair tenant turn |
+| ---: | --- | --- |
+| 1 | A A A A A A A A A A | A B C A A A A A A A |
+| 2 | A A A A A A A A A A | A A A A A A A A A A |
+
+Both use full capacity. Only the second guarantees prompt progress for B and C.
+
+I combine two layers:
+
+1. a provider-wide bucket protects the external quota;
+2. a tenant scheduler chooses which eligible tenant can spend the next token.
+
+The companion article [Fair Scheduling for Multi-Tenant Integration Workers](/blog/fair-scheduling-for-multi-tenant-integration-workers) covers the queue policy in more detail. Here, fairness exists specifically inside one external quota domain.
+
+## Hierarchical buckets make the policy explicit
+
+A request can require tokens from several buckets:
+
+```text
+provider application bucket
+    └── endpoint bucket
+          └── tenant share bucket
+```
+
+The request starts only if all required budgets admit it. If the provider has a true per-tenant quota, that tenant bucket models an external constraint. If not, it models the platform's fairness policy.
+
+I avoid permanently dividing all 100 requests per second among 100 tenants. Ninety idle tenants would waste 90% of capacity. Instead, active tenants borrow unused capacity while retaining per-tenant burst and concurrency ceilings. Under congestion, the scheduler returns toward weighted fair shares.
+
+This matches the work-conserving fairness principle described in AWS's [multi-tenant fairness guidance](https://builder.aws.com/content/3Eupj3d2bo4fEvlzYbICMZNhQ3B/fairness-in-multi-tenant-systems): allow spare capacity to be used, but enforce workload boundaries when shared resources are full.
+
+## Rate and concurrency need different controls
+
+A token bucket can control starts per unit of time. It does not limit how many slow requests remain in flight.
+
+If a normally 100 ms endpoint slows to 20 seconds, a safe request rate can still accumulate hundreds of sockets and tasks. I use a semaphore or lease counter for concurrency:
+
+```text
+rate token: spent when request begins
+concurrency permit: held until request completes or its lease expires
+```
+
+The limits interact. When latency rises, concurrency fills and naturally slows admission before the rate budget is exhausted. This protects the worker fleet and can reduce pressure on a degraded provider.
+
+## Treat provider feedback as evidence, not truth without context
+
+On `429`, I capture:
+
+- provider account and endpoint;
+- tenant and request class;
+- response headers and reason codes;
+- observed in-flight count;
+- coordinator token balance;
+- attempt and retry budget;
+- response time.
+
+A `Retry-After` header sets the earliest retry time for the affected quota domain. [RFC 6585](https://www.rfc-editor.org/rfc/rfc6585#section-4) defines `429 Too Many Requests` and allows this guidance.
+
+I do not assume every `429` is global. Stripe notes that a `429` without its limiter-reason header may come from another cause such as lock contention. A tenant-specific credential may be limited while the shared application remains healthy.
+
+The response updates the matching bucket or pause state. Applying one tenant's throttle to every provider request throws away capacity; treating a global throttle as local creates a retry storm.
+
+## Use adaptive limits conservatively
+
+Documented quotas change, and undocumented effective capacity can vary. A coordinator can adapt:
+
+```text
+success with headroom → increase slowly up to configured ceiling
+429 or overload       → decrease quickly and respect reset time
+```
+
+I keep a human-configured maximum and a conservative starting point. Feedback control should not probe the provider aggressively or oscillate after every response.
+
+A useful version resembles additive increase and multiplicative decrease:
+
+- after a stable window, add a small amount;
+- on confirmed rate limiting, multiply allowed rate by a factor below one;
+- add jitter to resumed traffic;
+- restore gradually after the provider's reset boundary.
+
+The algorithm must be scoped by endpoint and provider identity.
+
+## Reserve capacity for recovery and interactive work
+
+If backfills can consume the full budget, webhooks and user-triggered refreshes may wait for hours. I assign work classes:
+
+```text
+interactive refresh
+incremental synchronization
+repair and webhook recovery
+historical backfill
+```
+
+Strict priority can starve the backfill. Instead, I reserve a small share for latency-sensitive or repair work and allow borrowing when that lane is idle. Old low-priority work gains priority with age.
+
+This policy should be visible to the product. A “sync now” button cannot promise immediate work if no quota share is reserved for it.
+
+## Retries spend the same quota
+
+A retry is another provider request. It must acquire normal rate and concurrency capacity.
+
+I also impose a retry budget so failures do not replace useful first attempts with repeated load. When the provider is unavailable, queued new work and due retries compete under an explicit policy instead of each retry loop acting independently.
+
+The coordinator returns an admission decision such as:
+
+```json
+{
+  "admitted": false,
+  "reason": "provider_global_pause",
+  "not_before": "2026-09-26T09:00:17Z"
+}
+```
+
+Workers reschedule durably. They do not hold threads while sleeping and do not all wake at the exact reset instant.
+
+## Observe fairness and utilization together
+
+I monitor:
+
+- provider requests and 429s by quota domain;
+- global and per-tenant admitted cost units;
+- wait time by tenant and work class;
+- unused tokens while eligible work exists;
+- concurrency occupancy and request latency;
+- retry share of total requests;
+- largest tenant's share under congestion;
+- oldest eligible job.
+
+High utilization with extreme tenant wait time is not success. Perfectly equal shares with many unused tokens are not success either. The system needs protection, progress, and work conservation.
+
+## Failure testing matters at the coordinator
+
+I test the allocator under:
+
+- concurrent spends at an empty boundary;
+- coordinator restart with persisted state;
+- clock skew or a clock moving backwards;
+- an expired concurrency lease;
+- worker cancellation after admission but before request;
+- a global `Retry-After` while local tenant pauses exist;
+- autoscaling from one worker to many;
+- one tenant with endless work and many tenants with one request.
+
+The hardest invariant is no double spend without leaking capacity forever after crashes. Depending on consequence, a short token lease, conservative loss of unused capacity, or request reservation record can solve that trade-off.
+
+## The provider has one quota; the product needs a policy
+
+Backoff is required, but it begins after the provider says no. A reliable multi-tenant integration decides earlier which request may consume the next scarce unit.
+
+I coordinate the provider budget globally, schedule tenants fairly, separate rate from concurrency, scope throttling feedback correctly, and count retries as real demand.
+
+This does not create more provider quota. It makes the available quota produce predictable customer progress instead of a race between workers.

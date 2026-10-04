@@ -1,0 +1,121 @@
+---
+caseId: "RFA-062"
+title: "E0521: When a Typed Closure Parameter Makes a Borrow Escape"
+date: "2026-09-05T08:35:00+01:00"
+lastmod: "2026-09-05T08:35:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "cc8d85348adab8f9b0c450d0a900f22f04f725abbed39173e878f8b5c6f6fcc1"
+area: "diagnostics-macros"
+symptom: "Adding an explicit str reference type to a closure parameter triggers E0521 because the borrowed argument escapes into an outer vector."
+summary: "An explicit closure reference parameter introduces a lifetime contract that can be more general than the inferred closure needs. Remove the annotation as a test, then decide whether stored data should be borrowed or owned."
+rustVersions: ["Rust 1.98.1"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust E0521 borrowed data escapes outside closure",
+    "closure parameter type annotation lifetime escapes",
+    "Vec reference closure value escapes",
+  ]
+evidence:
+  ["Rust 1.98.1 compile failure", "inferred-lifetime comparison", "annotation removal repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/error_codes/E0521.html",
+    "https://doc.rust-lang.org/reference/types/closure.html",
+  ]
+---
+
+More type annotation does not always give Rust more useful information. This compact closure demonstrates the opposite:
+
+```rust
+fn main() {
+    let mut outside: Vec<&str> = Vec::new();
+    let mut push = |value: &str| outside.push(value);
+    push("atlas");
+}
+```
+
+On Rust 1.98.1, `outside.push(value)` receives E0521:
+
+```text
+borrowed data escapes outside of closure
+```
+
+The [failing fixture](/rust-failure-atlas/evidence/RFA-062/fail.rs) uses a string literal at the call, but the closure's declared contract must work for more than that one literal. The explicit parameter annotation is the important part.
+
+## The annotation introduces a reference lifetime
+
+Writing `|value: &str|` introduces a fresh lifetime for the closure parameter. The closure must be callable with an appropriate borrowed string under that declared input relationship. Its body then tries to store `value` in `outside`, a vector which exists beyond one closure invocation.
+
+An arbitrary reference accepted for a call cannot be stored into longer-lived captured state. It might point to a short local owned only by the caller of that invocation. Allowing the push would let the vector retain a dangling reference after that local was dropped.
+
+The compiler note also mentions invariance through `&mut Vec<&str>`. Mutation cannot safely widen or narrow the vector's reference element lifetime behind a mutable reference, because later code could both write and read values under the original type.
+
+The [Rust Reference closure section](https://doc.rust-lang.org/reference/types/closure.html) describes closure parameters, capture modes, and call traits. Here the surprising behavior comes from the relationship between an explicit input reference and captured mutable storage.
+
+## Remove only the annotation first
+
+The official diagnostic suggests letting Rust infer the parameter:
+
+```rust
+let mut outside: Vec<&str> = Vec::new();
+{
+    let mut push = |value| outside.push(value);
+    push("atlas");
+}
+```
+
+Inference can connect the closure input to the particular element lifetime required by `outside`, rather than promising an independently general `&str` input. The inner block ends the closure's mutable capture before the assertion in the [repaired fixture](/rust-failure-atlas/evidence/RFA-062/fixed.rs). That program compiles and runs on Rust 1.98.1.
+
+This is a discriminating repair, not a universal instruction to remove types. It proves that the explicit closure parameter contract was more general than the stored-reference relationship allowed.
+
+## Owned storage is often the real production design
+
+If `push` should accept strings from many unrelated call sites and retain them, the vector should own the data:
+
+```rust
+let mut outside: Vec<String> = Vec::new();
+let mut push = |value: &str| outside.push(value.to_owned());
+```
+
+Now every invocation may provide a short-lived reference. The closure copies the text into an owned `String` whose lifetime is controlled by the vector. The allocation is not a compiler workaround; it is the cost of retaining data independently from its caller.
+
+Another API can accept `String` and move it in, avoiding a copy when callers already own their text:
+
+```rust
+let mut push = |value: String| outside.push(value);
+```
+
+I choose between borrowed and owned storage from the lifetime of the underlying data, not from which version has fewer characters.
+
+## Why the literal hides the danger
+
+`"atlas"` is a `&'static str`, so this one call could safely be stored forever. But the annotated closure is not automatically restricted to static strings. It says `&str`, and a later call could pass a slice of a local `String`.
+
+If static input is truly the intended interface, I can state `|value: &'static str|`. This works only for literals and other genuinely static text. It is normally too restrictive for collected application input.
+
+## Equivalent named functions expose the design
+
+When the closure signature remains confusing, I write a named helper with explicit lifetimes. One form stores references sharing one outer lifetime:
+
+```rust
+fn push<'a>(outside: &mut Vec<&'a str>, value: &'a str) {
+    outside.push(value);
+}
+```
+
+Now the relationship is visible: the value must be valid for the vector's element lifetime. A different, higher-ranked function that accepts a reference of any lifetime could not store it in one fixed outer vector.
+
+## My debugging rule
+
+For E0521 in a closure, I inspect three boundaries:
+
+1. Which values are captured, and whether the capture is mutable.
+2. Whether the parameter reference lifetime is inferred or explicitly introduced.
+3. Whether the body returns or stores that reference outside one invocation.
+
+Removing an annotation can confirm the mechanism, but it cannot make genuinely short-lived data safe to retain. The final choice is still between a correctly related borrowed lifetime and owned data.
+
+The official [E0521 page](https://doc.rust-lang.org/error_codes/E0521.html) presents this same core shape. The deeper lesson is that `&str` is not one universal reference type with no time attached. A closure parameter annotation states a calling contract, and storing its value creates a second contract. Rust requires those two to agree.

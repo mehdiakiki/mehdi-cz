@@ -1,0 +1,92 @@
+---
+caseId: "RFA-720"
+title: "A Runtime Symbol Signature Can Look ABI-Compatible and Still Be Suspicious"
+date: "2026-09-07T11:52:00+01:00"
+lastmod: "2026-09-07T11:52:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "6875814c1692977587d6e66285ac04a245205b65bdb896ed8dd3910f95d85823"
+area: "ffi-targets"
+symptom: "An exported extern C function named strlen is rejected under deny(suspicious_runtime_symbol_definitions) because it accepts *mut f32 instead of *const c_char."
+summary: "Equal pointer width is not an equal C contract. Rust 1.98 warns when a well-known runtime symbol has an ABI-shaped signature whose pointer type or safety contract remains suspicious."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["targets using the checked core runtime symbol"]
+profiles: ["dev", "release"]
+searchTerms: ["Rust suspicious_runtime_symbol_definitions strlen pointer type", "suspicious definition runtime strlen symbol Rust 1.98", "no_mangle strlen expected const i8 found mut f32"]
+evidence: ["Rust 1.98.1 suspicious runtime-symbol diagnostic", "extern C strlen has matching pointer width but wrong pointee semantics", "application-specific exported name removes the accidental runtime collision"]
+sources: ["https://doc.rust-lang.org/releases.html#version-1980-2026-08-20", "https://doc.rust-lang.org/rustc/lints/listing/warn-by-default.html#suspicious-runtime-symbol-definitions", "https://doc.rust-lang.org/reference/items/functions.html#extern-function-qualifier"]
+---
+
+An FFI signature is not only a list of machine-sized slots. Its types describe what the other side may read, write, and assume.
+
+Rust 1.98 warns about this export:
+
+```rust
+#[unsafe(no_mangle)]
+pub extern "C" fn strlen(_: *mut f32) -> usize {
+    0
+}
+```
+
+The function has the C calling convention, one pointer argument, and a `usize` return. On a common target, its argument occupies the same register as `*const c_char`. Yet the function claims the global symbol `strlen`, whose runtime contract expects an unsafe C function reading a pointer to character data until a terminating zero.
+
+With `#![deny(suspicious_runtime_symbol_definitions)]`, the warning becomes a build error. The [failing fixture](/rust-failure-atlas/evidence/RFA-720/fail.rs) reproduces it on Rust 1.98.1. The [repaired fixture](/rust-failure-atlas/evidence/RFA-720/fixed.rs) keeps the application's actual function shape but exports an application-specific name.
+
+## ABI shape and semantic contract are different layers
+
+At the machine-call layer, several pointer types may use the same representation. `*mut f32` and `*const i8` are pointer-sized on the verifier target. This can make a declaration look close enough when reading assembly or a linker error.
+
+At the language boundary, they communicate different operations. `*const i8` points to bytes that `strlen` may read as a C string. `*mut f32` says the Rust function was designed around writable floating-point elements. The constness, pointee type, termination rule, validity, and safety obligations do not match.
+
+The linker cannot check these facts. It resolves symbol names. If my definition wins the name `strlen`, generated Rust code or a linked native library may call it according to the established C declaration, not according to the Rust source I happened to write.
+
+That is how an apparently harmless name collision can become undefined behavior, memory corruption, a hang, or a result which changes with optimization.
+
+## Why this lint is “suspicious” rather than always invalid
+
+Rust 1.98 also has a deny-by-default `invalid_runtime_symbol_definitions` lint. It catches clear structural mismatches such as the wrong ABI, argument count, variadic shape, or return form for known runtime symbols.
+
+The suspicious lint covers closer signatures where the machine-level call may be shaped compatibly but the Rust types still disagree with the expected declaration. There are rare low-level runtime implementations which intentionally provide such symbols and can audit their compatibility beyond the surface type.
+
+This distinction matters for diagnosis. If a zero-argument Rust function calls itself `memset`, the first problem is an incontrovertibly wrong runtime definition. If an extern function called `strlen` has one pointer and the expected return width but a different pointer type, the compiler can warn about the semantic mismatch without claiming that every possible implementation is invalid on every target.
+
+Most application crates are not implementing the platform runtime. For them, both messages usually lead to the same first question: did I mean to claim this global name at all?
+
+## Rename accidental exports before changing types
+
+In the evidence repair I rename the export:
+
+```rust
+#[unsafe(no_mangle)]
+pub extern "C" fn float_slice_len(_: *mut f32) -> usize {
+    0
+}
+```
+
+This is the faithful repair because the original function calculates something in the application's domain. Changing only its argument to `*const c_char` would silence one diagnostic while changing the API into a function it never implemented.
+
+I normally choose a namespaced exported name, verify it with the platform's symbol inspection tool, and give native callers one matching header. Prefixes tied to the library or protocol reduce collision risk better than generic names such as `open`, `read`, or `strlen`.
+
+If the code truly implements `strlen`, the work is larger. The signature must match the platform contract, the function must be safe for calls made by the compiler and core library, and its implementation must avoid accidentally using facilities which call `strlen` again. Bootstrapping runtime primitives deserves target-specific tests and native review, not only an `allow` attribute.
+
+## unsafe(no_mangle) does not validate the foreign contract
+
+Rust 2024 requires unsafe attributes such as `no_mangle` to be written through `unsafe(...)`. This makes the obligation visible: changing a global symbol name can affect code outside Rust's type system.
+
+The wrapper is an acknowledgement, not a proof. `#[unsafe(no_mangle)]` does not confirm uniqueness, calling convention, pointer validity, or agreement with a C header. It simply makes the author mark that these requirements have been considered.
+
+The new runtime-symbol lints add targeted checks for a small set of names known to be used by core or the compiler. They cannot inspect every library linked into the process. An application-specific export may still collide with another native dependency, so I keep link-time and integration checks as well.
+
+## My checklist for a suspicious runtime symbol
+
+I treat the symbol name as the primary identity and work outward:
+
+1. I inspect the final unmangled or exported name, including any `export_name` attribute.
+2. I decide who owns that name: my application, a protocol, libc, the compiler runtime, or another library.
+3. I compare the complete declared signature, not only argument widths.
+4. I check constness, pointee type, safety, variadics, unwind behavior, and return semantics.
+5. I inspect the final artifact's symbol table and test from a native caller when FFI is intentional.
+
+I do not silence the warning because “all pointers are the same size.” Size is only one fact needed for a call boundary.
+
+The broader principle is that binary interfaces carry meaning which a linker cannot see. A symbol name selects a contract before the function body runs. Rust 1.98 catches a dangerous middle ground: the call may fit into registers, but the types reveal that the two sides are probably talking about different memory.

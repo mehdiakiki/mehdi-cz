@@ -1,0 +1,269 @@
+---
+title: "Rust Drop Order for Fields, Locals, Temporaries, and Captures"
+date: "2026-11-21T09:00:00+01:00"
+tags: ["rust", "Drop", "destructors", "temporary lifetime", "ownership"]
+draft: false
+reviewed: true
+reviewedHash: "628b442104a81d139653aed4419efef1434073b46100c17b69febefa4e2599d1"
+cluster: "rust-under-the-hood"
+campaign: "authority-2026"
+opportunity: "RUST-056"
+summary: "Rust drops local bindings in reverse declaration order but struct fields in declaration order, and move-closure capture order is unspecified. An observable trace separates these rules."
+---
+
+“Rust drops things in reverse order” is only half true.
+
+Local variables in the same scope are dropped in reverse declaration order. Fields inside a struct are dropped in declaration order. Tuple and array elements also go from first to last. Variables captured by a move closure are dropped in an unspecified order.
+
+The rules are precise, but they apply at different levels.
+
+## The smallest observable type
+
+I use a destructor that prints its name:
+
+```rust
+struct Mark(&'static str);
+
+impl Drop for Mark {
+    fn drop(&mut self) {
+        println!("drop {}", self.0);
+    }
+}
+```
+
+This is useful for learning and tests. Production correctness should not depend on print timing or a trace collector surviving shutdown.
+
+## Locals are reverse; fields are forward
+
+```rust
+struct Packet {
+    header: Mark,
+    body: Mark,
+}
+
+fn main() {
+    let outer_first = Mark("outer first");
+
+    {
+        let packet = Packet {
+            header: Mark("header field"),
+            body: Mark("body field"),
+        };
+        let inner_last = Mark("inner last");
+
+        println!("leaving inner scope");
+    }
+
+    println!("leaving main");
+}
+```
+
+The relevant output is:
+
+```text
+leaving inner scope
+drop inner last
+drop header field
+drop body field
+leaving main
+drop outer first
+```
+
+`inner_last` is the last local declared in the inner scope, so it goes first. Then the `packet` local is destroyed. Its `header` and `body` fields go in their declaration order.
+
+The [Rust Reference destructor rules](https://doc.rust-lang.org/reference/destructors.html) specify both levels explicitly.
+
+## A type's own `Drop::drop` runs before its fields
+
+If `Packet` implements `Drop`, Rust first calls that method and then recursively drops its fields:
+
+```rust
+impl Drop for Packet {
+    fn drop(&mut self) {
+        println!("drop packet itself");
+    }
+}
+```
+
+The sequence becomes:
+
+```text
+drop packet itself
+drop header field
+drop body field
+```
+
+Inside `Drop::drop`, fields still exist and can be borrowed. Safe Rust does not let me move an ordinary field out of `&mut self` casually because automatic field destruction must still happen.
+
+## Tuple, array, and enum fields go first to last
+
+These composite values use forward element order:
+
+```rust
+let tuple = (Mark("tuple 0"), Mark("tuple 1"));
+let array = [Mark("array 0"), Mark("array 1")];
+```
+
+Because `array` is the later local, its elements drop first:
+
+```text
+drop array 0
+drop array 1
+drop tuple 0
+drop tuple 1
+```
+
+Fields of the active enum variant also drop in their declaration order.
+
+I avoid assuming C++-style reverse member destruction. Rust chose and documents a different field rule.
+
+## `drop(value)` is an ordinary early move
+
+The standard [`std::mem::drop`](https://doc.rust-lang.org/std/mem/fn.drop.html) function is essentially:
+
+```rust
+pub fn drop<T>(_x: T) {}
+```
+
+Passing a value moves it into the function. The parameter reaches the end of its scope immediately and is destroyed.
+
+```rust
+let guard = acquire();
+use_resource(&guard);
+drop(guard); // release before the surrounding block ends
+do_work_that_needs_no_guard();
+```
+
+This is the clear way to release a lock guard or file-backed resource early. After the move, `guard` cannot be used.
+
+## Assignment drops the old value at the assignment
+
+```rust
+let mut current = Mark("old");
+current = Mark("new");
+println!("assigned");
+```
+
+The old initialized value is dropped during assignment. The new value remains in `current` until its scope ends.
+
+```text
+drop old
+assigned
+drop new
+```
+
+This matters when assignment occurs while another resource is held. Replacing a field can execute arbitrary user `Drop` code at that line.
+
+## Partial moves drop only what remains
+
+```rust
+struct Pair {
+    first: Mark,
+    second: Mark,
+}
+
+let pair = Pair {
+    first: Mark("first"),
+    second: Mark("second"),
+};
+
+let moved = pair.first;
+drop(moved);
+// pair.second remains and drops at the end of the scope
+```
+
+Rust tracks which fields remain initialized. It does not run a destructor for the moved field a second time.
+
+A type implementing `Drop` has stricter partial-move rules because its destructor expects the whole value. Unsafe initialization code needs an explicit state machine rather than assumptions about automatic cleanup.
+
+## Temporaries follow their own scopes
+
+A temporary is associated with a temporary scope, often a statement or expression. This can make a guard live longer than its textual use suggests:
+
+```rust
+let length = make_string().len();
+```
+
+The temporary `String` is needed for the call and drops according to the expression's temporary scope.
+
+Borrowing a temporary in a `let` initializer can extend its lifetime:
+
+```rust
+let value = &String::from("kept for this binding");
+println!("{value}");
+```
+
+The Reference documents temporary lifetime extension and also notes Rust 2024 changes that narrow some `if let` and block-tail temporary scopes. I write a small `Mark` trace when cleanup timing matters instead of relying on memory from another edition.
+
+## Function parameters are another scope
+
+Function parameters live for the function body and are dropped after local bindings in that body. Pattern bindings inside parameters add another ordering rule.
+
+Rather than using parameter order as a resource protocol, I release important resources explicitly. A signature refactor should not quietly become a shutdown-order change.
+
+## Move-closure capture order is unspecified
+
+This is the exception people often miss:
+
+```rust
+let database = Mark("database");
+let telemetry = Mark("telemetry");
+
+let task = move || {
+    let _ = (&database, &telemetry);
+};
+
+drop(task);
+```
+
+The Reference says variables captured by move closures are dropped in an unspecified order. I do not assert a particular observed order, because compiler capture decisions and representation are not my contract.
+
+If one cleanup must precede another, I capture one wrapper struct with declared fields and give it an explicit lifecycle method. I still avoid relying only on `Drop` for fallible shutdown work.
+
+## Destructor order is not an async shutdown protocol
+
+`Drop::drop` cannot `await`. It is a poor place to promise that a network buffer flushed, a queue message acknowledged, or a child task joined.
+
+I separate:
+
+```text
+async close/shutdown method: fallible, awaitable business cleanup
+Drop implementation: local safety net and resource release
+```
+
+For task-level cleanup, [Graceful Shutdown in Async Rust Starts With Task Ownership](/blog/graceful-shutdown-in-async-rust-starts-with-task-ownership) gives the larger ownership model.
+
+## My executable drop-order fixture
+
+When reviewing resource dependencies, I test:
+
+```text
+normal scope exit
+early return
+`?` error propagation
+panic with unwinding enabled
+assignment replacement
+explicit drop
+partial move
+temporary in condition and tail expression
+edition used by the crate
+```
+
+I do not test closure-capture order as a stable expected sequence. The correct test is that correctness survives either order.
+
+## The practical rules
+
+The compact model is:
+
+```text
+drop scopes: inner before outer
+locals in one scope: reverse declaration order
+T: Drop: T::drop before recursive field destruction
+struct/enum fields: declaration order
+tuple/array elements: first to last
+move-closure captures: unspecified order
+moved-out fields: not dropped again
+assignment: old initialized value drops at assignment
+```
+
+Drop order is reliable when Rust specifies it and deliberately unavailable when it does not. I use the rules to understand cleanup, but I make important dependencies explicit in types and lifecycle methods so a declaration reorder cannot become a production incident.

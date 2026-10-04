@@ -1,0 +1,141 @@
+---
+caseId: "RFA-049"
+title: "Why Dropping a Large Recursive Rust Value Overflows the Stack"
+date: "2026-09-04T21:00:00+01:00"
+lastmod: "2026-09-07T10:45:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "d526988f4141877f8b7d62103d03d9ea0b621ac17f504ea745995ea88a80d174"
+area: "concurrency-memory"
+symptom: "Dropping a very large recursive Rust structure overflows the thread stack even though construction and traversal succeeded."
+summary: "Rust's generated drop glue recursively destroys owned fields. Take each child before its parent drops to turn a deep list or tree into iterative destruction."
+rustVersions: ["stable Rust"]
+targets: ["all targets; failure depth depends on thread stack"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust drop recursive list stack overflow",
+    "Box linked list destructor stack overflow",
+    "iterative drop Rust tree",
+  ]
+evidence: ["depth sweep", "drop-only fixture", "iterative destruction repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/reference/destructors.html",
+    "https://doc.rust-lang.org/std/ops/trait.Drop.html",
+  ]
+---
+
+Putting each node of a recursive structure on the heap does not make its destruction iterative. Rust's destructor operation runs a type's `Drop` implementation and then recursively destroys its fields. A `Box<Node>` owns its node, whose next field owns another box, and so on.
+
+For a large enough depth, the destructor call chain can exhaust the current thread's stack.
+
+## Separate use from destruction
+
+Consider a simple owned list:
+
+```rust
+struct Node {
+    value: u64,
+    next: Option<Box<Node>>,
+}
+
+struct List {
+    head: Option<Box<Node>>,
+}
+```
+
+Construction can be iterative. Traversal can be iterative. The automatically generated drop glue still follows `head -> next -> next` recursively.
+
+My first check builds structures at increasing depths and separates traversal from scope exit:
+
+```rust
+let list = build_list(depth);
+assert_eq!(list.iter().count(), depth);
+eprintln!("dropping depth={depth}");
+drop(list);
+eprintln!("drop complete");
+```
+
+If the second event disappears and the failure threshold follows depth, destruction becomes the primary mechanism.
+
+The exact threshold is not portable. Thread stack size, optimization, destructor body, target, and instrumentation change it. I care about the shape, not one magic number.
+
+The Atlas controls the variable instead of publishing a universal depth. Its [recursive-drop program](/rust-failure-atlas/evidence/RFA-049/fail.rs) builds 50,000 nodes on the heap, then drops them on a child thread with a recorded 64 KiB stack and observes a stack-overflow abort. The [iterative repair](/rust-failure-atlas/evidence/RFA-049/fixed.rs) drops the same number of nodes on the same requested stack. This is a subprocess proof for the recorded host, while the article remains explicit that another host may fail at a different depth.
+
+## Take ownership one node at a time
+
+The list can implement iterative drop:
+
+```rust
+impl Drop for List {
+    fn drop(&mut self) {
+        let mut current = self.head.take();
+
+        while let Some(mut node) = current {
+            current = node.next.take();
+            // `node` now has next=None, so dropping it does not recurse.
+        }
+    }
+}
+```
+
+`Option::take` replaces the field with `None` and returns the old value. Each loop iteration removes the owned child before the current box is dropped. Generated drop glue sees `next = None`, so it has no deeper chain to follow.
+
+After `List::drop` returns, Rust also drops the `head` field, but it is already `None`.
+
+This uses safe code and keeps each node's normal destructor behavior.
+
+## Trees need an explicit work stack
+
+A tree has several children. I take them and push their boxes onto a `Vec`:
+
+```rust
+impl Drop for Tree {
+    fn drop(&mut self) {
+        let mut pending = Vec::new();
+        if let Some(root) = self.root.take() {
+            pending.push(root);
+        }
+
+        while let Some(mut node) = pending.pop() {
+            pending.append(&mut node.children);
+            // `node.children` is empty before node drops.
+        }
+    }
+}
+```
+
+The heap-backed work vector grows with breadth or pending branches instead of consuming one call frame per depth. For very large structures, I may reserve based on measured shape, but correctness does not depend on that estimate.
+
+## Preserve custom destructor semantics
+
+If `Node` itself implements `Drop`, moving fields out directly is restricted because its destructor may expect them. Designing recursively owned fields as `Option` or emptyable collections gives `Drop` a valid state to leave behind.
+
+I document that `next = None` or `children = []` is a valid destruction state. The loop must still let every node destructor run exactly once.
+
+Unsafe manual deallocation is rarely needed. It adds layout, panic, and partial-destruction obligations to a problem that `take` often solves safely.
+
+## Panics during drop make the problem harder
+
+`Drop` implementations should generally avoid panicking. A panic during unwinding can abort the process, and a panic halfway through a custom destruction loop complicates which nodes remain owned.
+
+Resource cleanup should be infallible where possible. Operations requiring reportable failure belong in an explicit `close` or `shutdown` method before drop; the destructor remains a reliable fallback.
+
+## Increasing stack size is containment
+
+Running destruction on a thread with a larger stack can move the threshold and may be useful for a bounded known depth. It does not change the recursive complexity. An unexpectedly large input can reach the new limit.
+
+The iterative repair removes depth-dependent stack use and is preferable for structures whose size comes from external or long-running workloads.
+
+## Shared and cyclic structures differ
+
+`Rc` and `Arc` graphs can have cycles which never reach a reference count of zero. That causes a leak, not this recursive stack overflow. A very deep acyclic reference-counted chain can still produce recursive destruction when the last owners disappear.
+
+I first determine whether the graph is cyclic, shared, or uniquely owned. The appropriate repair can be weak links, explicit arena ownership, or iterative unique destruction.
+
+## The regression proof
+
+My test constructs a depth comfortably beyond the old failure threshold on a normal test thread, traverses it, and drops it explicitly. A drop counter confirms each node is destroyed once. A tree fixture includes both deep and wide shapes.
+
+I keep the depth large enough to distinguish iterative behavior without making CI memory excessive. The evidence is that stack usage no longer grows one frame per owned edge, not merely that one larger sample happened to survive.

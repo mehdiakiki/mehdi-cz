@@ -1,0 +1,78 @@
+---
+caseId: "RFA-285"
+title: "HashSet::take Returns the Stored Equal Value"
+date: "2026-09-06T01:05:00+01:00"
+lastmod: "2026-09-06T01:05:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "ce9ce24018634fcf3a9112b9af8bbd6e2b2e80760363a5464d392dae4eebd3fc"
+area: "concurrency-memory"
+symptom: "Looking up a set entry with an equal borrowed value and calling take returns the value that was stored, including fields ignored by equality, rather than returning the query value."
+summary: "HashSet uses equality to locate an entry but owns one concrete representative of that equality class. take removes and returns that stored representative; the borrowed query is only a lookup key."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets with std"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust HashSet take returns stored value", "HashSet equal values different fields take", "retrieve owned value from HashSet Rust"]
+evidence: ["Rust 1.98.1 custom equality by id", "different stored and query labels", "stored representative returned by take"]
+sources: ["https://doc.rust-lang.org/std/collections/struct.HashSet.html#method.take", "https://doc.rust-lang.org/std/collections/struct.HashSet.html#method.get", "https://doc.rust-lang.org/std/hash/trait.Hash.html"]
+---
+
+I once treated a `HashSet` lookup as if the value used for the lookup would come back from the collection. This sounds harmless when equality covers every field. It becomes wrong when equality deliberately uses only an identity field.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-285/fail.rs) stores an entry with an ID and the label `stored`. It then calls [`HashSet::take`](https://doc.rust-lang.org/std/collections/struct.HashSet.html#method.take) with another entry having the same ID but the label `query`. The method returns `stored`.
+
+## Equality finds an entry; it does not replace it
+
+A set owns the value inserted into it. Later, a lookup value is used to compute a hash and test equality. If those operations locate an existing entry, the collection still contains its original allocation and original fields.
+
+`take` removes that owned entry and gives it to the caller. It cannot return the borrowed query as the set's former value, because the query was never inserted.
+
+This distinction matters for types where identity and payload are different concepts. A service record may compare by stable ID while also containing a display label, timestamp, cached metadata, or source-specific spelling. Two records can be equal for membership while remaining observably different values.
+
+## Hash and Eq define the equivalence class
+
+The [`Hash`](https://doc.rust-lang.org/std/hash/trait.Hash.html) contract requires equal values to produce equal hashes. If my `Eq` implementation compares only `id`, my `Hash` implementation must use the same identity. Hashing the label as well would violate the contract and make lookup behavior unreliable.
+
+When both implementations use the ID, the set treats every label for that ID as one equivalence class. Only one representative is stored at a time. `get`, `replace`, and `take` then let me observe or exchange that representative in different ways.
+
+I review custom `Eq` and `Hash` together. Seeing only one implementation is not enough to understand a hash collection.
+
+## `get` has the same representative rule
+
+[`HashSet::get`](https://doc.rust-lang.org/std/collections/struct.HashSet.html#method.get) returns a reference to the stored value equivalent to the query. It is useful when I need the canonical spelling or metadata kept by the collection without removing it.
+
+`take` is the owned form of that operation: locate an equivalent value, remove the actual stored value, and return ownership. A missing entry produces `None`; it does not echo the query.
+
+This makes `take` convenient for work queues or caches where the stored object contains data needed during removal. It also means a caller must not assume fields from its probe will appear in the result.
+
+## `replace` expresses another policy
+
+Sometimes I do want the new equal value to become the representative. `HashSet::replace` inserts the supplied value and returns the old stored one when an equivalent entry existed.
+
+That is different from removing with `take` and then conditionally inserting. The method names encode distinct ownership policies:
+
+```text
+get(query)       -> borrow stored representative
+take(query)      -> remove and own stored representative
+replace(value)   -> store new representative, return old one
+```
+
+Writing this table near domain code has prevented subtle mistakes for me. It forces the update policy to be visible.
+
+## Borrowed lookup does not mean identical type
+
+Hash collections can support borrowed forms through the `Borrow` relationship. For example, a `HashSet<String>` can be queried with `&str` when the hash and equality behavior match. The borrowed input is still only a probe.
+
+The result remains the collection's `String`, because this is what the collection owns. That is often exactly why `take` is selected: it can recover an owned value using a lightweight borrowed key.
+
+I keep this in mind when designing wrapper types. A clever borrowed lookup is useful, but it must preserve the same equivalence relation as the owned key.
+
+## What I test
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-285/fixed.rs) asserts that the returned ID matches the query while the returned label comes from the stored entry. It also checks that the set is empty after removal.
+
+For production types I test equal IDs with different payloads, unequal IDs with identical payloads, a missing lookup, replacement, and a borrowed lookup when one exists. I also test that insertion of a second equal value does not silently update the first representative.
+
+If mutable payload updates are central to the design, a `HashMap<Id, Payload>` can communicate the model better than a set with partial-field equality. The map separates identity from data explicitly. I use a set when the whole stored value is genuinely the member and retrieving its representative is meaningful.
+
+The core principle is simple: equality answers which bucket member matches, while ownership answers which concrete value can be returned. `HashSet::take` uses the query for the first question and the stored representative for the second.

@@ -1,0 +1,215 @@
+---
+title: "Valid Time and System Time: Two Histories a Data Product May Need"
+date: "2026-11-24T09:00:00+01:00"
+tags: ["bitemporal data", "valid time", "system time", "temporal database", "data modelling"]
+draft: false
+reviewed: true
+reviewedHash: "44f8b59992fefea64b110a6df609d0bb774ec6e77eb4eb31d99e2ff85ea83501"
+cluster: "reliable-data-integrations"
+campaign: "authority-2026"
+opportunity: "DATA-069"
+summary: "Valid time records when a fact applies in the represented world. System time records when the database knew it. Keeping both preserves late corrections and reproducible past decisions."
+---
+
+There are two different questions hidden inside “what was the customer's plan on June 1?”
+
+```text
+What do we know now was valid on June 1?
+What did our system believe on June 1?
+```
+
+A correction received in July can make these answers different. Bitemporal data keeps both histories.
+
+## Valid time belongs to the domain
+
+Valid time says when a fact applies in the world the system represents.
+
+```text
+plan = pro
+valid from June 1 until July 1
+```
+
+The dates may come from a contract, provider, operator, or business event. They are not necessarily when the database row was written.
+
+## System time belongs to knowledge
+
+System time says when this version existed in the system.
+
+```text
+row recorded July 8 at 10:15
+superseded July 10 at 14:20
+```
+
+System-versioned databases manage this dimension from transaction history. MariaDB's [temporal-table documentation](https://mariadb.com/docs/server/reference/sql-structure/temporal-tables/system-versioned-tables) distinguishes it from application-time periods and supports combining both in bitemporal tables.
+
+I call it “recorded time” in product conversations because “system time” is easily confused with a server clock.
+
+## A retroactive correction needs four boundaries
+
+On July 8, support learns that a subscription upgraded on June 1, not June 15 as originally recorded.
+
+The corrected row has:
+
+```text
+valid_from  = June 1
+valid_to    = July 1
+system_from = July 8 10:15
+system_to   = open
+```
+
+The old belief remains:
+
+```text
+valid_from  = June 15
+valid_to    = July 1
+system_from = June 15 09:00
+system_to   = July 8 10:15
+```
+
+I can now answer:
+
+```text
+today's corrected truth for June 5: pro
+what billing believed on June 5: basic
+what the system believed on June 20: pro from June 15
+```
+
+Rewriting the old row in place destroys the second and third answers.
+
+## Use half-open intervals
+
+I represent periods as `[start, end)`:
+
+```text
+start inclusive
+end exclusive
+```
+
+Adjacent facts then meet without overlapping:
+
+```text
+basic [May 1, June 1)
+pro   [June 1, July 1)
+```
+
+At exactly June 1 there is one current value.
+
+Open-ended periods need one consistent representation: database infinity, a nullable end with careful constraints, or a governed maximum value. I do not mix them between services.
+
+## One table shape
+
+```sql
+create table plan_history (
+  customer_id text not null,
+  plan text not null,
+  valid_from timestamptz not null,
+  valid_to timestamptz not null,
+  system_from timestamptz not null,
+  system_to timestamptz not null,
+  source_event_id text not null,
+  check (valid_from < valid_to),
+  check (system_from < system_to)
+);
+```
+
+In a database with native support, generated system-time columns can replace application-managed ones. MariaDB documents a native [bitemporal table](https://mariadb.com/docs/server/reference/sql-structure/temporal-tables/bitemporal-tables) combining application and system periods.
+
+The conceptual model matters more than using one vendor syntax.
+
+## Prevent overlap in the right view
+
+For a single entity and property, two active beliefs should not usually claim overlapping valid periods.
+
+The constraint is two-dimensional:
+
+```text
+among rows current in system time,
+valid-time periods for the same key must not overlap
+```
+
+Historical superseded beliefs may overlap because they record what the system once thought.
+
+I enforce what the database can guarantee and use transaction-level checks for the rest. A read-then-insert check without locking can allow two concurrent overlapping rows.
+
+## Current projections keep ordinary reads simple
+
+Most application requests need:
+
+```text
+latest system belief
+valid at now
+```
+
+I expose this as a view or maintained projection. Callers should not reproduce four interval predicates differently.
+
+Historical queries use explicit names:
+
+```text
+as_corrected(valid_at)
+as_believed(valid_at, recorded_at)
+knowledge_history(entity)
+```
+
+Naming the two times in the API prevents analysts from silently choosing the wrong one.
+
+## Event logs do not automatically give bitemporal answers
+
+An immutable event log records arrival or occurrence, but a retroactive correction still needs interpretation.
+
+```text
+original event says effective June 15
+correction says effective June 1
+```
+
+Replaying with today's rules answers corrected truth. Replaying only events known by an earlier cutoff answers past belief. Both require event identity, ordering policy, and versioned projection rules.
+
+[Record-Level Provenance: Explain Where a Normalized Field Came From](/blog/record-level-provenance-explain-where-a-normalized-field-came-from) adds the derivation evidence beside these histories.
+
+## Late data should not rewrite knowledge time
+
+If an event arrives today with an old effective date, I set:
+
+```text
+valid time from the event's domain evidence
+system time from today's committed transaction
+```
+
+Backdating `system_from` to look tidy falsifies when the product actually knew the fact.
+
+This distinction is important for audit, model features, entitlement decisions, and explaining why yesterday's action differed from today's corrected view.
+
+## Correction and deletion need explicit meaning
+
+Closing a valid-time interval says the fact stopped applying. Closing only system time says the system replaced its belief about that fact. These are not the same as erasing personal data.
+
+For regulated deletion I may need to remove or tokenize historical values while retaining non-identifying evidence that a decision occurred. I design this with legal and product requirements early, because an append-only history that cannot honor deletion is not automatically safer. Temporal completeness and data minimization are constraints to reconcile, not excuses to ignore one another.
+
+## My bitemporal test
+
+I create:
+
+```text
+initial fact
+on-time replacement
+late retroactive correction
+correction of the correction
+two concurrent overlapping writes
+```
+
+I assert:
+
+- current projection has one value;
+- valid intervals are half-open and non-overlapping for the current belief;
+- every superseded belief remains queryable;
+- `as_corrected(t)` and `as_believed(t, k)` differ at the expected points;
+- retrying one correction is idempotent;
+- source event and reason remain attached;
+- retention and deletion policy covers both histories.
+
+## When I do not need two histories
+
+Bitemporal storage has real cost: more rows, harder constraints, more careful queries, and privacy retention concerns.
+
+I do not add it to disposable cache data. I consider it when retroactive truth and past decisions both matter: billing, entitlements, compliance, identity, contracts, reference data, or model features used for important actions.
+
+Valid time tells me when a fact applied. System time tells me when I believed it. Keeping them separate lets me correct reality without falsifying the history of the product.

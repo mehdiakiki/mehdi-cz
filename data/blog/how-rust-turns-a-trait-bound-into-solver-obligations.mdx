@@ -1,0 +1,229 @@
+---
+title: "How Rust Turns a Trait Bound Into Solver Obligations"
+date: "2026-09-20T09:00:00+01:00"
+tags: ["Rust trait solver", "trait bounds", "rustc internals", "E0277", "associated types"]
+draft: false
+reviewed: true
+reviewedHash: "9d56f172f7c91db32d737efe614051ff71145dde1b57a0e61ecd4b7c8141e13b"
+cluster: "rust-under-the-hood"
+campaign: "authority-2026"
+opportunity: "RUST-010"
+summary: "A source-to-diagnostic walkthrough of trait goals, parameter environments, candidates, associated-type normalization, and nested obligations."
+---
+
+A Rust bound such as `T: Clone` looks like a declaration attached to a generic function. Inside rustc it becomes evidence the compiler may assume, and calls inside or outside the function create goals that the trait solver must prove.
+
+The word “obligation” is useful here. It means a predicate that still needs justification, such as `Secret: Display` or `Vec<T>: Clone`.
+
+I will derive one real E0277 diagnostic from source-level bounds. The output was checked with `rustc 1.95.0-nightly (3a70d0349 2026-02-27)`, but the concepts come from the compiler model rather than this exact diagnostic formatting.
+
+## Start with a generic boundary
+
+```rust
+use std::fmt::Display;
+
+fn print_all<I>(items: I)
+where
+    I: IntoIterator,
+    I::Item: Display,
+{
+    for item in items {
+        println!("{item}");
+    }
+}
+```
+
+The function does not need to know one concrete iterator type. It states what every caller must provide:
+
+```text
+I: IntoIterator
+<I as IntoIterator>::Item: Display
+```
+
+The second predicate uses an associated-type projection. `I::Item` is shorthand whose meaning depends on which `IntoIterator` implementation applies.
+
+## Bounds become the parameter environment
+
+While type-checking this generic body, rustc does not search for a concrete impl of `IntoIterator` for unknown `I`. The `where` clause is an assumption in the current parameter environment, often called `ParamEnv` in compiler code.
+
+Conceptually:
+
+```text
+assumptions:
+  I: IntoIterator
+  <I as IntoIterator>::Item: Display
+
+goal created by `items.into_iter()`:
+  I: IntoIterator
+
+goal created by formatting `item`:
+  <I as IntoIterator>::Item: Display
+```
+
+Both goals can be proven from the assumptions. The caller will later be checked with concrete arguments.
+
+The [Rust Reference on trait bounds](https://doc.rust-lang.org/reference/trait-bounds.html) distinguishes bounds checked when an item is defined from those checked when it is used. The exact timing has special cases, but this assume-now/prove-at-use model is a good start for generic trait predicates.
+
+## A caller makes the goals concrete
+
+```rust
+struct Secret;
+
+fn main() {
+    print_all(vec![Secret]);
+}
+```
+
+Type inference determines:
+
+```text
+I = Vec<Secret>
+```
+
+The call must satisfy the instantiated bounds:
+
+```text
+goal 1: Vec<Secret>: IntoIterator
+goal 2: <Vec<Secret> as IntoIterator>::Item: Display
+```
+
+The solver can find an `IntoIterator` implementation for `Vec<T>`. That candidate establishes that its item is `T`, so normalizing the associated type turns goal 2 into:
+
+```text
+Secret: Display
+```
+
+There is no matching `Display` implementation. That is the unsatisfied obligation behind the diagnostic.
+
+## The real diagnostic preserves the chain
+
+rustc reports:
+
+```text
+error[E0277]: `Secret` doesn't implement `std::fmt::Display`
+  --> rust_trait_obligation.rs:16:15
+   |
+16 |     print_all(vec![Secret]);
+   |     --------- ^^^^^^^^^^^^ unsatisfied trait bound
+   |     |
+   |     required by a bound introduced by this call
+   |
+note: required by a bound in `print_all`
+  --> rust_trait_obligation.rs:6:14
+   |
+ 6 |     I::Item: Display,
+   |              ^^^^^^^ required by this bound in `print_all`
+```
+
+Read this from bottom to top:
+
+```text
+generic declaration requires I::Item: Display
+→ call chooses I = Vec<Secret>
+→ IntoIterator for Vec<Secret> has Item = Secret
+→ concrete goal is Secret: Display
+→ no candidate proves it
+→ E0277 points at the call and original bound
+```
+
+The diagnostic is a compressed proof failure.
+
+## Candidates can create nested obligations
+
+Suppose a standard-library-style implementation has this shape:
+
+```rust
+impl<T: Clone> Clone for Vec<T> { /* ... */ }
+```
+
+To prove `Vec<String>: Clone`, the solver considers this impl candidate. Confirming it creates the nested goal `String: Clone`. If that nested goal succeeds, the outer candidate works.
+
+```text
+goal Vec<String>: Clone
+└── impl candidate Clone for Vec<T>
+    └── nested goal String: Clone
+        └── matching impl → success
+```
+
+For `Vec<NotClone>: Clone`, the same outer impl may match structurally, but its nested obligation fails.
+
+The rustc guide's [trait resolution chapter](https://rustc-dev-guide.rust-lang.org/traits/resolution.html) calls out selection, fulfillment and evaluation in the current solver model. Selection finds a way to resolve a goal, an impl or parameter-bound candidate can introduce nested obligations, and fulfillment tracks the work until all obligations are discharged.
+
+## Success, ambiguity and failure are different
+
+The solver does not always return a simple boolean.
+
+```text
+success:   enough information proves the goal
+ambiguity: several outcomes remain possible because inference is incomplete
+failure:   no permitted candidate can prove the goal
+```
+
+For example, a goal involving an unconstrained type variable may be ambiguous now and become solvable after other type constraints arrive. Reporting “trait not implemented” immediately would be wrong.
+
+The next-generation [trait solver guide](https://rustc-dev-guide.rust-lang.org/solve/trait-solving.html) describes goals as a predicate plus its parameter environment. It evaluates possible candidates recursively and returns a canonical response containing success or ambiguity plus inference and region constraints, or an error.
+
+## Why canonicalization appears
+
+Inference variables are local to one inference context. The solver wants to cache and compare goals without treating a local variable identity as globally meaningful.
+
+Canonicalization replaces those local unknowns with a stable, numbered form, approximately:
+
+```text
+local goal:     Vec<?T_37>: Clone
+canonical goal: Vec<?0>: Clone
+```
+
+The result can describe constraints on `?0`, then the caller maps them back into its inference context. The real representation handles types, lifetimes, constants and universes with more precision, but the purpose is stable solver communication and caching.
+
+Canonical does not mean “the one concrete type.” It means a goal expressed independently of incidental local inference-variable identities.
+
+## Associated types add normalization goals
+
+`I::Item` may be written as a short projection, but the compiler often needs to normalize it through a selected impl. With deeper generics, one proof creates another:
+
+```rust
+fn render<I>(items: I)
+where
+    I: IntoIterator,
+    I::Item: Display,
+{}
+```
+
+Conceptually:
+
+```text
+prove I: IntoIterator
+normalize <I as IntoIterator>::Item to some type X
+prove X: Display
+```
+
+If the compiler cannot determine the relevant `IntoIterator` relationship, normalization can remain ambiguous. This is why associated-type errors can mention a long projection even when the source used `I::Item`.
+
+## Coherence and solving are related but not identical
+
+Coherence asks whether the program is allowed to contain a set of implementations that could overlap or violate orphan rules. Trait solving asks whether a goal can be proven from the available implementations and assumptions.
+
+Coherence makes solver candidate selection meaningful across crates. The [orphan rule and coherence guide](/blog/orphan-rule-rust) covers that global contract. Keeping the two questions separate helps when an error is about defining an impl rather than using one.
+
+## A practical way to decode E0277
+
+When I see a long trait error, I do this:
+
+1. Find the smallest unsatisfied predicate, often near the first E0277 line.
+2. Find the bound that introduced it.
+3. Substitute the concrete generic arguments from the call.
+4. Normalize associated types such as `I::Item` where possible.
+5. Follow `required because of` notes as nested obligations.
+6. Separate ambiguity from a truly absent impl.
+7. Reduce wrapper types until the failed inner predicate is visible.
+
+This is often faster than adding random bounds. Every added bound changes what callers must prove; it should correspond to an operation the implementation really needs.
+
+## My practical model
+
+A trait bound plays two roles. Inside a generic body it is evidence available in the parameter environment. At a concrete use site it becomes a goal the caller must satisfy.
+
+The solver considers impl and environment candidates, normalizes associated types, creates nested obligations and waits when inference leaves genuine ambiguity. An E0277 message is the surface form of the proof branch that could not close.
+
+Once I read trait errors as proof trees, the compiler's notes stop looking like unrelated type noise. They describe the path from one source-level promise to the exact missing obligation.

@@ -1,0 +1,112 @@
+---
+caseId: "RFA-186"
+title: "Why BufRead::fill_buf Repeats Bytes Until consume"
+date: "2026-09-05T17:25:00+01:00"
+lastmod: "2026-09-05T17:25:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "07126e895dc418e1621b4975ecfa387007d6ee7dccde439be366b3e45432a6db"
+area: "ffi-targets"
+symptom: "Two consecutive BufRead::fill_buf calls return the same unread bytes although application code expected the second call to advance the stream."
+summary: "fill_buf exposes currently buffered bytes without marking them read. Processing and advancing are separate operations: inspect the slice, remember the accepted length, release its borrow, and call consume exactly once."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust fill_buf returns same bytes",
+    "BufRead fill_buf consume example",
+    "fill_buf does not advance reader Rust",
+  ]
+evidence:
+  ["Rust 1.98.1 three-byte BufReader", "repeated abc observation", "consume-before-refill repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/std/io/trait.BufRead.html#tymethod.fill_buf",
+    "https://doc.rust-lang.org/std/io/trait.BufRead.html#method.consume",
+    "https://doc.rust-lang.org/std/io/struct.BufReader.html#method.with_capacity",
+  ]
+---
+
+`fill_buf` sounds like an instruction to fetch the next block. It is better understood as a request to view the unread block currently available. Viewing it does not advance the reader.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-186/fail.rs) wraps `abcdef` in a three-byte `BufReader`. The first `fill_buf` returns `abc`. The second call also returns `abc`, not `def`.
+
+## Observation and commitment are separate
+
+[`BufRead::fill_buf`](https://doc.rust-lang.org/std/io/trait.BufRead.html#tymethod.fill_buf) returns a borrowed slice of the internal buffer, filling it from the underlying reader only when necessary. [`BufRead::consume`](https://doc.rust-lang.org/std/io/trait.BufRead.html#method.consume) marks a number of those bytes as read.
+
+The low-level protocol is:
+
+```text
+fill_buf       observe unread bytes
+process        decide how many bytes were accepted
+consume(n)     commit that progress
+fill_buf       observe what remains
+```
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-186/fixed.rs) copies the first slice for its assertion, consumes its length, and then receives the next three bytes.
+
+## The split supports parsers that need to look ahead
+
+A parser may need to inspect bytes before deciding whether it has a complete token. If `fill_buf` advanced automatically, merely checking for a delimiter could lose input.
+
+With the split API, I can search the available slice, consume only a complete prefix, and leave an incomplete suffix for the next decision. This is useful for zero-copy scanning because accepted bytes do not need to be copied into an intermediate buffer.
+
+“Zero-copy” here still includes memory loads. It means the parser can borrow existing storage instead of writing the bytes into another allocation.
+
+## The borrow determines the code shape
+
+The returned slice borrows the reader mutably. I cannot call `consume` while that slice remains in use. A common pattern puts inspection in a smaller scope and keeps only the accepted length:
+
+```rust
+let accepted = {
+    let available = reader.fill_buf()?;
+    inspect(available)
+};
+reader.consume(accepted);
+```
+
+This is not ceremony added by the borrow checker. It prevents the internal buffer from being advanced or refilled while a reference into it remains active.
+
+If data must survive consumption, I transform or copy only what the next stage owns.
+
+## Partial consumption changes the next view
+
+I do not have to consume the whole slice. If `fill_buf` returns `abcdef` and the parser accepts two bytes, `consume(2)` makes the next view begin at `c`. An implementation may return `cdef` from existing storage without reading again.
+
+The exact buffer size and refill boundary are not protocol boundaries. [`BufReader::with_capacity`](https://doc.rust-lang.org/std/io/struct.BufReader.html#method.with_capacity) makes a deterministic fixture, but production parsing must work for every possible split.
+
+This is the same rule used for streaming pattern matching: chunk boundaries must not change meaning.
+
+## Over-consuming is a logic error
+
+The amount passed to `consume` must not exceed the unread bytes supplied by `fill_buf`. The documentation calls exceeding it a logic error. I calculate progress from the exact slice just inspected rather than from a stale counter or expected record size.
+
+I also call `consume` exactly once. Consuming the same accepted length again skips unprocessed data. Retrying after a downstream error therefore needs a defined commit point.
+
+## An empty slice means EOF for that reader
+
+`fill_buf` returns an empty slice at EOF. A short non-empty slice does not mean EOF; it may reflect buffer capacity, underlying read behaviour, or currently available data.
+
+I process every non-empty slice and stop only when the returned slice is empty. For nonblocking or async designs, readiness and EOF may have different representations, but the same observation-versus-consumption principle remains useful.
+
+## Higher-level methods may be a better choice
+
+For ordinary lines, `read_line` or `lines` is clearer. For fixed-size records, `read_exact` may express the success contract better. I use `fill_buf` when borrowing, delimiter search, or partial consumption produces a real benefit.
+
+Low-level control also means owning limits, error recovery, and progress invariants. A loop that repeatedly calls `fill_buf` without consuming anything can spin forever on the same bytes.
+
+## My buffered-parser checklist
+
+When a `BufRead` loop repeats or skips data, I check:
+
+1. Which call observes bytes and which call commits progress?
+2. Is the consumed length derived from the current borrowed slice?
+3. Can the parser accept only a prefix?
+4. Is `consume` accidentally missing or called twice?
+5. Does the algorithm work at every buffer split?
+6. Is an empty slice the only EOF signal being used?
+7. Does retained data own its bytes before the reader advances?
+
+The core principle reaches beyond Rust: look-ahead and acknowledgment are different state transitions. `fill_buf` lets me inspect without losing data. Progress happens only when I explicitly call `consume`.

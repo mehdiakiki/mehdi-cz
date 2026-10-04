@@ -1,0 +1,141 @@
+---
+caseId: "RFA-189"
+title: "Why HashMap Entry::or_insert Builds an Unused Default"
+date: "2026-09-05T17:28:00+01:00"
+lastmod: "2026-09-05T17:28:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "c88b25ab2aa83b42ba4b32eb399314821e9e2a5c3cacbbe98f02803b77420537"
+area: "concurrency-memory"
+symptom: "HashMap Entry::or_insert constructs and immediately drops an expensive default although the requested key is already occupied."
+summary: "or_insert receives an already-evaluated value, so occupied entries cannot prevent its construction. Pass a closure to or_insert_with when work must happen only for a vacant entry, and measure construction rather than inferring it from the final map."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets with alloc"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust HashMap or_insert eager evaluation",
+    "Entry or_insert expensive default called",
+    "or_insert vs or_insert_with lazy",
+  ]
+evidence: ["Rust 1.98.1 occupied entry", "atomic Drop counter", "closure-based repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/std/collections/hash_map/enum.Entry.html#method.or_insert",
+    "https://doc.rust-lang.org/std/collections/hash_map/enum.Entry.html#method.or_insert_with",
+    "https://doc.rust-lang.org/std/collections/hash_map/enum.Entry.html#method.or_insert_with_key",
+  ]
+---
+
+This line looks conditional at first sight:
+
+```rust
+map.entry(key).or_insert(build_value());
+```
+
+The insertion is conditional. The call to `build_value()` is not.
+
+I have seen this hide behind a correct final map: the existing value remains, every assertion about keys passes, but an expensive candidate was still allocated and then dropped. If construction opens a file, increments a metric, or reserves a large buffer, the hidden work becomes a production problem.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-189/fail.rs) makes the invisible work measurable. A `Candidate` increments an atomic counter when dropped. The map already contains the key, yet `or_insert(Candidate::tracked(...))` builds a second candidate and immediately drops it. The counter becomes one.
+
+## Method arguments are evaluated before the call
+
+[`Entry::or_insert`](https://doc.rust-lang.org/std/collections/hash_map/enum.Entry.html#method.or_insert) accepts a value of type `V`. To pass that value, Rust must evaluate the argument expression first. Only then can the method inspect whether the entry is occupied or vacant.
+
+The order is conceptually:
+
+```text
+evaluate map.entry(key)
+evaluate build_value()
+call or_insert with the completed value
+keep it if vacant, or drop it if occupied
+```
+
+The method name cannot make an ordinary argument lazy. This is not special behaviour from `HashMap`; it follows the language-level evaluation model of a function or method call.
+
+The returned reference still points to the existing value when the key is occupied. Looking only at that reference or at the map contents will miss the temporary candidate.
+
+## `or_insert_with` moves the work behind a closure
+
+[`Entry::or_insert_with`](https://doc.rust-lang.org/std/collections/hash_map/enum.Entry.html#method.or_insert_with) accepts `FnOnce() -> V` instead of `V`. The map can inspect its entry state first and invoke the closure only for a vacant entry.
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-189/fixed.rs) uses:
+
+```rust
+entry.or_insert_with(|| Candidate::tracked(&drops));
+```
+
+For the occupied key, the closure body never runs. The drop counter stays at zero until the existing map value itself is dropped.
+
+This is more than a micro-optimization when construction has observable effects. It aligns the side effect with the state transition that needs it.
+
+## A closure does not undo work done before it exists
+
+The lazy boundary must surround the expensive expression. This still performs the work eagerly:
+
+```rust
+let candidate = build_value();
+map.entry(key).or_insert_with(|| candidate);
+```
+
+The closure defers moving `candidate`, but the candidate was already built. I put allocation, parsing, file access, or other construction inside the closure body when I want it deferred.
+
+Creating a closure may also capture values immediately. Usually those captures are cheap moves or borrows, but I check them when ownership changes are important. “Uses a closure” is not by itself proof that every surrounding operation is lazy.
+
+## Use `or_insert_with_key` when construction depends on the stored key
+
+Sometimes the default needs the key. Cloning the key before `entry` only to make the value can add another unnecessary cost.
+
+[`Entry::or_insert_with_key`](https://doc.rust-lang.org/std/collections/hash_map/enum.Entry.html#method.or_insert_with_key) passes a reference to the moved key into the default function when the entry is vacant. This can avoid keeping a second clone only for construction:
+
+```rust
+map.entry(name).or_insert_with_key(|stored_name| {
+    Metadata::for_name(stored_name)
+});
+```
+
+I use this when the key already contains the information needed for the value. The closure still runs only for a vacant entry.
+
+## `or_default` states a simpler intention
+
+When `V::default()` is genuinely the wanted value, `or_default` is the clearest form. There is no default-value argument to evaluate at the call site. It also communicates that construction follows the type's standard empty state rather than application-specific policy.
+
+I do not implement `Default` only to shorten one insertion path. A misleading default can weaken the model. `or_insert_with` remains better when valid construction needs context.
+
+## Side effects make the bug larger than CPU time
+
+An unused value may be cheap, but an unused effect is rarely harmless. Eager construction can:
+
+- allocate memory and increase allocator contention,
+- register a metric or tracing span,
+- consume an identifier,
+- read configuration or environment state,
+- acquire and release a resource,
+- log a message that suggests insertion happened.
+
+I prefer constructors to be predictable and mostly free of external effects. Still, some resource-owning values must perform work. In those cases the lazy API is part of correctness, not only performance.
+
+Fallible construction needs an explicit design as well. I avoid hiding a complex `Result` policy in a closure just to save lines. Depending on the operation, matching `Entry::Vacant` and constructing with `?` can make failure handling easier to read.
+
+## Measure the event the hypothesis predicts
+
+A benchmark can show extra time, but it may be noisy for a small candidate. The drop counter in the fixture is a more direct discriminator. If the wrong value was constructed and rejected, its destructor must run.
+
+Other useful probes include a constructor counter, an allocation count in a controlled harness, or a fake resource factory. I avoid testing only the map length because both eager and lazy versions produce the same length.
+
+This principle improves debugging generally: observe the hidden transition, not only the final container state.
+
+## My Entry API checklist
+
+When code computes a default around `HashMap::entry`, I ask:
+
+1. Is the default expression evaluated before occupancy is known?
+2. Is construction expensive or externally observable?
+3. Can `or_insert_with` place all expensive work inside a closure?
+4. Does construction need the stored key, making `or_insert_with_key` clearer?
+5. Is `or_default` the honest model for this type?
+6. Are closure captures themselves doing work too early?
+7. Does the test count construction or Drop rather than checking only final map contents?
+
+The core principle goes beyond `HashMap`: conditional use does not imply conditional evaluation. An API taking `T` receives completed work. An API taking `FnOnce() -> T` can decide whether that work should happen.

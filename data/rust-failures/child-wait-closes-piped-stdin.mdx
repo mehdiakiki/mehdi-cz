@@ -1,0 +1,98 @@
+---
+caseId: "RFA-365"
+title: "Child::wait Closes Piped stdin Before Waiting"
+date: "2026-09-06T02:22:00+01:00"
+lastmod: "2026-09-06T02:22:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "3c460a0455ce2efe095f1f8ddfa4383c477a4a649ae7d6ca708fb324bd57f5de"
+area: "ffi-targets"
+symptom: "After Child::wait returns, child.stdin is None because Rust took and closed the piped handle before blocking for process exit."
+summary: "wait closes an owned ChildStdin first so a child reading until EOF can terminate instead of deadlocking with its waiting parent. Write complete input before wait, or take and coordinate the handle explicitly."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets with process support"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust Child wait closes stdin", "child stdin None after wait Rust", "process deadlock waiting for stdin EOF"]
+evidence: ["Rust 1.98.1 self-spawned evidence process", "piped ChildStdin present before wait", "EOF-driven child exit and absent handle afterward"]
+sources: ["https://doc.rust-lang.org/std/process/struct.Child.html#method.wait", "https://doc.rust-lang.org/std/process/struct.Child.html#structfield.stdin", "https://doc.rust-lang.org/std/process/struct.Command.html#method.stdin"]
+---
+
+I once kept a child's stdin handle inside `Child`, called [`wait`](https://doc.rust-lang.org/std/process/struct.Child.html#method.wait), and then tried to inspect the handle. It was gone. Rust deliberately closes piped stdin before waiting so a child reading until EOF can finish.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-365/fail.rs) spawns a second copy of itself. The child reads standard input until EOF. The parent confirms that `child.stdin` starts as `Some`, calls `wait`, and then finds `None`.
+
+## Parent and child can otherwise wait forever
+
+Consider the dependency cycle:
+
+```text
+child waits for stdin EOF
+parent waits for child exit
+stdin stays open in parent
+```
+
+Neither side can make progress. Closing the final write handle sends EOF once all previously written bytes have been consumed. The child can exit, and the parent's wait can return.
+
+The standard library breaks this common cycle by taking and dropping its stored `ChildStdin` before it blocks.
+
+## Child owns optional pipe handles
+
+When a command is configured with piped stdin, the resulting [`Child::stdin`](https://doc.rust-lang.org/std/process/struct.Child.html#structfield.stdin) field is an `Option<ChildStdin>`. It is public so the parent can borrow or take the handle.
+
+The option also records lifecycle. After `wait` has closed the stored handle, there is no live value to return, so the field is `None`.
+
+I avoid calling `unwrap()` on it after waiting. The process status and the I/O handles move through different states during child management.
+
+## Write all input before a simple wait
+
+The repaired fixture borrows the handle, writes `complete request`, then calls `child.stdin.take()` and drops the returned handle explicitly. Only after the input protocol is complete does it wait.
+
+The child asserts the exact bytes after reaching EOF. This proves both content and closure ordering without a shell, timeout, or external program.
+
+Explicitly dropping stdin is not mandatory before `wait`, because `wait` does it. I still like the explicit form when EOF is a meaningful protocol event: it shows that no more request bytes will be sent.
+
+## Taking the handle transfers responsibility
+
+If I call `let stdin = child.stdin.take().unwrap()`, the handle no longer lives in the `Child` field. `wait` cannot close my separate variable. I must drop it or arrange a writer task to finish.
+
+This is useful when writing concurrently with reading output, but it reintroduces the possibility of a deadlock if ownership is unclear. I define who closes every pipe and under what success, error, and cancellation paths.
+
+RAII closes the OS handle when the Rust value drops. It cannot decide when my application protocol considers the stream complete.
+
+## Large stdout can create another deadlock
+
+Closing stdin solves only one dependency. A child can fill its stdout pipe and block while the parent waits without reading. The parent then waits for exit, while the child waits for pipe capacity.
+
+[`wait_with_output`](https://doc.rust-lang.org/std/process/struct.Child.html#method.wait_with_output) collects remaining piped output while waiting and also closes stdin first. For interactive or large bidirectional protocols, I read and write concurrently with bounded memory and cancellation.
+
+I do not assume that one deadlock safeguard turns arbitrary process I/O into a safe request-response transport.
+
+## wait is repeatable for status, not for I/O state
+
+The documentation says repeated `wait` calls return the same exit status after the first. This does not recreate stdin or replay output. Waiting reaps or observes the process lifecycle; pipes have their own one-way consumption.
+
+I store the returned status if the application needs it and avoid designing code that depends on repeated waits as synchronization events.
+
+On failure to wait, I still inspect ownership carefully. Error paths must not leave background children or writer threads indefinitely alive.
+
+## Dropping Child alone does not guarantee waiting
+
+The standard `Child` type does not automatically wait in its destructor. A program that starts many children and drops handles without waiting can leave platform resources or zombie processes until another mechanism reaps them.
+
+My process wrapper owns an explicit shutdown policy: close input, drain required output, request termination if needed, and wait. Timeouts and forced termination are application choices layered above the basic API.
+
+This case is therefore not advice to rely on implicit cleanup. It explains one specific action performed by an explicit wait.
+
+## Tests should use a child that needs EOF
+
+A child that exits immediately cannot prove why stdin closure matters. The evidence executable enters a `--child` mode and calls `read_to_end(stdin)`. It can terminate only after the parent closes its pipe.
+
+Because the parent calls `wait` while the pipe is still stored in `Child`, a successful return proves that the automatic closure occurred. The final `None` assertion makes the handle transition observable.
+
+For production integration tests I also cover a child that writes more than one pipe buffer, exits non-zero, ignores input, and is cancelled while I/O is active.
+
+## The core principle is to draw resource dependencies before blocking
+
+Blocking is safe only when another participant can still perform the event that releases it. Here the child needs EOF, and EOF needs every parent write handle closed.
+
+`Child::wait` closes its stored piped stdin before waiting to remove the simplest cycle. When I take that handle or add stdout and stderr flow, the remaining dependency graph becomes my responsibility.

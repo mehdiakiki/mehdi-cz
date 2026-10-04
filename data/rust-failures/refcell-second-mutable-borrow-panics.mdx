@@ -1,0 +1,87 @@
+---
+caseId: "RFA-114"
+title: "Why a Second RefCell Mutable Borrow Panics at Runtime"
+date: "2026-09-05T10:14:00+01:00"
+lastmod: "2026-09-05T10:14:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "830bf431483ae9d86af095bbe521f9a6f6d701ed8bc4adbffd8d3f16aa53bb30"
+area: "concurrency-memory"
+symptom: "Code compiles through RefCell but panics with already borrowed when a RefMut guard is still alive during another mutable borrow."
+summary: "RefCell moves Rust's exclusive-borrow check to runtime; it does not remove the rule. Shorten RefMut guard lifetimes, avoid reentrant borrowing, and use try_borrow_mut where conflict is expected."
+rustVersions: ["Rust 1.98.1"]
+targets: ["all targets with core or std"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust RefCell already borrowed panic", "BorrowMutError second mutable borrow", "RefCell borrow_mut runtime panic"]
+evidence: ["Rust 1.98.1 deterministic runtime panic", "overlapping RefMut guards", "lexically scoped guard repair"]
+sources: ["https://doc.rust-lang.org/std/cell/struct.RefCell.html", "https://doc.rust-lang.org/book/ch15-05-interior-mutability.html"]
+---
+
+`RefCell<T>` lets code mutate through a shared reference, but it does not permit two mutable borrows. It checks the same core borrowing rule while the program runs.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-114/fail.rs) keeps one `RefMut<Vec<_>>` in `first_borrow` and calls `borrow_mut` again. It compiles, then panics with “RefCell already borrowed.”
+
+## Interior mutability moves the check
+
+The [`RefCell` documentation](https://doc.rust-lang.org/std/cell/struct.RefCell.html) describes dynamically checked borrow rules. At one instant the cell may have any number of immutable `Ref` guards or exactly one mutable `RefMut` guard, but not both arrangements together.
+
+The Rust Book's [interior mutability chapter](https://doc.rust-lang.org/book/ch15-05-interior-mutability.html) explains why this can be useful when static analysis cannot express a valid pattern. The trade is important: invalid overlap becomes a runtime panic instead of a compile-time error.
+
+I picture the cell holding a borrow state beside the value:
+
+```text
+unused -> shared count 1, 2, ...
+unused -> exclusive
+shared/exclusive conflict -> error or panic
+```
+
+Dropping the guard updates that state.
+
+## The guard lifetime is the real question
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-114/fixed.rs) puts the first mutable borrow in a block. The `RefMut` is dropped at the block end before the second borrow starts.
+
+Sometimes non-lexical lifetimes make a guard end after its last use, but I do not depend on subtle inference when the lifecycle matters. A block or explicit `drop(guard)` communicates the exclusive phase clearly.
+
+One-line expressions can retain guards longer than expected, especially when temporaries live through a statement or control-flow construct. I bind the guard and choose its scope during debugging.
+
+## Reentrant callbacks are a common cause
+
+The obvious second borrow may not be in the same function. Code borrows a state object mutably, calls a callback, and the callback reaches the same `RefCell` through another path. The outer guard remains alive across the call, so the inner borrow panics.
+
+I avoid calling unknown or user-provided code while holding a `RefMut`. Instead I extract the required data, release the guard, call outward, then borrow again if the state transition permits it.
+
+This resembles avoiding external calls while holding a mutex, even though `RefCell` is single-threaded. The issue is reentrancy rather than thread scheduling.
+
+## try_borrow_mut makes expected contention explicit
+
+`borrow_mut` panics on conflict. `try_borrow_mut` returns a `Result`. If overlapping access is a normal state—for example, a recursive observer skips updates while already processing—handling the result can be better.
+
+I do not replace every panic with `if let Ok(...)` and ignore failure. That can lose updates silently. The caller needs a policy: queue, merge, reject, or redesign the ownership.
+
+When overlap is logically impossible, `borrow_mut` plus a precise test can be appropriate. The panic then exposes an invariant violation close to its cause.
+
+## RefCell is not a thread-safety primitive
+
+`RefCell` is not `Sync`, so it is not the way to share mutable state across threads. `Rc<RefCell<T>>` is common in single-threaded graphs and UI-style ownership. Concurrent code needs synchronization such as `Mutex` or `RwLock`, chosen with an explicit contention and poisoning policy.
+
+Wrapping a `RefCell` in `Arc` does not change its inner synchronization properties. The outer smart pointer manages ownership count, not borrow-state races.
+
+## Refactor when guards spread too far
+
+If many functions receive `RefMut` or repeatedly borrow one large state object, I split the state by ownership or expose narrower operations. A method like `queue.push_job(job)` can keep the guard local, while returning the guard leaks dynamic borrowing into callers.
+
+Sometimes ordinary `&mut self` becomes possible after clarifying ownership. Compile-time checking is preferable when the model can express it because invalid states cannot reach production.
+
+## My debugging sequence
+
+When a `RefCell` panics, I follow this order:
+
+1. Get a backtrace and locate both the failing borrow and the earlier live guard.
+2. Bind temporary borrows to names so their lifetimes are visible.
+3. Inspect callbacks, formatting, iterator closures, and destructors for reentrant access.
+4. Shorten the guard with a block or extract-owned-update pattern.
+5. Use `try_borrow_mut` only when conflict is a designed runtime outcome.
+6. Reconsider whether `RefCell` is hiding an ownership boundary that should be static.
+
+Interior mutability is controlled delayed checking, not an escape from exclusivity. Once I treat every `Ref` and `RefMut` as a real guard with a lifetime, the runtime panic becomes as understandable as a borrow-checker error.

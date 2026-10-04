@@ -1,0 +1,134 @@
+---
+caseId: "RFA-032"
+title: "A Cargo Workspace Builds Locally but the Packaged Crate Misses Files"
+date: "2026-09-04T21:00:00+01:00"
+lastmod: "2026-09-07T10:20:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "7f3944b0ef87c6b97025af1d0766ef1509b3e8f0da9392cd1e70f4d9e8a88cb6"
+area: "cargo-dependencies"
+symptom: "A Rust crate builds inside its repository but cargo package or an installation from the packaged crate fails because generated, ignored, or workspace files are absent."
+summary: "The repository is not the crate. Diagnose publish-only Rust failures by inspecting cargo package --list, the normalized manifest, and a build from the extracted archive."
+rustVersions: ["stable Rust", "Cargo stable"]
+targets: ["host packaging target"]
+profiles: ["package verification"]
+searchTerms:
+  [
+    "cargo package missing file",
+    "crate builds locally fails after publish",
+    "cargo package list include exclude",
+  ]
+evidence: ["cargo package --list diff", "extracted .crate build", "normalized manifest inspection"]
+sources:
+  [
+    "https://doc.rust-lang.org/cargo/commands/cargo-package.html",
+    "https://doc.rust-lang.org/cargo/reference/manifest.html#the-exclude-and-include-fields",
+  ]
+---
+
+A workspace can pass `cargo build`, `cargo test`, and CI, then fail during `cargo package` or after somebody installs the published crate. This feels like Cargo changed the build. Usually the input changed first.
+
+The repository and the distributable crate are not the same object. Packaging selects files, rewrites parts of the manifest, creates a `.crate` archive, extracts it, and builds that clean copy for verification. A local build can silently depend on files which never enter the archive.
+
+## Start with the package file list
+
+My first command is not another workspace build:
+
+```bash
+cargo package --list
+```
+
+It prints the files Cargo intends to include. I search this list for every file named by:
+
+- `include_str!` and `include_bytes!`;
+- a build script;
+- examples and tests;
+- license and readme fields;
+- code generation;
+- relative paths in configuration.
+
+If a required file is absent, I already have a smaller problem than “publishing is broken.”
+
+Cargo uses manifest `include` and `exclude` rules, with version-control ignore rules involved when an explicit include list is not present. An ignored fixture may exist on every developer machine and still be absent from the crate.
+
+## A minimal failure
+
+Suppose the library embeds a template:
+
+```rust
+pub const DEFAULT_TEMPLATE: &str = include_str!("../assets/default.txt");
+```
+
+The repository contains `assets/default.txt`, but `.gitignore` excludes `assets/` because other generated files live there. A normal local build reads the existing file. The packaged source does not contain it, so Cargo's verification build fails.
+
+The direct check is:
+
+```bash
+cargo package --list | rg 'assets/default.txt'
+```
+
+No output confirms the package boundary, not Rust name resolution, is the first place to repair.
+
+The paired Atlas fixture makes that boundary observable. The [failing package](/rust-failure-atlas/evidence/RFA-032/fail/Cargo.toml) compiles from its checkout because the template exists there, but its explicit `include` list omits the asset and the extracted package cannot compile. The [repaired package](/rust-failure-atlas/evidence/RFA-032/fixed/Cargo.toml) includes the exact input. The verifier requires the first local check to pass before it accepts the package failure, so a generally broken crate cannot impersonate this case.
+
+## Inspect the artifact Cargo will distribute
+
+`cargo package` writes the archive under `target/package`. I inspect the archive and its generated manifest instead of assuming the source checkout is representative.
+
+Cargo includes both the original manifest and a normalized `Cargo.toml`. The normalized form is what consumers effectively build. Workspace sections are removed, and path dependencies cannot be used as unpublished shortcuts. A dependency can specify a path and version locally, but the packaged dependency resolves by version from the registry.
+
+This exposes another common case:
+
+```toml
+[dependencies]
+shared-types = { path = "../shared-types", version = "0.4" }
+```
+
+The workspace build reads the sibling directory. The packaged crate expects version `0.4` to exist in the selected registry and to contain the compatible API. If it is missing or different, local success proved only the path graph.
+
+## Use package verification as the clean-room test
+
+By default, `cargo package` extracts the archive and builds it from scratch. I keep this verification enabled. `--no-verify` can create an artifact, but it removes the strongest built-in check and should not become the normal escape hatch.
+
+For a workspace, I select the exact package:
+
+```bash
+cargo package -p my-library
+```
+
+Then I check four views:
+
+1. repository files;
+2. `cargo package --list` output;
+3. the extracted packaged source and normalized manifest;
+4. the dependency graph available to an external consumer.
+
+The difference between two adjacent views normally locates the failure.
+
+## Repairs with different meanings
+
+If a source asset is required at compile time, I add a narrow `include` policy or stop ignoring that source asset. A small explicit include list can make review easier, but it must include every source, manifest, build input, license, and documentation file the crate needs.
+
+If a file is generated, I decide when generation belongs:
+
+- Check in a deterministic generated artifact when consumers should compile without the generator.
+- Generate inside `build.rs` from inputs included in the crate and write only to `OUT_DIR`.
+- Remove compile-time file embedding when the data should be supplied at runtime.
+
+If the failure is a workspace path dependency, I publish dependencies in order with compatible version declarations, or keep the package private. Copying a sibling directory into the archive is not a dependency strategy.
+
+## False fixes I avoid
+
+`--allow-dirty` permits packaging an uncommitted checkout. It does not mean ignored or excluded files will enter the crate.
+
+`--no-verify` skips the extracted build. It can postpone the failure until a user downloads the crate.
+
+Running `cargo clean` may remove a stale local artifact, but it does not prove the package contains its inputs.
+
+These commands are useful for their stated purposes, not as repairs for a package-content mismatch.
+
+## The regression gate
+
+For a publishable crate, I make `cargo package -p package-name` part of release CI. I also keep targeted assertions on `cargo package --list` for unusual inputs such as templates, schemas, native sources, or generated files.
+
+The most useful review sentence is: “show me the files and manifest that the registry user receives.” Once I treat the `.crate` archive as the product, local-only assumptions become much easier to see.

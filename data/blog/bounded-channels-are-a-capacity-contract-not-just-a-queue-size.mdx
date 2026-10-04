@@ -1,0 +1,210 @@
+---
+title: "Bounded Channels Are a Capacity Contract, Not Just a Queue Size"
+date: "2026-11-06T09:00:00+01:00"
+tags: ["rust", "Tokio", "bounded channel", "backpressure", "async"]
+draft: false
+reviewed: true
+reviewedHash: "5e12898849363180cfa5812e886461ebd520ed04a2f613b6ce8fafd101a7b4b8"
+cluster: "rust-under-the-hood"
+campaign: "authority-2026"
+opportunity: "RUST-041"
+summary: "A bounded async channel defines who waits when capacity is full, what memory is covered, how cancellation affects queue position, and how shutdown reaches blocked senders."
+---
+
+Choosing `mpsc::channel(1000)` is not only choosing a data structure size. It is deciding what happens when producers create work faster than the consumer can finish it.
+
+A bounded channel is one part of a capacity contract.
+
+## Capacity controls queued items, not the whole pipeline
+
+With Tokio:
+
+```rust
+let (tx, mut rx) = tokio::sync::mpsc::channel::<Job>(1000);
+```
+
+At most 1,000 messages occupy channel slots. Additional work can still exist:
+
+```text
+jobs being built before send
+send futures waiting for capacity
+messages removed from channel but processing
+retries scheduled elsewhere
+cloned data retained by producers and consumer
+results waiting in another queue
+```
+
+If one `Job` owns a 4 MiB buffer, “capacity 1000” can be a multi-gigabyte promise. I measure retained bytes, not only item count.
+
+## Full decides who waits
+
+An asynchronous `send().await` waits until capacity becomes available or the receiver closes.
+
+```rust
+tx.send(job).await?;
+```
+
+This propagates pressure into the producer task. That may be exactly correct. It may also hold a database transaction, network body, permit, or lock while waiting.
+
+I inspect what is live across the await:
+
+```rust
+let job = build_job(input)?;
+drop(database_guard);
+tx.send(job).await?;
+```
+
+The sender should not accidentally block scarce upstream resources merely because the queue is full.
+
+## `try_send` changes overload semantics
+
+```rust
+match tx.try_send(job) {
+    Ok(()) => {}
+    Err(TrySendError::Full(job)) => { /* explicit overload path */ }
+    Err(TrySendError::Closed(job)) => { /* shutdown path */ }
+}
+```
+
+`try_send` does not provide backpressure by waiting. It asks the caller to decide immediately: reject, retry later, spill durably, coalesce, or drop an explicitly disposable item.
+
+Ignoring `Full` is silent data loss. Retrying in a tight loop is busy waiting.
+
+The [Tokio bounded mpsc documentation](https://docs.rs/tokio/latest/tokio/sync/mpsc/index.html) documents backpressure, clean shutdown, and bounded/unbounded variants.
+
+## Reserve capacity before constructing expensive work
+
+Tokio's bounded sender supports reserving a permit. This can be useful when creating the message is expensive or must not happen unless queue capacity is secured.
+
+Conceptually:
+
+```rust
+let permit = tx.reserve().await?;
+let job = build_expensive_job()?;
+permit.send(job);
+```
+
+The permit itself consumes capacity. Holding it for a long time reduces available slots even before a message appears.
+
+I keep the reserved period short and do not acquire unrelated locks after reservation. Otherwise several tasks can reserve all slots and wait on resources needed by the consumer.
+
+## Cancellation affects queue fairness
+
+A send waiting for capacity can be cancelled by `select!`, timeout, or task abortion. Channel APIs define whether cancelling loses a place in the wait queue and whether the message value is returned to the caller.
+
+This matters when producers assume FIFO fairness:
+
+```text
+sender A waits
+sender B waits
+A timeout branch cancels and retries
+A may rejoin behind B or lose the message if code drops it
+```
+
+I read the exact method's cancellation-safety documentation and make ownership visible. Retrying `send` with a newly generated job can also duplicate upstream work.
+
+## Receiver throughput includes handler time
+
+This loop has one in-flight job:
+
+```rust
+while let Some(job) = rx.recv().await {
+    process(job).await;
+}
+```
+
+Moving `process` into spawned tasks increases concurrency but creates another capacity boundary:
+
+```rust
+while let Some(job) = rx.recv().await {
+    tokio::spawn(process(job));
+}
+```
+
+The channel can drain quickly while unbounded spawned tasks accumulate. I use a semaphore or structured task set to bound processing concurrency too.
+
+```text
+channel slots: bound waiting work
+processing permits: bound active work
+downstream limits: bound external load
+```
+
+All three are part of capacity.
+
+## Closed is a lifecycle signal
+
+When all senders are dropped, the receiver eventually gets `None` after buffered messages drain. When the receiver closes or drops, blocked and future sends fail.
+
+A clean shutdown plan can be:
+
+```text
+stop accepting new external work
+drop or close producers
+drain buffered jobs until deadline
+record unfinished durable identities
+close receiver and join owned tasks
+```
+
+If messages exist only in memory, process termination still loses them. A bounded channel gives memory safety and coordination, not durability.
+
+## Capacity should come from a delay budget
+
+Suppose the consumer sustains 500 jobs/s and the product allows two seconds of queue wait during a burst.
+
+```text
+initial capacity estimate = 500 × 2 = 1,000 jobs
+```
+
+Then I validate memory:
+
+```text
+1,000 × measured retained bytes per job
+```
+
+and burst shape. If producers sustain 800/s while the consumer remains 500/s, 1,000 slots fill in about 3.3 seconds:
+
+```text
+1,000 / (800 - 500) ≈ 3.3 seconds
+```
+
+After that, the overload policy activates. A bigger capacity only delays it.
+
+## Cloning the sender does not divide capacity fairly
+
+Many producers can hold clones of one `Sender`. They share the channel capacity, but the application may still need fairness between tenants or work classes.
+
+A noisy producer that always has work can occupy every newly available slot. The bounded queue protects memory while an important low-volume job waits behind 1,000 cheap jobs.
+
+I add admission limits before the shared channel or use separate queues with a scheduler when fairness matters. Capacity answers “how much can wait”; it does not answer “whose work gets the next slot.” I also avoid giving an unbounded number of tasks their own pending `send` future, because those waiting tasks retain messages outside the channel's item count.
+
+## Observe the contract
+
+I record:
+
+- current and maximum queue depth;
+- estimated queued bytes;
+- send wait duration and `Full` count;
+- receive-to-start and end-to-end age;
+- active processing permits;
+- receiver-closed send failures;
+- shutdown drain time and abandoned work;
+- throughput and error rate at the downstream limit.
+
+One average depth can hide short periods when every producer is blocked.
+
+## Test saturation, cancellation, and closure
+
+My channel test fills capacity deliberately, blocks several senders, cancels one, frees one slot, then closes the receiver.
+
+I assert:
+
+```text
+memory and task counts remain bounded
+one freed slot admits only the expected work
+cancelled sender retains or disposes its job by policy
+blocked senders learn about closure
+no spawned-task escape bypasses the processing limit
+shutdown reaches a known terminal state
+```
+
+A bounded channel is useful because overload becomes observable at a specific line. The number only has meaning when message memory, active work, send cancellation, downstream capacity, durability, and shutdown are part of the same contract.

@@ -1,0 +1,1 @@
+(()=>{const e=()=>{const e=document.querySelector('link[data-article-style="katex"]');e&&(e.media="all")};"complete"===document.readyState?e():addEventListener("load",e,{once:!0})})();

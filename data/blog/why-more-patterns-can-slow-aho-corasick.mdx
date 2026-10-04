@@ -1,0 +1,131 @@
+---
+title: "Why More Patterns Can Make Aho–Corasick Slower Even Though It Is Linear"
+date: "2026-09-21T09:25:00+01:00"
+lastmod: "2026-09-05T12:00:00+01:00"
+tags: ["rust", "aho-corasick", "algorithm complexity", "cpu cache", "performance"]
+draft: false
+reviewed: true
+reviewedHash: "e1f38c4e9cd389fc455f87f1a8a20d18fdc4dea426c9495c2e85a3c4d319ab77"
+cluster: "rust-under-the-hood"
+campaign: "editorial"
+summary: "Linear-time search does not promise constant speed. I explain how automaton size, cache behavior, construction, match density, and pattern shape change real Rust throughput."
+---
+
+Aho–Corasick is usually described as a linear-time multi-pattern search algorithm. Then somebody adds many patterns and the search becomes slower. It can look as if either the benchmark or the complexity claim is wrong.
+
+Usually neither is wrong. The word “linear” describes how work grows with input size under a model. It does not promise the same nanoseconds per byte for every automaton, memory layout, or result set.
+
+This distinction is one of the most useful performance lessons I learned: complexity tells me the curve to expect; hardware and output behavior determine the constant factors on that curve.
+
+## What the linear claim gives us
+
+After construction, Aho–Corasick can inspect a haystack without trying every pattern independently at every position. A state summarizes which pattern prefixes remain possible. Search work is commonly expressed using the haystack length plus the matches reported.
+
+This is much better than a naive nested search whose work directly repeats for every pattern at many positions.
+
+But two automatons can both process an `n`-byte haystack in linear time while one requires twice as many cycles per byte. Big-O notation deliberately ignores those constant factors.
+
+The crate's [design document](https://github.com/BurntSushi/aho-corasick/blob/master/DESIGN.md#basics) makes a related warning: adding patterns does not change the one-pass idea, but a larger automaton can use the CPU cache less effectively.
+
+## A larger state machine touches more memory
+
+More patterns normally create more states and transitions. Shared prefixes can reduce some duplication, but the compiled representation still tends to grow with total pattern bytes.
+
+The hot transition needs data from that representation. When the useful working set fits in a nearby cache, access is cheap. When transitions are spread over a larger table, more accesses may be served from slower cache levels or memory.
+
+The loop is still linear:
+
+```text
+one input byte -> one or more representation-specific transition steps
+```
+
+The cost of an individual step changed.
+
+This is also why forcing a dense DFA is not automatically faster. A DFA simplifies transitions but can make the table much larger. The contiguous NFA often offers a better locality and memory balance. I compare the three implementations in [Aho–Corasick DFA or NFA](/blog/aho-corasick-dfa-or-nfa-rust).
+
+## Pattern shape matters beside pattern count
+
+Ten thousand versions of a shared prefix do not build the same machine as ten thousand unrelated byte strings. Short ASCII literals do not behave like long binary signatures. A corpus containing only a few useful rare bytes can enable a prefilter, while another corpus of the same size may not.
+
+I record at least:
+
+- number of patterns;
+- total pattern bytes;
+- minimum and maximum length;
+- duplicate count;
+- shared-prefix shape;
+- byte distribution;
+- constructed automaton kind and memory;
+- match kind and prefilter setting.
+
+“We tested 10,000 patterns” is not enough information to reproduce a result.
+
+The top-level API helps with several values:
+
+```rust
+use aho_corasick::AhoCorasick;
+
+fn main() {
+    let patterns = ["error", "errors", "errored", "failure"];
+    let matcher = AhoCorasick::new(patterns).unwrap();
+
+    println!("patterns: {}", matcher.patterns_len());
+    println!("shortest: {}", matcher.min_pattern_len());
+    println!("longest: {}", matcher.max_pattern_len());
+    println!("kind: {:?}", matcher.kind());
+    println!("heap bytes: {}", matcher.memory_usage());
+}
+```
+
+These are not a complete performance report, but they make hidden build choices visible.
+
+## Construction may dominate short-lived use
+
+Search complexity begins after the automaton exists. Building it takes work proportional to the combined pattern input, with potentially high constant factors. DFA construction can be especially expensive.
+
+If a web handler rebuilds the same matcher for every request, an excellent search loop cannot rescue the architecture. I build trusted stable patterns once and reuse the resulting matcher. When patterns change dynamically, I rebuild outside the request path and replace the shared instance only after construction succeeds.
+
+For command-line tools scanning one small file, I benchmark build plus search. For long-running services scanning many gigabytes, I show build and steady-state search separately.
+
+The official [`AhoCorasick` resource guidance](https://docs.rs/aho-corasick/latest/aho_corasick/struct.AhoCorasick.html#resource-usage) recommends building once and reusing because construction can be costly.
+
+## Reporting matches is real work
+
+Some complexity summaries include an output term for a reason. Searching `aaaaaaaa` for `a`, `aa`, `aaa`, and `aaaa` with overlapping results can produce many matches from a small input.
+
+Every reported result may require iterator work, offset calculations, allocation, serialization, a callback, or an application lookup. When matches are dense, this output path can dominate state transitions.
+
+I therefore benchmark at least three haystacks:
+
+1. no matches;
+2. sparse realistic matches;
+3. deliberately dense matches.
+
+I also count results. If two benchmark variants emit different counts, I stop. They are not comparable implementations of the same operation.
+
+## Prefilters can disappear as the corpus grows
+
+Rust's implementation may accelerate suitable pattern sets with specialized literal searches. This is heuristic. As the number or shape of patterns changes, a prefilter that helped a smaller set may no longer apply.
+
+The observed curve can therefore contain a step: the 500-pattern benchmark is fast not simply because it has fewer states, but because it uses a different search strategy from the 5,000-pattern benchmark.
+
+I run a paired test with prefilters enabled and disabled and report the selected automaton kind. This separates a lost prefilter from a larger transition working set instead of guessing from one throughput number.
+
+## My scaling experiment
+
+I do not generate every size from unrelated random patterns. That changes two variables at once. I create nested sets: 100 patterns, then the same 100 plus 900, then the same 1,000 plus 9,000. I keep the haystack and match distribution stable where possible.
+
+For each set I measure:
+
+- construction time and peak memory;
+- retained `memory_usage()`;
+- throughput with no, sparse, and dense matches;
+- latency distribution, not only the mean;
+- matches emitted and output handling time;
+- automatic and deliberately selected automaton kinds.
+
+Then a slowdown becomes explainable. It may come from the transition working set, a representation change, a lost prefilter, increased output, or repeated construction.
+
+Linear time remains an important guarantee. It protects us from a worse growth shape. It does not exempt the program from caches, allocations, output size, or the architecture around the algorithm.
+
+This is one part of the broader model in [Zero-Copy Does Not Mean Zero Memory Access](/blog/zero-copy-does-not-mean-zero-memory-access-aho-corasick-rust): after one cost is controlled, the next limiting cost becomes visible. The [Aho–Corasick article collection](/blog/tags/aho-corasick/page/1) lists the supporting work that is public so far.

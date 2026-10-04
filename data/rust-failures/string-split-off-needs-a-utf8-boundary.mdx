@@ -1,0 +1,92 @@
+---
+caseId: "RFA-361"
+title: "String::split_off Uses a Byte Index That Must Be a UTF-8 Boundary"
+date: "2026-09-06T02:18:00+01:00"
+lastmod: "2026-09-06T02:18:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "69acf16573b01f0c225d71f467fe0d2e1d690f50243bf3237bb7c8e2e673feea"
+area: "ffi-targets"
+symptom: "String::split_off(1) panics on éclair because byte one lies inside the two-byte UTF-8 encoding of é."
+summary: "String split points are byte offsets, but both resulting Strings must remain valid UTF-8. Derive offsets from char_indices or validate with is_char_boundary rather than treating character counts as byte indices."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust String split_off char boundary panic", "split String at character index Rust", "String split_off UTF-8 byte index"]
+evidence: ["Rust 1.98.1 éclair input", "byte offset one inside é", "char_indices derives byte offset two"]
+sources: ["https://doc.rust-lang.org/std/string/struct.String.html#method.split_off", "https://doc.rust-lang.org/std/primitive.str.html#method.char_indices", "https://doc.rust-lang.org/std/primitive.str.html#method.is_char_boundary"]
+---
+
+I wanted to separate the first visible letter from `éclair`, so I called `split_off(1)`. The program panicked. The number passed to [`String::split_off`](https://doc.rust-lang.org/std/string/struct.String.html#method.split_off) is a byte index, and byte one sits in the middle of `é`.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-361/fail.rs) contains only those two lines. Rust rejects the split because neither half may violate the `String` UTF-8 invariant.
+
+## String indexes bytes at structural boundaries
+
+Rust stores a `String` as valid UTF-8 bytes. UTF-8 uses one byte for ASCII scalars and multiple bytes for many other Unicode scalars. The character `é` in this example occupies two bytes.
+
+`split_off(at)` keeps byte range `[0, at)` in the original string and returns a newly allocated string containing `[at, len)`. This interval definition is precise, but `at` must be the start of a UTF-8 code point or the end of the string.
+
+An index of one is numerically inside the allocation and still invalid as a string boundary.
+
+## Character count is not a byte offset
+
+The phrase “after one character” describes a position in scalar iteration. Passing the count `1` directly as a byte offset works for ASCII and fails as soon as the first scalar needs more than one byte.
+
+I derive the offset from [`char_indices`](https://doc.rust-lang.org/std/primitive.str.html#method.char_indices). Each item contains the byte offset and scalar at that position. The second item in `éclair` begins at byte two, so splitting there leaves `é` and returns `clair`.
+
+This translation is linear in the traversed text. Rust does not promise constant-time indexing by Unicode scalar count because UTF-8 is variable width.
+
+## A char boundary is not a grapheme boundary
+
+Even a valid scalar boundary can split what a user sees as one character. A letter followed by a combining mark is multiple Unicode scalar values. Many emoji sequences contain several scalars joined into one displayed grapheme.
+
+`char_indices` solves UTF-8 validity, not user-perceived text segmentation. If my requirement is “first displayed character,” I need a Unicode grapheme segmentation policy from an appropriate library and must still convert its result to byte offsets for the Rust string operation.
+
+I write the unit in variable names: `byte_offset`, `scalar_index`, or `grapheme_index`. A bare `index` invites accidental mixing.
+
+## Validate untrusted offsets before mutation
+
+[`str::is_char_boundary`](https://doc.rust-lang.org/std/primitive.str.html#method.is_char_boundary) reports whether an offset is valid, including zero and `len()`. It returns false beyond the end.
+
+`String::split_off` itself has no checked variant in the contract used here. When an offset comes from a file, protocol, database, or earlier computation, I validate it and return a domain error rather than letting malformed input cause a panic.
+
+I also check the upper bound. Being an integer is not evidence that a position belongs to this particular string version.
+
+## Offsets become stale after edits
+
+Byte positions refer to one exact byte sequence. Inserting or removing content before a stored position changes what it points to. Replacing text can also change byte length without changing scalar count.
+
+This appears in editors and parsers that collect several spans and then mutate from the beginning. I usually apply edits from the highest byte offset downward, or rebuild output from immutable source slices. I associate spans with the source version from which they were computed.
+
+Rust prevents memory-unsafe references from surviving a mutable borrow, but plain stored integers have no lifetime. The application must keep their provenance valid.
+
+## split_off has ownership and capacity consequences
+
+The operation allocates a new `String` for the returned suffix. The original string's capacity does not change, even though its length becomes shorter. Repeated splitting can therefore allocate suffixes while retaining a large allocation in the prefix.
+
+If I only need two temporary views, `str::split_at_checked` or validated slicing can avoid creating new owned strings. If the suffix must move to another owner or be mutated independently, `split_off` expresses that ownership clearly.
+
+I measure allocation-sensitive paths instead of assuming that a short resulting prefix has released memory.
+
+## The repaired evidence derives rather than guesses
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-361/fixed.rs) asks for the byte offset of the second scalar with `char_indices().nth(1)`. If there is no second scalar, it uses `text.len()`, which means the suffix is empty.
+
+It then proves both values exactly: the original contains `é`, and the returned string contains `clair`.
+
+For a production helper I define behavior for an empty string, a scalar index beyond the end, and whether the end position is accepted. Returning `Option` or a structured range error keeps these cases explicit.
+
+## Tests must begin with non-ASCII text
+
+An ASCII-only test makes scalar counts and byte offsets identical and hides the bug. My minimum table includes a two-byte scalar, a four-byte emoji, combining text, empty input, and splitting at zero and at `len()`.
+
+I assert both halves and the original capacity only when capacity behavior is itself relevant. I avoid asserting allocator details not promised by the API.
+
+The one-byte interior split is useful evidence because it fails deterministically on every conforming target; no locale or display engine is involved.
+
+## The core principle is that encoded text has several coordinate systems
+
+Bytes, Unicode scalar values, and grapheme clusters answer different questions. Rust string mutation uses byte offsets so slicing remains efficient, while boundary checks preserve valid UTF-8.
+
+`String::split_off(1)` does not mean “after the first character.” It means “before byte one, if byte one begins a scalar.” Once I carry the unit with the index, the panic becomes preventable rather than mysterious.

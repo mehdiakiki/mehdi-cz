@@ -1,0 +1,89 @@
+---
+caseId: "RFA-545"
+title: "Replacing a Rust Value Would Invalidate a Live Borrow"
+date: "2026-09-06T06:24:00+01:00"
+lastmod: "2026-09-06T06:24:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "77de4583b2f4f655ed4e5f1845fc883a1c5773e161f244674eb4cdc02fd97b5d"
+area: "concurrency-memory"
+symptom: "Assigning a new String to endpoint fails with E0506 because selected still borrows the old string and is read after the replacement."
+summary: "Whole-value assignment drops or moves away the previous value. References into that value must finish before replacement, or own an independent snapshot."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust E0506 cannot assign because borrowed", "replace String while str reference alive", "end borrow before reassignment Rust"]
+evidence: ["Rust 1.98.1 E0506 compile failure", "str view remains live across String replacement", "observation scope ends before assignment repair"]
+sources: ["https://doc.rust-lang.org/error_codes/E0506.html", "https://doc.rust-lang.org/book/ch04-02-references-and-borrowing.html", "https://doc.rust-lang.org/reference/expressions/operator-expr.html#assignment-expressions"]
+---
+
+Reassigning an owned value does more than change what a variable name prints. The old value is moved out or dropped as part of replacement. Any reference into it would lose its valid backing storage, so Rust reports E0506.
+
+The [failing fixture](/rust-failure-atlas/evidence/RFA-545/fail.rs) takes `selected` as a string slice into `endpoint`, assigns a new `String` to `endpoint`, then uses the old slice. The new allocation cannot keep the old reference alive.
+
+## Assignment replaces the previous place value
+
+The left side of `endpoint = ...` is a place expression. Assignment evaluates the new value and stores it in that place, handling the previous `String` according to Rust's move and drop rules.
+
+The reference `selected` contains a pointer into the previous string's buffer. If replacement were allowed, its later print could read freed memory. Rust rejects the assignment while that borrow remains live.
+
+The [official E0506 explanation](https://doc.rust-lang.org/error_codes/E0506.html) describes this as assigning to a borrowed value and shows how shortening the borrow resolves it.
+
+## The last reference use is the important boundary
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-545/fixed.rs) puts observation in a small block. `selected` is used inside that block and has no later use. Afterward the endpoint can be replaced safely.
+
+Modern borrow analysis often makes the explicit block unnecessary when the last use is already clear. I still use a scope when it communicates a real phase: inspect current state, then install replacement state.
+
+The code structure becomes documentation of the same lifetime proof rustc performs.
+
+## Clone only when the old information must survive
+
+If logs or an audit record must retain the selected endpoint after replacement, I can own it:
+
+```rust
+let selected = endpoint.clone();
+endpoint = choose_fallback();
+record_transition(selected, &endpoint);
+```
+
+Now two strings have independent storage. This costs allocation and copying. A small enum, identifier, or shared `Arc<str>` may model the domain better when snapshots are frequent.
+
+I do not clone merely because it is the first compiler suggestion I remember. I decide whether the system truly needs two lifecycles.
+
+## Mutating in place has similar reference constraints
+
+Calling `endpoint.clear()`, `push_str`, or another `&mut self` operation also requires exclusive access. A live `&str` slice prevents those mutations because they may reallocate or change the bytes it describes.
+
+Changing whole-value assignment to `clear` is not a borrow workaround. Both operations conflict with a later-used reference into the same string.
+
+The Book's [references and borrowing chapter](https://doc.rust-lang.org/book/ch04-02-references-and-borrowing.html) provides the shared-versus-exclusive access rule that connects these cases.
+
+## Replacing through Option follows the same principle
+
+Methods such as `Option::take`, `mem::replace`, and `mem::take` are useful for moving values out of fields while leaving valid replacements. They do not invalidate live references safely. They still require mutable access to the place.
+
+I use these APIs to express ownership transitions when no incompatible borrow remains, not to evade lifetime rules. If a struct contains references into one of its own replaceable fields, the representation needs deeper redesign.
+
+Often offsets, indices, interned identifiers, or owned subvalues are safer than long-lived internal references.
+
+## Assignment and mutation should follow observation
+
+Configuration code commonly wants to read an old value, select a new one, and log both. I calculate independent log fields first, finish borrowed formatting if possible, then commit the mutation.
+
+For transactional state, I may compute a complete replacement from an immutable borrow and apply it only after validation succeeds. This reduces both borrow overlap and partial-update risk.
+
+The Reference defines [assignment expressions](https://doc.rust-lang.org/reference/expressions/operator-expr.html#assignment-expressions), including evaluation and place requirements.
+
+## My E0506 checklist
+
+- Which reference points into the value being assigned?
+- Where is that reference used last?
+- Does assignment replace or drop the referenced storage?
+- Can observation finish before mutation begins?
+- Is a block useful to document the phase boundary?
+- Must old data survive independently, justifying ownership or cloning?
+- Would a stable identifier or offset be better than a long-lived slice?
+- Am I expecting `mem::replace` to bypass a borrow it also must respect?
+
+The core principle is that references belong to a particular valid value, not merely to a variable name. I end those references before replacement or give the old information its own ownership.

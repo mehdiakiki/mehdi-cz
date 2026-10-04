@@ -1,0 +1,137 @@
+---
+title: "Rust BufRead, Slices, and Memory Mapping: Where the Bytes Actually Copy"
+date: "2026-10-24T09:10:00+01:00"
+lastmod: "2026-09-05T12:00:00+01:00"
+tags: ["rust", "aho-corasick", "bufread", "memory mapping", "zero-copy", "io"]
+draft: false
+reviewed: true
+reviewedHash: "f26359e3ea8428ea5f8540d457e8115ae6c0b01ead32022ef888853c8b1debed"
+cluster: "rust-under-the-hood"
+campaign: "editorial"
+summary: "A borrowed slice, buffered reader, and memory map can all feed the same Rust scanner, but they move and own bytes differently. I trace each boundary and its trade-offs."
+---
+
+A Rust scanner may accept `&[u8]`, read through `BufRead`, or inspect a memory-mapped file. All three can look like a byte slice inside the hot loop. They do not have the same I/O, ownership, or safety model.
+
+I draw the data path before calling any of them zero-copy.
+
+## A slice is a view, not storage
+
+A shared byte slice contains a pointer and a length. Creating a smaller slice normally creates another view over the same storage; it does not duplicate the elements.
+
+```rust
+fn inspect(bytes: &[u8]) -> usize {
+    bytes.iter().filter(|&&byte| byte == b'!').count()
+}
+
+fn main() {
+    let owned = b"look!".to_vec();
+    let borrowed = &owned[1..];
+    assert_eq!(1, inspect(borrowed));
+}
+```
+
+The standard library describes a [slice](https://doc.rust-lang.org/stable/std/primitive.slice.html) as a view into contiguous memory represented by a pointer and length.
+
+Passing `borrowed` does not copy its four bytes into `inspect`. The loop still loads each byte from memory. If `inspect` calls `to_vec()`, that creates a new owned allocation and copies elements. The type makes this boundary visible.
+
+## `Read` copies into the caller's buffer
+
+The [`Read` trait](https://doc.rust-lang.org/stable/std/io/trait.Read.html) accepts a mutable output buffer. A file or socket implementation fills part of that buffer. At the application level, bytes become materialized in caller-provided memory.
+
+```rust
+let mut storage = [0_u8; 8192];
+let amount = reader.read(&mut storage)?;
+scan(&storage[..amount]);
+```
+
+This is not a defect. The scanner needs accessible bytes, and the operating system's file or network path has its own buffering and copying rules.
+
+The avoidable extra copy would be taking `storage[..amount]`, appending it to a second scanner-owned vector, and then scanning that vector without a semantic need.
+
+## `BufRead` lets me borrow its filled region
+
+`BufReader` owns an internal buffer. Its `fill_buf()` method returns a borrowed slice of currently available bytes, and `consume(n)` tells it how many were processed.
+
+```rust
+use std::io::{self, BufRead};
+
+fn scan_reader(mut reader: impl BufRead) -> io::Result<()> {
+    loop {
+        let consumed = {
+            let available = reader.fill_buf()?;
+            if available.is_empty() {
+                return Ok(());
+            }
+            scan(available);
+            available.len()
+        };
+        reader.consume(consumed);
+    }
+}
+```
+
+This avoids copying the buffered region into another application vector. It does not mean the reader never filled its own buffer. The official [`BufRead` documentation](https://doc.rust-lang.org/stable/std/io/trait.BufRead.html#tymethod.fill_buf) defines the borrow and consume contract.
+
+The borrow cannot remain alive while I mutably call `consume` or refill the reader. If results need matched bytes later, I return owned offsets, process them before consuming, or retain owned input deliberately.
+
+## A memory map exposes file-backed pages as a slice
+
+A memory mapping gives the process a virtual-memory region backed by a file. The `memmap2` crate's [`Mmap`](https://docs.rs/memmap2/latest/memmap2/struct.Mmap.html) dereferences to `&[u8]`, so the same slice scanner can inspect it.
+
+```rust
+use std::fs::File;
+use memmap2::Mmap;
+
+fn scan_file(file: &File) -> std::io::Result<()> {
+    // Safety depends on the file not being modified incompatibly while mapped.
+    let mapping = unsafe { Mmap::map(file)? };
+    scan(&mapping);
+    Ok(())
+}
+```
+
+At the application level, this avoids reading the complete file into a separate `Vec<u8>`. It does not mean storage bytes teleport into CPU registers. Pages are faulted into memory as accessed, and the operating system manages the page cache.
+
+Mapping also changes failure and safety considerations. The mapping constructor is unsafe because modifying or truncating the underlying file while it is mapped can violate assumptions. I read the crate's safety documentation and control file ownership rather than wrapping `unsafe` in a helper and forgetting it.
+
+## Memory mapping is not automatically faster
+
+Mapping is attractive for large stable files, random access, and APIs already designed around slices. Buffered reads can be better for sequential streams, pipes, sockets, small files, or systems where predictable read-ahead and error handling matter.
+
+A map can also make page faults appear inside the scanning loop. A hot repeated benchmark over the same mapping measures cached memory more than first-pass file processing.
+
+I compare end-to-end behavior:
+
+- open and map plus first scan;
+- repeated scan over an existing map;
+- open and buffered sequential read;
+- actual peak resident memory and page-fault behavior;
+- error handling when the source changes.
+
+The fastest steady-state loop is not always the simplest safe product design.
+
+## Chunk boundaries still need state
+
+`BufRead` supplies temporary slices. A network or custom reader can split a pattern between calls. Directly scanning every `fill_buf()` region from the initial automaton state loses cross-boundary matches.
+
+A memory map is contiguous from the scanner's view, so one-shot search avoids this particular boundary problem. Dividing it among worker threads reintroduces boundaries and needs overlap or correct initial-state handling.
+
+[How to Search Across Chunk Boundaries in Rust](/blog/search-across-chunk-boundaries-rust-without-missing-matches) gives the correctness test.
+
+## My terminology
+
+I describe each design narrowly:
+
+| Design | Precise claim |
+| --- | --- |
+| Borrowed slice | No element copy when the view is created or passed |
+| `BufRead::fill_buf` | Scan the reader's existing buffer without another staging copy |
+| Memory map | Access file-backed virtual memory through a slice without materializing the whole file in a `Vec` |
+| `read_to_end` | Materialize all remaining input in an owned vector |
+
+These descriptions expose ownership and boundaries without pretending the whole machine performs no movement.
+
+My choice starts from source type, lifetime, input size, safety, and output needs. Only then do I benchmark. “Zero-copy” is useful when it names a removed materialization; it is not an I/O architecture by itself.
+
+The complete principle is in [Zero-Copy Does Not Mean Zero Memory Access](/blog/zero-copy-does-not-mean-zero-memory-access-aho-corasick-rust).

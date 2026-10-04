@@ -1,0 +1,79 @@
+---
+caseId: "RFA-687"
+title: "compare_exchange Failure Returns the Actual Atomic Value"
+date: "2026-09-06T08:47:00+01:00"
+lastmod: "2026-09-06T08:47:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "dac9bdc1a2ab4f37e2f57dc64ba8a41b96ba194db7d858044d6ac93cc4fdfadb"
+area: "concurrency-memory"
+symptom: "Atomic compare_exchange returns Err(5), not Err(4), when the expected value 4 is stale and the atomic currently contains 5."
+summary: "CAS failure reports the value actually observed. Retry loops must update expectations, recompute dependent state, and use justified success and failure orderings."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["targets supporting AtomicUsize"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust compare_exchange Err current value", "atomic CAS failure return value", "compare_exchange retry loop ordering Rust"]
+evidence: ["Rust 1.98.1 runtime assertion", "expected four while atomic contains five", "retry uses returned observation and succeeds"]
+sources: ["https://doc.rust-lang.org/std/sync/atomic/struct.AtomicUsize.html#method.compare_exchange", "https://doc.rust-lang.org/std/sync/atomic/enum.Ordering.html", "https://doc.rust-lang.org/std/sync/atomic/struct.AtomicUsize.html#method.fetch_update"]
+---
+
+`compare_exchange(current, new, success, failure)` writes `new` only if the atomic equals `current`. On mismatch, `Err` contains the actual value observed from the atomic. The [failing fixture](/rust-failure-atlas/evidence/RFA-687/fail.rs) expects its stale proposal four back and receives five.
+
+## Err is fresh evidence, not the rejected argument
+
+The [`compare_exchange` contract](https://doc.rust-lang.org/std/sync/atomic/struct.AtomicUsize.html#method.compare_exchange) returns `Ok(previous)` after a successful exchange and `Err(actual)` after failure. The caller already knows the expected value it supplied; the useful information is what memory contained.
+
+This supports retry loops. They can update the expected value, recompute a desired transition, and attempt again. The [repaired fixture](/rust-failure-atlas/evidence/RFA-687/fixed.rs) verifies `Err(5)` and then succeeds with expectation five.
+
+## Recompute before retrying
+
+If the new value depends on the old one, blindly changing only the expected operand can install a result calculated from stale state. A counter increment loop recomputes `observed + 1` each time. A state machine checks whether the newly observed state still permits the transition.
+
+Contention can cause many retries. Backoff or a lock may outperform a hot compare-exchange loop. I benchmark the actual workload and preserve a bounded progress story.
+
+[`fetch_update`](https://doc.rust-lang.org/std/sync/atomic/struct.AtomicUsize.html#method.fetch_update) can express some update loops while still requiring a closure that handles newly observed values.
+
+## Memory ordering has two paths
+
+Compare-exchange accepts success and failure orderings because the successful read-modify-write and failed load have different semantics. The failure ordering cannot include Release or AcqRel because no write occurred.
+
+I derive ordering from a documented happens-before relationship, not from a desire to make the code “strong enough.” `SeqCst` simplifies the fixture but does not explain a production protocol. Relaxed can be sufficient for independent counters and insufficient for publishing associated data.
+
+The [`Ordering` documentation](https://doc.rust-lang.org/std/sync/atomic/enum.Ordering.html) is necessary, but an algorithm-level proof is still required.
+
+## ABA is not detected by equal values
+
+CAS compares the current bits. A location can change from A to B and back to A, making the comparison succeed even though state changed in between. This ABA problem matters for pointers, freelists, and versioned state.
+
+Generation tags, hazard pointers, epoch reclamation, or a lock may be required. Atomic pointer equality also does not prove an allocation is still valid without a safe reclamation scheme.
+
+I do not build lock-free ownership from integer examples alone. Memory reclamation is usually the hardest invariant.
+
+## Weak compare exchange permits spurious failure
+
+`compare_exchange_weak` may fail spuriously even when values match, which can be efficient inside loops on some platforms. Code must already retry and treat every Err as an observation, not a logical conflict verdict.
+
+The strong form is often clearer for a one-shot attempt. Neither form makes the wider multi-field operation atomic.
+
+Metrics around CAS track retries and contention, not only final success. A system can be correct but spend excessive CPU repeatedly losing the same cache line.
+
+## Tests separate state and ordering proof
+
+The deterministic fixture creates a known mismatch and asserts returned current state. Concurrent stress tests exercise allowed transitions and final invariants, but passing them does not prove memory ordering.
+
+Tools and formal models can help with subtle interleavings. I keep the protocol small enough to explain in comments and code review.
+
+I also avoid packing unrelated fields into one integer only to claim lock freedom. Bit allocation, rollover, and atomic width support become new contracts. A clear mutex-protected struct can be faster under low contention and much easier to evolve. Atomics earn their place when measurement and a reviewable correctness argument support them.
+
+## My compare-exchange checklist
+
+- Does Err get interpreted as the actual observed value?
+- Is the desired state recomputed after every mismatch?
+- Can the retry loop starve or create cache-line contention?
+- What happens-before edges justify both orderings?
+- Could ABA make equal bits hide an intervening change?
+- Is memory reclamation safe for atomic pointers?
+- Is weak CAS used only in a retry-capable path?
+- Would a lock make the invariant clearer at acceptable cost?
+
+The core principle is that CAS is a conditional state observation plus update. Failure returns new evidence about shared state. I use that evidence to reconsider the transition rather than mechanically repeating a stale calculation.

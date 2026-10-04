@@ -1,0 +1,99 @@
+---
+caseId: "RFA-190"
+title: "Why Rust sort_by_key May Compute the Same Key Many Times"
+date: "2026-09-05T17:29:00+01:00"
+lastmod: "2026-09-05T17:29:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "68dea9077ab0a35c90b93831927e51acbbb387ba0010fd92414027fc760a6445"
+area: "concurrency-memory"
+symptom: "slice::sort_by_key invokes an expensive key function many more times than the number of elements being sorted."
+summary: "sort_by_key extracts keys during comparisons and may revisit one element many times. Use sort_by_cached_key when extraction is expensive, keep ordering functions deterministic, and count evaluations separately from checking the sorted result."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets with alloc"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust sort_by_key called multiple times",
+    "sort_by_key expensive closure repeated",
+    "sort_by_cached_key versus sort_by_key",
+  ]
+evidence: ["Rust 1.98.1 six-element slice", "counted key evaluations", "cached-key repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/std/primitive.slice.html#method.sort_by_key",
+    "https://doc.rust-lang.org/std/primitive.slice.html#method.sort_by_cached_key",
+    "https://doc.rust-lang.org/std/primitive.slice.html#method.sort_unstable_by_key",
+  ]
+---
+
+I used to read `sort_by_key` as “calculate one key for each item, then sort those keys.” That is a reasonable mental picture, but it is not the contract of this method.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-190/fail.rs) sorts six signed integers by absolute value. The key closure increments a counter. The values finish in the right order, but the counter is larger than six because the sorting algorithm asks for keys while it compares elements.
+
+This bug is easy to miss. Most tests check only the final order, so a correct result can hide repeated database lookups, parsing, Unicode normalization, or other expensive work.
+
+## A key function is part of comparison
+
+[`slice::sort_by_key`](https://doc.rust-lang.org/std/primitive.slice.html#method.sort_by_key) accepts a closure from `&T` to an ordered key `K`. It is a stable sort, meaning equal keys preserve their previous relative order. Stability says nothing about how often the closure runs.
+
+Conceptually, a comparison may look like this:
+
+```rust
+key(left).cmp(&key(right))
+```
+
+A sorting algorithm performs many comparisons, and an element can participate in several of them. The implementation may therefore request the same logical key repeatedly.
+
+I do not depend on an exact call count. The algorithm and its optimizations can change between Rust releases or between input shapes. The evidence records only the fact that calls can exceed the number of elements on the pinned Rust 1.98.1 fixture.
+
+## Caching is a separate API decision
+
+[`sort_by_cached_key`](https://doc.rust-lang.org/std/primitive.slice.html#method.sort_by_cached_key) exists for the other trade-off. It stores extracted keys in temporary memory and calls the key function at most once per element.
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-190/fixed.rs) uses the cached form. On this non-empty six-element input, the counter becomes exactly six and the resulting order stays the same.
+
+Caching is not automatically faster. It allocates temporary storage and moves or compares stored keys. For a field access such as `|user| user.age`, ordinary `sort_by_key` may be better. For a key that parses a version, folds a long string, or performs a nontrivial calculation, avoiding repeated work can dominate the extra allocation.
+
+I measure with a realistic key and data distribution instead of treating the longer method name as a universal optimization.
+
+## The closure should still be deterministic
+
+A key function used for sorting should return a consistent key for the same element during one sort. If it reads changing external state or increments the key itself, comparisons may stop describing a total order.
+
+The counter in my fixture observes calls but does not influence the returned absolute value. That distinction matters. Instrumentation is safe here because it measures the algorithm without changing its ordering decisions.
+
+I avoid network calls, clock reads, random numbers, and mutable global policy inside a sorting key. Apart from cost, changing results can make the output unspecified or make the comparator panic.
+
+If key computation is fallible, I normally compute `Result<(K, T), E>` values before sorting. Sorting closures cannot return an error to stop the operation cleanly.
+
+## Cached keys are snapshots
+
+Caching also changes when the key is observed. The cached method takes one key snapshot per item before or during its sorting work and reuses it. This is useful when the key is expensive, but it does not make interior mutation safe.
+
+If another actor can change data used by the key while sorting, the design already has a synchronization or ownership problem. A mutable slice borrow prevents ordinary mutation of the elements through safe aliases, yet a key can still consult interior mutable or external state. I keep ordering data inside the owned element where possible.
+
+The key type also influences memory. Caching a compact integer is different from caching a cloned `String`. Sometimes I precompute a compact rank in my domain model, especially when the same ordering is used many times.
+
+## Stable and unstable sorts have separate costs
+
+[`sort_unstable_by_key`](https://doc.rust-lang.org/std/primitive.slice.html#method.sort_unstable_by_key) does not preserve the order of equal keys and does not allocate in the ordinary way stable sorting does. It can still evaluate its key function repeatedly.
+
+So there are two independent choices:
+
+```text
+must equal keys preserve input order?  stable vs unstable
+must expensive keys be reused?         recompute vs cache
+```
+
+Rust does not currently provide a `sort_unstable_by_cached_key` standard method. If I need a special combination, I decorate values with keys explicitly, sort the decorated representation, and then remove the decoration. I only add that machinery after measuring a real need.
+
+## A useful regression test counts work
+
+For this failure, elapsed time is a weak first test. A small fixture completes too quickly, and machine noise can hide a regression. A call counter directly observes the disputed event.
+
+I test the sorted values and the count separately. The first protects correctness; the second protects the intended cost model. If I only assert the count, a broken ordering could still pass.
+
+When the exact count is not part of the API contract, I assert the promised bound. The official cached-key documentation says “at most once per element,” so production tests should prefer `calls <= len` unless the application itself guarantees that every item needs one key.
+
+The core principle is simple: naming a closure “key” does not mean Rust materializes a key table. `sort_by_key` is comparison-driven. `sort_by_cached_key` makes storage and reuse explicit. I choose between them from the cost and consistency of the key, not from the final order alone.

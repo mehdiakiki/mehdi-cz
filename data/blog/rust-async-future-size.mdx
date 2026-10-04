@@ -1,0 +1,249 @@
+---
+title: "Why Rust Async Futures Get So Large"
+date: "2026-09-04T15:00:00+01:00"
+tags: ["rust", "async rust", "future", "performance", "compiler internals"]
+draft: false
+reviewed: true
+reviewedHash: "15f1d9743b2f4335e50d1aa8d17c3095a0f27897bd030e4d73159fd02f67b5f9"
+cluster: "rust-under-the-hood"
+campaign: "authority-2026"
+opportunity: "RUST-026"
+summary: "Rust async functions store every value needed after an await. Learn to measure future size, identify saved fields, and reduce it without boxing everything."
+---
+
+An `async fn` looks like an ordinary function with a few `.await` points. Its value in memory can be less ordinary. A local array, one nested future, or a variable that stays alive a little too long can turn a small future into tens of kilobytes.
+
+This matters when the future is created many times. It can increase task allocation size, move more memory, and put more pressure on caches. Still, "box every future" is not a good answer. First I need to see what the compiler has built.
+
+I will make this concrete.
+
+## The short model
+
+Calling an async function does not run its body. It returns an anonymous type implementing `Future`. Very roughly, this type behaves like an enum:
+
+```rust
+enum RequestFuture {
+    Start { request: Request },
+    WaitingForUser {
+        request: Request,
+        lookup: LookupFuture,
+    },
+    WaitingForWrite {
+        response: Response,
+        write: WriteFuture,
+    },
+    Done,
+}
+```
+
+There is one state around each suspension point. Each state needs the values required when execution resumes there.
+
+The real layout is not this literal enum, and its format is deliberately unspecified. Rust can overlap fields that are never alive in the same state, keep other fields in a common prefix, and reorder details. But the enum model gives me the correct question:
+
+> Which values must survive each `.await`?
+
+That question is much more useful than counting lines in the function.
+
+## A 64 KiB surprise
+
+This program measures a future without running it:
+
+```rust
+use std::future::pending;
+use std::mem::size_of_val;
+
+struct Buffer([u8; 64 * 1024]);
+
+async fn holds_buffer() {
+    let buffer = Buffer([0; 64 * 1024]);
+
+    pending::<()>().await;
+
+    // This use forces `buffer` to remain available after the await.
+    std::hint::black_box(buffer);
+}
+
+fn main() {
+    let future = holds_buffer();
+    println!("future size: {} bytes", size_of_val(&future));
+}
+```
+
+The future never needs to be polled for `size_of_val` to work. Its concrete anonymous type is already known to the compiler.
+
+Do not copy an exact byte count from somebody else's machine. Layout is not a stable API, and compiler versions or targets may produce different numbers. The useful result is the comparison with the next version.
+
+I made that comparison with `rustc 1.95.0-nightly (3a70d0349 2026-02-27)`, edition 2024, an optimized build, and the x86-64 Linux target:
+
+| Future expression | Measured size |
+| --- | ---: |
+| large buffer used after `.await` | 65,537 bytes |
+| buffer consumed in a scope before `.await` | 1 byte |
+| boxed buffer used after `.await` | 16 bytes |
+| parent directly awaiting the large child | 65,538 bytes |
+| parent awaiting `Box::pin(large_child)` | 16 bytes |
+
+These are observations from one toolchain, not ABI guarantees. The important evidence is the shape of the change: ending liveness removed the payload from suspended state, direct child awaiting carried its storage upward, and boxing replaced inline storage with pointer-sized state plus a heap allocation.
+
+## End the lifetime before the await
+
+If the large value is not needed later, make that fact clear in the control flow:
+
+```rust
+use std::future::pending;
+
+struct Buffer([u8; 64 * 1024]);
+
+fn process(buffer: Buffer) {
+    std::hint::black_box(buffer);
+}
+
+async fn does_not_hold_buffer() {
+    let buffer = Buffer([0; 64 * 1024]);
+    process(buffer);
+
+    pending::<()>().await;
+}
+```
+
+`process` consumes the buffer before the suspension point. The future does not need a field for it in the waiting state.
+
+A nested scope can express the same thing:
+
+```rust
+async fn scoped_buffer() {
+    {
+        let buffer = Buffer([0; 64 * 1024]);
+        process(buffer);
+    }
+
+    pending::<()>().await;
+}
+```
+
+This is usually my first fix. It keeps ownership visible and does not add allocation or dynamic dispatch.
+
+## Boxing changes where the bytes live
+
+Sometimes the value really must survive the await. Then indirection can reduce the inline size of the future:
+
+```rust
+async fn boxed_buffer() {
+    let buffer = Box::new(Buffer([0; 64 * 1024]));
+
+    pending::<()>().await;
+
+    std::hint::black_box(buffer);
+}
+```
+
+The future now stores a `Box` pointer instead of the full array. The 64 KiB still exists, of course. It moved to a separate heap allocation.
+
+This trade is useful when a smaller task allocation and cheaper movement are worth one more allocation and pointer chase. It is not automatically faster. Measure the workload, not only `size_of_val`.
+
+## Awaiting a child embeds its storage
+
+There is another common surprise. The parent future needs somewhere to store the child future while it is awaiting it:
+
+```rust
+async fn child() {
+    let buffer = Buffer([0; 64 * 1024]);
+    pending::<()>().await;
+    std::hint::black_box(buffer);
+}
+
+async fn parent() {
+    child().await;
+}
+```
+
+Even if `parent` has no large local variable, its state can contain the large `child()` future. A chain of async calls therefore carries layout upward.
+
+Putting a box at one deliberate boundary can stop this inline growth:
+
+```rust
+use std::pin::Pin;
+
+async fn boxed_parent() {
+    let child: Pin<Box<_>> = Box::pin(child());
+    child.await;
+}
+```
+
+Again, this is a layout boundary, not free performance. The point is to put the boundary where it helps, instead of adding boxes randomly across the codebase.
+
+## Ask rustc what it stored
+
+`size_of_val` tells me that a future is large. Nightly rustc can show why:
+
+```bash
+cargo +nightly rustc --lib -- -Zprint-type-sizes
+```
+
+For a binary target, use:
+
+```bash
+cargo +nightly rustc --bin your-binary -- -Zprint-type-sizes
+```
+
+The output is verbose. Search for the async function name and entries described as a coroutine. You will see its total size, variants, saved locals, alignment, and padding.
+
+This flag is an unstable diagnostic. Its output format can change. I use it during investigation, not as something a build script should parse forever.
+
+If the output is too large, make a tiny reproduction containing only the suspicious async call. This also helps to distinguish your future from large futures coming from dependencies.
+
+## Four details that are easy to miss
+
+### 1. It is about liveness, not lexical appearance
+
+A value declared before `.await` is not necessarily stored across it. If its last use is before the await, the compiler may not need it in that state. A value used after the await must be preserved.
+
+Explicit scopes are still valuable because they make the intended lifetime understandable to both the compiler and the next reader.
+
+### 2. Future size is not the same as stack usage while polling
+
+The future value holds suspended state. Temporary values used entirely between two await points can live in the normal call stack while `poll` is running and disappear before it returns `Pending`.
+
+So there are two different investigations:
+
+- the size of the stored future;
+- the synchronous stack depth and temporary stack use of one poll.
+
+Do not mix them.
+
+### 3. The largest state often dominates
+
+State-machine variants can overlap because only one is active. The future is therefore not simply the sum of every local in the function. A large value in one suspension state can still determine the maximum variant size.
+
+### 4. Runtime spawning often adds an allocation
+
+An async function itself does not require a heap allocation. It returns a normal value. A runtime may allocate when the future is spawned as a task, and the future's size influences that allocation. Exact task representation is runtime-specific.
+
+## A practical investigation order
+
+When a future looks suspicious, I use this order:
+
+1. Measure it with `size_of_val` in a small reproduction.
+2. Use `-Zprint-type-sizes` to locate the large saved field or child future.
+3. Check which value crosses which `.await`.
+4. Consume it or move it into a smaller scope when possible.
+5. If it must survive, consider storing the large payload behind a pointer.
+6. If nested futures amplify the size, add one intentional boxing boundary.
+7. Benchmark allocations, latency, and memory under realistic concurrency.
+
+The important part is step three. Once I understand the generated state, most "mysterious async bloat" becomes an ordinary ownership and layout problem.
+
+## What is guaranteed, and what is only observed
+
+Rust documents async blocks as producing an anonymous `Future` type roughly equivalent to an enum with one variant per await point. It also explicitly says the actual data format is unspecified.
+
+This distinction matters. It is safe to reason that values needed after suspension must be preserved somehow. It is not safe to build an FFI format, serialization scheme, or transmute around the future's observed bytes.
+
+Measure the layout for performance. Never treat it as a public representation contract.
+
+## Further reading
+
+- [Async blocks in the Rust Reference](https://doc.rust-lang.org/reference/expressions/block-expr.html#async-blocks)
+- [Futures and the generated state-machine model in The Rust Programming Language](https://doc.rust-lang.org/book/ch17-01-futures-and-syntax.html)
+- [`cargo rustc` and the `-Zprint-type-sizes` example](https://doc.rust-lang.org/cargo/commands/cargo-rustc.html)
+- [Coroutine layout internals in rustc](https://doc.rust-lang.org/nightly/nightly-rustc/rustc_abi/layout/coroutine/index.html)

@@ -1,0 +1,135 @@
+---
+caseId: "RFA-038"
+title: "A Rust Release Crash Disappears When Logging Is Added"
+date: "2026-09-04T21:00:00+01:00"
+lastmod: "2026-09-07T14:20:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "244afb538a78a387f7ca6e927ef5e0db0998eaaa5f342ef3494c900daccfaa07"
+area: "concurrency-memory"
+symptom: "A release-only Rust crash disappears when a log statement, assertion, or unrelated local variable is added."
+summary: "Logging changes timing, layout, and optimization. Preserve the failing binary, vary one compiler dimension at a time, and test unsafe invariants instead of accepting println as a repair."
+rustVersions: ["stable Rust", "Cargo stable"]
+targets: ["affected production target"]
+profiles: ["release", "custom diagnostic profiles"]
+searchTerms:
+  [
+    "Rust release crash disappears with println",
+    "Rust heisenbug optimization logging",
+    "release only undefined behavior Rust",
+  ]
+evidence:
+  ["2x2 optimization and logging matrix", "checked stale-identity model", "tooling escalation path"]
+sources:
+  [
+    "https://doc.rust-lang.org/reference/behavior-considered-undefined.html",
+    "https://doc.rust-lang.org/cargo/reference/profiles.html",
+  ]
+---
+
+A log statement is not inert. It evaluates arguments, creates temporaries, performs I/O or synchronization, changes timing, increases code size, and can affect which values remain visible to the optimizer. When adding one makes a release crash disappear, I preserve both binaries. Their difference is evidence.
+
+The cause is not automatically undefined behavior, but unsafe-code bugs, data races, stale pointers, invalid values, and FFI contract errors become high-priority hypotheses. Rust's guarantees apply only when every unsafe boundary upholds its contract, including foreign code.
+
+## Freeze the failing artifact first
+
+Rebuilding can erase the only reproducible binary. I record and retain:
+
+- the executable and debug companion files;
+- exact `rustc -Vv` and Cargo versions;
+- target triple and CPU features;
+- `Cargo.lock` and enabled features;
+- environment and arguments;
+- panic strategy, optimization, LTO, codegen units, and debuginfo;
+- input which caused the crash.
+
+I also distinguish a Rust panic from a signal, access violation, allocator abort, or explicit process abort. “Crash” is too broad for the next step.
+
+## Build a one-variable profile matrix
+
+Debug and release differ in many settings. Cargo's defaults change optimization, debug assertions, overflow checks, incremental compilation, debuginfo, and codegen-unit count. Comparing only the two bundles cannot identify which difference matters.
+
+I create diagnostic profiles inheriting from release and vary one field:
+
+```toml
+[profile.release-with-symbols]
+inherits = "release"
+debug = "line-tables-only"
+
+[profile.release-no-opt]
+inherits = "release"
+opt-level = 0
+
+[profile.release-one-cgu]
+inherits = "release"
+codegen-units = 1
+```
+
+If changing debuginfo alone affects the result, layout or timing may be involved. If optimization alone does, an invalid assumption exposed by transformation becomes more likely. This is still classification, not proof that the compiler is wrong.
+
+The Atlas fixture makes this separation executable without pretending that undefined behavior has a portable outcome. The [failing model](/rust-failure-atlas/evidence/RFA-038/fail.rs) captures a generation ticket, replaces the value which owned that identity, optionally logs both generations, and then asks a checked boundary to use the stale ticket. The verifier compiles it at optimization levels 0 and 3 and runs each binary with logging off and on. All four cells reject the same stale identity.
+
+The [repaired model](/rust-failure-atlas/evidence/RFA-038/fixed.rs) obtains a current ticket after replacement. It also runs in all four cells, proves the old ticket remains invalid, and reads value `38` only through the current identity. The log changes output but never validity.
+
+This is deliberately a checked model, not an attempt to execute a dangling pointer and hope for a crash. It proves the diagnostic method and the invariant independently of one allocator, optimizer, or schedule. When the reduced production path contains actual unsafe code, Miri or a suitable sanitizer is the stronger next layer.
+
+## Separate timing from value observation
+
+`println!` normally locks output and enters the operating system. To test whether timing is important, I replace it with controlled yields, barriers, or delays. To test whether evaluating the value matters, I pass the value through `std::hint::black_box` without I/O.
+
+```rust
+let observed = std::hint::black_box(candidate_pointer);
+use_candidate(observed);
+```
+
+If a barrier makes the failure deterministic, I investigate synchronization. If `black_box` changes it, lifetime, initialization, or optimizer visibility may be involved. Neither is a repair.
+
+## Audit the unsafe frontier
+
+The Rust Reference lists behaviors the compiler may assume never happen: data races, dangling or misaligned accesses, invalid values, broken aliasing requirements, and incorrect FFI behavior among them.
+
+I search for the smallest code which can create such a state:
+
+- raw pointer retained across `Vec` growth;
+- reference into an object which later moves;
+- `MaybeUninit` read before initialization;
+- foreign function signature with the wrong width or calling convention;
+- concurrent non-atomic access;
+- value reconstructed with the wrong allocator or layout;
+- reference aliasing which an optimizer can exploit.
+
+Then I extract that boundary into a small fixture. A checked model can first make the claimed lifetime or ownership transition deterministic. Miri is valuable for supported real code paths. Platform sanitizers can catch memory and race errors outside Miri's scope. A debugger with symbols can identify the faulting instruction in the preserved release artifact.
+
+## Check concurrency with an explicit schedule
+
+Logging can serialize threads enough to hide a race. I replace lucky scheduling with barriers:
+
+```text
+thread A reads shared state
+thread A pauses
+thread B mutates or frees state
+thread B pauses
+thread A continues
+```
+
+If safe Rust owns all the shared data, the type system prevents data races. But unsafe containers, FFI callbacks, signal handlers, and incorrect `Send` or `Sync` implementations can bypass that protection.
+
+The fix is the missing ownership or synchronization rule, not retaining a slow log call.
+
+## Consider ordinary release differences too
+
+Not every case is UB. Disabled overflow checks can change arithmetic. Disabled debug assertions can remove validation with side effects—putting required mutation inside `debug_assert!` is a bug. A dependency may use `cfg(debug_assertions)` to select different code. Stack use and allocation timing can also differ.
+
+I inspect expanded configuration and avoid assertions whose expressions must run for correctness.
+
+## When to suspect a compiler defect
+
+Compiler bugs exist, but I raise that hypothesis after the reduced case is valid according to Rust's contracts, contains no mismatched FFI, reproduces across clean builds, and changes with a specific compiler version or optimization pass.
+
+A good report includes the minimized source, commands, target, good and bad compiler versions, and observed output. A large private service with “adding println fixes it” is not yet actionable evidence.
+
+## The regression proof
+
+After repairing the violated invariant, I remove diagnostic timing changes and run the minimized case many times under the original release settings. I add the strongest suitable checker to CI and retain a test that forces the old interleaving or reallocation.
+
+The disappearance caused by logging was the first clue. The verified repair must continue working after the log is gone.

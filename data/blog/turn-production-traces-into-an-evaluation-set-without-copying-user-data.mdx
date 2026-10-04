@@ -1,0 +1,233 @@
+---
+title: "Turn Production Traces Into an Evaluation Set Without Copying User Data"
+date: "2026-09-06T19:00:00+01:00"
+tags: ["ai", "llm evaluation", "privacy", "observability", "testing"]
+draft: false
+reviewed: true
+reviewedHash: "e3e1bdb1ff1f8871cc24f4277296fb88d308524ea8fd6507c8eca9fb2bee1bf5"
+cluster: "reliable-ai-systems"
+campaign: "authority-2026"
+opportunity: "AI-003"
+summary: "A practical pipeline for learning from production AI failures while minimizing personal data, preserving the failure signal, and keeping evaluation fixtures reviewable."
+---
+
+Production traces are valuable because they contain the cases that our design did not predict. They are also dangerous material for an evaluation dataset. I learned to treat these two facts together: an incident may give me a very good test case, but it does not give me permission to copy every field into a new system.
+
+A trace may contain a person's message, account data, retrieved documents, tool arguments, employee notes, and the model's answer. Copying the whole trace into a test fixture is fast. It can also create a second, poorly controlled store of sensitive data.
+
+I use production traces as **evidence for creating tests**, not as files to copy blindly.
+
+The difference is important. I want to preserve the behaviour that failed while removing details that are not needed to reproduce it.
+
+## Start with a failure contract
+
+Before extracting anything, I write one sentence describing the failure:
+
+```text
+When two accounts have similar names, the assistant must use the caller's
+tenant boundary before ranking documents.
+```
+
+This sentence is the contract. The original customer names, document text, email addresses, and account IDs are not automatically part of it.
+
+If the problem cannot be described without keeping the entire trace, I pause. Perhaps the failure depends on a subtle document shape. Perhaps an expert must inspect it in the controlled production environment. That does not justify putting the raw trace into a developer-facing repository.
+
+## The pipeline I use
+
+I separate the process into seven stages:
+
+```text
+production trace
+    ↓ eligibility decision
+isolated snapshot
+    ↓ structural extraction
+failure skeleton
+    ↓ replacement and redaction
+synthetic candidate fixture
+    ↓ human privacy review
+approved evaluation case
+    ↓ automated leakage tests
+versioned evaluation set
+```
+
+Each arrow should leave an audit record. I want to know who selected the trace, why it was useful, which transformations ran, who approved the fixture, and when the raw snapshot must be deleted.
+
+## Stage 1: decide whether the trace is eligible
+
+Not every failure should become a reusable test. I reject a trace early when:
+
+- the user's consent or product terms do not support this use;
+- the content includes regulated or unusually sensitive information;
+- access came from a privileged support workflow;
+- the behaviour can be reproduced safely with a synthetic case;
+- the failure is already covered by an existing fixture;
+- retention requirements cannot be met.
+
+This is data minimization before redaction. The safest field is the field never copied.
+
+NIST describes de-identification as a way to reduce privacy risk, not as a guarantee that linkage becomes impossible. I keep that distinction. Pseudonymous data can remain personal data when another table or context can reconnect it to a person. See NIST's [overview of de-identifying personal information](https://www.nist.gov/publications/de-identification-personal-information).
+
+## Stage 2: extract structure, not content
+
+Suppose the original trace contains:
+
+- a question about one customer's invoice;
+- retrieval from two tenants because of a missing filter;
+- a final answer citing the wrong invoice;
+- a tool call that succeeded technically.
+
+The reusable structure is:
+
+```text
+two tenants
+similar document titles
+one authenticated caller
+retrieval corpus containing both tenants
+missing or defective authorization filter
+grader checking that only the caller's document can be selected
+```
+
+I can generate synthetic tenants, invoices, and text that preserve this shape. The test remains meaningful because the failure came from authorization and ranking, not the real invoice value.
+
+This technique works for many categories:
+
+| Production signal | Safe fixture structure |
+|---|---|
+| wrong entity selected | synthetic entities with confusable names |
+| stale answer | old and new versions with explicit timestamps |
+| tool called twice | deterministic fake tool with an effect ledger |
+| unsupported claim | documents that omit one required fact |
+| prompt injection | synthetic untrusted document carrying an instruction |
+
+The fixture should be boring to read and precise to grade.
+
+## Stage 3: replace identifiers carefully
+
+Simple search-and-replace is not enough. The same identifier may appear in a prompt, a tool result, a URL, and the model output. Different identifiers may share substrings. Free text may refer to a person indirectly.
+
+I parse known structures before touching text:
+
+```typescript
+type Trace = {
+  actor: { tenantId: string; userId: string }
+  messages: Array<{ role: string; content: string }>
+  retrievals: Array<{ documentId: string; text: string; score: number }>
+  toolCalls: Array<{ name: string; arguments: unknown; result: unknown }>
+  outcome: unknown
+}
+```
+
+Structured fields are replaced according to their type. Free-text fields go through detection and then human review. I do not place secrets, access tokens, raw headers, or internal credentials in the candidate snapshot at all.
+
+Stable pseudonyms can help preserve relationships inside one fixture:
+
+```text
+real tenant A → tenant_alpha
+real tenant B → tenant_beta
+same real user in two steps → user_1 in both steps
+```
+
+The mapping is short-lived and stored separately. A keyed hash may create stable pseudonyms, but it is still pseudonymization. It does not make the dataset anonymous by itself.
+
+## Stage 4: preserve the failure signal
+
+Redaction can accidentally make a test easier or change what it measures.
+
+If two real company names were visually similar, replacing them with `A` and `B` removes the confusion. If the failure involved a very long document, replacing it with one sentence removes the context-pressure condition. If the production trace used mixed languages, translating everything to English changes tokenization and retrieval.
+
+After transformation, I compare properties rather than words:
+
+- number and sizes of documents;
+- position of the decisive fact;
+- similarity of competing records;
+- tool sequence and side effects;
+- permission relationships;
+- timestamps and version ordering;
+- language and formatting features;
+- expected outcome.
+
+The synthetic fixture does not need to look real. It needs to reproduce the mechanism.
+
+## Stage 5: grade the outcome, not the prose alone
+
+A useful evaluation case contains more than an input and a preferred answer:
+
+```typescript
+type EvaluationCase = {
+  id: string
+  failureClass: string
+  input: unknown
+  environmentFixture: unknown
+  assertions: Array<
+    | { kind: "tool_not_called"; tool: string }
+    | { kind: "selected_document"; documentId: string }
+    | { kind: "state_equals"; path: string; expected: unknown }
+    | { kind: "rubric"; criterion: string }
+  >
+  provenance: {
+    derivedFromProduction: boolean
+    approvedAt: string
+    sourceDeletionDueAt: string
+  }
+}
+```
+
+I prefer code-based assertions for permissions, state changes, selected sources, and tool effects. A model grader can help with tone or explanation quality, but it should not decide whether an unauthorized write happened.
+
+Current evaluation guidance from Anthropic defines a trace as the record of intermediate actions and an outcome as the resulting environment state. That distinction is useful here: [Demystifying evals for AI agents](https://www.anthropic.com/engineering/demystifying-evals-for-ai-agents).
+
+## Stage 6: prevent evaluation leakage
+
+There are two forms of leakage I care about.
+
+The first is privacy leakage: a supposedly synthetic fixture still contains a real email, hostname, document sentence, or identifier.
+
+The second is experimental leakage: related examples appear in both training or prompt-tuning data and the evaluation split, making progress look better than it is.
+
+I add automated checks for:
+
+- email addresses, phone numbers, IP addresses, and token formats;
+- known production domains and tenant IDs;
+- unusually long copied spans compared with the source snapshot;
+- secrets detected by the repository's normal secret scanner;
+- duplicate or near-duplicate fixtures across dataset splits.
+
+I split related cases by incident or failure family, not by individual row. Ten variations derived from one production failure must not be scattered across development and test sets.
+
+Automated detection is a guardrail. A person who understands the domain still reviews the final fixture.
+
+## Stage 7: keep a deletion path
+
+The raw snapshot should have a short, explicit retention period. The approved synthetic fixture should not need the raw trace to run.
+
+I keep a small provenance record:
+
+```text
+fixture_id
+source_trace_reference
+selection_reason
+transform_version
+reviewer
+approved_at
+raw_snapshot_delete_at
+```
+
+Deleting the snapshot is a real workflow step with an owner and alert. "We will clean it later" is not a retention policy.
+
+If a user deletion request or policy change affects the derived fixture, the provenance record gives us a way to find it. In highly sensitive domains, I may avoid persistent linkage entirely and accept that the fixture cannot be traced back after approval.
+
+## A small review checklist
+
+Before merging an evaluation case derived from production, I ask:
+
+1. Can we explain the failure without the original personal details?
+2. Does the transformed case preserve the property that caused failure?
+3. Are permission and consent compatible with this secondary use?
+4. Are deterministic assertions used where possible?
+5. Has a human reviewed free text and indirect identifiers?
+6. Are related cases kept in the same dataset split?
+7. Is the raw snapshot deletion scheduled and observable?
+
+This process takes longer than copying JSON from an observability tool. It also produces better tests. The fixture becomes small, readable, stable, and tied to one failure contract.
+
+Production data teaches us where the system is weak. Good data engineering lets us learn that lesson without turning every user's history into permanent test material.

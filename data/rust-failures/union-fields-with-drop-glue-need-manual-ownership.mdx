@@ -1,0 +1,71 @@
+---
+caseId: "RFA-623"
+title: "Union Fields with Drop Glue Need Manual Ownership"
+date: "2026-09-06T07:43:00+01:00"
+lastmod: "2026-09-06T07:43:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "6a54f06dbb70a873493b5c3d1bd3cbbca81e9bc146335be676ea455fc4b3e92d"
+area: "ffi-targets"
+symptom: "Putting String directly in a union fails with E0740 because Rust cannot know which overlapping field needs destruction."
+summary: "A union has shared storage but no tracked active variant. Use Copy fields or ManuallyDrop, carry a trustworthy tag, and centralise every unsafe read and destruction transition."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust E0740 union field ManuallyDrop", "union field must implement Copy", "drop String inside Rust union"]
+evidence: ["Rust 1.98.1 E0740 compile failure", "String placed directly in union storage", "ManuallyDrop field repair"]
+sources: ["https://doc.rust-lang.org/error_codes/E0740.html", "https://doc.rust-lang.org/reference/items/unions.html", "https://doc.rust-lang.org/std/mem/struct.ManuallyDrop.html"]
+---
+
+A Rust union lets several fields interpret the same storage. It does not remember which interpretation is currently active. If a field owns heap data, automatic destruction would need exactly that missing fact. The [failing fixture](/rust-failure-atlas/evidence/RFA-623/fail.rs) puts `String` directly in a union and receives E0740.
+
+## Shared bytes do not carry an active-field bit
+
+Writing one union field can overwrite the bytes of another. Reading a field asks Rust to interpret the current bits as that field’s type, and the programmer must prove they form a valid value. The Reference explains that [union fields share storage](https://doc.rust-lang.org/reference/items/unions.html) and restricts field types so no field needs automatic drop glue.
+
+For a struct, Rust knows every initialized field that must be dropped. For an enum, the discriminant selects a variant. A bare union has neither guarantee. Automatically dropping `text` might interpret an integer’s bits as a `String`, which would be undefined behaviour.
+
+## ManuallyDrop moves the responsibility to me
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-623/fixed.rs) wraps the string field in `ManuallyDrop<String>`. The wrapper suppresses automatic destruction and has the same layout as its inner value, as described by the standard library’s [`ManuallyDrop` documentation](https://doc.rust-lang.org/std/mem/struct.ManuallyDrop.html).
+
+This is a type-checking repair, not a complete safe abstraction. If code actually initializes the text field, some trusted logic must know when it is active and call the correct manual drop exactly once. Forgetting leaks; dropping twice or dropping the wrong interpretation can become memory unsafety.
+
+I therefore rarely expose the raw union directly. I pair it with a tag in a private representation, provide constructors that initialise matching pairs, and centralise access and `Drop` in a small audited module.
+
+## The tag is part of the safety proof
+
+A separate enum or integer tag must always agree with the stored field. Every mutation is a transition: destroy the previous active value if necessary, write the new value, then publish the matching tag in an order appropriate to the concurrency model.
+
+If untrusted bytes or foreign code can modify either part independently, I validate before reading. Merely matching on a Rust tag is not enough when the tag itself may contain an invalid raw value. FFI conversion should reject unknown or inconsistent states without constructing an invalid enum.
+
+Concurrent access requires a synchronization protocol around the whole tagged value. Atomically changing only the tag while non-atomically rewriting storage can let another thread observe mismatched state. A lock or carefully specified atomic representation is normally clearer.
+
+## Prefer enums for Rust-owned alternatives
+
+When Rust owns both creation and use, a normal enum records the active variant and drops it correctly. Its layout is compiler-managed unless an explicit representation is needed. It gives exhaustive matching and makes impossible tag/value combinations unrepresentable.
+
+I use unions mainly for C ABI structures, hardware views, or low-level representation work where overlapping storage is genuinely required. Saving a few bytes in ordinary application state is rarely worth expanding the unsafe proof surface.
+
+Even in FFI, an opaque handle or explicit byte conversion may be easier to version than sharing a tagged union layout. I choose representation from the external contract, not from the visual similarity of C and Rust declarations.
+
+## Replacement and panic paths matter
+
+Manual transitions must remain sound if allocation or conversion fails. I prepare fallible new state before destroying the old state where possible. Once destruction begins, I leave the object in a valid documented state even if later work cannot complete.
+
+Drop implementations should avoid panicking. A panic during unwinding can abort, and half-completed manual destruction makes recovery difficult. Small unsafe helpers with preconditions, debug assertions, and focused tests are better than repeated field reads scattered across business code.
+
+Miri and sanitizers can catch some mistakes in exercised paths, but they cannot prove a tag invariant across all inputs. I document the invariant next to the representation and test every constructor, transition, accessor, and destructor branch.
+
+## My E0740 checklist
+
+- Which union field has drop glue or is not Copy?
+- Is overlapping storage truly required instead of a normal enum?
+- Will `ManuallyDrop` have one clearly owned destruction path?
+- Where is the active-field tag stored and how is its agreement protected?
+- Can foreign or untrusted input create an invalid tag/value pair?
+- Are replacement, failure, and panic paths valid and leak expectations explicit?
+- Is concurrent mutation synchronized as one state transition?
+- Do focused tests and unsafe documentation cover every field interpretation?
+
+The core principle is that shared storage does not know which resource it owns. E0740 prevents automatic destruction from guessing. `ManuallyDrop` makes the representation possible, while the surrounding tag protocol and audited unsafe layer make it defensible.

@@ -1,0 +1,72 @@
+---
+caseId: "RFA-318"
+title: "BufWriter::into_inner Does Not Flush the Underlying Writer"
+date: "2026-09-06T01:38:00+01:00"
+lastmod: "2026-09-06T01:38:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "2ca1055e5297f5587a8eecbdb6b6eb0a177fb9972702b26abf576af08f9e4cf2"
+area: "ffi-targets"
+symptom: "into_inner writes bytes buffered by BufWriter, but a probe shows that the underlying writer's flush method was never called."
+summary: "into_inner drains BufWriter's own byte buffer before returning the wrapped writer. That is different from Write::flush, which also asks the underlying layer to push its intermediate state to its destination."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust BufWriter into_inner calls flush", "into_inner underlying writer flush not called", "BufWriter flush versus into_inner"]
+evidence: ["Rust 1.98.1 counting writer", "buffered bytes delivered", "zero underlying flush calls until explicit flush"]
+sources: ["https://doc.rust-lang.org/std/io/struct.BufWriter.html#method.into_inner", "https://doc.rust-lang.org/std/io/trait.Write.html#tymethod.flush", "https://doc.rust-lang.org/std/io/struct.BufWriter.html#method.into_parts"]
+---
+
+I used `BufWriter::into_inner()` as the final step of an output path and read “the buffer is written out” as a complete flush. A wrapped writer had its own intermediate state. Its `flush` method was never called.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-318/fail.rs) wraps a probe counting writes and flushes. `into_inner` delivers `atlas` through `write`, but the flush count remains zero.
+
+## There can be more than one buffer layer
+
+[`BufWriter::into_inner`](https://doc.rust-lang.org/std/io/struct.BufWriter.html#method.into_inner) consumes the adapter, writes its internal buffer to `W`, and returns `W`. It can fail if writing those buffered bytes fails.
+
+The operation needs to empty the buffer it owns so those bytes are not lost when the wrapper disappears. It does not need to call `W::flush()` merely to return ownership of `W`.
+
+If `W` is another buffering adapter, a compression encoder, a framed transport, or a custom writer, accepting bytes through `write` may not finish that layer's protocol.
+
+## Write::flush expresses the complete adapter chain request
+
+[`Write::flush`](https://doc.rust-lang.org/std/io/trait.Write.html#tymethod.flush) asks an output stream to ensure intermediate buffered contents reach their destination. `BufWriter` first writes its own buffer and then calls `flush` on the underlying writer.
+
+The repaired fixture explicitly calls `buffered.flush()` before `into_inner`. The probe sees both the bytes and one flush call. `into_inner` then has no BufWriter bytes left to write and returns the probe.
+
+I handle the `Result` from explicit flush at a point where the caller can still retry, preserve state, or report failure. Drop cannot provide that error channel, as RFA-131 explains.
+
+## Flush is not necessarily durable storage
+
+Even an explicit `Write::flush` does not universally mean bytes are durable on physical media or acknowledged by a remote peer. Its meaning is defined by the writer implementation.
+
+For a file, durability requirements may need `sync_data` or `sync_all` and careful directory synchronization around replacement. For a buffered network protocol, a flush may only hand bytes to the operating system. For an encoder, finalization may write a footer that a generic flush does not produce.
+
+I name the requirement precisely: leave Rust's buffer, finish encoder, send to kernel, receive peer acknowledgement, or persist through a crash. “Flushed” is otherwise too easy to overpromise.
+
+## into_parts deliberately performs no write
+
+[`BufWriter::into_parts`](https://doc.rust-lang.org/std/io/struct.BufWriter.html#method.into_parts) separates the underlying writer and pending buffer without attempting to flush. This can support error recovery when writing is no longer possible or when the wrapped writer panicked.
+
+It is not a successful-finalization shortcut. The caller now owns both parts and must decide what to do with pending bytes.
+
+This distinction gives three useful lifecycle choices: explicit flush and unwrap, write BufWriter bytes while unwrapping with `into_inner`, or recover parts without writing. I select the one matching failure policy.
+
+## Error recovery must avoid duplicate bytes
+
+A lower writer can accept a prefix and then fail on a later call. Standard `Write` rules report successful byte counts, but layered retries still need to know which buffer owns the remaining suffix.
+
+`IntoInnerError` returns the buffered writer so code can inspect and retry. Blindly replaying the original complete message to another sink may duplicate the prefix already accepted by the first destination.
+
+For important protocols I use message identifiers or transactional boundaries rather than assuming an I/O error means nothing happened.
+
+## What I test
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-318/fixed.rs) writes into a buffer smaller than its capacity, explicitly flushes, unwraps, and asserts exact bytes plus one underlying flush call.
+
+My adapter tests include data smaller and larger than capacity, partial writes, interrupted writes, write-zero, flush failure, into-inner failure and recovery, double buffering, and normal drop. A counting writer separates write calls from flush calls so final bytes alone cannot hide the lifecycle.
+
+For real files or sockets, I add integration tests for the stronger outcome the system claims. An in-memory probe verifies Rust call semantics, not disk power-loss behavior or peer processing.
+
+The core principle is that each buffering layer owns a different completion boundary. `into_inner` drains BufWriter's bytes into its immediate writer; `flush` also invokes that writer's flush contract. Reliable output code names the final outcome it needs and executes every layer required to reach it.

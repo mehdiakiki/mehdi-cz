@@ -1,0 +1,112 @@
+---
+caseId: "RFA-074"
+title: "E0728: Why `.await` Needs the Containing Function to Be Async"
+date: "2026-09-05T08:40:00+01:00"
+lastmod: "2026-09-05T08:40:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "a9730aad47915a98dd9046d87320d31ee565d56663e2f9ff7497f99b81c5f753"
+area: "diagnostics-macros"
+symptom: "Using await inside an ordinary function produces E0728 even when the awaited expression is itself an async block."
+summary: "Await suspends its surrounding future, not the value in isolation. Propagate async through the call boundary until an executor drives the returned future, or keep a deliberate synchronous adapter at the edge."
+rustVersions: ["Rust 1.98.1"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust E0728 await only allowed inside async function",
+    "cannot await async block in normal fn",
+    "where to call await Rust executor boundary",
+  ]
+evidence:
+  ["Rust 1.98.1 compile failure", "surrounding-state-machine model", "async-boundary repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/error_codes/E0728.html",
+    "https://doc.rust-lang.org/reference/expressions/await-expr.html",
+  ]
+---
+
+An async value does not bring its own place to suspend. This function still fails:
+
+```rust
+fn load() {
+    let value = async { 1_u8 }.await;
+}
+```
+
+Rust 1.98.1 reports E0728: `await` is allowed only inside async functions and blocks. The expression to the left is an async block, but the `.await` operation belongs to the ordinary `load` body. The [failing fixture](/rust-failure-atlas/evidence/RFA-074/fail.rs) isolates that boundary.
+
+## Await transforms the surrounding control flow
+
+Polling a future can return `Pending`. At that point, `.await` must save the containing computation's state and return control to its caller or executor. Later, the containing computation is polled again and resumes after the await.
+
+A synchronous function has an ordinary call-and-return ABI. It cannot return `Pending`, store a suspended program counter, and resume through `poll`. Marking the function `async` asks the compiler to generate that future state:
+
+```rust
+async fn load() -> u8 {
+    async { 1_u8 }.await
+}
+```
+
+Calling `load()` now constructs a future. It does not execute the body to completion. The [repaired fixture](/rust-failure-atlas/evidence/RFA-074/fixed.rs) verifies that the async boundary compiles under Rust 1.98.1.
+
+The [Reference definition of await expressions](https://doc.rust-lang.org/reference/expressions/await-expr.html) describes repeated polling, `Pending`, and resumption. That behavior requires an enclosing async context.
+
+## Async propagates until something drives the future
+
+If a synchronous `service` calls `load().await`, making only `load` async is not enough. `service` must also become async, return the future without awaiting, or use a deliberate synchronous executor adapter. The dependency often moves upward:
+
+```text
+async I/O operation
+  -> async repository method
+  -> async service method
+  -> async request handler
+  -> runtime drives handler future
+```
+
+This propagation is not compiler contagion without meaning. Every async boundary says that completion may pause and the caller participates in scheduling.
+
+## Do not create a new runtime inside arbitrary library code
+
+A tempting repair is to construct an executor and `block_on` at the failing line. This can work in a command-line `main`, but inside an existing async runtime it may panic, deadlock, block an executor worker, or create nested scheduling behavior the caller cannot control.
+
+Libraries normally expose async functions and let the application choose the runtime. A synchronous adapter belongs at a well-defined edge where blocking is acceptable and re-entry rules are documented.
+
+Tests need the same decision. An async test attribute supplies a runtime and an async containing body; adding `.await` to an ordinary unit test without changing its harness boundary produces the same E0728.
+
+## Moving `.await` into an inner async block changes the return
+
+This compiles in a synchronous function:
+
+```rust
+fn load() -> impl std::future::Future<Output = u8> {
+    async { 1_u8 }
+}
+```
+
+There is no await in the ordinary body; it returns a future to its caller. This can be useful when avoiding `async fn` syntax or controlling captures, but the caller still needs to await or poll the result somewhere async.
+
+Writing `async { operation().await }` without awaiting that outer block only constructs another future. If immediately dropped, the operation may never start. I check for unused-future warnings after moving boundaries.
+
+## Iterator closures are synchronous too
+
+E0728 commonly appears inside `Iterator::map`:
+
+```rust
+items.iter().map(|item| fetch(item).await)
+```
+
+Even inside an async function, the closure passed to ordinary `map` is synchronous. It can return an async block, producing an iterator of futures, but choosing how to drive those futures also chooses concurrency, ordering, and cancellation. A loop, buffered stream, or joined collection are not interchangeable fixes.
+
+The relevant enclosing context is the immediate closure body, not merely some async function higher in the syntax tree.
+
+## My boundary check
+
+For E0728, I mark the smallest function, closure, or block containing the `.await`. Then I decide which of three contracts it should have:
+
+- It is async and may suspend.
+- It returns a future for another layer to drive.
+- It is intentionally synchronous and uses a documented blocking boundary at the application edge.
+
+The official [E0728 explanation](https://doc.rust-lang.org/error_codes/E0728.html) states the location rule. The deeper model is that await is an operation on the surrounding state machine. An async expression on the left supplies the child future; only an async context around the operation can store the parent state while that child is pending.

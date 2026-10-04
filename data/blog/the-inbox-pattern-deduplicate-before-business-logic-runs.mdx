@@ -1,0 +1,228 @@
+---
+title: "The Inbox Pattern: Deduplicate Before Business Logic Runs"
+date: "2026-09-30T17:00:00+01:00"
+tags: ["inbox pattern", "idempotent consumer", "message processing", "postgresql", "distributed systems"]
+draft: false
+reviewed: true
+reviewedHash: "7f702e875766eeb21595b8d7ac778350e2631a790f35dd5a2afbde14bdf035cd"
+cluster: "reliable-data-integrations"
+campaign: "authority-2026"
+opportunity: "DATA-040"
+summary: "A database inbox turns at-least-once delivery into one committed business effect by claiming message identity in the same transaction as domain changes."
+---
+
+Message brokers redeliver. Consumers crash. A timeout can happen after the database commit but before the broker receives its acknowledgement.
+
+The dangerous sequence is short:
+
+```text
+receive message
+update business state
+commit database
+crash before acknowledgement
+receive the same message again
+```
+
+If the handler increments balance, sends work downstream, or changes status again, at-least-once delivery becomes duplicate business effect.
+
+I use an inbox table to make message identity part of the same database transaction as the business change.
+
+## The inbox is a claim, not only a log
+
+A minimal PostgreSQL table is:
+
+```sql
+create table consumer_inbox (
+  consumer_name text not null,
+  producer_name text not null,
+  message_id text not null,
+  payload_sha256 text not null,
+  received_at timestamptz not null default now(),
+  processed_at timestamptz,
+  handler_version text not null,
+  primary key (consumer_name, producer_name, message_id)
+);
+```
+
+The key includes the consumer because two independent consumers may both need to apply the event. It includes producer scope because message IDs from different producers can collide.
+
+Tenant can also be part of the key when IDs are unique only inside a tenant.
+
+## Claim and mutate in one transaction
+
+The handler starts a transaction and tries to insert the message identity:
+
+```sql
+begin;
+
+insert into consumer_inbox (
+  consumer_name,
+  producer_name,
+  message_id,
+  payload_sha256,
+  handler_version
+)
+values (:consumer, :producer, :message_id, :payload_hash, :handler_version)
+on conflict do nothing
+returning message_id;
+```
+
+If `RETURNING` yields a row, this transaction owns first processing. It applies the domain change:
+
+```sql
+update account
+set available_credit = available_credit + :delta
+where account_id = :account_id;
+
+update consumer_inbox
+set processed_at = now()
+where consumer_name = :consumer
+  and producer_name = :producer
+  and message_id = :message_id;
+
+commit;
+```
+
+If the insert returns no row, the handler loads the existing hash. Matching hash means a duplicate delivery. Different hash under the same identity means a producer contract violation and goes to quarantine.
+
+PostgreSQL documents that [`INSERT ... ON CONFLICT`](https://www.postgresql.org/docs/18/sql-insert.html) can replace a unique-constraint error with `DO NOTHING` or `DO UPDATE`. The unique primary key is what serializes concurrent claims.
+
+## Why the transaction boundary matters
+
+This implementation is unsafe:
+
+```text
+insert inbox row and commit
+apply business change and commit
+```
+
+A crash between the commits leaves a message marked as seen but not applied. Every redelivery is then skipped. Deduplication has become data loss.
+
+This order is unsafe too:
+
+```text
+apply business change and commit
+insert inbox row and commit
+```
+
+A crash between commits repeats the business change.
+
+When inbox and domain state share one transactional database, one transaction removes both gaps. If processing fails, the inbox insert rolls back with the domain writes and the message can retry.
+
+## Concurrent duplicates
+
+Two workers can receive the same message at nearly the same time.
+
+Both attempt the inbox insert. The unique index allows only one to own the row. Depending on isolation and timing, the other waits or observes the conflict after the first transaction completes.
+
+I do not implement this as `SELECT` followed by `INSERT`. Both workers can see absence before either inserts. The unique constraint, not an application-level pre-check, is the concurrency control.
+
+## External side effects break the atomic boundary
+
+The database transaction cannot atomically send an email or call another API.
+
+I insert an outbox record in the same transaction:
+
+```sql
+insert into message_outbox (
+  effect_id,
+  destination,
+  payload,
+  status
+)
+values (:stable_effect_id, :destination, :payload, 'pending')
+on conflict (effect_id) do nothing;
+```
+
+A separate dispatcher delivers it with an idempotency key and records the remote result. The inbox prevents duplicate domain decisions; the outbox makes the intended external effect durable.
+
+Calling the email provider inside the database transaction is not atomic. It only keeps a database lock open across a network request.
+
+## Message identity must represent producer intent
+
+A broker offset can be unique in one partition, but it may change after migration or republishing. A content hash can collapse two legitimate identical commands. A timestamp is rarely unique.
+
+I prefer a producer-assigned immutable event or command ID. The contract is:
+
+```text
+same ID + same semantic payload = retry of one intent
+same ID + different payload      = identity conflict
+new ID + same payload             = possibly a new intent
+```
+
+This distinction prevents a repeated “add 10 credits” command from being mistaken for a legitimate second command.
+
+## Handler versions need an explicit replay policy
+
+After a bug fix, a team may want to replay old events through a new handler. The existing inbox will correctly call them duplicates.
+
+I choose one of three policies:
+
+1. **No reapplication:** rebuild a derived read model elsewhere.
+2. **Versioned projection:** include projection version in the consumer identity.
+3. **Compensated migration:** run a controlled migration with its own operation IDs.
+
+I do not delete inbox rows casually to “make replay work.” That also reopens the door to ordinary broker redelivery.
+
+## Failure handling
+
+Transient errors roll back and retry with a bounded policy. Permanent data errors cannot block a partition forever without visibility.
+
+For poison messages I keep:
+
+```text
+message identity
+payload hash and protected payload reference
+validation code
+attempt count
+first and last failure time
+handler version
+repair or discard decision
+```
+
+A dead-letter move is not success. It is a change of operational ownership.
+
+## Metrics that expose the protocol
+
+I monitor:
+
+- first-seen messages;
+- duplicate deliveries by producer and consumer;
+- identity conflicts with different hashes;
+- transaction retries and lock wait time;
+- handler failures by stable reason code;
+- inbox age and storage growth;
+- outbox effects pending after domain commit;
+- messages moved to repair and later recovered.
+
+A sudden drop to zero duplicates can mean the broker improved. It can also mean message IDs disappeared from the producer. Metrics need contract tests.
+
+## Retention is part of correctness
+
+Inbox rows cannot always live forever, but deleting them too soon makes an old delivery new again.
+
+The retention must cover broker retention, offset rewind, dead-letter redrive, producer retry, outages, backups, and planned replays. [How Long Must a Consumer Remember Duplicate Messages?](/blog/how-long-must-a-consumer-remember-duplicate-messages) derives this window from failure scenarios instead of picking an arbitrary TTL.
+
+## Tests I require
+
+My database-backed test runs these cases:
+
+- same message delivered sequentially twice;
+- same message delivered concurrently by many workers;
+- crash before inbox insert;
+- exception after claim but before domain update;
+- commit succeeds and acknowledgement is lost;
+- same ID arrives with different payload;
+- outbox dispatcher retries after an ambiguous remote timeout;
+- inbox retention expires before a simulated redrive;
+- handler version changes during a replay plan.
+
+The invariant is:
+
+```text
+For one consumer and one producer intent,
+there is at most one committed domain transition,
+while uncommitted attempts remain retryable.
+```
+
+The inbox pattern does not stop duplicate delivery. It makes duplicate delivery an expected input that cannot silently repeat business logic.

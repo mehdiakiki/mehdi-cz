@@ -1,0 +1,117 @@
+---
+caseId: "RFA-065"
+title: "E0271: Chaining Rust Iterators That Yield `&T` and `T`"
+date: "2026-09-05T08:35:00+01:00"
+lastmod: "2026-09-05T08:35:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "46497667f2c18009578712628cf4f1be0cde7cc2f0a94fd661213a334b5c8969"
+area: "diagnostics-macros"
+symptom: "Iterator chain produces E0271 when one iterator yields references and the next yields owned values."
+summary: "Iterator adapters compose through exact associated Item types. Decide whether the combined stream borrows, copies, clones, or owns its elements before joining iter and into_iter."
+rustVersions: ["Rust 1.98.1"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust Iterator chain expected reference found value E0271",
+    "chain iter into_iter item type mismatch",
+    "IntoIter Item equals reference Rust error",
+  ]
+evidence: ["Rust 1.98.1 compile failure", "associated-item table", "copied iterator repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/error_codes/E0271.html",
+    "https://doc.rust-lang.org/std/iter/trait.Iterator.html#method.chain",
+  ]
+---
+
+Iterator types can look compatible because their printed elements look the same. `chain` needs more precision:
+
+```rust
+let owned = vec![1_u8, 2];
+let borrowed = &owned;
+
+let combined: Vec<_> = borrowed
+    .iter()
+    .chain(owned.into_iter())
+    .collect();
+```
+
+Rust 1.98.1 emits E0271. The diagnostic says it expected `&u8` and found `u8`. The [failing fixture](/rust-failure-atlas/evidence/RFA-065/fail.rs) records the full associated-type message.
+
+The values have the same numeric appearance, but their ownership is different. `borrowed.iter()` yields references into the vector. `owned.into_iter()` consumes the vector and yields owned elements.
+
+## `chain` has one item protocol
+
+The [`Iterator::chain` documentation](https://doc.rust-lang.org/std/iter/trait.Iterator.html#method.chain) requires the second input to produce the same `Item` type as the first iterator. Conceptually:
+
+```text
+first:  Iterator<Item = &u8>
+second: IntoIterator<Item = u8>
+required: second Item == first Item
+```
+
+There is no implicit dereference, copy, clone, or allocation between adapters. Rust does not guess whether identity or ownership is important.
+
+This is why E0271 mentions an associated type. `Item` belongs to the `Iterator` or `IntoIterator` implementation selected for each receiver. Method names alone do not determine it.
+
+## Normalize both sides deliberately
+
+For Copy elements, I can turn borrowed items into values:
+
+```rust
+let combined: Vec<u8> = borrowed
+    .iter()
+    .copied()
+    .chain(owned.iter().copied())
+    .collect();
+```
+
+Both sides now yield `u8`. In this fixture I also use `iter()` on the second side, because attempting to consume `owned` while the first chained iterator still borrows it would reveal a second, independent ownership error. The [repaired fixture](/rust-failure-atlas/evidence/RFA-065/fixed.rs) compiles, executes, and checks the four results on Rust 1.98.1.
+
+For non-Copy but Clone values, `.cloned()` makes the allocation or cloning behavior explicit. If cloning is expensive or semantically wrong, I keep both sides borrowed or restructure ownership.
+
+## A type repair can uncover an ownership repair
+
+Suppose I changed only the first iterator:
+
+```rust
+borrowed.iter().copied().chain(owned.into_iter())
+```
+
+The item types now match, but `borrowed` is a reference to `owned`, and the first lazy iterator retains that borrow while the second expression tries to move `owned`. Rust can then reject the move. E0271 was the first visible mismatch, not necessarily the last problem in the line.
+
+This is why I compile after one controlled change. I do not treat a new diagnostic as regression; it can be the next hidden constraint becoming visible.
+
+## Three coherent designs
+
+If both collections stay alive, a borrowed chain avoids copies:
+
+```rust
+left.iter().chain(right.iter()) // Item = &T
+```
+
+If both collections should be consumed:
+
+```rust
+left.into_iter().chain(right) // Item = T
+```
+
+If sources mix borrowed and owned data, the output can normalize to owned values with `copied`, `cloned`, or a domain conversion. Another option is an enum such as `Cow<'a, T>` when consumers must distinguish or flexibly handle borrowed and owned items.
+
+Each design answers who owns elements during and after iteration. The correct one depends on whether source collections must remain usable and whether duplicating elements is acceptable.
+
+## Edition history can change array intuition
+
+Arrays had an edition-related transition around `.into_iter()` method syntax. Current Rust editions support value iteration consistently, but old examples and generic code can create confusing expectations. I inspect the receiver type and compiler-recorded edition instead of assuming every `into_iter` yields the same ownership form.
+
+For `&Vec<T>`, `IntoIterator` yields `&T`; for `&mut Vec<T>`, it yields `&mut T`; for owned `Vec<T>`, it yields `T`. Writing these three rows often resolves an adapter error immediately.
+
+I also avoid using the collected output type as my only clue. `Vec<_>` accepts references and values alike, so collection may preserve a mistaken ownership choice without making it obvious in the local annotation. The iterator boundary is where I state the intended item type.
+
+## My first check for E0271
+
+I ask the compiler or IDE for the exact `Item` type after every adapter. Then I place the first mismatch in a small table before adding conversions. This prevents a long chain of `.map(|x| ...)` calls that happen to compile but obscure ownership costs.
+
+The official [E0271 explanation](https://doc.rust-lang.org/error_codes/E0271.html) covers associated-type mismatches generally. For iterators, the practical rule is that composability includes ownership: `T`, `&T`, and `&mut T` are three different item protocols. `chain` combines only one protocol unless I translate the others explicitly.

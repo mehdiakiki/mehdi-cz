@@ -1,0 +1,198 @@
+---
+title: "HIR, THIR, and MIR: The Same Rust Function at Three Compiler Stages"
+date: "2026-09-17T09:00:00+01:00"
+tags: ["Rust compiler", "rustc internals", "HIR", "THIR", "MIR"]
+draft: false
+reviewed: true
+reviewedHash: "8c26a38da6518ff64c1aee91ad8e132e2c3450fb62805e7ec5cf6ac30895c7ad"
+cluster: "rust-under-the-hood"
+campaign: "authority-2026"
+opportunity: "RUST-008"
+summary: "One small Rust function followed through real HIR, THIR, and MIR output, with a practical explanation of what each compiler representation is for."
+---
+
+HIR, THIR and MIR are not three names for the same Rust syntax. They are three answers to three different compiler questions.
+
+- HIR asks: what does the expanded and resolved program mean at a Rust-like level?
+- THIR asks: what is the fully typed, more explicit shape of this executable body?
+- MIR asks: what are the control-flow blocks, places, operations and drops that analyses and code generation need?
+
+I found these names much easier after I stopped reading their type definitions separately and followed one function through the compiler. This article does exactly that with output I generated using `rustc 1.95.0-nightly (3a70d0349 2026-02-27)`.
+
+These `-Z` outputs are nightly implementation tools. Their formatting can change and is not a stable Rust interface.
+
+## The source function
+
+```rust
+fn choose(flag: bool, left: i32, right: i32) -> i32 {
+    let picked = if flag { left } else { right };
+    picked + 1
+}
+```
+
+It is intentionally ordinary. The `if` creates control flow, the local variable creates a place, and integer addition lets MIR expose a debug overflow check.
+
+I inspected it with:
+
+```bash
+rustc -Zunpretty=hir example.rs
+rustc -Zunpretty=thir-flat example.rs
+rustc -Zunpretty=mir example.rs
+```
+
+The complete debug dumps are long. The useful comparison is not their line count. It is what information becomes explicit at each stage.
+
+## HIR: Rust-like, resolved and partly desugared
+
+The human-readable HIR for the function stayed close to the source:
+
+```rust
+fn choose(flag: bool, left: i32, right: i32) -> i32 {
+    let picked = if flag { left } else { right };
+    picked + 1
+}
+```
+
+That can make HIR look pointless. The plain printer hides important structure.
+
+HIR is built after parsing, macro expansion and name resolution. It removes some syntax that later analyses do not need. A `for` loop, for example, no longer remains a `for` loop. HIR also assigns compiler identities to definitions and nodes, so later passes do not repeatedly resolve a textual name such as `picked`.
+
+The detailed command shows that structure:
+
+```bash
+rustc -Zunpretty=hir-tree example.rs
+```
+
+The compiler's [HIR guide](https://rustc-dev-guide.rust-lang.org/hir.html) describes HIR as the primary compiler-friendly representation of the expanded AST. It represents a whole crate and keeps items separately from bodies. This separation also helps dependency tracking: asking for one item does not require walking the contents of everything around it.
+
+For this function, the useful HIR facts are still recognizable as Rust:
+
+```text
+function item choose
+├── parameters flag, left, right
+└── body
+    ├── local picked
+    │   └── if flag { left } else { right }
+    └── picked + 1
+```
+
+HIR is a good level for name-based and language-level analyses. It is not yet the final account of every implicit adjustment or branch.
+
+## THIR: typed executable expressions
+
+The THIR dump changes the texture. Here are selected facts from the real output:
+
+```text
+Expr { kind: VarRef { ... }, ty: bool, ... }       // flag
+Expr { kind: VarRef { ... }, ty: i32, ... }        // left
+Expr { kind: If { cond: e1, then: e5, else_opt: Some(e9) }, ty: i32, ... }
+Expr { kind: Binary { op: Add, lhs: e13, rhs: e15 }, ty: i32, ... }
+```
+
+Every expression carries its inferred type. Expressions, statements, blocks and patterns live in indexed arrays and refer to one another with IDs such as `e13`. Scopes are explicit too.
+
+According to the compiler's [THIR guide](https://rustc-dev-guide.rust-lang.org/thir.html), THIR is created after type checking and only represents executable bodies, including function bodies and constant initializers. Unlike HIR, it has no representation for a struct or trait item by itself. A body's THIR is temporary and can be dropped after use.
+
+THIR performs more desugaring than HIR. In a richer example it makes automatic borrows and dereferences explicit and turns method calls or overloaded operators into function calls. This makes it useful for MIR construction, exhaustiveness checking and unsafety checking.
+
+The key difference is this:
+
+```text
+HIR:  an expression written as picked + 1
+THIR: a typed Add expression whose operands and scopes are explicit
+```
+
+THIR is not merely “HIR with a type field.” It is body-only, more desugared and organized for the consumers that run after type checking.
+
+## MIR: a control-flow graph over places
+
+The MIR output no longer tries to look like a nested expression tree:
+
+```text
+fn choose(_1: bool, _2: i32, _3: i32) -> i32 {
+    let mut _0: i32;
+    let _4: i32;
+    let mut _5: i32;
+    let mut _6: (i32, bool);
+
+    bb0: {
+        switchInt(copy _1) -> [0: bb2, otherwise: bb1];
+    }
+
+    bb1: {
+        _4 = copy _2;
+        goto -> bb3;
+    }
+
+    bb2: {
+        _4 = copy _3;
+        goto -> bb3;
+    }
+
+    bb3: {
+        _5 = copy _4;
+        _6 = AddWithOverflow(copy _5, const 1_i32);
+        assert(!move (_6.1: bool), "attempt to compute ...")
+            -> [success: bb4, unwind continue];
+    }
+
+    bb4: {
+        _0 = move (_6.0: i32);
+        return;
+    }
+}
+```
+
+Now the `if` is a `switchInt` terminator with two successor blocks. Both branches assign local `_4` and join at `bb3`. Addition produces both the result and an overflow flag. The assertion has normal and unwind edges. `_0` is the return place.
+
+MIR's basic blocks contain statements and end in terminators. This control-flow shape is suited to borrow checking, dataflow analyses, drop elaboration and optimizations. The compiler's [MIR introduction](https://rustc-dev-guide.rust-lang.org/mir/index.html) explains why this representation is simpler than trying to perform those jobs directly on nested Rust syntax.
+
+## The same fact at three levels
+
+| Source idea | HIR | THIR | MIR |
+| --- | --- | --- | --- |
+| Function | Crate item plus body | One typed executable body | Function body with locals and blocks |
+| `if` | Rust-like expression | Typed `If` expression with expression IDs | Branch terminator and successor blocks |
+| `picked` | Resolved local binding | Typed binding and `VarRef` | Local place `_4` |
+| `+` | Binary expression | Typed `Binary(Add)` | `AddWithOverflow` plus assertion in this build |
+| Scopes | Language-level body structure | Explicit expression and destruction scopes | Control flow, storage and drops after lowering |
+| Main use | Language analysis and type checking input | Typed body analyses and MIR construction | Borrow checking, optimization and codegen input |
+
+This is a lowering pipeline, not three independent parsers:
+
+```text
+tokens → AST → expansion/name resolution → HIR → type checking → THIR → MIR → codegen IR
+```
+
+Information does not only accumulate. Each representation discards distinctions its consumers no longer need and exposes other distinctions they do need.
+
+## Why this helps when reading compiler code
+
+When I work around rustc or rust-analyzer code, I first ask which representation owns the fact I need.
+
+- If I care which definition a path names, HIR identities may be the useful level.
+- If I care about inferred expression types or implicit adjustments, THIR can be clearer.
+- If I care about a move, borrow, drop, unwind edge or optimization, MIR is normally the right level.
+- If I care about tokens before expansion, all three may already be too late.
+
+This prevents a common mistake: searching MIR for syntax that was deliberately lowered away, or expecting HIR to contain a complete control-flow story.
+
+The related [DefId versus HirId walkthrough](/blog/rustc-defid-vs-hirid) goes deeper on identity. The [AST inspection guide](/blog/rust-ast-display) explains why compiler AST output is not the same as the original text.
+
+## A repeatable way to explore another feature
+
+Start with one function and change one construct at a time:
+
+1. Replace `if` with `match` and compare its MIR blocks.
+2. Replace `picked + 1` with a trait method and inspect THIR's explicit call.
+3. Add a borrowed local and inspect MIR places and drops.
+4. Add `async fn` and observe how much lowering happens before the final state machine.
+5. Record the exact nightly version beside every dump.
+
+Do not copy a dump into a long-lived test unless its unstable formatting is the thing you intentionally test. Prefer checking a small semantic property.
+
+## My practical model
+
+HIR is the resolved, desugared, Rust-shaped crate. THIR is a temporary, fully typed and more explicit executable body. MIR is a control-flow graph over operations and places.
+
+The names become useful when I see them as changes of question. One source function remains recognizable, but every stage reshapes it for the work the compiler must do next.

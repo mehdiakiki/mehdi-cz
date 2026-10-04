@@ -1,0 +1,187 @@
+---
+title: "cfg_select! in Rust 1.95 as a Compile-Time Match"
+date: "2026-12-18T09:00:00+01:00"
+tags: ["Rust 1.95", "cfg_select", "conditional compilation", "cross compilation", "Rust macros"]
+draft: false
+reviewed: true
+reviewedHash: "e08359aa671d06cfab8a2c85b7821d1ed239ca7f4780bbf2fa12298525fb2f14"
+cluster: "rust-under-the-hood"
+campaign: "authority-2026"
+opportunity: "RUST-066"
+summary: "Rust 1.95's cfg_select! chooses the first true configuration branch and does not emit the others. I use it like a compile-time match, with explicit precedence and cross-target tests."
+---
+
+Platform-specific Rust often begins cleanly and grows into a wall of repeated `#[cfg(...)]` attributes. One function for Unix, one for Windows, another fallback, then the same predicates repeated on imports, modules, and constants.
+
+Rust 1.95 stabilizes `cfg_select!`, a standard macro that lets me express this as one ordered compile-time choice.
+
+## The smallest useful example
+
+```rust
+use std::cfg_select;
+
+cfg_select! {
+    target_os = "linux" => {
+        const PLATFORM: &str = "linux";
+    }
+    unix => {
+        const PLATFORM: &str = "other-unix";
+    }
+    _ => {
+        const PLATFORM: &str = "non-unix";
+    }
+}
+
+fn main() {
+    println!("{PLATFORM}");
+}
+```
+
+The macro checks predicates at compile time, selects the **first** true branch, and emits only that branch. The [`cfg_select!` documentation](https://doc.rust-lang.org/stable/std/macro.cfg_select.html) also says that omitting the `_` fallback produces a compile error when no predicate matches.
+
+I think of it as `match` for the target configuration, with ordering that carries policy.
+
+## Order is not visual decoration
+
+On Linux, both `target_os = "linux"` and `unix` are true. The specific branch must appear first.
+
+```text
+specific target
+broader target family
+feature or capability fallback
+wildcard
+```
+
+If I put `unix` first, the Linux branch is unreachable through this selection. There is no runtime warning because only one branch is emitted.
+
+I add tests that expose the selected branch as a constant or behaviour. Reviewers should not need to infer precedence from a large macro body.
+
+## This is different from `cfg!`
+
+`cfg!` returns a compile-time boolean, but an ordinary `if` still has to type-check both branches:
+
+```rust,compile_fail
+let metadata = std::fs::metadata(".").unwrap();
+
+if cfg!(windows) {
+    std::os::windows::fs::MetadataExt::file_attributes(&metadata);
+}
+```
+
+On a non-Windows target, the Windows module is not available. A false constant does not remove the branch before name resolution and type checking.
+
+With conditional emission, the non-selected tokens do not become program items:
+
+```rust
+use std::cfg_select;
+
+cfg_select! {
+    windows => {
+        fn separator() -> char { '\\' }
+    }
+    _ => {
+        fn separator() -> char { '/' }
+    }
+}
+```
+
+This is the same fundamental job as `#[cfg]`, expressed as one mutually exclusive choice.
+
+## Expression position is useful for small values
+
+The macro can produce an expression:
+
+```rust
+use std::cfg_select;
+
+let family = cfg_select! {
+    windows => "windows",
+    target_arch = "wasm32" => "wasm",
+    unix => "unix",
+    _ => "other",
+};
+```
+
+I keep expression branches short. Large platform implementations belong in modules so normal files remain readable and testable.
+
+```rust
+cfg_select! {
+    windows => { mod windows; use windows as imp; }
+    unix => { mod unix; use unix as imp; }
+    _ => { mod portable; use portable as imp; }
+}
+```
+
+The public wrapper calls `imp` through one internal contract. Platform difference stays at the boundary.
+
+## A compile-time match still needs all-target testing
+
+My host compiler sees only its selected branch. A typo in the Windows module can survive Linux CI forever.
+
+I create a target matrix:
+
+```text
+x86_64-unknown-linux-gnu
+x86_64-pc-windows-msvc
+aarch64-apple-darwin
+wasm32-unknown-unknown
+```
+
+The exact list follows the crate's support statement. For branches that need target-specific system libraries, `cargo check --target` may be enough for some layers and a native or emulated job may be required for linking and execution.
+
+```bash
+rustup target add x86_64-pc-windows-msvc
+cargo check --target x86_64-pc-windows-msvc
+```
+
+I also use compile-time assertions or small tests to confirm which branch wins when predicates overlap.
+
+## Features and targets can create invalid combinations
+
+Configuration grows more difficult when target predicates mix with Cargo features:
+
+```rust
+cfg_select! {
+    all(target_os = "linux", feature = "io-uring") => { /* ... */ }
+    target_os = "linux" => { /* portable Linux path */ }
+    _ => { /* other targets */ }
+}
+```
+
+I validate unsupported combinations with `compile_error!` and document supported ones. A feature name should describe an optional capability, not secretly mean “this only works on my machine”.
+
+For runtime capabilities such as a kernel version or CPU instruction detected after startup, compile-time selection alone is insufficient. I keep a runtime fallback where the environment can differ from the compilation target.
+
+## Sometimes no wildcard is the safer fallback
+
+The `_` branch makes a crate compile on an unexpected target, but compilation is not the same as support. If the portable implementation has weaker durability, security, or filesystem semantics, silently selecting it can be worse than stopping the build.
+
+For a crate with a closed support matrix, I omit `_` or place an explicit `compile_error!` in it with a useful message. For a library that genuinely has a portable implementation, I keep the wildcard and test it as a real supported path.
+
+This choice is part of the API promise. “Other platforms compile” should mean their behaviour is acceptable, not only that the conditional syntax had somewhere to go.
+
+## Why use the standard macro now?
+
+The ecosystem already has approaches such as repeated `#[cfg]` and the `cfg-if` crate. Existing code does not need churn merely because a similar macro entered `std`.
+
+For new code with MSRV 1.95 or later, `cfg_select!` gives me:
+
+- an ordered, mutually exclusive selection;
+- item and expression forms;
+- a wildcard or deliberate no-match compilation error;
+- no extra dependency for this small job.
+
+The [Rust 1.95 release notes](https://doc.rust-lang.org/releases.html#version-1950-2026-03-05) list its stabilization. Rust 1.98 also notes that rustfmt now discovers module files defined inside `cfg_select!`, a reminder that conditional module layout affects tooling as well as compilation.
+
+## My review questions
+
+I ask:
+
+1. Can more than one predicate be true, and is priority correct?
+2. Should an unsupported target fail compilation instead of using `_`?
+3. Does every supported branch compile in CI?
+4. Is the difference truly compile-time rather than runtime capability?
+5. Do branches expose the same internal contract?
+6. Will rustfmt and documentation see the module structure we expect?
+
+`cfg_select!` removes repetition, not platform complexity. I use it when it makes that complexity look like what it really is: one compile-time choice, ordered from specific to general, tested for every target I claim to support.

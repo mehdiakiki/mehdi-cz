@@ -1,0 +1,226 @@
+---
+title: "How Long Must a Consumer Remember Duplicate Messages?"
+date: "2026-10-02T09:00:00+01:00"
+tags: ["message processing", "deduplication", "retention", "idempotency", "distributed systems"]
+draft: false
+reviewed: true
+reviewedHash: "b704d7766382ba5286a7402cab6e444424b8297d314dc86602097e36ada1dd5f"
+cluster: "reliable-data-integrations"
+campaign: "authority-2026"
+opportunity: "DATA-041"
+summary: "A deduplication TTL must cover every supported path by which an old message can return. Derive the window from retries, replays, outages, and redrives."
+---
+
+An inbox table grows every day. Someone asks a reasonable question: “Can we delete deduplication keys after seven days?”
+
+Seven days may be correct. It may also reopen a year-old payment event during a replay.
+
+I do not choose deduplication retention from storage comfort first. I list every supported path by which an old message can reach the consumer again, then keep identity for the longest of those paths plus a margin.
+
+## Deduplication has a time-bounded promise
+
+If a consumer deletes a message ID, the next delivery of that ID is indistinguishable from a first delivery.
+
+The honest contract is therefore:
+
+```text
+This consumer suppresses repeated message identity
+for every delivery arriving before remember_until.
+```
+
+After that time, another safety mechanism must exist, or the business accepts that replay can apply the effect again.
+
+## Enumerate duplicate paths
+
+I build a table for the actual system:
+
+| Duplicate path | Maximum age or deadline | Evidence owner |
+| --- | ---: | --- |
+| producer transport retry | 24 hours | producer retry policy |
+| broker redelivery | 7 days | broker/topic configuration |
+| consumer offset rewind | 30 days | operations policy |
+| dead-letter redrive | 45 days | incident runbook |
+| regional outage backlog | 3 days | recovery objective |
+| backup restore and replay | 90 days | disaster recovery plan |
+| manual backfill | unbounded unless governed | data operations |
+
+The last row is often the real problem. If anyone can replay arbitrary history, no finite TTL can guarantee deduplication.
+
+I require a maximum backfill age, a new projection identity, or a business-level idempotency key that lives longer.
+
+## Use the maximum supported return time
+
+For a message first produced at `t_event`, a useful starting point is:
+
+```text
+remember_until = max(
+  producer_retry_deadline,
+  broker_retention_deadline,
+  latest_allowed_offset_rewind,
+  latest_dead_letter_redrive,
+  latest_disaster_replay,
+  latest_manual_backfill
+) + safety_margin
+```
+
+Some deadlines are relative to first receipt instead of event time. I store the explicit resulting timestamp rather than only `ttl_days`, because different producers and topics can have different promises.
+
+The safety margin covers clock skew, scheduler delay, delayed cleanup, and uncertainty in operational execution. It does not compensate for an undocumented unlimited replay policy.
+
+## A concrete calculation
+
+Suppose:
+
+```text
+broker retains events:             14 days
+operations may rewind:             10 days
+dead-letter items may be redriven: 30 days
+maximum outage plus catch-up:       3 days
+disaster restore may replay:       45 days
+safety margin:                      2 days
+```
+
+These windows are not all added. Most are alternative paths. The longest supported path is the 45-day disaster replay, so the basic retention is 47 days.
+
+If the recovery plan says a backup can be 45 days old **and then** the backlog can wait 3 days before delivery, those steps are sequential. That scenario becomes 48 days plus margin, or 50 days.
+
+I calculate scenarios first, then take their maximum:
+
+```text
+normal redelivery scenario: 14 days
+DLQ scenario:              30 days
+restore + backlog:         45 + 3 = 48 days
+
+retention: max(14, 30, 48) + 2 = 50 days
+```
+
+This avoids both mistakes: adding unrelated windows into an inflated number and taking a maximum when two stages actually happen in sequence.
+
+## Broker retention is not dedup retention
+
+Kafka retains records independently of whether one consumer has processed them. Consumers can move their position and re-read retained data. The [Kafka documentation](https://kafka.apache.org/08/documentation.html#intro_topics) describes the offset as consumer-controlled and the log as retained for a configured period.
+
+That means:
+
+```text
+broker can still deliver an old record
++ inbox forgot its identity
+= duplicate business effect
+```
+
+Reducing inbox TTL below the allowed replay window changes the replay contract, even if normal redelivery happens within minutes.
+
+## Anchor expiry carefully
+
+For a message first seen late, expiry based only on its old event timestamp can delete the key immediately.
+
+I usually calculate:
+
+```text
+remember_until = max(
+  first_seen_at + post-receipt retry horizon,
+  event_time + governed replay horizon,
+  explicit redrive or migration deadline
+) + margin
+```
+
+`first_seen_at` protects late first delivery followed by ordinary retry. `event_time` protects governed historical replay. An explicit operation deadline handles a temporary migration or incident.
+
+I never extend TTL on every duplicate automatically without thought. A malicious or broken producer could keep a key alive forever. Extension policy is part of the contract.
+
+## Different effects need different memory
+
+Not every consumer needs the same retention.
+
+| Effect | Safer identity lifetime |
+| --- | --- |
+| rebuildable search projection | projection generation lifetime |
+| email notification | longer than all replay paths |
+| balance or payment mutation | business record lifetime or permanent operation ID |
+| cache invalidation | short window may be enough because effect is naturally convergent |
+| append-only audit record | permanent unique event identity |
+
+For high-consequence effects, I often keep a compact permanent business-operation key even after deleting the full inbox payload and diagnostic metadata.
+
+Storage optimization can tier the record:
+
+```text
+hot window: full inbox row and payload reference
+warm window: identity, hash, outcome, timestamps
+long-term: compact business operation key only
+```
+
+Deleting private payload does not require deleting the deduplication identity.
+
+## Payload conflicts must remain visible
+
+If the same ID arrives with a different payload after 20 days, `already seen` is not enough. I store a payload hash with the key.
+
+```text
+same ID + same hash      -> duplicate
+same ID + different hash-> identity conflict
+```
+
+Retention of the hash should match retention of the identity. Otherwise the consumer can suppress an event without proving semantic equivalence.
+
+## Cleanup itself needs safe mechanics
+
+Large deletes can lock tables, create replication lag, and make indexes unhealthy. I expire in bounded batches by an indexed timestamp:
+
+```sql
+create index consumer_inbox_expiry_idx
+on consumer_inbox (remember_until);
+```
+
+The cleanup selects a small ordered set, deletes it, commits, observes database pressure, and repeats. Partitioning by month or expiry range can make lifecycle operations cheaper at high volume.
+
+Before deletion I verify there is no active replay, legal hold, unresolved incident, or delayed redrive extending the deadline.
+
+## Monitor the promise
+
+I track:
+
+- oldest and newest retained identity per consumer;
+- configured replay and redrive horizons;
+- duplicates blocked by age bucket;
+- deliveries older than the promised window;
+- identity conflicts;
+- cleanup lag;
+- storage bytes per retained key;
+- operations that requested replay beyond the dedup window.
+
+A histogram of duplicate age is useful. If duplicates are normally minutes old but a monthly process creates 35-day duplicates, an average hides the important tail.
+
+## Test the boundary, not only day one
+
+I use a controllable clock and test messages at:
+
+```text
+remember_until - 1 second -> duplicate is blocked
+remember_until             -> defined boundary behaviour
+remember_until + 1 second  -> expired policy applies
+```
+
+I also simulate restored backups, dead-letter redrive, offset rewind, late first delivery, and cleanup running concurrently with a duplicate arrival.
+
+[The Inbox Pattern](/blog/the-inbox-pattern-deduplicate-before-business-logic-runs) explains how the unique identity participates in the business transaction. Retention decides how long that invariant remains enforceable.
+
+## The decision I document
+
+My retention record contains:
+
+```text
+consumer and producer scope
+effect consequence class
+supported retry/redelivery paths
+scenario calculations
+selected remember-until rule
+safety margin and reason
+payload and identity storage tiers
+owner who can extend replay deadlines
+behaviour after expiry
+```
+
+There is no universally correct number of days. There is a correct relationship: the consumer must remember longer than any supported way the message can return.
+
+If the organization wants a longer replay window, it must also pay for longer identity memory—or change the replay so it cannot repeat the original business effect.

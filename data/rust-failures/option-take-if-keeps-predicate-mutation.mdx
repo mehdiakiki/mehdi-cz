@@ -1,0 +1,114 @@
+---
+caseId: "RFA-157"
+title: "Option::take_if Keeps Predicate Mutations When It Returns None"
+date: "2026-09-05T16:47:00+01:00"
+lastmod: "2026-09-05T16:47:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "986fe7d75cdca04d2e4559b73b2c4336f30c6ae43a5b315997c582adc3896622"
+area: "concurrency-memory"
+symptom: "Option::take_if returns None, yet the value remaining inside the Option contains mutations performed by the false predicate."
+summary: "take_if lends &mut T to its predicate before deciding whether to take T. Returning false preserves the Option, not a snapshot of its previous contents; separate observation from mutation when rejection must have no side effects."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust Option take_if mutation remains false", "take_if predicate mutates value not taken", "Option take_if rollback mutation"]
+evidence: ["Rust 1.98.1 runtime assertion", "false mutating predicate", "separate-decision repair"]
+sources: ["https://doc.rust-lang.org/std/option/enum.Option.html#method.take_if", "https://doc.rust-lang.org/std/option/enum.Option.html#method.take", "https://doc.rust-lang.org/std/option/enum.Option.html#method.as_ref"]
+---
+
+The word “predicate” often makes me expect observation only. `Option::take_if` does not enforce that expectation. Its predicate receives a mutable reference.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-157/fail.rs) starts with `Some("pending")`. Inside the predicate it appends `"-checked"`, then returns `false`. `take_if` correctly returns `None`, but the original option now contains `"pending-checked"`.
+
+Nothing rolls that mutation back.
+
+## Read the predicate's argument type
+
+The essential part of [`Option::take_if`](https://doc.rust-lang.org/std/option/enum.Option.html#method.take_if) is its bound:
+
+```rust
+P: FnOnce(&mut T) -> bool
+```
+
+The method gives the closure temporary mutable access to the contained value. After the closure returns:
+
+- `true` means replace `self` with `None` and return the value;
+- `false` means leave the value inside `self` and return `None`.
+
+“Leave the value” refers to ownership location. It does not mean restore the bytes or fields that existed before the closure ran.
+
+Rust has no automatic transaction around an `&mut T`. The closure can perform many mutations, call other functions, or modify external state. A boolean controls taking only.
+
+## Why mutable access is useful
+
+The method can inspect and prepare a value in one borrow. The official examples include changing the value and then taking it based on its updated state. This can avoid a second lookup or borrow.
+
+For instance, a queued job could increment an attempt counter and be taken only after reaching a threshold. If the threshold is not reached, keeping the new counter is exactly the intended behaviour.
+
+So mutation on `false` is not a leak in the abstraction. It is part of the capability deliberately passed to the predicate.
+
+The failure appears when application code silently assumes predicate means pure function.
+
+## Separate the decision when false must be unchanged
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-157/fixed.rs) first checks the value through a shared reference:
+
+```rust
+let should_take = state.as_deref() == Some("ready");
+let taken = if should_take { state.take() } else { None };
+```
+
+The decision cannot mutate `String`, so the rejected state remains `"pending"`. If accepted values need a final mutation, I perform it inside the `true` branch before calling [`Option::take`](https://doc.rust-lang.org/std/option/enum.Option.html#method.take).
+
+This creates a visible boundary:
+
+```text
+observe -> decide -> mutate accepted value -> transfer ownership
+```
+
+It is longer than one `take_if` call, but it matches the transactional meaning the application needs.
+
+## A false result is not an error rollback
+
+The same misunderstanding appears in validation code. A closure normalizes input, discovers a later validation failure, and returns false. The option retains partially normalized data. A retry now sees a different value than the first attempt.
+
+If all changes must commit together, I use one of these approaches:
+
+- validate through `&T`, then mutate only after acceptance;
+- clone into a candidate, transform and validate it, then replace on success;
+- build a new value from immutable inputs;
+- implement an explicit rollback guard when cloning is impossible and the invariant warrants it.
+
+Cloning is not always too expensive. For configuration, control-plane state, and infrequent transitions, a clear transactional copy can be cheaper than debugging partial mutation.
+
+## External side effects are even more important
+
+The closure can also update metrics, write logs, send messages, or modify another cell. None of these actions is reversed when it returns false. I avoid placing irreversible effects inside a predicate unless repeated or rejected evaluation is part of the design.
+
+This matters when the option transition is retried. A predicate that charges, publishes, or acknowledges before returning false can duplicate external work. `take_if` provides ownership convenience, not distributed transaction semantics.
+
+I prefer a predicate whose effects are local to the value and explicitly desired on both branches. Otherwise I split the phases.
+
+## Panic leaves the same design question
+
+If the predicate panics after mutation, unwinding keeps the `Option` in its occupied location, subject to whatever changes occurred before the panic. The method cannot restore arbitrary `T` state.
+
+For a value protected by a mutex, a panic may add a poison signal. For a plain local option, there is no such generic warning. The type's own invariant must tolerate unwinding or the operation needs a guard.
+
+I test panic points when the closure performs multi-step mutation, especially if the type is reused after `catch_unwind`.
+
+## My review checklist
+
+When I see `take_if`, I ask:
+
+1. Does the closure need `&mut T`, or is `&T` enough for the decision?
+2. Are mutations intentional when the closure returns false?
+3. What state remains if the closure panics halfway?
+4. Does the closure perform external effects?
+5. Could a separate `as_ref` decision followed by `take` express the policy better?
+6. Does the test inspect both the returned option and the original one?
+
+The last point catches this bug. Checking only `taken.is_none()` confirms the ownership result but says nothing about retained contents.
+
+The core principle is that conditional ownership transfer and transactional mutation are different operations. `take_if` makes the transfer conditional. Because it supplies `&mut T`, mutations happen immediately and survive rejection. When I need all-or-nothing state, I make the decision phase non-mutating and commit explicitly.

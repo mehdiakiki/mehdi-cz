@@ -1,0 +1,183 @@
+---
+title: "The Processor Has No Types: What add Does to Bits It Does Not Understand"
+date: "2026-09-11T07:10:00+01:00"
+lastmod: "2026-09-11T07:10:00+01:00"
+tags: ["types", "rust", "assembly", "x86", "types under the hood"]
+draft: false
+reviewed: true
+reviewedHash: "3a8165ee4624fa76ab9eba955350fc2af511e5066426b87f1bbdf0b7ab192927"
+cluster: "rust-under-the-hood"
+campaign: "editorial"
+summary: "I compiled the same operations for i32 and u32. Addition produced one shared function, comparison used the same compare instruction with a different flag, and division and shifting used different instructions. Where the sign lives in the machine code is not where most people expect."
+---
+
+Adding two signed integers and adding two unsigned integers is the same instruction. The compiler proved it for me by compiling both functions and then merging them into one, because it could not find a difference. Comparison is almost the same: one compare instruction, and then a different flag is read. Division and shifting are the two places where signed and unsigned genuinely need different machine instructions.
+
+This is a spoke of [What Is a Type?](/blog/what-is-a-type-a-set-of-values-a-promise-about-operations-or-both). The opinion here is small but practical: choosing `u32` over `i32` because a value cannot be negative is not a free decision, and the places where it changes the generated code are also the places where it changes the answers.
+
+The programs and a script that reproduces every output are in the `types-under-the-hood` fixture of the site repository. I used rustc 1.95 nightly on x86-64 Linux. Every function below is written with plain operators, and everything is compiled with optimizations, which matters: in a release build the overflow checks are off, as I measured in [Does a Type Exist at Runtime?](/blog/does-a-type-exist-at-runtime-following-one-value-from-source-to-register). A debug build would add a guard to the arithmetic and hide the comparison I am making.
+
+## Addition: one function for both types
+
+```rust
+#[no_mangle] pub fn add_i32(a: i32, b: i32) -> i32 { a + b }
+#[no_mangle] pub fn add_u32(a: u32, b: u32) -> u32 { a + b }
+```
+
+The output:
+
+```asm
+add_i32:
+    leal    (%rdi,%rsi), %eax
+    retq
+
+add_u32 = add_i32
+```
+
+One instruction, and the unsigned version is an alias of the signed one. This is the same function merging I measured in [Shape Without Behavior](/blog/shape-without-behavior-two-structs-with-the-same-fields), and here it is doing something more interesting than removing a duplicate name. It is telling me that for addition, `i32` and `u32` are not merely similar. They are the same operation on the same 32 bits.
+
+The reason is two's complement, the representation almost every machine uses for signed numbers. It is designed so that the bit pattern for minus one plus the bit pattern for one gives the bit pattern for zero, using the same adder as unsigned arithmetic. The sign is a convention about how to read the top bit, not a different way to add.
+
+Floating point is the exception in this group:
+
+```asm
+add_f32:
+    addss   %xmm1, %xmm0
+    retq
+```
+
+A different instruction, on a different set of registers, running on a different execution unit of the same core. Floats are not integers with a flag on them, they are a different encoding, so the hardware that adds them is not the hardware that adds integers.
+
+## Comparison: the same compare, a different flag
+
+```asm
+less_i32:
+    cmpl    %esi, %edi
+    setl    %al
+    retq
+
+less_u32:
+    cmpl    %esi, %edi
+    setb    %al
+    retq
+```
+
+The comparison instruction `cmpl` is identical in both. It subtracts and sets flags, and it does not know or care about sign. The difference is the next instruction: `setl` means "set if less, signed", and `setb` means "set if below, unsigned". They read different flags from the same subtraction.
+
+So the type did not change the comparison. It chose which conclusion to draw from it.
+
+Here is the same thing from the running program, with the bits `0xFFFFFFFF`. I cut one line that I come back to below, and a closing summary line:
+
+```text
+the bits 0xFFFFFFFF as u32: 4294967295
+the same bits as i32:       -1
+as u32: 4294967295 < 1 is false
+as i32: -1 < 1 is true
+u32 addition wraps to: 0
+i32 addition wraps to: 0
+```
+
+The same 32 bits are the largest `u32` and minus one as `i32`. Adding one wraps to zero in both readings, because it is the same addition. Comparing against one gives opposite answers, because it is a different flag.
+
+## Division and shifting: the sign finally costs instructions
+
+Both of these are the same source expression, `a / b`, compiled for the two types:
+
+```rust
+#[no_mangle] pub fn div_i32(a: i32, b: i32) -> i32 { a / b }
+#[no_mangle] pub fn div_u32(a: u32, b: u32) -> u32 { a / b }
+```
+
+```asm
+div_u32:
+    testl   %esi, %esi
+    je      .LBB3_2          # -> panic: division by zero
+    movl    %edi, %eax
+    xorl    %edx, %edx
+    divl    %esi
+    retq
+```
+
+```asm
+div_i32:
+    pushq   %rax
+    testl   %esi, %esi
+    je      .LBB2_3          # -> panic: division by zero
+    movl    %esi, %eax
+    notl    %eax
+    leal    -2147483648(%rdi), %ecx
+    orl     %eax, %ecx
+    je      .LBB2_2          # -> panic: division overflow
+    movl    %edi, %eax
+    cltd
+    idivl   %esi
+    popq    %rcx
+    retq
+```
+
+Division uses `divl` for unsigned and `idivl` for signed, two genuinely different instructions. The signed version also carries five more instructions before the division, plus a push and a pop for the extra panic call. Those five test for the one overflow case in the whole of integer division: the smallest negative number divided by minus one, which has no representable answer. The check is `notl` on the divisor and a subtraction on the dividend, combined with `orl`, so the branch is taken only when both are the bad value.
+
+The two comments in those blocks are mine. In the real output the branch targets are labels, and the panic functions they lead to appear further down the file under the names `panic_const_div_by_zero` and `panic_const_div_overflow`.
+
+These two checks are not the overflow checks that a release build removes. Dividing by zero panics in a release build too, and so does the signed overflow case.
+
+Shifting right is a smaller version of the same story:
+
+```asm
+shr_i32:
+    movl    %edi, %eax
+    sarl    %eax
+    retq
+
+shr_u32:
+    movl    %edi, %eax
+    shrl    %eax
+    retq
+```
+
+`shrl` brings in zeros from the left. `sarl` copies the top bit, so a negative number stays negative. One instruction each, and they are different instructions.
+
+## The opinion: pick the type for the answers, not for the instruction
+
+The usual advice is to use unsigned types for values that cannot be negative. I followed that for years and I am now less sure it is the right default for ordinary application code.
+
+The measurements say the code generation difference is nothing for addition, nothing for comparison, and a handful of instructions for division. What is not nothing is the behavior at the edge. Subtracting past zero in an unsigned type does not give a negative number:
+
+```text
+subtracting past zero as u32: 4294967295
+```
+
+That is a plain `a - b` on two values the optimizer cannot fold, and the large number then flows into a length, an index, or a loop bound, where a negative number would have been obviously wrong.
+
+I have to be fair to the other side here, because Rust already softens this. I compiled the same line as a debug build, and it does not produce a large number at all. It panics with "attempt to subtract with overflow", so the mistake is loud during development.
+
+The classic infinite loop, a countdown with an unsigned index that never goes below zero, is a C bug rather than a Rust one: in Rust the decrement panics in debug and the index panics out of bounds. What survives into Rust is the quieter version, a release build where the wrap becomes a huge value and nothing stops it.
+
+So I use unsigned types where the bit pattern matters, in hashes, masks, and wire formats, and where an API demands them, which in Rust means `usize` for indexing and lengths. I use signed types for quantities I do arithmetic on, even when they cannot be negative, because the arithmetic that goes wrong is then visible as a negative number rather than hidden as a very large one.
+
+This is a preference, not a law, and plenty of good code does the opposite. It comes from the same place as the rest of this series: the type does not protect the value at runtime, it only decides which instruction the compiler picks.
+
+## The model I take from this
+
+1. Addition is the same instruction for signed and unsigned integers, because two's complement was designed that way, and subtraction works the same way for the same reason.
+2. Comparison is the same instruction with a different flag read afterwards, which is why the same bits compare differently.
+3. Division and right shift need genuinely different instructions, and signed division also needs an overflow check that a release build does not remove.
+4. Floating point is a different encoding on a different execution unit, not a variation of integer arithmetic.
+5. The type decides which instruction runs and how the result is read, and the bits themselves carry none of that.
+
+## What I check when I choose an integer type
+
+- Will I subtract these values? If yes, can the result go below zero, and would I rather see a negative number or a very large one?
+- Is this a quantity or a bit pattern? Quantities are arithmetic and a signed type fails loudly. Bit patterns are masks and shifts, and an unsigned type is correct.
+- Is the value an index or a length? Then the API decides, and in Rust that is `usize`.
+- Am I dividing in a hot loop? That is the one arithmetic case where the sign really does cost instructions.
+- Is the panic on division by zero acceptable here, or do I want `checked_div`? That check is present in release as well.
+
+## Sources
+
+- [The Rust Reference: operator expressions](https://doc.rust-lang.org/reference/expressions/operator-expr.html)
+- [x86 instruction reference: SETcc](https://www.felixcloutier.com/x86/setcc)
+- [x86 instruction reference: IDIV](https://www.felixcloutier.com/x86/idiv)
+- [x86 instruction reference: SAL, SAR, SHL, SHR](https://www.felixcloutier.com/x86/sal:sar:shl:shr)
+- [Rust standard library: i32::checked_div](https://doc.rust-lang.org/std/primitive.i32.html#method.checked_div)
+- [LLVM language reference](https://llvm.org/docs/LangRef.html)

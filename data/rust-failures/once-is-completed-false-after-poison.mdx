@@ -1,0 +1,84 @@
+---
+caseId: "RFA-327"
+title: "Once::is_completed Is False After a Poisoned Initializer"
+date: "2026-09-06T01:47:00+01:00"
+lastmod: "2026-09-06T01:47:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "d28d643519dea8729c990e83b8cf6c3c148d4d63b871d94fba7205873a830472"
+area: "concurrency-memory"
+symptom: "An initializer definitely ran and panicked, but Once::is_completed still returns false, making an attempted execution look like no execution."
+summary: "Once completion means one initialization call finished successfully. Never-called, currently-running, and poisoned states all report false; call_once_force is the explicit recovery path when retry is safe."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["targets with std::sync::Once"]
+profiles: ["dev", "release with panic=unwind", "test"]
+searchTerms: ["Rust Once is_completed false poisoned", "Once initializer panic recovery", "call_once_force is_poisoned Rust"]
+evidence: ["Rust 1.98.1 panicking initializer thread", "false completion after poison", "call_once_force recovery state"]
+sources: ["https://doc.rust-lang.org/std/sync/struct.Once.html#method.is_completed", "https://doc.rust-lang.org/std/sync/struct.Once.html#method.call_once_force", "https://doc.rust-lang.org/std/sync/struct.OnceState.html#method.is_poisoned"]
+---
+
+I used `Once::is_completed()` as a quick health check and read false as “initialization has never run.” That interpretation lost the most important state: initialization had started and panicked.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-327/fail.rs) runs a panicking initializer on a worker thread, observes the failed join, and then expects the `Once` to be completed. Rust returns false.
+
+## Completed means successfully finished
+
+[`Once::is_completed`](https://doc.rust-lang.org/std/sync/struct.Once.html#method.is_completed) returns true only after some call to `call_once` has completed successfully. The documentation lists several false cases: it has never been called, a call is currently running, or the instance is poisoned.
+
+The Boolean therefore answers a narrow question. It does not expose a complete lifecycle history and cannot distinguish all reasons for false.
+
+This is similar to many readiness flags in distributed systems. “Not ready” may mean not started, working, failed, or deliberately disabled. One bit cannot explain the state machine.
+
+## Panic poisons the Once
+
+When a `call_once` closure panics, the `Once` becomes poisoned. Later ordinary `call_once` calls panic rather than silently retrying the initializer.
+
+That behaviour prevents code from assuming an initializer is safely repeatable. The failed attempt might have changed external state, registered half a resource, or exposed data through another channel before panicking.
+
+Poison is a warning about an interrupted operation, not a rollback. Rust cannot know whether the closure left the wider program consistent.
+
+## Recovery must be an explicit decision
+
+[`call_once_force`](https://doc.rust-lang.org/std/sync/struct.Once.html#method.call_once_force) lets a caller run a closure even when the `Once` is poisoned. The closure receives a `OnceState`, whose [`is_poisoned`](https://doc.rust-lang.org/std/sync/struct.OnceState.html#method.is_poisoned) method reveals whether this is recovery.
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-327/fixed.rs) first verifies false completion, then uses `call_once_force`, checks the poison state, and completes successfully. After that, `is_completed()` returns true.
+
+In real code I recover only if I can establish an idempotent or reconstructive operation. Otherwise the safer response may be to fail the process and let a clean restart rebuild state.
+
+## A health endpoint needs richer state
+
+If operators must know whether initialization is idle, running, ready, or failed, I maintain that state explicitly. An atomic enum representation, a lock-protected status, or a higher-level initialization primitive can carry failure context.
+
+I do not use `is_completed()` as proof that no attempt happened. I also do not poll it in a busy loop for coordination. `call_once` already provides synchronization for callers that need the initialized state.
+
+A health endpoint should include a stable error category without leaking secrets from the initialization failure.
+
+## Side effects determine whether retry is safe
+
+An initializer that only constructs an owned value and publishes it after success is easier to retry. One that creates files, sends network registrations, mutates a global C library, or starts background threads may not be.
+
+I list the closure's possible commit points. If work can escape before the final success, recovery either detects and reuses it or compensates for it. “Run it again” is not a recovery plan by itself.
+
+Often a fallible application startup is clearer as a normal `Result` returned before serving traffic. One-time primitives are excellent for shared lazy values, but they should not hide operational failures that need reporting and policy.
+
+## Panic strategy changes the observable path
+
+RFA-327 assumes unwinding: the worker panic can be joined and the process continues to inspect the poisoned `Once`. With `panic=abort`, the process terminates and in-memory recovery does not occur.
+
+I record the panic strategy in tests and deployment configuration. A recovery path that is never reachable under the production profile should not be the only documented response.
+
+After a process restart, `Once` returns to its new-process initial state, while external side effects may remain. That is another reason to design idempotent startup work.
+
+## Tests should observe each lifecycle branch
+
+My initialization tests cover never called, successful first call, repeated call after success, concurrent callers, panic with unwind, ordinary call after poison, forced recovery, and panic during forced recovery.
+
+I count closure executions and verify when state becomes visible. Timing-only tests are fragile; barriers or channels establish the intended ordering.
+
+The failure case runs the panic on a child thread so the evidence process can continue. The join result is part of the proof, not noise to suppress.
+
+## What the Boolean can safely tell me
+
+A true value means successful initialization completed. A false value means only that this guarantee has not been established. It does not promise that the closure never executed or that recovery is safe.
+
+The core principle is that readiness is not history. `Once::is_completed()` compresses several unfinished states into false because its job is to report successful completion. When failure reason and retry policy matter, I model those facts separately and use `call_once_force` only after making recovery intentional.

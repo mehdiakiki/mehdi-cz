@@ -1,0 +1,96 @@
+---
+caseId: "RFA-353"
+title: "Ordering::then Evaluates Its Fallback Eagerly"
+date: "2026-09-06T02:13:00+01:00"
+lastmod: "2026-09-06T02:13:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "51d91a3e8aa2d1c54db58d83f2a288ebf1fee76b04c1f5b17e1e7eae833d1071"
+area: "upgrades-compatibility"
+symptom: "A secondary comparison with visible work runs even though Ordering::Less already determines the combined comparison result."
+summary: "Ordering::then short-circuits which Ordering value it returns, but normal Rust argument evaluation computes the fallback first. Ordering::then_with accepts a closure and defers that work until self is Equal."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust Ordering then eager evaluation", "Ordering then vs then_with", "secondary comparison called when first not equal Rust"]
+evidence: ["Rust 1.98.1 atomic call counter", "Less result with secondary call count one", "then_with skips and invokes closure according to equality"]
+sources: ["https://doc.rust-lang.org/std/cmp/enum.Ordering.html#method.then", "https://doc.rust-lang.org/std/cmp/enum.Ordering.html#method.then_with", "https://doc.rust-lang.org/reference/expressions/call-expr.html"]
+---
+
+I used [`Ordering::then`](https://doc.rust-lang.org/std/cmp/enum.Ordering.html#method.then) to chain two comparisons and assumed it behaved like `&&`: once the first comparison was decisive, the second would not run. The returned order was correct, but the secondary function still performed its work.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-353/fail.rs) starts with `Ordering::Less` and passes `compare_secondary()` to `then`. The result remains `Less`, while an atomic counter proves that the secondary comparison ran once.
+
+## Value selection and expression evaluation are different
+
+`Ordering::then(self, other)` returns `self` when `self` is not `Equal`; otherwise it returns `other`. This describes how two already available `Ordering` values are combined.
+
+At the call site, however, `compare_secondary()` is an argument expression. Rust evaluates function and method-call arguments before the callee can use their values. By the time `then` decides it does not need `other`, the call has already happened.
+
+So `then` short-circuits selection, not evaluation. The distinction is small in syntax and important in execution.
+
+## then_with carries suspended work
+
+[`Ordering::then_with`](https://doc.rust-lang.org/std/cmp/enum.Ordering.html#method.then_with) accepts an `FnOnce() -> Ordering`. The closure is a description of work rather than the completed result. The method calls it only if `self == Ordering::Equal`.
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-353/fixed.rs) proves both paths. `Less.then_with(compare_secondary)` leaves the counter at zero. `Equal.then_with(compare_secondary)` invokes the function once and returns its `Greater` result.
+
+When the fallback is already stored in a variable, `then` is direct. When computing it is expensive or has an observable effect, `then_with` expresses the intended laziness.
+
+## This is the same eager-versus-lazy family seen elsewhere
+
+Rust's standard library often offers pairs with this shape. An `Option` or `Result` method taking a value must receive an evaluated value. A sibling ending in `_with` or `_else` commonly accepts a closure so it can defer construction.
+
+I do not rely on the suffix alone; I read the signature. A parameter of type `T` means I supply a value now. A parameter such as `F: FnOnce() -> T` lets the function decide whether to call the producer.
+
+This signature-reading habit scales better than memorizing every method name.
+
+## Comparators should usually be pure, but cost still matters
+
+A comparison function is easier to reason about when it has no externally visible side effects. Even then, eager work can be wasteful. A secondary comparison might normalize a long path, compare large byte arrays, parse a version, or calculate a derived key.
+
+In a sort comparator, that cost can multiply because the comparator runs many times. If the primary key usually differs, `then_with` can avoid most secondary work.
+
+I still benchmark meaningful workloads before claiming a speedup. Closure syntax by itself is not automatically faster, and cheap comparisons may be inlined. The semantic reason to choose `then_with` is that the fallback is conditional.
+
+## Side effects make the bug easier to see
+
+The fixture uses an atomic counter even though there is only one thread. This gives deterministic evidence that survives optimization and avoids borrowing a local mutable counter through a closure in the failing form.
+
+In production, the side effect might be a metric, allocation, cache access, or log record. If I accidentally use `then`, telemetry can claim secondary comparisons happened for records where the primary key had already decided the result.
+
+Worse, a fallback that can panic or block will still do so. A return value that ignores it does not erase those effects.
+
+## Lexicographic ordering is the usual use case
+
+Suppose I order jobs first by deadline and then by ID:
+
+```rust
+left.deadline
+    .cmp(&right.deadline)
+    .then_with(|| left.id.cmp(&right.id))
+```
+
+The ID comparison runs only for equal deadlines. This produces lexicographic ordering: the second key breaks ties from the first.
+
+If both comparisons are already cheap primitive operations, `.then(left.id.cmp(&right.id))` can be perfectly correct. The eager version changes performance or effects, not the resulting `Ordering`, provided the secondary comparison completes normally.
+
+## Keep Ord laws intact
+
+Laziness does not repair an invalid comparator. The final ordering must still be consistent and transitive. Stateful comparisons whose answer changes by call count can violate the assumptions of sorting and ordered collections.
+
+I use the counter only to observe evaluation, not to decide the returned order. Real comparison logic should derive its answer from the compared values and stable context.
+
+For floating-point data, missing values, locale rules, or domain-specific ties, I define the policy explicitly and test it. Chaining methods make a policy compact; they do not invent one.
+
+## Tests need a decisive and a tied primary result
+
+A test using only `Ordering::Equal` cannot reveal the problem because both methods must obtain the fallback then. I cover `Less`, `Greater`, and `Equal`, and I count fallback calls.
+
+The decisive cases must return the original order with zero calls under `then_with`. The tied case must return the secondary order with exactly one call. This table tests the control-flow contract, not only the final sort output.
+
+## The core principle is that laziness needs representation
+
+Rust cannot postpone an ordinary expression after its value has been passed. Deferred work has to be represented as a closure, future, iterator, or another object that can be invoked later.
+
+`Ordering::then` combines values. `Ordering::then_with` conditionally runs work. Once I separate these two ideas, the API stops being surprising, and I can choose the form that matches both correctness and cost.

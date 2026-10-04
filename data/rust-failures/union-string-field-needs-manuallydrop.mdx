@@ -1,0 +1,117 @@
+---
+caseId: "RFA-079"
+title: "E0740: Why a Rust Union Field With `String` Needs `ManuallyDrop`"
+date: "2026-09-05T08:40:00+01:00"
+lastmod: "2026-09-05T08:40:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "81ba97b5b3a776e9375c6304f40ef45e4a518c74c4614d7deb72bc113550776b"
+area: "concurrency-memory"
+symptom: "A Rust union containing String fails with E0740 because a union field may not run automatic drop glue."
+summary: "Rust unions do not track which field is active, so automatic destruction of an owned field cannot be correct in every state. ManuallyDrop makes cleanup explicit, but an enum is safer when a runtime tag is available."
+rustVersions: ["Rust 1.98.1"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust E0740 union field must implement Copy ManuallyDrop",
+    "String field in Rust union",
+    "union active field manual drop safety",
+  ]
+evidence: ["Rust 1.98.1 compile failure", "active-field invariant", "ManuallyDrop repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/error_codes/E0740.html",
+    "https://doc.rust-lang.org/reference/items/unions.html",
+  ]
+---
+
+A union shares storage between fields, but Rust does not store an automatic active-variant tag:
+
+```rust
+union Slot {
+    text: String,
+    number: u64,
+}
+```
+
+Rust 1.98.1 emits E0740: the field must implement `Copy` or be wrapped in `ManuallyDrop`. The [failing fixture](/rust-failure-atlas/evidence/RFA-079/fail.rs) needs no field access. The type declaration itself leaves automatic destruction ambiguous.
+
+## Drop glue cannot know which field is live
+
+If `Slot` currently contains `number`, interpreting the bytes as `String` and dropping them would be undefined behavior. If it contains `text`, doing nothing would leak the string allocation. There is no tag telling generic drop code which action is correct.
+
+The [Rust Reference union chapter](https://doc.rust-lang.org/reference/items/unions.html) restricts fields to Copy types, references, `ManuallyDrop<T>`, or combinations that do not need automatic destruction. Reading a union field is unsafe because the programmer must know that its current bytes are valid for that field.
+
+## `ManuallyDrop` transfers the cleanup obligation
+
+The field can be declared:
+
+```rust
+use std::mem::ManuallyDrop;
+
+union Slot {
+    text: ManuallyDrop<String>,
+    number: u64,
+}
+```
+
+`ManuallyDrop<String>` has the same layout as `String` but suppresses automatic drop glue. Code that knows `text` is active must explicitly destroy it exactly once:
+
+```rust
+let mut slot = Slot {
+    text: ManuallyDrop::new(String::from("atlas")),
+};
+
+unsafe {
+    ManuallyDrop::drop(&mut slot.text);
+}
+```
+
+The [repaired fixture](/rust-failure-atlas/evidence/RFA-079/fixed.rs) creates and reads both field forms separately, then manually drops the string on Rust 1.98.1.
+
+Compiling this version proves only that cleanup is explicit. It does not prove the active-field invariant.
+
+## The tag must live somewhere
+
+An FFI protocol may provide a separate integer tag. A surrounding Rust struct can store it beside the union. Every constructor, mutation, read, clone, and destructor must keep tag and payload synchronized.
+
+The destructor conceptually matches on the tag and drops only the active `ManuallyDrop` field. Changing the tag before initializing the new payload, or panicking between dropping the old field and writing the new one, can break the invariant.
+
+I document the state transition order and test each transition, including panic or error exits. A private union behind safe constructors is more reviewable than public fields callers can combine arbitrarily.
+
+For an actual C boundary, `repr(C)` belongs on the union and its containing tagged struct when the foreign ABI requires it. I verify sizes, alignments, tag widths, and field offsets on every supported target. `ManuallyDrop` addresses Rust destruction only; it does not by itself make the layout compatible with C or assign stable numeric tag values.
+
+Foreign code may transfer ownership of a string-like buffer using a completely different representation. Placing Rust `String` directly in a C-facing union is normally wrong even after E0740 is repaired, because `String` has no C ABI guarantee and its allocator ownership must return to Rust.
+
+## An enum already implements the tagged design
+
+For Rust-only code, this is normally better:
+
+```rust
+enum Slot {
+    Text(String),
+    Number(u64),
+}
+```
+
+The compiler tracks the active variant, drops the correct field, and enforces exhaustive access. Layout may be slightly larger because of the discriminant, though niche optimization can sometimes reduce overhead. I use a union when layout compatibility, FFI, or a measured representation constraint justifies the unsafe state machine.
+
+## Deriving traits can expose inactive fields
+
+Unions have restricted trait derivation and cannot safely format or compare an unknown active field. Wrapping a field in `ManuallyDrop` does not make reading an inactive field safe. Public APIs should implement operations using the external tag and avoid exposing safe references that outlive a later variant change.
+
+Moving a `ManuallyDrop<String>` after manually dropping its contents also has subtle validity constraints. I keep post-drop states private and avoid derived safe operations over them.
+
+## My union audit
+
+Before accepting this repair, I write down:
+
+1. Where the active tag is stored.
+2. Which constructors establish each state.
+3. Which operations may change the state.
+4. How the old field is dropped exactly once.
+5. What happens if initialization or transition panics.
+6. Whether foreign code agrees on layout and tag values.
+
+The official [E0740 explanation](https://doc.rust-lang.org/error_codes/E0740.html) gives the `ManuallyDrop` requirement. The important warning is that this wrapper removes compiler-managed cleanup; it does not add variant tracking. When a safe enum fits, use it. When a union is necessary, the missing tag-and-drop protocol becomes part of the unsafe contract.

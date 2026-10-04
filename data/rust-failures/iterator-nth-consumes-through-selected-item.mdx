@@ -1,0 +1,77 @@
+---
+caseId: "RFA-230"
+title: "Iterator::nth Consumes the Skipped Items and the Selected Item"
+date: "2026-09-06T00:10:00+01:00"
+lastmod: "2026-09-06T00:10:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "d7dd6dd5676c98a8f94d3a5df4ccddbd47a441d20950611ab464f2749d546ff9"
+area: "concurrency-memory"
+symptom: "After nth(2) returns the third value, the next iterator call returns the fourth value rather than the second."
+summary: "Iterator::nth advances through n skipped items and consumes the item it returns. Use indexing or a cloned iterator for observation without advancing, and make the cursor transition visible in tests."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust Iterator nth consumes items", "what remains after nth Rust", "peek nth item without consuming iterator"]
+evidence: ["Rust 1.98.1 four-item iterator", "nth followed by next", "slice observation repair"]
+sources: ["https://doc.rust-lang.org/std/iter/trait.Iterator.html#method.nth", "https://doc.rust-lang.org/std/slice/struct.Iter.html#method.as_slice", "https://doc.rust-lang.org/std/iter/trait.Iterator.html#method.advance_by"]
+---
+
+I used `nth(2)` as if it were indexing an iterator. It returned the value I wanted, but the iterator had moved farther than the surrounding code expected. The next stage never saw the earlier values or the selected value again.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-230/fail.rs) calls `nth(2)` on `10, 20, 30, 40`. It receives `30`. A following `next` receives `40`, not `20`.
+
+## `nth` is an advancing operation
+
+[`Iterator::nth`](https://doc.rust-lang.org/std/iter/trait.Iterator.html#method.nth) returns the nth element of the iterator, where the first item is position zero. To reach it, the method consumes the preceding n items. The returned item is consumed too.
+
+The state transition is easier to see as calls to `next`:
+
+```text
+nth(2) = discard next() -> 10
+         discard next() -> 20
+         return  next() -> 30
+remaining iterator      -> 40
+```
+
+Calling `nth(0)` repeatedly is equivalent to calling `next` repeatedly. Calling `nth(1)` repeatedly skips every other remaining item. The documentation calls out both behaviours because the method name can look like random access.
+
+## An iterator does not promise random access
+
+Some iterator sources sit over arrays, but others decode a stream, walk a tree, receive messages, or generate values. A general iterator cannot jump to an item without advancing its source.
+
+Even when the source supports fast skipping, the semantic result is still consumption. An implementation can override `nth` for efficiency, but it cannot preserve skipped items for later iteration and still follow the same contract.
+
+This matters when skipped items own resources. Their destructors run as they are discarded. An iterator over results can also hide errors if code skips past them without inspecting each value.
+
+## Observation needs another primitive
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-230/fixed.rs) uses a slice iterator's [`as_slice`](https://doc.rust-lang.org/std/slice/struct.Iter.html#method.as_slice) method and indexes the remaining slice. This observes the requested item without changing iterator state.
+
+That repair is deliberately specific to a slice iterator. For a cloneable iterator, I can clone its current state and call `nth` on the clone. I do this only when cloning represents an independent cursor and does not duplicate external effects.
+
+For a single-pass stream, non-consuming lookahead needs buffering. `Peekable` gives one-item lookahead; looking several items ahead requires an explicit queue or parser buffer. The storage cost is part of the design rather than something `nth` provides for free.
+
+## `skip(n).next()` has the same consumption model
+
+Rewriting as `iterator.skip(2).next()` does not preserve anything. `skip` owns and advances the iterator, and `next` consumes the selected item. It may read more clearly in a pipeline, but it is not an indexing repair.
+
+[`advance_by`](https://doc.rust-lang.org/std/iter/trait.Iterator.html#method.advance_by) makes pure advancement explicit and reports how far an exhausted iterator fell short. I use it when discarding a prefix is the actual goal.
+
+The choice becomes simple once I name the action: observe, peek, buffer, or advance.
+
+## Partial exhaustion also changes the source
+
+If the iterator contains only two values, `nth(5)` returns `None` after consuming both. The failure to reach position five does not roll the iterator back.
+
+This is important in parsers that try one interpretation and then attempt another. Using `nth` during speculative parsing commits consumption. A transactional parser needs an index into stable input, a checkpoint that can be restored, or a buffered cursor designed for backtracking.
+
+## My regression asserts state after the answer
+
+An assertion that `nth(2) == Some(30)` proves only the returned value. It cannot reveal the mistaken state assumption. The fixture immediately calls `next` and asserts the remaining frontier.
+
+I also test `nth(0)`, an index exactly at the end, an index beyond the end, and an iterator with visible drop probes when discarded-item lifecycle matters. For parser code, the regression checks the source position and error span after an unsuccessful lookahead.
+
+This makes later refactoring of the iterator source observable too.
+
+The wider principle is that queries on stateful cursors can also be transitions. `nth` answers by advancing. When I need observation, I use a data structure that supports observation; when I accept consumption, I make the new frontier part of the contract and the test.

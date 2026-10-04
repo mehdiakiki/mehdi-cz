@@ -1,0 +1,86 @@
+---
+caseId: "RFA-331"
+title: "BufWriter::get_mut Can Reorder Direct Output"
+date: "2026-09-06T01:51:00+01:00"
+lastmod: "2026-09-06T01:51:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "261ce5a68a965ce738bf23834401d06c3813af79468bbfa78cfbe7a17d819b02"
+area: "ffi-targets"
+symptom: "Bytes written directly through BufWriter::get_mut arrive before older bytes still held in the wrapper's buffer."
+summary: "get_mut exposes the current underlying writer without draining BufWriter's pending output. Flush the buffering layer before unavoidable direct access, or keep one ordered write owner for the destination."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["all Rust targets"]
+profiles: ["dev", "release", "test"]
+searchTerms: ["Rust BufWriter get_mut reorders writes", "write underlying BufWriter before buffer flush", "BufWriter direct write ordering"]
+evidence: ["Rust 1.98.1 Vec writer", "pending buffered prefix", "explicit flush before direct write"]
+sources: ["https://doc.rust-lang.org/std/io/struct.BufWriter.html#method.get_mut", "https://doc.rust-lang.org/std/io/struct.BufWriter.html#method.buffer", "https://doc.rust-lang.org/std/io/trait.Write.html#method.flush"]
+---
+
+I used `BufWriter::get_mut` to call a method available only on the underlying transport. During the same block I wrote a small marker directly. The marker appeared before data I had written earlier through the buffered wrapper.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-331/fail.rs) makes the order visible with a `Vec<u8>`. It writes `buffered` through `BufWriter`, writes `direct` through `get_mut`, then flushes. The final bytes are `directbuffered`.
+
+## The older bytes have not reached the destination
+
+`BufWriter` accepts small writes into its own memory and sends them to `W` later. [`BufWriter::buffer`](https://doc.rust-lang.org/std/io/struct.BufWriter.html#method.buffer) exposes the pending slice for observation.
+
+While that slice is non-empty, the underlying writer has not necessarily seen it. Calling [`get_mut`](https://doc.rust-lang.org/std/io/struct.BufWriter.html#method.get_mut) returns `&mut W`; it does not first drain the wrapper's buffer.
+
+A direct write therefore happens at the destination's current position. The later flush sends the older pending bytes afterward.
+
+## Mutable access does not imply synchronized access
+
+The borrow checker proves exclusive Rust access to the underlying writer during the returned borrow. It does not promise that higher-level buffered state has been reconciled.
+
+This is a useful distinction. Memory alias safety and protocol ordering are different invariants. `get_mut` can be perfectly safe while my byte stream is semantically wrong.
+
+The standard documentation says direct writes through this reference are inadvisable. The fixture demonstrates one concrete reason.
+
+## Flush before direct access when ordering matters
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-331/fixed.rs) calls [`Write::flush`](https://doc.rust-lang.org/std/io/trait.Write.html#method.flush) on the `BufWriter` before writing to the inner `Vec`. The final sequence is `buffereddirect`.
+
+With a real destination, flush can fail. I propagate that error and do not perform the direct operation if the prefix could not be delivered. Otherwise the result would contain an unexplained gap or reorder.
+
+After direct writing, I also consider whether the underlying operation changed a cursor, compression state, encryption frame, or transport mode expected by the buffer.
+
+## Flushing has layers
+
+Calling `BufWriter::flush` writes its pending bytes and invokes `flush` on the immediate inner writer. That inner writer may itself buffer, and a filesystem flush is not necessarily durable storage synchronization.
+
+The required boundary depends on the promise. Ordering inside one in-memory stream needs the pending buffer drained. A network protocol may need a frame completed. A durable file commit may need a separate synchronization and rename sequence.
+
+I name the guarantee rather than treating “flush” as one universal persistence operation.
+
+## get_ref is safer for observation but still shows partial state
+
+An immutable reference from `get_ref` cannot directly write, but reading its state may still exclude pending buffered bytes. RFA-212 in this Atlas covers that observation trap.
+
+If I inspect a byte count or cursor on the inner writer, I add the buffer length when the measurement is meant to describe logically accepted output. If I need physical-delivery state, I flush first and handle failure.
+
+The two measurements answer different operational questions.
+
+## Keep one ordered owner when possible
+
+The cleanest design is to route all byte writes through the `BufWriter`. If a transport-specific control operation is required, I provide a wrapper method that flushes and then performs the operation in one reviewed place.
+
+Passing `&mut W` widely lets callers bypass framing and ordering policy. A narrow domain method such as `finish_frame` or `shutdown_write_side` is easier to test.
+
+If several buffering layers exist, I document their flush order from outermost encoding to innermost transport.
+
+## Error recovery must preserve pending bytes
+
+A failed flush can leave some data written and some still buffered. Retrying an entire logical message may duplicate the successful prefix unless the protocol is idempotent or framed with identifiers.
+
+I keep the `BufWriter` available after recoverable errors and inspect APIs designed to preserve buffered state. I do not unwrap into the inner writer and assume the pending suffix followed it.
+
+The earlier `into_inner` Atlas case explains that unwrapping has its own error type because draining the buffer can fail.
+
+## What RFA-331 proves
+
+The pinned fixture uses a capacity larger than the first write, so the prefix remains pending. It confirms the inner vector is empty before direct access and verifies both failing and repaired byte order on Rust 1.98.1.
+
+It does not claim every write is buffered; a large write or full buffer may be passed through. Correctness cannot rely on which optimisation path a particular size happens to take.
+
+The core principle is that logical acceptance and physical emission occur at different times. `BufWriter::get_mut` crosses below that boundary without draining pending work. I flush before crossing, propagate the failure, and keep one component responsible for output order.

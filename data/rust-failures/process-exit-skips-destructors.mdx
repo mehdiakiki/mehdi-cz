@@ -1,0 +1,100 @@
+---
+caseId: "RFA-213"
+title: "std::process::exit Skips Rust Destructors"
+date: "2026-09-05T17:52:00+01:00"
+lastmod: "2026-09-05T17:52:00+01:00"
+draft: false
+reviewed: true
+reviewedHash: "afbae2415d5f2b25a9b2628b0a1598900279314606e733b6cb9d227ef7cdc907"
+area: "ffi-targets"
+symptom: "A Drop implementation that writes a cleanup marker runs when main returns but never runs when the child calls process::exit."
+summary: "std::process::exit terminates without unwinding and does not run Drop on thread stacks. Return ExitCode or Result from main when normal RAII cleanup is required."
+rustVersions: ["Rust 1.98.1", "edition 2024"]
+targets: ["targets with process spawning; exit-code representation is platform-specific"]
+profiles: ["dev", "release", "test"]
+searchTerms:
+  [
+    "Rust process exit does not run Drop",
+    "destructor skipped std process exit",
+    "Rust clean shutdown return ExitCode",
+  ]
+evidence: ["Rust 1.98.1 parent-child fixture", "missing Drop marker", "ExitCode return repair"]
+sources:
+  [
+    "https://doc.rust-lang.org/std/process/fn.exit.html",
+    "https://doc.rust-lang.org/std/process/struct.ExitCode.html",
+    "https://doc.rust-lang.org/reference/destructors.html#process-termination-without-unwinding",
+  ]
+---
+
+I once saw `process::exit` used as an easy way to return an error code from deep inside a command. The code owned buffered output and cleanup guards. None of their `Drop` implementations ran.
+
+The [failing program](/rust-failure-atlas/evidence/RFA-213/fail.rs) starts a child containing a destructor that writes a marker file. The child calls `process::exit(17)`. Its parent observes exit code 17 and no marker.
+
+Immediate process termination is not normal scope exit.
+
+## `process::exit` does not unwind
+
+[`std::process::exit`](https://doc.rust-lang.org/std/process/fn.exit.html) never returns. It terminates the process without running destructors on the current stack or the stacks of other threads.
+
+This skips ordinary RAII cleanup for values such as:
+
+```text
+BufWriter pending bytes
+temporary-file deletion guards
+lock guards and transaction guards
+tracing flush guards
+application shutdown objects
+```
+
+The operating system still reclaims process memory and closes handles, but that is not the same as executing application cleanup logic.
+
+The [repaired program](/rust-failure-atlas/evidence/RFA-213/fixed.rs) returns [`ExitCode`](https://doc.rust-lang.org/std/process/struct.ExitCode.html) from the child path. The local marker drops before `main` completes, and the process still reports code 17.
+
+## Returning from `main` preserves normal scope cleanup
+
+Rust allows `main` to return types implementing `Termination`, including `ExitCode` and suitable `Result` values. Returning lets stack scopes end normally before the runtime terminates the process.
+
+For a command-line application, I usually propagate errors to one top-level boundary, print the final diagnostic there, flush important output, and return the selected code.
+
+This keeps policy at the edge. A parsing helper should not decide to kill unrelated threads and bypass all cleanup because one input was invalid.
+
+## Panic behaviour depends on the panic strategy
+
+With unwinding enabled, a panic normally drops initialized stack values as unwinding crosses their scopes. With `panic=abort`, the process stops without that destructor path. A panic that occurs while another panic is already unwinding can also abort.
+
+The [Rust Reference destructor section](https://doc.rust-lang.org/reference/destructors.html#process-termination-without-unwinding) groups `exit`, `abort`, and aborting panic behaviour as ways normal destructors may not run.
+
+I do not build correctness that requires `Drop` to execute under every possible process failure. Power loss, kill signals, and hardware failure exist too. RAII gives strong normal and unwinding cleanup, not an external durability guarantee.
+
+## Drop must not be the only record of committed work
+
+A destructor is excellent for releasing an in-process resource. It is a poor only mechanism for committing business state.
+
+If a payment, database migration, or distributed lease needs a durable transition, I write that transition explicitly and make it recoverable. `Drop` can provide best-effort local cleanup around the protocol, but another process must be able to determine what happened after a crash.
+
+Temporary files often use write, sync where required, rename, and startup cleanup rules. Hoping a destructor deletes every partial file is not enough.
+
+## Other threads are stopped too
+
+The documentation explicitly includes other thread stacks. Calling `process::exit` from one worker does not join the remaining threads or run their local destructors.
+
+This can cut logs in half, abandon buffered telemetry, and leave external operations at an unknown point. The OS releases process-owned resources, while remote systems may still have received partial requests.
+
+I send an error toward the owning thread instead. The owner cancels or joins work according to a declared shutdown order, then returns the final process status.
+
+## Exit handlers are a different mechanism
+
+Platform exit handlers may still run, but they are not Rust stack destructors. They have strict synchronization concerns because `exit` can be called while other threads are using shared state.
+
+I do not move normal Rust cleanup into global exit hooks to compensate for a deep `process::exit`. Structured ownership and a top-level return remain easier to test.
+
+## The fixture needs a separate process
+
+Testing this inside one process would terminate the test runner before it could inspect anything. The evidence uses a parent-child design. The child chooses between immediate exit and returning; the parent verifies code and marker.
+
+This is a general testing principle for aborts, signals, and crashes: observe them from outside the failure boundary. An in-process assertion cannot run after the process is gone.
+
+I also remove the marker before every run so stale evidence cannot create a false pass.
+
+The core principle is that scope-based cleanup requires scope exit. `process::exit` bypasses it. I return `ExitCode` from the program boundary for controlled failures and design durable recovery for cases where no destructor can be guaranteed.
