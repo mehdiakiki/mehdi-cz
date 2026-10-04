@@ -1,4 +1,5 @@
 import type { AuthorityOpportunity } from "./authority-opportunities.mjs";
+import type { RustFailureAreaSlug } from "./rust-failure-atlas.mjs";
 
 export type RustSystemsAtlasSectionSlug =
   | "diagnostic-failures"
@@ -17,6 +18,7 @@ export interface RustSystemsAtlasSection {
   description: string;
   questions: string[];
   href: string;
+  failureArea?: RustFailureAreaSlug;
 }
 
 export const rustSystemsAtlasGoal: {

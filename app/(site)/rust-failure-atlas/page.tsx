@@ -4,8 +4,14 @@ import { BreadcrumbJsonLd, JsonLd } from "@/components/JsonLd";
 import Link from "@/components/Link";
 import RustFailureAtlasExplorer from "@/components/RustFailureAtlasExplorer";
 import { isRustFailureAtlasLaunched, rustFailureAreas } from "@/data/rust-failure-atlas.mjs";
-import { rustFailureEvidenceCases } from "@/data/rust-failure-evidence.mjs";
-import { isCanonicalRustFailureCase } from "@/data/rust-failure-intent-review.mjs";
+import {
+  getRustFailureFeatureNote,
+  getRustFailureRunner,
+  getRustFailureTier,
+  isRustFailureErrorCodeCase,
+  rustFailureFeaturedLayers,
+  rustFailureSystemsRunners,
+} from "@/data/rust-failure-tiers.mjs";
 import { rustFailureTrails } from "@/data/rust-failure-trails.mjs";
 import siteMetadata from "@/data/siteMetadata";
 import { getVisibleRustFailureEntries } from "lib/rust-failure-atlas";
@@ -14,7 +20,7 @@ const pagePath = "/rust-failure-atlas";
 const pageUrl = `${siteMetadata.siteUrl}${pagePath}`;
 
 export function generateMetadata(): Metadata {
-  const title = "Rust Failure Atlas: Symptom, Cause, Proof, Repair";
+  const title = "Rust Failure Atlas: Symptom, Cause, Reproduction, Repair";
   const description =
     "A symptom-first field guide to Rust failures that depend on async boundaries, Cargo graphs, targets, linkers, memory invariants, and compiler versions.";
 
@@ -50,9 +56,9 @@ const method = [
   },
   {
     number: "03",
-    title: "Keep proof with the repair",
+    title: "Keep the fixture with the repair",
     description:
-      "Each case connects the fix to a compile failure, trace, model, target matrix, or other reproducible evidence.",
+      "Each case page ships a failing and a repaired fixture. The fixture shows that the failure reproduces and that the repair passes. The explanation is written by hand, and you can check it against the fixture.",
   },
 ];
 
@@ -81,12 +87,12 @@ function RustFailureAtlasDirectory({ areas }: { areas: VisibleArea[] }) {
           id="atlas-directory-heading"
           className="text-xl font-bold text-gray-950 dark:text-gray-100"
         >
-          Crawlable directories by failure family
+          Browse by failure family
         </h3>
         <p className="mt-2 leading-7 text-gray-600 dark:text-gray-400">
-          Every stable symptom anchor and canonical case link is present on one of these six
-          server-rendered family pages. Detailed mechanisms and checks load here only when you
-          search or choose a filter.
+          Each family page lists every record in that family, featured or not, with a stable anchor
+          for each case ID. Mechanisms and first checks appear here when you search or choose a
+          filter.
         </p>
       </div>
 
@@ -104,7 +110,7 @@ function RustFailureAtlasDirectory({ areas }: { areas: VisibleArea[] }) {
                 {area.description}
               </span>
               <span className="text-primary-600 dark:text-primary-400 mt-4 block text-sm font-semibold">
-                Open the complete family directory &rarr;
+                Open the family list &rarr;
               </span>
             </a>
           </li>
@@ -116,6 +122,26 @@ function RustFailureAtlasDirectory({ areas }: { areas: VisibleArea[] }) {
 
 export default function RustFailureAtlasPage() {
   const entries = getVisibleRustFailureEntries();
+  const entriesById = new Map(entries.map((entry) => [entry.id, entry]));
+  const fixtureCount = entries.filter((entry) => entry.hasExecutableFixture).length;
+  const withoutFixtureCount = entries.length - fixtureCount;
+  const featuredLayers = rustFailureFeaturedLayers.flatMap((layer) => {
+    const layerEntries = layer.caseIds.flatMap((caseId) => {
+      const entry = entriesById.get(caseId);
+      return entry?.destinationAvailable ? [entry] : [];
+    });
+    return layerEntries.length > 0 ? [{ ...layer, entries: layerEntries }] : [];
+  });
+  const featuredEntries = featuredLayers.flatMap((layer) => layer.entries);
+  const systemsRunners = new Set<string>(rustFailureSystemsRunners);
+  const featuredWithSystemsFixtureCount = featuredEntries.filter((entry) => {
+    const runner = getRustFailureRunner(entry.id);
+    return runner ? systemsRunners.has(runner.id) : false;
+  }).length;
+  const referenceEntries = entries.filter((entry) => getRustFailureTier(entry.id) === "reference");
+  const referenceErrorCodeCount = referenceEntries.filter((entry) =>
+    isRustFailureErrorCodeCase(entry.id)
+  ).length;
   const visibleAreas = rustFailureAreas.flatMap((area) => {
     const count = entries.filter((entry) => entry.area === area.slug).length;
     return count > 0
@@ -171,10 +197,12 @@ export default function RustFailureAtlasPage() {
           from what you can observe, isolate the mechanism, reproduce it, and verify the repair.
         </p>
         <p className="mt-5 max-w-3xl leading-7 text-gray-600 dark:text-gray-400">
-          The official Rust error index is the right reference when a compiler error has a stable
-          code. This atlas covers the other class: failures that appear only across an await, on one
-          target, under one profile, after a dependency decision, with a particular linker, or in
-          one unlucky interleaving.
+          The front of this page collects failures below the application layer: an FFI symbol that
+          disappears under LTO, a linker killed for memory, a sys crate that finds the wrong native
+          library, two copies of one native library in one binary, a C object built for the host
+          instead of the target, memory freed by the wrong allocator, and a doctest that sees a
+          different cfg. The full collection, including compiler diagnostics with a stable error
+          code, stays searchable below and on the family pages.
         </p>
       </header>
 
@@ -189,11 +217,12 @@ export default function RustFailureAtlasPage() {
           </p>
         </div>
         <div>
-          <p className="text-3xl font-bold text-gray-950 dark:text-gray-100">
-            {rustFailureEvidenceCases.filter((item) => isCanonicalRustFailureCase(item.id)).length}
-          </p>
+          <p className="text-3xl font-bold text-gray-950 dark:text-gray-100">{fixtureCount}</p>
           <p className="mt-1 text-sm leading-6 text-gray-600 dark:text-gray-400">
-            downloadable failing and repaired fixtures
+            records with a downloadable failing and repaired fixture
+            {withoutFixtureCount > 0
+              ? `; ${withoutFixtureCount} link to articles without an executable fixture yet`
+              : ""}
           </p>
         </div>
         <div>
@@ -206,8 +235,78 @@ export default function RustFailureAtlasPage() {
         </div>
       </section>
 
+      {featuredLayers.length > 0 && (
+        <section className="py-16 md:py-20" aria-labelledby="atlas-featured">
+          <div className="max-w-4xl">
+            <p className="text-primary-600 dark:text-primary-400 text-sm font-semibold tracking-[0.16em] uppercase">
+              Below the application layer
+            </p>
+            <h2
+              id="atlas-featured"
+              className="mt-4 text-3xl font-bold tracking-tight text-gray-950 dark:text-gray-100"
+            >
+              Linkers, native libraries, targets, and runtimes
+            </h2>
+            <p className="mt-5 text-lg leading-8 text-gray-600 dark:text-gray-300">
+              These {featuredEntries.length} cases depend on more than the source file: the final
+              link, a symbol table, a C toolchain, the target triple, the allocator on the other
+              side of an FFI call, a Cargo profile, or the test harness. For{" "}
+              {featuredWithSystemsFixtureCount} of them the fixture goes past a single compiler run:
+              nm and readelf, a link map, a linker under a memory cap, a C host built with
+              AddressSanitizer, paired Cargo profiles, or a subprocess deadline.
+            </p>
+          </div>
+
+          <div className="mt-12 space-y-12">
+            {featuredLayers.map((layer) => (
+              <section key={layer.slug} aria-labelledby={`featured-${layer.slug}`}>
+                <div className="max-w-3xl">
+                  <h3
+                    id={`featured-${layer.slug}`}
+                    className="text-xl font-bold text-gray-950 dark:text-gray-100"
+                  >
+                    {layer.label}
+                  </h3>
+                  <p className="mt-2 leading-7 text-gray-600 dark:text-gray-400">
+                    {layer.description}
+                  </p>
+                </div>
+                <ul className="mt-5 grid gap-4 md:grid-cols-2">
+                  {layer.entries.map((entry) => {
+                    const runner = getRustFailureRunner(entry.id);
+                    return (
+                      <li key={entry.id}>
+                        <Link
+                          href={entry.destinationPath}
+                          prefetch={false}
+                          className="hover:border-primary-500 dark:hover:border-primary-500 block h-full rounded-lg border border-gray-200 p-5 dark:border-gray-800"
+                          data-umami-event="failure-atlas-featured-open"
+                          data-umami-event-failure={entry.id}
+                          data-umami-event-layer={layer.slug}
+                        >
+                          <span className="block text-xs font-semibold tracking-[0.12em] text-gray-500 uppercase dark:text-gray-400">
+                            {entry.id}
+                            {runner ? ` · ${runner.label}` : ""}
+                          </span>
+                          <span className="mt-2 block leading-6 font-semibold text-gray-950 dark:text-gray-100">
+                            {entry.destinationTitle}
+                          </span>
+                          <span className="mt-2 block text-sm leading-6 text-gray-600 dark:text-gray-400">
+                            {getRustFailureFeatureNote(entry.id)}
+                          </span>
+                        </Link>
+                      </li>
+                    );
+                  })}
+                </ul>
+              </section>
+            ))}
+          </div>
+        </section>
+      )}
+
       <section
-        className="grid gap-5 border-b border-gray-200 py-10 md:grid-cols-3 dark:border-gray-800"
+        className="grid gap-5 border-y border-gray-200 py-10 md:grid-cols-3 dark:border-gray-800"
         aria-label="Atlas method"
       >
         {method.map((item) => (
@@ -233,9 +332,7 @@ export default function RustFailureAtlasPage() {
           </h2>
           <p className="mt-4 text-lg leading-8 text-gray-600 dark:text-gray-400">
             Search error fragments and observed behavior. The first check is deliberately narrow: it
-            should remove a branch from the diagnosis, not merely produce more logs. Every indexed
-            record is useful on this page; long-form reproductions appear only after their separate
-            review and publication gate.
+            should remove a branch from the diagnosis, not merely produce more logs.
           </p>
         </div>
         <div className="mt-8">
@@ -271,6 +368,14 @@ export default function RustFailureAtlasPage() {
             shortcut, and connect the repair to evidence that would fail again if the mechanism
             returned.
           </p>
+          <p className="mt-4 leading-7 text-gray-600 dark:text-gray-400">
+            A fixture run shows two things: the failing project fails with the recorded output, and
+            the repaired project passes. It does not check the written explanation, which is my
+            reading of the mechanism with primary sources cited on each case page.
+            {withoutFixtureCount > 0
+              ? ` ${withoutFixtureCount} records link to long-form articles instead of case pages. They do not have an executable fixture yet, and search results say so.`
+              : ""}
+          </p>
           <ul className="mt-6 grid gap-3 text-gray-600 sm:grid-cols-2 dark:text-gray-400">
             {inclusionChecks.map((item) => (
               <li key={item} className="border-primary-500 border-l-2 pl-4 leading-7">
@@ -283,21 +388,29 @@ export default function RustFailureAtlasPage() {
 
       <section className="py-16 md:py-20" aria-labelledby="atlas-boundary">
         <div className="max-w-4xl">
+          <p className="text-primary-600 dark:text-primary-400 text-sm font-semibold tracking-[0.16em] uppercase">
+            Reference layer
+          </p>
           <h2
             id="atlas-boundary"
-            className="text-3xl font-bold tracking-tight text-gray-950 dark:text-gray-100"
+            className="mt-4 text-3xl font-bold tracking-tight text-gray-950 dark:text-gray-100"
           >
-            What belongs here
+            Compiler diagnostics and library contracts
           </h2>
           <p className="mt-4 text-lg leading-8 text-gray-600 dark:text-gray-300">
-            The atlas is intentionally narrower than a Rust tutorial and more operational than an
-            error dictionary. A case belongs when copying the final fix without understanding the
-            mechanism is likely to make the failure return in another target, task, dependency, or
-            release.
+            The other {referenceEntries.length} records are the reference layer. Most of them start
+            from a compiler diagnostic or a documented standard library contract, where the cause is
+            closer to the code you wrote: borrow and trait errors, macro and type diagnostics,
+            collection and I/O behavior, numeric edge cases, and edition changes.{" "}
+            {referenceErrorCodeCount} of them are keyed to a compiler error code. All of them stay
+            in search and on their family pages.
           </p>
           <p className="mt-5 leading-7 text-gray-600 dark:text-gray-400">
-            For language concepts without a failure symptom, use the Rust Under the Hood series. For
-            a compiler diagnostic with a stable code, begin with the official Rust error-code index.
+            A case belongs in the atlas when copying the final fix without understanding the
+            mechanism is likely to make the failure return in another target, task, dependency, or
+            release. For language concepts without a failure symptom, use the Rust Under the Hood
+            series. For a compiler error code on its own, the official Rust error-code index is
+            usually the faster reference.
           </p>
           <div className="mt-5 flex flex-wrap gap-4">
             <Link
@@ -325,7 +438,7 @@ export default function RustFailureAtlasPage() {
         </h2>
         <p className="mt-4 max-w-3xl text-lg leading-8 text-gray-600 dark:text-gray-300">
           Send the smallest evidence you still trust: the symptom, versions, target, profile, and
-          what makes it appear or disappear. A useful case can become a verified entry without
+          what makes it appear or disappear. A useful report can become an Atlas case without
           exposing private source code.
         </p>
         <Link

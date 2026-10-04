@@ -7,6 +7,12 @@ import {
   isRustFailureAtlasLaunched,
   rustFailureAreas,
 } from "@/data/rust-failure-atlas.mjs";
+import {
+  getRustFailureFeatureNote,
+  getRustFailureRunner,
+  isRustFailureErrorCodeCase,
+  rustFailureFeaturedLayers,
+} from "@/data/rust-failure-tiers.mjs";
 import siteMetadata from "@/data/siteMetadata";
 import { getVisibleRustFailureEntries } from "lib/rust-failure-atlas";
 
@@ -50,6 +56,15 @@ export default async function RustFailureAtlasAreaPage({ params }: PageProps) {
   if (!area) return notFound();
 
   const entries = getVisibleRustFailureEntries().filter((entry) => entry.area === area.slug);
+  const entriesById = new Map(entries.map((entry) => [entry.id, entry]));
+  const featuredEntries = rustFailureFeaturedLayers.flatMap((layer) =>
+    layer.caseIds.flatMap((caseId) => {
+      const entry = entriesById.get(caseId);
+      return entry?.destinationAvailable ? [entry] : [];
+    })
+  );
+  const fixtureCount = entries.filter((entry) => entry.hasExecutableFixture).length;
+  const errorCodeCount = entries.filter((entry) => isRustFailureErrorCodeCase(entry.id)).length;
   const path = `${atlasPath}/area/${area.slug}`;
   const pageUrl = `${siteMetadata.siteUrl}${path}`;
 
@@ -83,7 +98,7 @@ export default async function RustFailureAtlasAreaPage({ params }: PageProps) {
           href={atlasPath}
           className="text-primary-600 hover:text-primary-700 dark:text-primary-400 dark:hover:text-primary-300 text-sm font-semibold tracking-[0.16em] uppercase"
         >
-          Rust Failure Atlas / family directories
+          Rust Failure Atlas / failure families
         </a>
         <h1 className="mt-5 text-4xl leading-tight font-bold tracking-tight text-gray-950 md:text-6xl dark:text-gray-100">
           {area.label}
@@ -92,8 +107,10 @@ export default async function RustFailureAtlasAreaPage({ params }: PageProps) {
           {area.description}
         </p>
         <p className="mt-5 max-w-3xl leading-7 text-gray-600 dark:text-gray-400">
-          This server-rendered directory contains all {entries.length} canonical symptoms in this
-          family. Return to the Atlas to search mechanisms, checks, evidence, and related terms.
+          This page lists all {entries.length} records in this family. {fixtureCount} of them have a
+          failing and a repaired fixture
+          {errorCodeCount > 0 ? `, and ${errorCodeCount} are keyed to a compiler error code` : ""}.
+          Use the Atlas search to filter by mechanism, first check, or evidence.
         </p>
       </header>
 
@@ -121,6 +138,51 @@ export default async function RustFailureAtlasAreaPage({ params }: PageProps) {
         </ul>
       </nav>
 
+      {featuredEntries.length > 0 && (
+        <section
+          className="border-b border-gray-200 py-12 md:py-16 dark:border-gray-800"
+          aria-labelledby="family-featured-heading"
+        >
+          <div className="max-w-4xl">
+            <h2
+              id="family-featured-heading"
+              className="text-3xl font-bold tracking-tight text-gray-950 dark:text-gray-100"
+            >
+              Below the application layer
+            </h2>
+            <p className="mt-3 leading-7 text-gray-600 dark:text-gray-400">
+              These cases in this family depend on the linker, a native toolchain, the target, a
+              Cargo profile, the test harness, or the runtime. They are also featured on the Atlas
+              front page.
+            </p>
+          </div>
+          <ul className="mt-8 grid gap-4 md:grid-cols-2">
+            {featuredEntries.map((entry) => {
+              const runner = getRustFailureRunner(entry.id);
+              return (
+                <li key={entry.id}>
+                  <a
+                    href={entry.destinationPath}
+                    className="hover:border-primary-500 dark:hover:border-primary-500 block h-full rounded-lg border border-gray-200 p-5 dark:border-gray-800"
+                  >
+                    <span className="block text-xs font-semibold tracking-[0.12em] text-gray-500 uppercase dark:text-gray-400">
+                      {entry.id}
+                      {runner ? ` · ${runner.label}` : ""}
+                    </span>
+                    <span className="mt-2 block leading-6 font-semibold text-gray-950 dark:text-gray-100">
+                      {entry.destinationTitle}
+                    </span>
+                    <span className="mt-2 block text-sm leading-6 text-gray-600 dark:text-gray-400">
+                      {getRustFailureFeatureNote(entry.id)}
+                    </span>
+                  </a>
+                </li>
+              );
+            })}
+          </ul>
+        </section>
+      )}
+
       <section className="py-12 md:py-16" aria-labelledby="family-directory-heading">
         <div className="max-w-4xl">
           <h2
@@ -130,9 +192,9 @@ export default async function RustFailureAtlasAreaPage({ params }: PageProps) {
             Complete symptom directory
           </h2>
           <p className="mt-3 leading-7 text-gray-600 dark:text-gray-400">
-            Case identifiers and anchors are stable. Published reproductions use ordinary links;
-            entries still in review remain visible without pretending their long-form destination is
-            ready.
+            Case identifiers and anchors are stable. Records whose page is not published yet are
+            listed without a link. Records marked &ldquo;no fixture yet&rdquo; link to an article
+            and have no executable fixture.
           </p>
         </div>
 
@@ -148,6 +210,11 @@ export default async function RustFailureAtlasAreaPage({ params }: PageProps) {
                     {entry.id}
                   </span>{" "}
                   — {entry.symptom}
+                  {!entry.hasExecutableFixture && (
+                    <span className="ml-2 text-xs font-semibold tracking-[0.08em] text-amber-700 uppercase dark:text-amber-400">
+                      No fixture yet
+                    </span>
+                  )}
                 </a>
               ) : (
                 <span className="text-gray-600 dark:text-gray-400">
@@ -155,6 +222,11 @@ export default async function RustFailureAtlasAreaPage({ params }: PageProps) {
                     {entry.id}
                   </span>{" "}
                   — {entry.symptom}
+                  {!entry.hasExecutableFixture && (
+                    <span className="ml-2 text-xs font-semibold tracking-[0.08em] text-amber-700 uppercase dark:text-amber-400">
+                      No fixture yet
+                    </span>
+                  )}
                 </span>
               )}
             </li>

@@ -15,6 +15,7 @@ import { getRustAtlasGrowthCohort } from "@/data/rust-atlas-growth-experiments.m
 import { getRustFailureEvidence, rustFailureEvidenceUrl } from "@/data/rust-failure-evidence.mjs";
 import { getRustFailureArea, rustFailureAtlasEntries } from "@/data/rust-failure-atlas.mjs";
 import { canonicalRustFailureCaseId } from "@/data/rust-failure-intent-review.mjs";
+import { getRustFailureRunner } from "@/data/rust-failure-tiers.mjs";
 import { getRelatedRustFailureIds, getRustFailureTrails } from "@/data/rust-failure-trails.mjs";
 import siteMetadata from "@/data/siteMetadata";
 import { allRustFailures, type RustFailure } from "contentlayer/generated";
@@ -104,43 +105,8 @@ export default async function RustFailurePage({ params }: { params: Promise<{ sl
 
   const executableEvidence = getRustFailureEvidence(failure.caseId);
   const growthCohort = getRustAtlasGrowthCohort(failure.caseId);
-  const evidenceRunner: string | undefined = executableEvidence?.runner;
-  const evidenceLabel =
-    evidenceRunner === "cargo"
-      ? "Cargo workspace evidence"
-      : evidenceRunner === "cargo-rebuild"
-        ? "Cargo rebuild evidence"
-        : evidenceRunner === "cargo-runtime-env"
-          ? "Cargo runtime-boundary evidence"
-          : evidenceRunner === "cargo-package"
-            ? "Cargo package-boundary evidence"
-            : evidenceRunner === "cargo-profile-pair"
-              ? "Cargo profile-pair evidence"
-              : evidenceRunner === "cargo-test-surfaces"
-                ? "Cargo test-surface evidence"
-                : evidenceRunner === "cargo-suite-isolation"
-                  ? "Cargo suite-isolation evidence"
-                  : evidenceRunner === "cargo-subprocess"
-                    ? "Cargo deadline-isolated evidence"
-                    : evidenceRunner === "rustc-run"
-                      ? "Runtime evidence"
-                      : evidenceRunner === "rustc-link"
-                        ? "Linker evidence"
-                        : evidenceRunner === "rustc-symbol-matrix"
-                          ? "Native symbol-matrix evidence"
-                          : evidenceRunner === "rustc-native-target-matrix"
-                            ? "Native target-matrix evidence"
-                            : evidenceRunner === "rustc-native-discovery"
-                              ? "Native discovery evidence"
-                              : evidenceRunner === "rustc-native-owner"
-                                ? "Native ownership evidence"
-                                : evidenceRunner === "rustc-invariant-matrix"
-                                  ? "Invariant matrix evidence"
-                                  : evidenceRunner === "rustc-allocator-sanitizer"
-                                    ? "Allocator sanitizer evidence"
-                                    : evidenceRunner === "rustc-link-resource-matrix"
-                                      ? "Link resource-matrix evidence"
-                                      : "Compiler evidence";
+  const evidenceRunner = executableEvidence ? getRustFailureRunner(failure.caseId) : undefined;
+  const evidenceLabel = evidenceRunner?.label || "Compiler evidence";
   const status = publicationStatus(failure);
   const path = `/rust/failures/${failure.slug}`;
   const url = `${siteMetadata.siteUrl}${path}`;
@@ -169,7 +135,7 @@ export default async function RustFailurePage({ params }: { params: Promise<{ sl
     const relatedCase = casesBySlug.get(entry.caseSlug);
     return relatedCase ? [relatedCase] : [];
   });
-  const areaAtlasPath = `/rust-failure-atlas?area=${encodeURIComponent(failure.area)}#atlas-results`;
+  const areaAtlasPath = `/rust-failure-atlas/area/${encodeURIComponent(failure.area)}`;
 
   return (
     <SectionContainer>
@@ -208,7 +174,8 @@ export default async function RustFailurePage({ params }: { params: Promise<{ sl
             Rust Failure Atlas / {area.label}
           </Link>
           <p className="mt-5 text-sm font-semibold tracking-[0.14em] text-gray-500 uppercase dark:text-gray-400">
-            {failure.caseId} · {executableEvidence ? "Executable case file" : "Reviewed case file"}
+            {failure.caseId} ·{" "}
+            {executableEvidence ? "Case file with fixtures" : "No executable fixture yet"}
             {caseIndex >= 0 ? ` · Case ${caseIndex + 1} of ${orderedCases.length}` : ""}
             {executableEvidence ? ` · ${evidenceLabel}` : ""}
           </p>
@@ -318,7 +285,7 @@ export default async function RustFailurePage({ params }: { params: Promise<{ sl
           <aside className="space-y-8 xl:order-last" aria-label="Case evidence">
             <div>
               <h2 className="text-sm font-semibold tracking-[0.14em] text-gray-950 uppercase dark:text-gray-100">
-                Evidence in this case
+                {executableEvidence ? "Evidence in this case" : "Evidence described in the text"}
               </h2>
               <ul className="mt-3 space-y-2 text-sm leading-6 text-gray-600 dark:text-gray-400">
                 {failure.evidence.map((item) => (
@@ -334,8 +301,12 @@ export default async function RustFailurePage({ params }: { params: Promise<{ sl
                   Reproduce it
                 </h2>
                 <p className="mt-3 text-sm leading-6 text-gray-600 dark:text-gray-400">
-                  {evidenceLabel}. Rechecked {executableEvidence.verifiedAt} with Rust{" "}
-                  {executableEvidence.toolchain}, edition {executableEvidence.edition}.
+                  {evidenceLabel}. {evidenceRunner?.method}
+                </p>
+                <p className="mt-2 text-sm leading-6 text-gray-600 dark:text-gray-400">
+                  Last run {executableEvidence.verifiedAt} with Rust {executableEvidence.toolchain},
+                  edition {executableEvidence.edition}. The run checks that the failure reproduces
+                  and that the repair passes. It does not check the explanation on this page.
                 </p>
                 <ul className="mt-3 space-y-2 text-sm leading-6">
                   <li>
@@ -483,6 +454,17 @@ export default async function RustFailurePage({ params }: { params: Promise<{ sl
                 </ul>
               </div>
             )}
+            {!executableEvidence && (
+              <div>
+                <h2 className="text-sm font-semibold tracking-[0.14em] text-gray-950 uppercase dark:text-gray-100">
+                  Reproduce it
+                </h2>
+                <p className="mt-3 text-sm leading-6 text-gray-600 dark:text-gray-400">
+                  No executable fixture exists for this case yet. Nothing on this page has been run
+                  as a failing and repaired pair.
+                </p>
+              </div>
+            )}
             <div>
               <h2 className="text-sm font-semibold tracking-[0.14em] text-gray-950 uppercase dark:text-gray-100">
                 Primary sources
@@ -593,26 +575,35 @@ export default async function RustFailurePage({ params }: { params: Promise<{ sl
             </div>
           </nav>
 
-          <div className="mt-10 rounded-lg bg-gray-50 p-6 md:flex md:items-center md:justify-between md:gap-8 dark:bg-gray-900">
-            <div className="max-w-2xl">
-              <p className="font-semibold text-gray-950 dark:text-gray-100">
-                Working through a Rust failure that does not fit the obvious answer?
-              </p>
-              <p className="mt-2 text-sm leading-6 text-gray-600 dark:text-gray-400">
-                I help teams reduce difficult compiler, runtime, integration, and performance
-                problems into evidence they can reproduce and maintain.
-              </p>
-            </div>
+          <div className="mt-10 rounded-lg bg-gray-50 p-6 dark:bg-gray-900">
+            <p className="font-semibold text-gray-950 dark:text-gray-100">
+              More from the Rust Failure Atlas
+            </p>
+            <p className="mt-2 max-w-2xl text-sm leading-6 text-gray-600 dark:text-gray-400">
+              The Atlas index starts with failures below the application layer: linking and symbol
+              export, native libraries, cross-compilation, FFI ownership, and runtime boundaries.
+            </p>
             <Link
-              href="/work"
-              className="text-primary-700 hover:text-primary-800 dark:text-primary-400 dark:hover:text-primary-300 mt-5 inline-block shrink-0 font-semibold md:mt-0"
-              data-umami-event="rust-failure-professional-cta"
+              href="/rust-failure-atlas"
+              className="text-primary-700 hover:text-primary-800 dark:text-primary-400 dark:hover:text-primary-300 mt-4 inline-block text-sm font-semibold"
+              data-umami-event="rust-failure-atlas-open"
               data-umami-event-case={failure.caseId}
-              data-umami-event-cohort={growthCohort?.cohort.slug}
-              data-umami-event-destination="work"
             >
-              See how I work &rarr;
+              Open the Atlas index &rarr;
             </Link>
+            <p className="mt-4 text-sm leading-6 text-gray-500 dark:text-gray-400">
+              Written by {siteMetadata.author}.{" "}
+              <Link
+                href="/work"
+                className="underline hover:text-gray-700 dark:hover:text-gray-300"
+                data-umami-event="rust-failure-professional-cta"
+                data-umami-event-case={failure.caseId}
+                data-umami-event-cohort={growthCohort?.cohort.slug}
+                data-umami-event-destination="work"
+              >
+                Selected engineering work
+              </Link>
+            </p>
           </div>
         </footer>
       </article>

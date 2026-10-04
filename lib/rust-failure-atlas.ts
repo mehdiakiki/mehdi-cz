@@ -7,6 +7,7 @@ import type {
   RustFailureExplorerWirePayload,
 } from "@/components/RustFailureAtlasExplorer";
 import { getRustFailureArea, rustFailureAtlasEntries } from "@/data/rust-failure-atlas.mjs";
+import { getRustFailureEvidence } from "@/data/rust-failure-evidence.mjs";
 import { isCanonicalRustFailureCase } from "@/data/rust-failure-intent-review.mjs";
 import { filterVisiblePosts, publicationStatus } from "lib/publication.mjs";
 
@@ -46,6 +47,7 @@ export function getVisibleRustFailureEntries(): RustFailureExplorerEntry[] {
           firstCheck: entry.firstCheck,
           searchTerms: entry.searchTerms,
           evidence: entry.evidence,
+          hasExecutableFixture: Boolean(getRustFailureEvidence(entry.id)),
           destinationPath: post
             ? `/blog/${post.slug}`
             : failure
@@ -77,6 +79,7 @@ export function getRustFailureSearchIndex(): RustFailureExplorerWirePayload {
       entry.destinationTitle,
       entry.destinationAvailable,
       entry.isPreview,
+      entry.hasExecutableFixture,
     ]),
   };
 }

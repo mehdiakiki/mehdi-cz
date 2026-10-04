@@ -13,7 +13,8 @@ export const rustSystemsAtlasEditorialSections = {
   "where-a-type-becomes-a-layout-fields-padding-and-reordering": "types-memory-unsafe",
   "two-ways-to-make-a-type-disappear-erasure-and-monomorphization": "compiler-internals",
   "the-processor-has-no-types-what-add-does-to-bits-it-does-not-understand": "types-memory-unsafe",
-  "runtime-type-tags-what-dynamic-languages-keep-that-static-ones-throw-away": "types-memory-unsafe",
+  "runtime-type-tags-what-dynamic-languages-keep-that-static-ones-throw-away":
+    "types-memory-unsafe",
   "types-as-proofs-what-the-checker-knows-that-the-binary-forgets": "types-memory-unsafe",
   "behavior-without-shape-traits-interfaces-and-types-that-own-no-bytes": "types-memory-unsafe",
   "a-type-is-a-set-why-human-has-two-members-and-option-human-has-three": "types-memory-unsafe",
@@ -72,6 +73,7 @@ export const rustSystemsAtlasSections = [
       "How does the compiler map the result back to source?",
     ],
     href: "/blog/topics/rust-under-the-hood",
+    failureArea: "diagnostics-macros",
   },
   {
     slug: "cargo-build-linking",
@@ -86,6 +88,7 @@ export const rustSystemsAtlasSections = [
       "Which host, target, flag, or native input changed?",
     ],
     href: "/rust#cargo-build-linking",
+    failureArea: "cargo-dependencies",
   },
   {
     slug: "async-concurrency",
@@ -100,6 +103,7 @@ export const rustSystemsAtlasSections = [
       "Who owns progress, capacity, and completion?",
     ],
     href: "/rust#async-concurrency",
+    failureArea: "async-runtime",
   },
   {
     slug: "types-memory-unsafe",
@@ -114,6 +118,7 @@ export const rustSystemsAtlasSections = [
       "Can Miri, layout inspection, or a drop trace test the model?",
     ],
     href: "/rust#types-memory-unsafe",
+    failureArea: "concurrency-memory",
   },
   {
     slug: "ffi-targets",
@@ -128,6 +133,7 @@ export const rustSystemsAtlasSections = [
       "What does the final linked binary actually import and export?",
     ],
     href: "/rust#ffi-targets",
+    failureArea: "ffi-targets",
   },
   {
     slug: "release-compatibility",
@@ -135,25 +141,26 @@ export const rustSystemsAtlasSections = [
     shortTitle: "Releases",
     targetPages: 50,
     description:
-      "Important stable changes translated into affected code, compatibility boundaries, migration checks, and behavior verified across toolchain versions.",
+      "Important stable changes translated into affected code, compatibility boundaries, migration checks, and behavior compared across toolchain versions.",
     questions: [
       "Which release first changed this behavior?",
       "Is the change source, binary, target, or behavioral compatibility?",
       "What should CI compare before and after migration?",
     ],
     href: "/rust#release-compatibility",
+    failureArea: "upgrades-compatibility",
   },
 ];
 
 export const rustSystemsAtlasAxes = [
   "observed symptom",
-  "compiler or runtime subsystem",
-  "Rust and dependency versions",
-  "host and target",
-  "debug or release profile",
-  "reproduction and proof method",
-  "repair and regression check",
-  "upstream source",
+  "failure family",
+  "likely cause and first discriminating check",
+  "Rust versions",
+  "targets and profiles",
+  "failing and repaired fixture, with the toolchain it ran on",
+  "review date",
+  "primary sources",
 ];
 
 const failureArticleSlugs = new Set(rustFailureAtlasEntries.map((entry) => entry.articleSlug));

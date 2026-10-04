@@ -25,6 +25,7 @@ export interface RustFailureExplorerEntry {
   destinationTitle: string;
   destinationAvailable: boolean;
   isPreview: boolean;
+  hasExecutableFixture: boolean;
 }
 
 export type RustFailureExplorerWireEntry = [
@@ -39,6 +40,7 @@ export type RustFailureExplorerWireEntry = [
   destinationTitle: string,
   destinationAvailable: boolean,
   isPreview: boolean,
+  hasExecutableFixture?: boolean,
 ];
 
 export interface RustFailureExplorerWirePayload {
@@ -119,6 +121,7 @@ export default function RustFailureAtlasExplorer({
           destinationTitle,
           destinationAvailable,
           isPreview,
+          hasExecutableFixture,
         ]) => ({
           id,
           area: areaSlug,
@@ -132,6 +135,7 @@ export default function RustFailureAtlasExplorer({
           destinationTitle,
           destinationAvailable,
           isPreview,
+          hasExecutableFixture: hasExecutableFixture === true,
         })
       );
     },
@@ -349,7 +353,7 @@ export default function RustFailureAtlasExplorer({
                 ? "Preparing detailed search data. The complete directory remains available below."
                 : indexStatus === "error"
                   ? "Detailed search data could not load. The complete directory remains available below."
-                  : "Browse all indexed symptoms below. Detailed search data loads only after search intent."}
+                  : "Browse the failure families below, or search to load the detailed records."}
           </p>
           {children}
         </>
@@ -380,8 +384,8 @@ export default function RustFailureAtlasExplorer({
                 Search is temporarily unavailable.
               </p>
               <p className="mt-2 leading-7 text-gray-600 dark:text-gray-400">
-                Clear the filters to use the complete server-rendered directory, or retry the
-                detailed index.
+                Clear the filters to use the family directories, or retry loading the detailed
+                records.
               </p>
               <button
                 type="button"
@@ -432,16 +436,25 @@ export default function RustFailureAtlasExplorer({
                     </div>
                   </dl>
 
-                  <div className="mt-5 flex flex-wrap gap-2" aria-label="Evidence included">
-                    {entry.evidence.map((item) => (
-                      <span
-                        key={item}
-                        className="rounded-full bg-gray-100 px-3 py-1 text-xs font-medium text-gray-600 dark:bg-gray-800 dark:text-gray-300"
-                      >
-                        {item}
+                  {entry.hasExecutableFixture ? (
+                    <div className="mt-5 flex flex-wrap gap-2" aria-label="Evidence included">
+                      <span className="bg-primary-50 text-primary-800 dark:bg-primary-950 dark:text-primary-300 rounded-full px-3 py-1 text-xs font-semibold">
+                        Failing and repaired fixture
                       </span>
-                    ))}
-                  </div>
+                      {entry.evidence.map((item) => (
+                        <span
+                          key={item}
+                          className="rounded-full bg-gray-100 px-3 py-1 text-xs font-medium text-gray-600 dark:bg-gray-800 dark:text-gray-300"
+                        >
+                          {item}
+                        </span>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="mt-5 text-sm leading-6 text-gray-600 dark:text-gray-400">
+                      No executable fixture exists for this record yet.
+                    </p>
+                  )}
 
                   {entry.destinationAvailable ? (
                     <IntentLink
@@ -450,11 +463,14 @@ export default function RustFailureAtlasExplorer({
                       data-umami-event="failure-atlas-case-open"
                       data-umami-event-failure={entry.id}
                     >
-                      Read the reproduction and repair: {entry.destinationTitle} &rarr;
+                      {entry.hasExecutableFixture
+                        ? "Read the reproduction and repair"
+                        : "Read the article"}
+                      : {entry.destinationTitle} &rarr;
                     </IntentLink>
                   ) : (
                     <p className="mt-5 text-sm leading-6 text-gray-500 dark:text-gray-400">
-                      Full investigation in the reviewed publication queue: {entry.destinationTitle}
+                      Not published yet: {entry.destinationTitle}
                     </p>
                   )}
                 </li>

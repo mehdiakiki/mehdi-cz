@@ -10,12 +10,16 @@ import {
   rustAtlasClaimStatuses,
 } from "@/data/rust-atlas-claims.mjs";
 import { getRustFailureEvidence } from "@/data/rust-failure-evidence.mjs";
-import { isRustFailureAtlasLaunched } from "@/data/rust-failure-atlas.mjs";
+import {
+  getRustFailureArea,
+  isRustFailureAtlasLaunched,
+  rustFailureAtlasEntries,
+} from "@/data/rust-failure-atlas.mjs";
+import { getRustFailureFeaturedPreviewIds } from "@/data/rust-failure-tiers.mjs";
 import {
   rustAtlasSectionForEditorialArticle,
   rustAtlasSectionForOpportunity,
   rustSystemsAtlasAxes,
-  rustSystemsAtlasGoal,
   rustSystemsAtlasSections,
 } from "@/data/rust-systems-atlas.mjs";
 import siteMetadata from "@/data/siteMetadata";
@@ -101,7 +105,21 @@ export default function RustSystemsAtlasPage() {
     availableArticleSlugs.has(claim.articleSlug)
   );
   const articleMaterial = material.filter((item) => item.kind === "Article");
-  const executableMaterial = material.filter((item) => item.evidenceStatus === "verified").length;
+  const failureMaterial = material.filter((item) => item.kind === "Failure case");
+  const failuresWithFixtures = failureMaterial.filter(
+    (item) => item.evidenceStatus === "verified"
+  ).length;
+  const featuredFailureIds = getRustFailureFeaturedPreviewIds(4);
+  const featuredFailures = featuredFailureIds.flatMap((caseId) => {
+    const item = failureMaterial.find((candidate) => candidate.id === caseId);
+    return item ? [item] : [];
+  });
+  const failureIds = new Set(failureMaterial.map((item) => item.id));
+  const failureCountByArea = new Map<string, number>();
+  for (const entry of rustFailureAtlasEntries) {
+    if (!failureIds.has(entry.id)) continue;
+    failureCountByArea.set(entry.area, (failureCountByArea.get(entry.area) || 0) + 1);
+  }
 
   return (
     <>
@@ -153,35 +171,32 @@ export default function RustSystemsAtlasPage() {
       >
         <div>
           <p className="text-3xl font-bold text-gray-950 tabular-nums dark:text-gray-100">
-            {material.length} / {rustSystemsAtlasGoal.canonicalPages}
+            {articleMaterial.length}
           </p>
-          <p className="mt-2 font-semibold text-gray-950 dark:text-gray-100">
-            {material.some((item) => item.isPreview)
-              ? "canonical pages in local preview"
-              : "published canonical pages"}
-          </p>
+          <p className="mt-2 font-semibold text-gray-950 dark:text-gray-100">long-form articles</p>
           <p className="mt-2 text-sm leading-6 text-gray-500 dark:text-gray-400">
-            Articles and dedicated failure pages count once, even when several maps link to them.
+            Each article sits in one map, listed in the article directory below.
           </p>
         </div>
         <div>
           <p className="text-3xl font-bold text-gray-950 tabular-nums dark:text-gray-100">
-            {rustSystemsAtlasSections.length}
+            {failureMaterial.length}
           </p>
-          <p className="mt-2 font-semibold text-gray-950 dark:text-gray-100">permanent maps</p>
+          <p className="mt-2 font-semibold text-gray-950 dark:text-gray-100">failure case pages</p>
           <p className="mt-2 text-sm leading-6 text-gray-500 dark:text-gray-400">
-            Failures, compiler, builds, async, memory, targets, and releases stay connected.
+            Symptom-first cases in the Rust Failure Atlas, grouped by failure family.
           </p>
         </div>
         <div>
           <p className="text-3xl font-bold text-gray-950 tabular-nums dark:text-gray-100">
-            {executableMaterial}
+            {failuresWithFixtures}
           </p>
           <p className="mt-2 font-semibold text-gray-950 dark:text-gray-100">
-            executable evidence links
+            cases with a failing and a repaired fixture
           </p>
           <p className="mt-2 text-sm leading-6 text-gray-500 dark:text-gray-400">
-            A passing fixture proves a bounded claim; performance claims stay conditional.
+            A fixture run shows that the failure reproduces and the repair passes. It does not check
+            the explanation, and performance claims stay conditional.
           </p>
         </div>
       </section>
@@ -203,9 +218,23 @@ export default function RustSystemsAtlasPage() {
 
         <div className="mt-9 space-y-8">
           {rustSystemsAtlasSections.map((section) => {
-            const entries = material.filter((item) => item.section === section.slug);
+            const sectionEntries = material.filter((item) => item.section === section.slug);
+            const entries =
+              section.slug === "diagnostic-failures"
+                ? [
+                    ...featuredFailures,
+                    ...sectionEntries.filter((item) => !featuredFailures.includes(item)),
+                  ]
+                : sectionEntries;
             const sectionLinkAvailable =
-              section.slug !== "diagnostic-failures" || failureAtlasLaunched;
+              section.href !== `${pagePath}#${section.slug}` &&
+              (section.slug !== "diagnostic-failures" || failureAtlasLaunched);
+            const relatedFailureArea = section.failureArea
+              ? getRustFailureArea(section.failureArea)
+              : undefined;
+            const relatedFailureCount = section.failureArea
+              ? failureCountByArea.get(section.failureArea) || 0
+              : 0;
 
             return (
               <article
@@ -224,21 +253,35 @@ export default function RustSystemsAtlasPage() {
                     <p className="mt-4 max-w-3xl leading-7 text-gray-600 dark:text-gray-400">
                       {section.description}
                     </p>
-                    {sectionLinkAvailable && (
-                      <Link
-                        href={section.href}
-                        prefetch={false}
-                        className="text-primary-600 hover:text-primary-700 dark:text-primary-400 dark:hover:text-primary-300 mt-5 inline-block font-semibold"
-                        data-umami-event="rust-atlas-section-open"
-                        data-umami-event-section={section.slug}
-                      >
-                        Open this map &rarr;
-                      </Link>
-                    )}
+                    <div className="mt-5 flex flex-wrap gap-x-6 gap-y-2">
+                      {sectionLinkAvailable && (
+                        <Link
+                          href={section.href}
+                          prefetch={false}
+                          className="text-primary-600 hover:text-primary-700 dark:text-primary-400 dark:hover:text-primary-300 font-semibold"
+                          data-umami-event="rust-atlas-section-open"
+                          data-umami-event-section={section.slug}
+                        >
+                          Open this map &rarr;
+                        </Link>
+                      )}
+                      {failureAtlasLaunched && relatedFailureArea && relatedFailureCount > 0 && (
+                        <Link
+                          href={`/rust-failure-atlas/area/${relatedFailureArea.slug}`}
+                          prefetch={false}
+                          className="text-primary-600 hover:text-primary-700 dark:text-primary-400 dark:hover:text-primary-300 font-semibold"
+                          data-umami-event="rust-atlas-failure-family-open"
+                          data-umami-event-section={section.slug}
+                        >
+                          Related failure cases: {relatedFailureArea.label} ({relatedFailureCount})
+                          &rarr;
+                        </Link>
+                      )}
+                    </div>
                   </div>
                   <aside>
                     <p className="text-sm font-semibold text-gray-950 dark:text-gray-100">
-                      Questions this map must answer
+                      Questions this map works through
                     </p>
                     <ul className="mt-3 space-y-2 text-sm leading-6 text-gray-600 dark:text-gray-400">
                       {section.questions.map((question) => (
@@ -279,9 +322,9 @@ export default function RustSystemsAtlasPage() {
                       <p className="mt-4 text-sm leading-6 text-gray-500 dark:text-gray-400">
                         {section.slug === "diagnostic-failures" ? (
                           <>
-                            The full canonical failure collection is available in the symptom
-                            directory linked above; related investigations also appear in the
-                            article directory below.
+                            The cases above are from the part of the Failure Atlas that sits below
+                            the application layer. Every failure case is listed in the Atlas linked
+                            above; related articles are in the article directory below.
                           </>
                         ) : (
                           <>
@@ -315,8 +358,8 @@ export default function RustSystemsAtlasPage() {
             Every published Rust investigation
           </h2>
           <p className="mt-5 text-lg leading-8 text-gray-600 dark:text-gray-300">
-            These article links stay in the server-rendered document. The much larger symptom-first
-            failure collection has its own complete server directory in the Rust Failure Atlas.
+            Long-form Rust articles, grouped by map. The symptom-first failure cases have their own
+            directory in the Rust Failure Atlas.
           </p>
         </div>
 
@@ -423,7 +466,7 @@ export default function RustSystemsAtlasPage() {
                     data-umami-event="rust-atlas-claim-open"
                     data-umami-event-claim={claim.id}
                   >
-                    Read the tested explanation &rarr;
+                    Read the article &rarr;
                   </Link>
                 </li>
               );
@@ -433,7 +476,7 @@ export default function RustSystemsAtlasPage() {
 
         <div className="mt-8 rounded-lg bg-gray-50 p-6 dark:bg-gray-900">
           <p className="font-semibold text-gray-950 dark:text-gray-100">
-            Run the current deterministic claim lab
+            Run the executable claim checks
           </p>
           <code className="mt-3 block overflow-x-auto text-sm text-gray-700 dark:text-gray-300">
             npm run content:verify-rust-claims
@@ -453,7 +496,7 @@ export default function RustSystemsAtlasPage() {
       >
         <div className="max-w-4xl">
           <p className="text-primary-600 dark:text-primary-400 text-sm font-semibold tracking-[0.16em] uppercase">
-            The difficult-to-copy layer
+            Evidence
           </p>
           <h2
             id="evidence-layer"
@@ -462,9 +505,12 @@ export default function RustSystemsAtlasPage() {
             Explanations are connected to evidence
           </h2>
           <p className="mt-5 text-lg leading-8 text-gray-600 dark:text-gray-300">
-            The long-term advantage is not article volume. It is a versioned evidence layer:
-            compile-fail fixtures, Miri and concurrency cases, target builds, compiler output,
-            source locations, traces, layouts, IR, assembly, and regressions that can be rerun.
+            Failure case pages ship fixtures pinned to a toolchain, and the claim ledger above ties
+            each executable claim to a named test. Depending on the case, the evidence is compiler
+            or runtime output, a symbol table, an object header, a link map, or an AddressSanitizer
+            report. A fixture shows that the failure reproduces and that the repair passes. Whether
+            the explanation is right is still an argument, and each case page cites the primary
+            sources it rests on.
           </p>
         </div>
         <ol className="mt-8 grid gap-4 md:grid-cols-4">
@@ -486,12 +532,11 @@ export default function RustSystemsAtlasPage() {
               id="atlas-indexing"
               className="text-3xl font-bold tracking-tight text-gray-950 dark:text-gray-100"
             >
-              More than a folder of articles
+              What each failure case records
             </h2>
             <p className="mt-5 text-lg leading-8 text-gray-600 dark:text-gray-300">
-              Each canonical page is indexed across the dimensions engineers actually use while
-              debugging. This makes the same investigation reachable from an error fragment, a
-              compiler phase, a target, a release, or the kind of evidence available.
+              Every case page in the Failure Atlas records the same fields, so two cases can be
+              compared directly.
             </p>
           </div>
           <ul className="space-y-2 rounded-lg bg-gray-50 p-6 text-sm leading-6 text-gray-700 dark:bg-gray-900 dark:text-gray-300">

@@ -19,6 +19,17 @@ import {
 } from "../data/rust-failure-atlas.mjs";
 import { getRelatedRustFailureIds, rustFailureTrails } from "../data/rust-failure-trails.mjs";
 import {
+  getRustFailureFeaturedPreviewIds,
+  getRustFailureRunner,
+  getRustFailureTier,
+  isRustFailureErrorCodeCase,
+  isRustFailureSystemsCase,
+  rustFailureCuratedSystemsCases,
+  rustFailureFeaturedLayers,
+  rustFailureRunners,
+  rustFailureSystemsRunners,
+} from "../data/rust-failure-tiers.mjs";
+import {
   rustAtlasSectionForOpportunity,
   rustSystemsAtlasEditorialSections,
   rustSystemsAtlasGoal,
@@ -67,7 +78,7 @@ test("the full Atlas search payload stays behind an interaction boundary", () =>
   );
 
   assert.match(pageSource, /<RustFailureAtlasDirectory/);
-  assert.match(pageSource, /Crawlable directories by failure family/);
+  assert.match(pageSource, /Browse by failure family/);
   assert.match(pageSource, /entryCount=\{entries\.length\}/);
   assert.doesNotMatch(pageSource, /<RustFailureAtlasExplorer[^>]*\bentries=/);
   assert.doesNotMatch(pageSource, /id=\{entry\.id\.toLocaleLowerCase/);
@@ -485,4 +496,163 @@ test("the systems atlas and launched failure index are connected to discovery", 
   assert.match(caseRoute, /Continue by mechanism/);
   assert.match(caseRoute, /rust-failure-related-open/);
   assert.match(writingIndex, /href="\/rust"/);
+});
+
+test("the Atlas front page features systems cases while the reference layer stays complete", () => {
+  const evidenceById = new Map(rustFailureEvidenceCases.map((evidence) => [evidence.id, evidence]));
+  const entriesById = new Map(rustFailureAtlasEntries.map((entry) => [entry.id, entry]));
+  const layeredIds = rustFailureFeaturedLayers.flatMap((layer) => layer.caseIds);
+  const systemsRunners = new Set(rustFailureSystemsRunners);
+  const dataSelected = rustFailureEvidenceCases
+    .filter((evidence) => evidence.runner && systemsRunners.has(evidence.runner))
+    .map((evidence) => evidence.id);
+  const featured = rustFailureAtlasEntries
+    .filter((entry) => isRustFailureSystemsCase(entry.id))
+    .map((entry) => entry.id);
+
+  for (const evidence of rustFailureEvidenceCases) {
+    const runner = rustFailureRunners[evidence.runner || "rustc"];
+    assert.ok(runner, `${evidence.id} uses a runner without a description`);
+    assert.ok(runner.label.length > 8 && runner.method.length > 40);
+  }
+
+  assert.equal(new Set(layeredIds).size, layeredIds.length);
+  assert.deepEqual(new Set(layeredIds), new Set(featured));
+  for (const caseId of dataSelected) assert.ok(layeredIds.includes(caseId), caseId);
+  for (const [caseId, reason] of Object.entries(rustFailureCuratedSystemsCases)) {
+    assert.ok(layeredIds.includes(caseId), `${caseId} is curated but not shown`);
+    assert.ok(!dataSelected.includes(caseId), `${caseId} is already selected by its runner`);
+    assert.ok(reason.length > 50, `${caseId} needs a concrete reason`);
+    assert.doesNotMatch(reason, /\u2014/, `${caseId} reason uses an em dash`);
+  }
+
+  for (const caseId of layeredIds) {
+    assert.ok(entriesById.get(caseId)?.caseSlug, `${caseId} needs a case page`);
+    assert.ok(isCanonicalRustFailureCase(caseId), `${caseId} is not canonical`);
+    assert.ok(evidenceById.has(caseId), `${caseId} is featured without a fixture`);
+    assert.ok(getRustFailureRunner(caseId));
+  }
+
+  const featuredSlugs = new Set(layeredIds.map((caseId) => entriesById.get(caseId).caseSlug));
+  for (const slug of [
+    "lto-removes-ffi-symbol",
+    "linker-killed-release-build",
+    "native-dependency-built-for-host",
+    "sys-crate-wrong-native-library",
+    "incompatible-native-library-copies",
+    "ffi-memory-freed-wrong-allocator",
+    "doctest-different-cfg",
+  ]) {
+    assert.ok(featuredSlugs.has(slug), `${slug} must be featured`);
+  }
+  assert.deepEqual(getRustFailureFeaturedPreviewIds(4), [
+    "RFA-039",
+    "RFA-041",
+    "RFA-046",
+    "RFA-050",
+  ]);
+
+  const canonicalEntries = rustFailureAtlasEntries.filter((entry) =>
+    isCanonicalRustFailureCase(entry.id)
+  );
+  const reference = canonicalEntries.filter(
+    (entry) => getRustFailureTier(entry.id) === "reference"
+  );
+  assert.equal(featured.length, 27);
+  assert.equal(reference.length, canonicalEntries.length - featured.length);
+  assert.ok(reference.filter((entry) => isRustFailureErrorCodeCase(entry.id)).length > 250);
+  assert.ok(isRustFailureErrorCodeCase("RFA-031"));
+  assert.ok(!isRustFailureErrorCodeCase("RFA-039"));
+});
+
+test("pages never claim executable evidence for records without fixtures", () => {
+  const evidenceIds = new Set(rustFailureEvidenceCases.map((evidence) => evidence.id));
+  const withoutFixtures = rustFailureAtlasEntries.filter((entry) => !evidenceIds.has(entry.id));
+  const landing = readFileSync("app/(site)/rust-failure-atlas/page.tsx", "utf8");
+  const areaRoute = readFileSync("app/(site)/rust-failure-atlas/area/[area]/page.tsx", "utf8");
+  const caseRoute = readFileSync("app/(site)/rust/failures/[slug]/page.tsx", "utf8");
+  const explorer = readFileSync("components/RustFailureAtlasExplorer.tsx", "utf8");
+  const atlasLibrary = readFileSync("lib/rust-failure-atlas.ts", "utf8");
+
+  assert.deepEqual(
+    withoutFixtures.map((entry) => entry.id),
+    Array.from({ length: 28 }, (_, index) => `RFA-${String(index + 1).padStart(3, "0")}`)
+  );
+  for (const entry of withoutFixtures) {
+    assert.ok(entry.articleSlug && !entry.caseSlug, `${entry.id} must not have a case page`);
+  }
+
+  assert.match(
+    atlasLibrary,
+    /hasExecutableFixture: Boolean\(getRustFailureEvidence\(entry\.id\)\)/
+  );
+  assert.match(landing, /entries\.filter\(\(entry\) => entry\.hasExecutableFixture\)\.length/);
+  assert.doesNotMatch(landing, /rustFailureEvidenceCases/);
+  assert.doesNotMatch(landing, />\s*\d{2,}\s*</, "landing counts must come from data");
+  assert.match(areaRoute, /entry\.hasExecutableFixture/);
+  assert.match(areaRoute, /No fixture yet/);
+  assert.match(explorer, /No executable fixture exists for this record yet/);
+  assert.match(explorer, /entry\.hasExecutableFixture \? \(/);
+
+  assert.match(caseRoute, /\{executableEvidence && \(/);
+  assert.match(caseRoute, /\{!executableEvidence && \(/);
+  assert.match(caseRoute, /No executable fixture exists for this case yet/);
+  assert.match(caseRoute, /"No executable fixture yet"/);
+  const gatedBlock = caseRoute.slice(
+    caseRoute.indexOf("{executableEvidence && ("),
+    caseRoute.indexOf("{!executableEvidence && (")
+  );
+  assert.match(gatedBlock, /Download the failing fixture/);
+  assert.match(gatedBlock, /Last run \{executableEvidence\.verifiedAt\}/);
+  assert.doesNotMatch(caseRoute.replace(gatedBlock, ""), /Download the|Last run|Rechecked/);
+
+  assert.match(caseRoute, /It does not check the explanation on this page/);
+  assert.match(landing, /It does not check the written explanation/);
+  for (const source of [landing, areaRoute, caseRoute, explorer]) {
+    assert.doesNotMatch(source, /verified explanation|tested explanation|verified entry/i);
+  }
+});
+
+test("Atlas and Rust hub pages carry no campaign or production language", () => {
+  const sources = Object.fromEntries(
+    [
+      "app/(site)/rust/page.tsx",
+      "app/(site)/rust-failure-atlas/page.tsx",
+      "app/(site)/rust-failure-atlas/area/[area]/page.tsx",
+      "app/(site)/rust/failures/[slug]/page.tsx",
+      "components/RustFailureAtlasExplorer.tsx",
+    ].map((file) => [file, readFileSync(file, "utf8")])
+  );
+
+  for (const [file, source] of Object.entries(sources)) {
+    for (const phrase of [
+      /crawlable/i,
+      /server-rendered/i,
+      /canonical (pages|symptoms|case link|failure collection)/i,
+      /\bSEO\b/,
+      /difficult-to-copy/i,
+      /long-term advantage/i,
+      /article volume/i,
+      /publication (gate|queue)/i,
+      /must answer/i,
+      /rustSystemsAtlasGoal/,
+      /I help teams/,
+      /See how I work/,
+    ]) {
+      assert.doesNotMatch(source, phrase, `${file} still says ${phrase}`);
+    }
+  }
+
+  const caseRoute = sources["app/(site)/rust/failures/[slug]/page.tsx"];
+  assert.match(caseRoute, /More from the Rust Failure Atlas/);
+  assert.match(caseRoute, /href="\/rust-failure-atlas"/);
+  assert.match(caseRoute, /href="\/work"/);
+  assert.match(
+    caseRoute,
+    /`\/rust-failure-atlas\/area\/\$\{encodeURIComponent\(failure\.area\)\}`/
+  );
+
+  const hub = sources["app/(site)/rust/page.tsx"];
+  assert.match(hub, /getRustFailureFeaturedPreviewIds\(4\)/);
+  assert.doesNotMatch(hub, /\/ \{/);
 });
