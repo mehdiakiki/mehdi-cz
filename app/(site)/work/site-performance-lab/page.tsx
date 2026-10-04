@@ -17,6 +17,9 @@ export const metadata = genPageMetadata({
     "More than fifty performance experiments on this site: what changed, what was rejected even when a headline metric improved, what was found in Next.js and Chrome DevTools, and why I stopped.",
 });
 
+const evidenceLinkClass =
+  "text-primary-700 hover:text-primary-800 dark:text-primary-400 dark:hover:text-primary-300 underline-offset-2 hover:underline";
+
 const outcomeLabels: Record<LabOutcome, string> = {
   kept: "Kept",
   rejected: "Rejected",
@@ -61,7 +64,7 @@ function Evidence({ evidence }: { evidence: LabEvidence }) {
       {evidence.folders.map((folder, index) => (
         <span key={folder}>
           {index > 0 && ", "}
-          <Link href={`${experimentsBaseUrl}/${folder}`}>
+          <Link href={`${experimentsBaseUrl}/${folder}`} className={evidenceLinkClass}>
             <code>{folder}</code>
           </Link>
         </span>
@@ -257,7 +260,12 @@ export default function SitePerformanceLab() {
                   <div className="font-semibold text-gray-950 dark:text-gray-100">{entry.idea}</div>
                   <div className="mt-1 text-gray-500 dark:text-gray-400">
                     {entry.folder ? (
-                      <Link href={`${experimentsBaseUrl}/${entry.folder}`}>{entry.perf}</Link>
+                      <Link
+                        href={`${experimentsBaseUrl}/${entry.folder}`}
+                        className={evidenceLinkClass}
+                      >
+                        {entry.perf}
+                      </Link>
                     ) : (
                       entry.perf
                     )}
@@ -308,7 +316,13 @@ export default function SitePerformanceLab() {
                 className="border-b border-gray-200 align-top dark:border-gray-800"
               >
                 <td className="py-3 pr-4 font-semibold text-gray-950 dark:text-gray-100">
-                  {entry.href ? <Link href={entry.href}>{entry.item}</Link> : entry.item}
+                  {entry.href ? (
+                    <Link href={entry.href} className={evidenceLinkClass}>
+                      {entry.item}
+                    </Link>
+                  ) : (
+                    entry.item
+                  )}
                 </td>
                 <td className="py-3 pr-4 text-gray-700 dark:text-gray-300">{entry.layer}</td>
                 <td className="py-3 pr-4 text-gray-700 dark:text-gray-300">{entry.role}</td>
