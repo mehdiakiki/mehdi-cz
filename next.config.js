@@ -153,6 +153,16 @@ module.exports = () => {
       unoptimized,
     },
 
+    async redirects() {
+      return [
+        {
+          source: "/blog/ai-engineer-title-means-everything-nothing",
+          destination: "/blog/what-is-an-ai-engineer-really",
+          permanent: true,
+        },
+      ];
+    },
+
     async headers() {
       return [
         {
