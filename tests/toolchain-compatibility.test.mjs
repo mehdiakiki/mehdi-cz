@@ -12,17 +12,14 @@ import {
 import { remarkPromoteFirstContentImage } from "../lib/remark-promote-first-content-image.mjs";
 
 const mdxComponentsPath = new URL("../components/MDXComponents.tsx", import.meta.url);
-const codePlaygroundPath = new URL("../components/CodePlayground.tsx", import.meta.url);
 const sharedLinkPath = new URL("../components/Link.tsx", import.meta.url);
 const intentLinkPath = new URL("../components/IntentLink.tsx", import.meta.url);
-const fullEditorPath = new URL("../components/FullEditor.tsx", import.meta.url);
 const nextConfigPath = new URL("../next.config.js", import.meta.url);
 const footerPath = new URL("../components/Footer.tsx", import.meta.url);
 const footerNavigationPath = new URL("../components/FooterNavigation.tsx", import.meta.url);
 const deferredNewsletterPath = new URL("../components/DeferredNewsletterForm.tsx", import.meta.url);
 const rootLayoutPath = new URL("../app/layout.tsx", import.meta.url);
 const siteLayoutPath = new URL("../app/(site)/layout.tsx", import.meta.url);
-const editorPagePath = new URL("../app/editor/page.tsx", import.meta.url);
 const navigationIntentLinkPath = new URL("../components/NavigationIntentLink.tsx", import.meta.url);
 const tagPath = new URL("../components/Tag.tsx", import.meta.url);
 const writingIndexIntentLinkPath = new URL(
@@ -111,14 +108,9 @@ test("Pliny subpaths resolve to real modules with modern package exports", async
 });
 
 test("Prism cannot rewrite server-highlighted MDX before hydration", async () => {
-  const [mdxComponents, codePlayground] = await Promise.all([
-    readFile(mdxComponentsPath, "utf8"),
-    readFile(codePlaygroundPath, "utf8"),
-  ]);
+  const mdxComponents = await readFile(mdxComponentsPath, "utf8");
 
-  assert.match(mdxComponents, /from "\.\/ClientOnlyCodePlayground"/);
-  assert.doesNotMatch(mdxComponents, /from "\.\/CodePlayground"/);
-  assert.match(codePlayground, /Prism\.manual = true/);
+  assert.doesNotMatch(mdxComponents, /CodePlayground|prismjs/);
 });
 
 test("fixed avatars use Next Image's compact candidate path without preload", async () => {
@@ -283,20 +275,6 @@ test("article tag links defer dynamic-route prefetch until visitor intent", asyn
   assert.doesNotMatch(tag, /from "next\/link"/);
 });
 
-test("Monaco stays on the installed version and same-origin workers", async () => {
-  const [fullEditor, nextConfig] = await Promise.all([
-    readFile(fullEditorPath, "utf8"),
-    readFile(nextConfigPath, "utf8"),
-  ]);
-
-  assert.match(fullEditor, /import \* as monaco from "monaco-editor"/);
-  assert.match(fullEditor, /loader\.config\(\{ monaco \}\)/);
-  assert.match(fullEditor, /monaco-editor\/language\/typescript\/ts\.worker\.js/);
-  assert.match(fullEditor, /monaco-editor\/editor\/editor\.worker\.js/);
-  assert.match(nextConfig, /worker-src 'self' blob:/);
-  assert.doesNotMatch(nextConfig, /cdn\.jsdelivr\.net/);
-});
-
 test("the global newsletter form waits until the footer is near", async () => {
   const [footer, deferredNewsletter] = await Promise.all([
     readFile(footerPath, "utf8"),
@@ -342,7 +320,6 @@ test("route-specific client boundaries do not leak site chrome or article chunks
       readFile(navigationIntentLinkPath, "utf8"),
       readFile(writingIndexIntentLinkPath, "utf8"),
       readFile(writingIndexPath, "utf8"),
-      access(editorPagePath),
     ]);
 
   assert.doesNotMatch(rootLayout, /<Header|<Footer|<DeferredSearchProvider/);

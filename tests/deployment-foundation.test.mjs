@@ -35,11 +35,7 @@ test("production deployments are serialized and identify an immutable image", as
   );
   assert.match(workflow, /docker pull "\$DEPLOY_IMAGE"/);
   assert.match(workflow, /--wait --wait-timeout 120/);
-  assert.match(workflow, /docker compose config --services \| grep -Fxq code-playground/);
-  assert.match(
-    workflow,
-    /docker inspect --format '\{\{\.State\.Health\.Status\}\}' code-playground/
-  );
+  assert.doesNotMatch(workflow, /code-playground/);
   assert.match(compose, /image: mast2133\/mehdicz-site:latest/);
 });
 
@@ -129,21 +125,12 @@ test("production TypeScript gate excludes intentionally invalid research fixture
   assert.ok(tsconfig.include.includes("app") || tsconfig.include.includes("**/*.tsx"));
 });
 
-test("playground requires a secret and the backend validates the versioned HMAC", async () => {
-  const [compose, proxy, security] = await Promise.all([
-    readFile(composePath, "utf8"),
-    readFile(new URL("../app/api/playground/execute/route.ts", import.meta.url), "utf8"),
-    readFile(
-      new URL("../js_go_rust_playground/code-playground/src/security.rs", import.meta.url),
-      "utf8"
-    ),
-  ]);
+test("the code playground and its backend service are gone", async () => {
+  const compose = await readFile(composePath, "utf8");
 
-  assert.match(compose, /PLAYGROUND_SECRET=\$\{PLAYGROUND_SECRET:\?/);
-  assert.match(proxy, /createHmac\("sha256", secret\)/);
-  assert.match(proxy, /"X-Playground-Signature-V2": signature/);
-  assert.match(security, /\.get\("x-playground-signature-v2"\)/);
-  assert.doesNotMatch(security, /\.get\("x-playground-signature"\)/);
+  assert.doesNotMatch(compose, /code-playground|PLAYGROUND_/);
+  await assert.rejects(access(new URL("../app/api/playground", import.meta.url)));
+  await assert.rejects(access(new URL("../js_go_rust_playground", import.meta.url)));
 });
 
 test("the analytics script asks Umami for Web Vitals and still loads after the page", async () => {

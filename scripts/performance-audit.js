@@ -20,8 +20,6 @@ const tailwindCss = read("css/tailwind.css");
 const prismCss = read("css/prism.css");
 const nextConfig = read("next.config.js");
 const mdxComponents = read("components/MDXComponents.tsx");
-const codePlayground = read("components/CodePlayground.tsx");
-const fullEditor = read("components/FullEditor.tsx");
 const footer = read("components/Footer.tsx");
 const footerNavigation = read("components/FooterNavigation.tsx");
 const deferredNewsletter = read("components/DeferredNewsletterForm.tsx");
@@ -186,13 +184,6 @@ const checks = [
     pass: packageJson.scripts?.build?.includes("next build --webpack"),
   },
   {
-    name: "The playground and Prism stay off ordinary MDX article startup paths",
-    pass:
-      mdxComponents.includes('from "./ClientOnlyCodePlayground"') &&
-      !mdxComponents.includes('from "./CodePlayground"') &&
-      codePlayground.includes("Prism.manual = true"),
-  },
-  {
     name: "Shared internal links prefetch on intent instead of viewport entry",
     pass:
       sharedLink.includes('import IntentLink from "./IntentLink"') &&
@@ -200,16 +191,6 @@ const checks = [
       intentLink.includes('import Link from "next/link"') &&
       intentLink.includes("prefetch={false}") &&
       intentLink.includes("router.prefetch(href)"),
-  },
-  {
-    name: "Monaco uses the installed ESM build and same-origin workers",
-    pass:
-      fullEditor.includes('import * as monaco from "monaco-editor"') &&
-      fullEditor.includes("loader.config({ monaco })") &&
-      fullEditor.includes('new URL("monaco-editor/language/typescript/ts.worker.js"') &&
-      fullEditor.includes('new URL("monaco-editor/editor/editor.worker.js"') &&
-      nextConfig.includes("worker-src 'self' blob:") &&
-      !nextConfig.includes("cdn.jsdelivr.net"),
   },
   {
     name: "The global newsletter form loads only near the footer",
@@ -246,7 +227,6 @@ const checks = [
     pass:
       prismCss.includes("color: rgb(148, 163, 163)") &&
       !prismCss.includes("color: rgb(99, 119, 119)") &&
-      codePlayground.includes("color:#94a3a3") &&
       tailwindConfig.includes('color: theme("colors.indigo.400")') &&
       tag.includes("min-h-6 min-w-6") &&
       authorLayout.includes('<h2 className="pt-4 pb-2') &&
@@ -291,8 +271,6 @@ const checks = [
   {
     name: "Route-specific chrome and writing links stay out of unrelated client chunks",
     pass:
-      existsSync(path.join(repositoryRoot, "app/editor/page.tsx")) &&
-      !existsSync(path.join(repositoryRoot, "app/(site)/editor/page.tsx")) &&
       !layout.includes("<Header") &&
       !layout.includes("<Footer") &&
       !layout.includes("<DeferredSearchProvider") &&

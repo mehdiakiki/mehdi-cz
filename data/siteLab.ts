@@ -93,7 +93,7 @@ export const labInvestigations: LabInvestigation[] = [
     perf: "PERF-019",
     outcomes: ["rejected"],
     result:
-      "Three curated Monaco builds, about 21% smaller than the CDN version, became usable later than the full local build. Evaluation and grammar setup, not bytes, decided the ready time. The full local build was kept.",
+      "Three curated Monaco builds, about 21% smaller than the CDN version, became usable later than the full local build. Evaluation and grammar setup, not bytes, decided the ready time. The full local build was kept until the editor was removed from the site in October 2026.",
     conclusion:
       "Bytes are a proxy. When the proxy and the user-visible milestone disagree, trust the milestone.",
     evidence: { kind: "historical" },

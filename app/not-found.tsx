@@ -11,7 +11,6 @@ export default function NotFound() {
           This page does not exist.
         </p>
         <p className="mb-8">It may have moved. The homepage links to the work and the writing.</p>
-        {/* A global 404 already crossed a document boundary; Next Link leaked the home chunk into /editor. */}
         {/* eslint-disable-next-line @next/next/no-html-link-for-pages */}
         <a
           href="/"

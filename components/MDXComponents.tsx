@@ -5,7 +5,6 @@ import type { ComponentProps } from "react";
 import Image from "./Image";
 import CustomLink from "./Link";
 import TableWrapper from "./TableWrapper";
-import CodePlayground from "./ClientOnlyCodePlayground";
 import Pre from "./Pre";
 
 // Custom image component for MDX with optimizations
@@ -45,5 +44,4 @@ export const components: MDXComponents = {
   pre: Pre,
   table: TableWrapper,
   BlogNewsletterForm: AccessibleBlogNewsletterForm,
-  CodePlayground,
 };
