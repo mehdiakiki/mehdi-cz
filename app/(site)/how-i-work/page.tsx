@@ -48,7 +48,7 @@ const evidence = [
   {
     title: "Hands-on systems depth",
     description:
-      "Financial and healthcare systems, ten merged Rust compiler changes, contributions to Deno and rust-analyzer, and the Bitarena crate demonstrate the underlying engineering range.",
+      "Financial and healthcare systems, ten merged pull requests to rust-lang/rust, contributions to Deno and rust-analyzer, and the Bitarena crate show the underlying engineering range.",
     href: "/open-source",
     linkLabel: "Open-source evidence",
   },

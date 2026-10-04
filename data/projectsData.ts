@@ -21,7 +21,7 @@ export const projectsData: Project[] = [
     title: "Rust Programming Language",
     subtitle: "Open Source Contributor",
     description:
-      "Contributed ten merged changes to the Rust compiler across linker and crate metadata, language behavior, parser checks, diagnostics, and compiler tooling.",
+      "Contributed ten merged pull requests to rust-lang/rust: linker and crate metadata, a coherence crash fix, attribute parsing, profiling output, a core library message, and documentation tooling.",
     imgSrc: "/static/images/rust.png",
     href: "https://github.com/rust-lang/rust",
     type: "opensource",

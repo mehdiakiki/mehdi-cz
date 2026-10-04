@@ -29,7 +29,7 @@ export default function MonitorMeCaseStudy() {
 
       <h2>Owning the system end to end</h2>
       <p>
-        I designed the product across telemetry ingestion, backend services, trace and metric
+        I designed the product across telemetry ingestion, backend services, trace and event
         storage, a real-time dashboard, and browser session replay. That scope required the data
         path and the product experience to evolve together: what the interface can explain depends
         on what the instrumentation captures and how the backend models it.

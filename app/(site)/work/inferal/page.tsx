@@ -29,7 +29,7 @@ export default function InferalCaseStudy() {
 
       <h2>The engine</h2>
       <p>
-        I worked on Inferal's core engine: the part of the product responsible for turning its data
+        I work on Inferal's core engine: the part of the product responsible for turning its data
         and behavior model into running software. The detailed implementation remains proprietary;
         the relevant scope is that this was foundational product work rather than an isolated
         application feature.
@@ -37,7 +37,7 @@ export default function InferalCaseStudy() {
 
       <h2>The ontology system</h2>
       <p>
-        I also worked on the ontologies used to give connected data an explicit, shared model. That
+        I also work on the ontologies used to give connected data an explicit, shared model. That
         work sits at the boundary between external schemas, internal meaning, validation, and what
         the engine can safely infer or act upon.
       </p>

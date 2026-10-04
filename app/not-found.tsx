@@ -8,9 +8,9 @@ export default function NotFound() {
       </div>
       <div className="max-w-md">
         <p className="mb-4 text-xl leading-normal font-bold md:text-2xl">
-          Sorry we couldn't find this page.
+          This page does not exist.
         </p>
-        <p className="mb-8">But dont worry, you can find plenty of other things on our homepage.</p>
+        <p className="mb-8">It may have moved. The homepage links to the work and the writing.</p>
         {/* A global 404 already crossed a document boundary; Next Link leaked the home chunk into /editor. */}
         {/* eslint-disable-next-line @next/next/no-html-link-for-pages */}
         <a

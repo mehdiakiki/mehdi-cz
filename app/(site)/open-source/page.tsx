@@ -11,7 +11,7 @@ import { genPageMetadata } from "app/seo";
 export const metadata = genPageMetadata({
   title: "Open Source",
   description:
-    "Verified open-source work by Mehdi Akiki across the Rust compiler, Deno, rust-analyzer, and the Bitarena crate.",
+    "Merged open-source work by Mehdi Akiki in rust-lang/rust, Deno and rust-analyzer, and the Bitarena crate, with the problem behind each change.",
 });
 
 function ContributionList({ contributions }: { contributions: Contribution[] }) {
@@ -22,12 +22,17 @@ function ContributionList({ contributions }: { contributions: Contribution[] }) 
           key={contribution.href}
           className="grid gap-2 py-4 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-baseline sm:gap-6"
         >
-          <Link
-            href={contribution.href}
-            className="hover:text-primary-600 dark:hover:text-primary-400 font-medium text-gray-900 dark:text-gray-100"
-          >
-            {contribution.title} <span className="text-gray-400">#{contribution.number}</span>
-          </Link>
+          <div>
+            <Link
+              href={contribution.href}
+              className="hover:text-primary-600 dark:hover:text-primary-400 font-medium text-gray-900 dark:text-gray-100"
+            >
+              {contribution.title} <span className="text-gray-400">#{contribution.number}</span>
+            </Link>
+            <p className="mt-1 leading-7 text-gray-600 dark:text-gray-400">
+              {contribution.problem}
+            </p>
+          </div>
           <time
             dateTime={contribution.merged}
             className="text-sm text-gray-500 tabular-nums dark:text-gray-400"
@@ -51,12 +56,12 @@ export default function OpenSource() {
           Open source
         </h1>
         <p className="mt-6 max-w-3xl text-xl leading-9 text-gray-600 dark:text-gray-300">
-          Work across arena design, compiler metadata and linking, language semantics, editor
-          tooling, and web-runtime behavior—built under real constraints for correctness,
-          compatibility, performance, and review.
+          Merged changes in rust-lang/rust, Deno and rust-analyzer, and an original Rust crate. Each
+          change is listed with the problem it solved, so the scope is clear before you open the
+          pull request.
         </p>
         <p className="mt-4 text-sm text-gray-500 dark:text-gray-400">
-          Contribution counts and merge status verified against GitHub on September 3, 2026.
+          Contribution counts and merge status verified against GitHub on October 4, 2026.
         </p>
       </header>
 
@@ -106,12 +111,19 @@ export default function OpenSource() {
             id="rust-compiler"
             className="mt-2 text-3xl font-bold text-gray-950 dark:text-gray-100"
           >
-            Rust compiler
+            rust-lang/rust
           </h2>
           <p className="mt-4 text-lg leading-8 text-gray-600 dark:text-gray-400">
-            The work ranges from linker and crate metadata to language behavior, parser checks,
-            diagnostics, and compiler tooling. The individual changes are listed with merge dates so
-            their scope and review history can be inspected directly.
+            Eight are compiler changes, one is in the core library, and one is documentation tooling
+            that reads the compiler&apos;s option definitions. The linking and metadata series is
+            the deepest of them, and it has{" "}
+            <Link
+              href="/work/rustc-late-metadata"
+              className="text-primary-600 hover:text-primary-700 dark:text-primary-400 dark:hover:text-primary-300 font-medium"
+            >
+              its own case study
+            </Link>
+            .
           </p>
         </div>
 
@@ -124,7 +136,7 @@ export default function OpenSource() {
           </div>
           <div>
             <h3 className="mb-4 text-xl font-bold text-gray-950 dark:text-gray-100">
-              Language behavior, parsing, and tooling
+              Front-end fixes, library, and tooling
             </h3>
             <ContributionList contributions={rustLanguageAndToolingContributions} />
           </div>
@@ -161,9 +173,8 @@ export default function OpenSource() {
 
       <section className="border-t border-gray-200 py-12 dark:border-gray-800">
         <p className="max-w-3xl text-lg leading-8 text-gray-700 dark:text-gray-300">
-          Across these contributions, the work is consistent: understand the surrounding system,
-          work within its constraints, incorporate maintainer review, and deliver a change the
-          project can support over time.
+          Most of these are small. The linking and metadata series is not: it changed the format of
+          a compiler artifact and went through several rounds of review.
         </p>
         <Link
           href="/work"

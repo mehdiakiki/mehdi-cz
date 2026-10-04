@@ -46,7 +46,7 @@ export function PersonJsonLd() {
     name: siteMetadata.author,
     url: siteMetadata.siteUrl,
     sameAs: [siteMetadata.github, siteMetadata.linkedin, siteMetadata.x].filter(Boolean),
-    jobTitle: "Backend and Systems Engineer",
+    jobTitle: "Software Engineer",
     description:
       "Mehdi Akiki builds startup products, financial systems, distributed infrastructure, developer tooling, and open-source systems.",
     image: `${siteMetadata.siteUrl}${siteMetadata.authorImage}`,

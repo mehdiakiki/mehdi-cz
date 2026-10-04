@@ -43,9 +43,11 @@ export default function BitarenaCaseStudy() {
       <h2>Correctness is part of the data structure</h2>
       <p>
         The repository documents the invariants instead of leaving them implicit. Unit tests cover
-        expected behavior, property tests compare operations against an oracle, and Miri exercises
-        the implementation for undefined behavior. The crate supports <code>no_std</code> with
-        <code>alloc</code>, with optional Serde and Rayon integrations.
+        expected behavior, and Miri runs in CI to catch undefined behavior in the unsafe code. There
+        is also a property-test oracle that compares operations against a simple model, but today
+        the main oracle runs a single case per test (the parallel oracle runs 128), so I do not
+        count it as strong evidence yet. Expanding it is the next step. The crate supports{" "}
+        <code>no_std</code> with <code>alloc</code>, with optional Serde and Rayon integrations.
       </p>
 
       <h2>Performance without universal claims</h2>
@@ -56,7 +58,7 @@ export default function BitarenaCaseStudy() {
         workload and measurement setup.
       </p>
 
-      <h2>Where it fits—and where it does not</h2>
+      <h2>Where it fits, and where it does not</h2>
       <p>
         Bitarena is designed for long-lived tables that accumulate holes and are swept repeatedly. A
         dense packed representation remains a better fit when iteration dominates, mutations are
