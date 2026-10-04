@@ -565,6 +565,12 @@ test("the Atlas front page features systems cases while the reference layer stay
   assert.ok(!isRustFailureErrorCodeCase("RFA-039"));
 });
 
+test("Atlas records never point readers at an unpublished article", () => {
+  const atlasLibrary = readFileSync("lib/rust-failure-atlas.ts", "utf8");
+
+  assert.match(atlasLibrary, /if \(destination && !destinationAvailable\) return \[\];/);
+});
+
 test("pages never claim executable evidence for records without fixtures", () => {
   const evidenceIds = new Set(rustFailureEvidenceCases.map((evidence) => evidence.id));
   const withoutFixtures = rustFailureAtlasEntries.filter((entry) => !evidenceIds.has(entry.id));

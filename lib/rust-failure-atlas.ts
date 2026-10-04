@@ -36,6 +36,7 @@ export function getVisibleRustFailureEntries(): RustFailureExplorerEntry[] {
         : failure
           ? visibleCaseSlugs.has(failure.slug)
           : false;
+      if (destination && !destinationAvailable) return [];
 
       return [
         {
