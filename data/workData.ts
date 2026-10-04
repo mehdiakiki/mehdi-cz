@@ -32,11 +32,11 @@ export const deepWork: WorkItem[] = [
     title: "Changing what goes inside a Rust rlib",
     context: "rust-lang/rust · 4 merged pull requests, 1 open",
     problem:
-      "rustc decided which rlib archive members were Rust object files by looking at their names, and link-only data such as bundled native library filenames was stored with the early crate metadata.",
+      "rustc decided which rlib archive members were Rust object files from their names, which a bundled native library can imitate, and link-only data such as bundled native library filenames was stored with the early crate metadata.",
     depth:
       "The compiler backend and the metadata format: the archive writer and reader, the LTO paths of the LLVM and GCC backends, native library handling, and object file sections on different platforms.",
     decision:
-      "Added a late lib.rmeta-link archive member read only at link time, moved native library filenames into it with a metadata version bump, added a decode-once cache, and kept a fallback for rlibs from older compilers.",
+      "Added a lib.rmeta-link archive member that only the linking code reads, deleted the filename heuristic, moved native library filenames into the member, and added a cache so each member is decoded once per link. Review reshaped most of the first design.",
     evidence: [
       { label: "Read the case study", href: "/work/rustc-late-metadata" },
       { label: "Tracking issue #138243", href: "https://github.com/rust-lang/rust/issues/138243" },

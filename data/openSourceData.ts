@@ -12,7 +12,7 @@ export const rustLinkingContributions: Contribution[] = [
     number: 154861,
     title: "Add rlib digest to identify Rust object files",
     problem:
-      "During LTO, rustc decided which rlib members were Rust object files from their file names. The archive now lists them in a late metadata member, with a fallback for rlibs from older compilers.",
+      "During LTO, rustc decided which rlib members were Rust object files from their file names, which a bundled native library can imitate. The archive now lists them in a link-time metadata member, and the heuristic is gone.",
     href: "https://github.com/rust-lang/rust/pull/154861",
     merged: "2026-05-05",
   },
@@ -20,7 +20,7 @@ export const rustLinkingContributions: Contribution[] = [
     number: 156735,
     title: "Move NativeLib filename metadata into the rmeta-link archive member",
     problem:
-      "Bundled native library filenames are only needed at link time but were decoded with the crate metadata. They moved into the late member, which changed the metadata format from version 10 to 11.",
+      "Bundled native library filenames are only needed at link time but were decoded with the crate metadata. They moved into the link-time member, and only the linking code reads them.",
     href: "https://github.com/rust-lang/rust/pull/156735",
     merged: "2026-07-11",
   },
