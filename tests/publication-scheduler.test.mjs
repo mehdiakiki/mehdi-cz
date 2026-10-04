@@ -194,7 +194,10 @@ test("paused upgrade deadlines are not reported overdue", () => {
     { upgradeDeadlinesPaused: true }
   );
 
-  assert.equal(overdue.find((entry) => entry.id === "DATA-004"), undefined);
+  assert.equal(
+    overdue.find((entry) => entry.id === "DATA-004"),
+    undefined
+  );
 });
 
 test("a held article's passed slot is paused, not overdue", () => {
@@ -204,5 +207,8 @@ test("a held article's passed slot is paused, not overdue", () => {
     upgradeDeadlinesPaused: true,
   });
 
-  assert.equal(overdue.find((item) => item.id === entry.id), undefined);
+  assert.equal(
+    overdue.find((item) => item.id === entry.id),
+    undefined
+  );
 });

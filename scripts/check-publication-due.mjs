@@ -6,10 +6,7 @@ import { authorityUpgradeBaselines } from "../data/authority-upgrade-baselines.m
 import { articleReviewHash, hasValidReviewHash } from "../lib/content-review.mjs";
 import { publicationStatus } from "../lib/publication.mjs";
 import { authorityCalendar } from "../lib/authority-schedule.mjs";
-import {
-  campaignUpgradeDeadlinesPaused,
-  heldArticleSlugs,
-} from "../data/publication-hold.mjs";
+import { campaignUpgradeDeadlinesPaused, heldArticleSlugs } from "../data/publication-hold.mjs";
 
 function unquote(value) {
   const trimmed = value.trim();
@@ -124,6 +121,11 @@ export function missingDuePublications(posts, liveSitemap, now = new Date()) {
   );
 }
 
+/**
+ * Return campaign actions whose slot has passed and whose work is incomplete.
+ * Slots of held articles, and upgrade slots while upgrade deadlines are paused,
+ * are never returned.
+ */
 export function overdueAuthorityActions(
   posts,
   now = new Date(),
@@ -131,27 +133,43 @@ export function overdueAuthorityActions(
 ) {
   const postsBySlug = new Map(posts.map((post) => [post.slug, post]));
 
-  return authorityCalendar
-    .filter((entry) => new Date(entry.scheduledFor).getTime() <= now.getTime())
-    // Paused work is not overdue: a held article, or an upgrade slot while the
-    // campaign's upgrade deadlines are paused.
-    .filter((entry) => !held.has(entry.slug))
-    .filter((entry) => !(upgradeDeadlinesPaused && entry.action !== "publish"))
-    .flatMap((entry) => {
-      const post = postsBySlug.get(entry.slug);
-      const base = {
-        id: entry.id,
-        action: entry.action,
-        slug: entry.slug,
-        scheduledFor: entry.scheduledFor,
-      };
+  return (
+    authorityCalendar
+      .filter((entry) => new Date(entry.scheduledFor).getTime() <= now.getTime())
+      .filter((entry) => !held.has(entry.slug))
+      .filter((entry) => !(upgradeDeadlinesPaused && entry.action !== "publish"))
+      .flatMap((entry) => {
+        const post = postsBySlug.get(entry.slug);
+        const base = {
+          id: entry.id,
+          action: entry.action,
+          slug: entry.slug,
+          scheduledFor: entry.scheduledFor,
+        };
 
-      if (!post) return [{ ...base, reason: "source file is missing" }];
+        if (!post) return [{ ...base, reason: "source file is missing" }];
 
-      if (entry.action === "publish") {
-        const status = publicationStatus(post, now);
-        if (status !== "published") {
-          return [{ ...base, reason: `article is ${status}` }];
+        if (entry.action === "publish") {
+          const status = publicationStatus(post, now);
+          if (status !== "published") {
+            return [{ ...base, reason: `article is ${status}` }];
+          }
+          if (
+            post.campaign !== "authority-2026" ||
+            post.opportunity !== entry.id ||
+            entry.validation !== "validated" ||
+            entry.publishDecision !== "approved" ||
+            !hasValidReviewHash(post)
+          ) {
+            return [{ ...base, reason: "article is not fully validated and review-bound" }];
+          }
+          return [];
+        }
+
+        const baselineHash = authorityUpgradeBaselines[entry.id];
+        if (!baselineHash) return [{ ...base, reason: "upgrade baseline is missing" }];
+        if (post.sourceHash === baselineHash) {
+          return [{ ...base, reason: "upgrade has not changed from its baseline" }];
         }
         if (
           post.campaign !== "authority-2026" ||
@@ -160,28 +178,12 @@ export function overdueAuthorityActions(
           entry.publishDecision !== "approved" ||
           !hasValidReviewHash(post)
         ) {
-          return [{ ...base, reason: "article is not fully validated and review-bound" }];
+          return [{ ...base, reason: "upgrade revision is not fully validated and review-bound" }];
         }
+
         return [];
-      }
-
-      const baselineHash = authorityUpgradeBaselines[entry.id];
-      if (!baselineHash) return [{ ...base, reason: "upgrade baseline is missing" }];
-      if (post.sourceHash === baselineHash) {
-        return [{ ...base, reason: "upgrade has not changed from its baseline" }];
-      }
-      if (
-        post.campaign !== "authority-2026" ||
-        post.opportunity !== entry.id ||
-        entry.validation !== "validated" ||
-        entry.publishDecision !== "approved" ||
-        !hasValidReviewHash(post)
-      ) {
-        return [{ ...base, reason: "upgrade revision is not fully validated and review-bound" }];
-      }
-
-      return [];
-    });
+      })
+  );
 }
 
 export async function checkLivePublications({
