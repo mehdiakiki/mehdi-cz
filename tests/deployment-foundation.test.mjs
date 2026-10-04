@@ -145,3 +145,10 @@ test("playground requires a secret and the backend validates the versioned HMAC"
   assert.match(security, /\.get\("x-playground-signature-v2"\)/);
   assert.doesNotMatch(security, /\.get\("x-playground-signature"\)/);
 });
+
+test("the analytics script asks Umami for Web Vitals and still loads after the page", async () => {
+  const rootDocument = await readFile(new URL("../app/root-document.tsx", import.meta.url), "utf8");
+
+  assert.match(rootDocument, /data-performance="true"/);
+  assert.match(rootDocument, /strategy="lazyOnload"/);
+});

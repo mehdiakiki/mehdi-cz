@@ -110,7 +110,12 @@ export default function RootDocument({ children }: { children: React.ReactNode }
       </head>
       <body className="bg-white pl-[calc(100vw-100%)] text-black antialiased dark:bg-gray-950 dark:text-white">
         {umami?.umamiWebsiteId ? (
-          <Script src={umami.src} data-website-id={umami.umamiWebsiteId} strategy="lazyOnload" />
+          <Script
+            src={umami.src}
+            data-website-id={umami.umamiWebsiteId}
+            data-performance="true"
+            strategy="lazyOnload"
+          />
         ) : null}
         {children}
       </body>
