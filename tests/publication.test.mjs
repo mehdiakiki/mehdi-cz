@@ -1,14 +1,24 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { heldArticleSlugs } from "../data/publication-hold.mjs";
 import {
   filterPublishedPosts,
   filterVisiblePosts,
+  isPostPublished,
   publicationDate,
   publicationStatus,
 } from "../lib/publication.mjs";
 
 const now = new Date("2026-09-03T12:00:00Z");
+
+test("a held article never publishes, even after its date passes", () => {
+  const [slug] = heldArticleSlugs;
+  const post = { slug, date: "2026-01-01T00:00:00Z", draft: false, reviewed: true };
+
+  assert.equal(publicationStatus(post, new Date("2027-01-01T00:00:00Z")), "held");
+  assert.equal(isPostPublished(post, new Date("2027-01-01T00:00:00Z")), false);
+});
 
 test("drafts never publish automatically", () => {
   const post = { date: "2026-09-01T09:00:00Z", draft: true };

@@ -6,6 +6,10 @@ import { authorityUpgradeBaselines } from "../data/authority-upgrade-baselines.m
 import { articleReviewHash, hasValidReviewHash } from "../lib/content-review.mjs";
 import { publicationStatus } from "../lib/publication.mjs";
 import { authorityCalendar } from "../lib/authority-schedule.mjs";
+import {
+  campaignUpgradeDeadlinesPaused,
+  heldArticleSlugs,
+} from "../data/publication-hold.mjs";
 
 function unquote(value) {
   const trimmed = value.trim();
@@ -120,11 +124,19 @@ export function missingDuePublications(posts, liveSitemap, now = new Date()) {
   );
 }
 
-export function overdueAuthorityActions(posts, now = new Date()) {
+export function overdueAuthorityActions(
+  posts,
+  now = new Date(),
+  { held = heldArticleSlugs, upgradeDeadlinesPaused = campaignUpgradeDeadlinesPaused } = {}
+) {
   const postsBySlug = new Map(posts.map((post) => [post.slug, post]));
 
   return authorityCalendar
     .filter((entry) => new Date(entry.scheduledFor).getTime() <= now.getTime())
+    // Paused work is not overdue: a held article, or an upgrade slot while the
+    // campaign's upgrade deadlines are paused.
+    .filter((entry) => !held.has(entry.slug))
+    .filter((entry) => !(upgradeDeadlinesPaused && entry.action !== "publish"))
     .flatMap((entry) => {
       const post = postsBySlug.get(entry.slug);
       const base = {
@@ -228,7 +240,7 @@ async function main() {
   const overdue = overdueAuthorityActions(posts, now);
 
   if (process.argv.includes("--status")) {
-    const counts = { published: 0, scheduled: 0, draft: 0, unapproved: 0, invalid: 0 };
+    const counts = { published: 0, scheduled: 0, held: 0, draft: 0, unapproved: 0, invalid: 0 };
     for (const post of posts) {
       counts[publicationStatus(post, now)] += 1;
     }

@@ -1,12 +1,19 @@
 export type Publishable = {
   date: string;
+  slug?: string | null;
   draft?: boolean | null;
   reviewed?: boolean | null;
   campaign?: string | null;
   opportunity?: string | null;
 };
 
-export type PublicationStatus = "draft" | "unapproved" | "invalid" | "published" | "scheduled";
+export type PublicationStatus =
+  | "draft"
+  | "held"
+  | "unapproved"
+  | "invalid"
+  | "published"
+  | "scheduled";
 
 export function publicationDate(post: Publishable): Date | null;
 export function publicationStatus(post: Publishable, now?: Date): PublicationStatus;

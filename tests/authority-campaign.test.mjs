@@ -105,14 +105,14 @@ test("a reviewed campaign article still needs an exact content review hash", () 
   const report = auditAuthorityCampaign(
     [
       {
-        slug: "what-rust-1-93-s-musl-upgrade-changed-for-static-network-binaries",
-        title: "What Rust 1.93's musl Upgrade Changed for Static Network Binaries",
+        slug: "why-procedural-macro-errors-point-at-the-wrong-code",
+        title: "Why Procedural Macro Errors Point at the Wrong Code",
         date: "2026-09-01T09:00:00Z",
         draft: false,
         reviewed: true,
         cluster: "rust-under-the-hood",
         campaign: "authority-2026",
-        opportunity: "RUST-070",
+        opportunity: "RUST-007",
         summary: "Summary",
         wordCount: 1200,
       },
@@ -122,8 +122,8 @@ test("a reviewed campaign article still needs an exact content review hash", () 
 
   assert.deepEqual(report.backlogErrors.unsafeCampaignPublications, [
     {
-      slug: "what-rust-1-93-s-musl-upgrade-changed-for-static-network-binaries",
-      opportunity: "RUST-070",
+      slug: "why-procedural-macro-errors-point-at-the-wrong-code",
+      opportunity: "RUST-007",
       reason: "review hash is missing or stale",
     },
   ]);

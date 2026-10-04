@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { authorityUpgradeBaselines } from "../data/authority-upgrade-baselines.mjs";
+import { authorityCalendar } from "../lib/authority-schedule.mjs";
 import {
   checkLivePublications,
   missingDuePublications,
@@ -169,11 +170,39 @@ test("a due unchanged public URL is reported as an unfinished upgrade", () => {
         sourceHash: authorityUpgradeBaselines["DATA-004"],
       },
     ],
-    new Date("2026-09-04T11:00:00Z")
+    new Date("2026-09-04T11:00:00Z"),
+    { upgradeDeadlinesPaused: false }
   );
 
   assert.equal(
     overdue.find((entry) => entry.id === "DATA-004").reason,
     "upgrade has not changed from its baseline"
   );
+});
+
+test("paused upgrade deadlines are not reported overdue", () => {
+  const overdue = overdueAuthorityActions(
+    [
+      {
+        slug: "reconciliation-cross-system-sync",
+        date: "2025-01-01",
+        draft: false,
+        sourceHash: authorityUpgradeBaselines["DATA-004"],
+      },
+    ],
+    new Date("2026-09-04T11:00:00Z"),
+    { upgradeDeadlinesPaused: true }
+  );
+
+  assert.equal(overdue.find((entry) => entry.id === "DATA-004"), undefined);
+});
+
+test("a held article's passed slot is paused, not overdue", () => {
+  const entry = authorityCalendar.find((item) => item.action === "publish");
+  const overdue = overdueAuthorityActions([], new Date(entry.scheduledFor), {
+    held: new Set([entry.slug]),
+    upgradeDeadlinesPaused: true,
+  });
+
+  assert.equal(overdue.find((item) => item.id === entry.id), undefined);
 });

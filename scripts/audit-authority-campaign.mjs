@@ -390,6 +390,7 @@ export function auditAuthorityCampaign(posts, now = new Date()) {
       const statusCounts = {
         published: 0,
         scheduled: 0,
+        held: 0,
         draft: 0,
         unapproved: 0,
         invalid: 0,
@@ -504,7 +505,7 @@ function printReport(report) {
       `  upgrade revisions complete ${cluster.completedUpgrades}/${cluster.stages.upgrade}`
     );
     console.log(
-      `  published ${cluster.status.published}; scheduled ${cluster.status.scheduled}; drafts ${cluster.status.draft}; unapproved ${cluster.status.unapproved}`
+      `  published ${cluster.status.published}; scheduled ${cluster.status.scheduled}; held ${cluster.status.held}; drafts ${cluster.status.draft}; unapproved ${cluster.status.unapproved}`
     );
     console.log(
       `  review flags: ${cluster.qualityFlags.under700Words.length} under 700 words; ${cluster.qualityFlags.missingSummary.length} missing summaries; ${cluster.qualityFlags.draftWithoutReviewGate.length} drafts missing reviewed:false`
