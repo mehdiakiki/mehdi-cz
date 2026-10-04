@@ -53,10 +53,17 @@ test("an overdue campaign action makes the scheduled workflow visible as a failu
 
 test("every production build runs both campaign audit and safety tests", async () => {
   const packageJson = JSON.parse(await readFile(packagePath, "utf8"));
+  const build = packageJson.scripts.build;
 
   assert.match(packageJson.scripts.prebuild, /audit-authority-campaign/);
-  assert.match(packageJson.scripts.prebuild, /node --test/);
-  assert.match(packageJson.scripts.build, /^yarn prebuild &&/);
+  assert.match(build, /^yarn prebuild &&/);
+
+  // The safety suite reads generated output such as public/search.json, so it
+  // runs after the content build and before Next.js builds the site.
+  const contentBuild = build.indexOf("contentlayer2 build");
+  const safetyTests = build.indexOf("yarn test:publication");
+  const nextBuild = build.indexOf("next build");
+  assert.ok(contentBuild >= 0 && contentBuild < safetyTests && safetyTests < nextBuild);
 });
 
 test("production content generation cannot expose preview-only search entries", async () => {
