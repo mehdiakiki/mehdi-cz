@@ -62,6 +62,16 @@ export default function RustcLateMetadataCaseStudy() {
         },
       ]}
     >
+      <h2>How I came to this</h2>
+      <p>
+        I came to this work by reading the current compiler code: how rustc writes an rlib, reads it
+        back, and links it. That is how I found the problem and started working on it.
+      </p>
+      <p>
+        For me, understanding Rust was more than learning Rust. It was a way to become a much better
+        software engineer, interested in hard and practical problems.
+      </p>
+
       <h2>The problem</h2>
       <p>
         An rlib is an <code>ar</code> archive. It contains the crate metadata that other crates
