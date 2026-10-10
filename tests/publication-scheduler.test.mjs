@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 import { authorityUpgradeBaselines } from "../data/authority-upgrade-baselines.mjs";
@@ -8,6 +9,7 @@ import {
   missingDuePublications,
   overdueAuthorityActions,
   parsePublicationFrontmatter,
+  readPublicationManifest,
   sitemapPaths,
 } from "../scripts/check-publication-due.mjs";
 
@@ -89,6 +91,36 @@ test("only due, non-draft, missing posts trigger publication", () => {
   assert.deepEqual(
     missingDuePublications(posts, liveSitemap, now).map((post) => post.path),
     ["/blog/due-now"]
+  );
+});
+
+test("the resumed October queue publishes due articles and keeps future articles scheduled", async () => {
+  const manifest = await readPublicationManifest(
+    fileURLToPath(new URL("../data/blog", import.meta.url))
+  );
+  const beforeHold = new Date("2026-10-04T07:59:59Z");
+  const alreadyLive = missingDuePublications(manifest, "", beforeHold);
+  const sitemap = alreadyLive.map((post) => `<loc>https://www.mehdi.cz${post.path}</loc>`).join("");
+
+  assert.deepEqual(
+    missingDuePublications(manifest, sitemap, new Date("2026-10-10T12:00:00Z"))
+      .map((post) => post.slug)
+      .sort(),
+    [
+      "a-dead-letter-queue-is-evidence-not-a-disposal-bin",
+      "approval-boundaries-for-expensive-external-and-irreversible-ai-actions",
+      "how-rust-analyzer-recomputes-only-what-an-edit-invalidates",
+      "macro-expansion-and-name-resolution-rusts-compiler-feedback-loop",
+      "ordering-exists-inside-a-boundary-choosing-an-event-partition-key",
+      "retry-topics-change-ordering-decide-whether-that-is-acceptable",
+      "where-a-transaction-ends-in-a-message-consumer",
+      "why-one-lookup-per-byte-can-be-latency-bound",
+    ]
+  );
+
+  assert.ok(
+    missingDuePublications(manifest, sitemap, new Date("2026-10-10T13:15:00Z"))
+      .some((post) => post.slug === "benchmark-streaming-scanner-rust")
   );
 });
 

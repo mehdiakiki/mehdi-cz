@@ -13,11 +13,16 @@ import {
 const now = new Date("2026-09-03T12:00:00Z");
 
 test("a held article never publishes, even after its date passes", () => {
-  const [slug] = heldArticleSlugs;
+  const slug = "publication-hold-test-fixture";
   const post = { slug, date: "2026-01-01T00:00:00Z", draft: false, reviewed: true };
 
-  assert.equal(publicationStatus(post, new Date("2027-01-01T00:00:00Z")), "held");
-  assert.equal(isPostPublished(post, new Date("2027-01-01T00:00:00Z")), false);
+  heldArticleSlugs.add(slug);
+  try {
+    assert.equal(publicationStatus(post, new Date("2027-01-01T00:00:00Z")), "held");
+    assert.equal(isPostPublished(post, new Date("2027-01-01T00:00:00Z")), false);
+  } finally {
+    heldArticleSlugs.delete(slug);
+  }
 });
 
 test("drafts never publish automatically", () => {
