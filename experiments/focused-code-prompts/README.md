@@ -11,9 +11,10 @@ a parser, a React renderer, and an unwired preview caller. Duplicate detection
 was a throwing stub. The worker started without the article conversation and
 received `session-01/harness.txt` and `session-01/prompt-01.txt`.
 
-The seed parser deliberately accepts only one email column and one record per
-physical line. Its address validation is a narrow ASCII demo policy. It rejects
-extra columns and multiline fields; it is not a general CSV ingestion library.
+The seed parser is intended for one email column and one record per physical
+line. Its address validation is a narrow ASCII demo policy. Reliable rejection
+of multiline fields was added to the corrected working parser, as described
+below; the seed is not a general CSV ingestion library.
 The rendered output is static React HTML, not an interactive browser workflow.
 
 ## What was captured
