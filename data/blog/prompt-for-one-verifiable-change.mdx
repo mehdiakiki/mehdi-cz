@@ -1,0 +1,261 @@
+---
+title: "Prompt for One Verifiable Change"
+date: "2026-10-20"
+tags: ["ai", "prompting", "code-review", "typescript", "software-quality"]
+draft: true
+reviewed: false
+cluster: "reliable-ai-systems"
+campaign: "editorial"
+summary: "Work through a contact importer with focused AI prompts, a duplicate-detection bug, and a preview integration mistake. Keep each change small enough to explain and check."
+---
+
+> **Work in progress.** The code and prompts are AI-written teaching examples, not captured coding-session output. Recorded agent runs and CI verification are pending.
+
+"Remove duplicate contacts" sounds like a small requirement. It could mean keeping the first occurrence, keeping the latest, or skipping addresses that already exist in the database.
+
+An agent can write a reasonable implementation for any of those choices. If you leave the choice open, you have to discover what it decided by reading the patch.
+
+I'd settle that question before generating an importer around it. Let's work through a small example: tell the agent what the upload preview should show, inspect a bug in duplicate detection, then follow the result into the preview.
+
+The [earlier article on AI and code review](/blog/the-review-ratchet-how-ai-is-quietly-eating-your-codebase-from-the-inside) describes the cost of generating code faster than we understand it. A useful place to intervene is the request that produces the next diff.
+
+## Decide which contact survives
+
+Consider this starting prompt:
+
+```text
+Build a CSV contact importer. Let people upload a file, validate the
+contacts, remove duplicates, save them, and see what happened.
+```
+
+That's a useful description of a feature. Before implementing it, though, we need to decide what "remove duplicates" means for an actual file:
+
+| Source row | Email as uploaded | What the preview should say |
+| --- | --- | --- |
+| 7 | `" Ana@example.com "` | Keep this row |
+| 11 | `"ben@example.com"` | Keep this row |
+| 19 | `"ana@EXAMPLE.com"` | Matches row 7 |
+| 23 | `"ANA@example.com"` | Matches row 7 |
+
+For this application, matching ignores surrounding whitespace and letter case. We keep the first occurrence and preserve its original data. Both later occurrences must refer to row 7, even after we've seen row 19.
+
+Those four rows already tell us more than "handle duplicates correctly." [GitHub's prompting guidance](https://docs.github.com/en/copilot/concepts/prompting-and-context/prompt-engineering) recommends supplying examples and relevant context. Here the example makes a product decision visible before we have an implementation to argue about.
+
+Start with duplicate detection over parsed, validated rows, then connect its result to the preview. Database writes can follow once we've decided what happens when an email already exists in storage or an upload is retried.
+
+The right size depends on the codebase. If the detection logic and preview already fit together cleanly, ask for both in one change. If we haven't settled the matching rule, isolate that decision first. Counting files or setting an arbitrary line limit won't answer that question.
+
+## Point the agent to the existing rules
+
+Assume our example importer already defines a row and a matching helper:
+
+```ts
+export type ContactRow = Readonly<{
+  rowNumber: number;
+  email: string;
+}>;
+
+export function normalizeEmail(email: string): string {
+  return email.trim().toLowerCase();
+}
+```
+
+The parser supplies a unique source row number for each record and preserves file order. Validation has already rejected invalid or empty emails. Lowercasing the whole address is this application's matching policy; other applications may need a different rule.
+
+The preview needs retained rows and a report of the later occurrences:
+
+```ts
+export type Duplicate = Readonly<{
+  rowNumber: number;
+  firstRowNumber: number;
+}>;
+
+export type DeduplicationResult = {
+  unique: ContactRow[];
+  duplicates: Duplicate[];
+};
+```
+
+In your repository, give the agent the paths to those definitions, the preview caller, and a representative test. All three tell it something: how matching works, who consumes the result, and how the project checks behavior.
+
+Avoid pasting the whole repository when a few references answer those questions. Also avoid specifying a new normalization helper when the existing one already owns that policy.
+
+## Ask for the next change
+
+With those files and the four example rows available, I'd use a prompt like this:
+
+```text
+Add within-file duplicate detection to the importer. Read the
+row types, normalizeEmail, and preview caller first.
+
+Keep the first occurrence of each normalized email, preserving
+the original row objects and their order. Report later occurrences
+against that first source row, in encounter order. Leave the
+input unchanged. Empty input should return two empty arrays.
+
+For the supplied fixture, keep rows 7 and 11. Both 19 and 23
+must point to 7. Add coverage for this case, empty input,
+distinct emails, and preservation of the original data.
+
+Keep parsing, preview changes, and database writes for later.
+Reuse the existing types and test conventions; add no dependencies.
+If these requirements conflict with existing behavior, explain how.
+
+Verify in the existing CI workflow and link the result. Report
+any assumptions you could not resolve from the code.
+```
+
+There is a reason to distinguish matching from rewriting here. We can compare `" Ana@example.com "` with its normalized value while leaving the uploaded text available for the preview. Turning a lookup key into stored data would be another change.
+
+If the repository already documents these rules, the request can be shorter: "Implement within-file duplicate detection using the importer contract and its existing normalization helper; include the three-occurrence regression." Reference settled decisions instead of repeating them in every prompt.
+
+## Look for the bug that two matching rows will miss
+
+The loop is small enough to inspect in full. The same decisions are harder to trace when they're spread across an importer, its API, and its UI.
+
+Consider this implementation. It uses the right types and helper, and the first duplicate gets the right report:
+
+```ts
+// Illustrative implementation with a first-occurrence defect.
+export function deduplicateContacts(
+  rows: readonly ContactRow[]
+): DeduplicationResult {
+  const firstRowByEmail = new Map<string, number>();
+  const result: DeduplicationResult = { unique: [], duplicates: [] };
+
+  for (const row of rows) {
+    const key = normalizeEmail(row.email);
+    const firstRowNumber = firstRowByEmail.get(key);
+
+    if (firstRowNumber === undefined) {
+      result.unique.push(row);
+    } else {
+      result.duplicates.push({ rowNumber: row.rowNumber, firstRowNumber });
+    }
+
+    firstRowByEmail.set(key, row.rowNumber);
+  }
+
+  return result;
+}
+```
+
+The problem is the last statement in the loop. [Map.set](https://tc39.es/ecma262/multipage/keyed-collections.html#sec-map.prototype.set) replaces the value for an existing key, so each occurrence becomes the reference for the next one.
+
+The lookup changes like this for Ana's address:
+
+| Row being processed | Reference found | Reference saved after processing |
+| --- | --- | --- |
+| 7 | None | 7 |
+| 19 | 7 | 19 |
+| 23 | 19 | 23 |
+
+Row 23 ends up matching row 19. With only two occurrences, the defect would stay hidden.
+
+Before asking the agent to patch it, give it that specific failure:
+
+```text
+With matching emails on rows 7, 19, and 23, row 23 is reported
+as matching 19. Both duplicates must refer to 7.
+
+Trace the lookup across those three rows and explain why it
+changes. Add a regression for the first-occurrence rule, make
+a focused patch, and verify it in CI. Keep unrelated cleanup
+outside this patch.
+```
+
+The repair is small: record a row number only when the email has not been seen. This is the change to the loop above:
+
+```diff
+     if (firstRowNumber === undefined) {
++      firstRowByEmail.set(key, row.rowNumber);
+       result.unique.push(row);
+     } else {
+       result.duplicates.push({ rowNumber: row.rowNumber, firstRowNumber });
+     }
+-    firstRowByEmail.set(key, row.rowNumber);
+```
+
+Now a later occurrence adds a report without replacing the original reference. We can explain the patch by tracing three rows; a rewrite of the whole importer would be harder to assess.
+
+## Check the result you actually wanted
+
+The requirement says both later occurrences refer to row 7. Put that expectation into a check, even if the current implementation does something else. Otherwise, tests written alongside the function can preserve the same mistake.
+
+This assertion excerpt uses the types above and the function after the patch:
+
+```ts
+import { deepStrictEqual, strictEqual } from "node:assert";
+
+const rows: ContactRow[] = [
+  { rowNumber: 7, email: " Ana@example.com " },
+  { rowNumber: 11, email: "ben@example.com" },
+  { rowNumber: 19, email: "ana@EXAMPLE.com" },
+  { rowNumber: 23, email: "ANA@example.com" },
+];
+
+const originalRows = [...rows];
+const before = rows.map((row) => ({ ...row }));
+const result = deduplicateContacts(rows);
+
+deepStrictEqual(result.unique, [before[0], before[1]]);
+strictEqual(result.unique[0], originalRows[0]);
+strictEqual(result.unique[1], originalRows[1]);
+deepStrictEqual(result.duplicates, [
+  { rowNumber: 19, firstRowNumber: 7 },
+  { rowNumber: 23, firstRowNumber: 7 },
+]);
+deepStrictEqual(rows, before);
+rows.forEach((row, index) => strictEqual(row, originalRows[index]));
+```
+
+The case also checks that the original objects, email strings, and ordering survive. Empty input and entirely distinct emails deserve their own checks. [TypeScript's readonly properties](https://www.typescriptlang.org/docs/handbook/2/objects.html#readonly-properties) do not freeze data at runtime, so keep the unchanged-input assertion.
+
+[Anthropic's coding guidance](https://code.claude.com/docs/en/best-practices) recommends giving the agent a way to verify its work. For this change, I'd want the CI result for the patch I'm reviewing, plus a check that distinguishes the broken version from the repaired one. A green result from an earlier revision would tell us little about this patch.
+
+## Follow the rows into the preview
+
+A correct helper can still feed a misleading screen. For example, the preview caller might rebuild source row numbers from array positions:
+
+```ts
+// Incorrect caller: source row numbers have already been supplied.
+const previewRows = validatedRows.map((row, index) => ({
+  ...row,
+  rowNumber: index + 1,
+}));
+const result = deduplicateContacts(previewRows);
+```
+
+For our fixture, the helper now receives rows 1, 2, 3, and 4. It can satisfy its own rules perfectly while the preview sends the user looking for the wrong records in their file. A test that passes source rows directly into the helper won't catch the caller changing them.
+
+The caller should pass through the validated rows with their source numbers intact:
+
+```ts
+const result = deduplicateContacts(validatedRows);
+```
+
+That makes the next prompt concrete:
+
+```text
+Connect duplicate detection to the existing preview. Preserve
+source row numbers through parsing, validation, and rendering.
+
+Use a fixture whose valid rows are 7, 11, 19, and 23. The preview
+should retain 7 and 11 with their original email text, and show
+19 and 23 as matching 7. Check the rendered preview through the
+real caller, not only the helper. Keep database writes for later.
+
+Preserve the existing response shape and verify the change in CI.
+```
+
+Now the check follows the same path as the user's data. It can catch a correct function wired into the wrong transformation. Running that path through a real importer is still the missing step in this worked example.
+
+## Give the agent room where the task is already clear
+
+This much explanation would be excessive for a button-label correction. Ask for the edit and the appropriate check. A mechanical rename across several modules can also be one task if the intended result is clear. [Anthropic explicitly notes that planning adds overhead for small, clear changes](https://code.claude.com/docs/en/best-practices#explore-first-then-plan-then-code).
+
+For a larger feature, let the agent explore the repository and suggest a sequence of changes. You don't need to prescribe its private helper names or approve every loop. Decide the product behavior and inspect the choices that affect it. Split the task when it contains unresolved decisions that would make the resulting patch hard to judge.
+
+Detailed instructions also have limits. [SlopCodeBench](https://arxiv.org/abs/2603.24755) reports code degradation during repeated agent-led extensions, including with explicit quality guidance. It doesn't establish that the prompts here work better. The prompts give us specific behavior to check and a smaller patch to explain; review still has to do that work.
+
+For this importer, I'd finish the preview before moving on to writes. At that point we should be able to point to the uploaded rows, the duplicate reports, and the screen the user sees. Then we can decide what happens when the destination already contains Ana's email.
