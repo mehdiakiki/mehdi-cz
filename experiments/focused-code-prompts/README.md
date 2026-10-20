@@ -46,8 +46,9 @@ groups, frozen inputs, source row numbers after parsing, and server-rendered
 preview output. The CSV fixture has valid rows 7, 11, 19, and 23, with invalid
 records on rows 3 and 16.
 
-The formatter check runs in CI as well. Recorded text snapshots stay byte-for-byte
-unchanged; any later code or formatting adjustment belongs in a new snapshot.
+The formatter check runs in CI as well. Seed inputs and recorded text snapshots
+stay byte-for-byte unchanged. The working candidate may receive formatting-only
+changes; its original code remains available in the recorded text snapshots.
 
 CI runs and their exact source revisions are recorded in the session manifest
 and the article's editorial notes. The article remains marked as a draft.
