@@ -55,8 +55,13 @@ complete tool-event trace; the capture states those limits.
   function checks, and all four preview checks passed. The rendered artifact
   retains rows 7 and 11 and reports rows 19 and 23 against row 7. The overall
   workflow failed formatting, so the site build did not run in that revision.
-- The CI formatting patch has been applied. A final run of the example checks,
-  formatting check, and existing site build is pending for the revised files.
+- [Third run](https://github.com/mehdiakiki/mehdi-cz/actions/runs/39417441459),
+  revision `f6584135f15f13f7e31aaf2222e770bf63dfe5d1`: typechecking, all ten
+  example checks, rendering, and formatting passed. Contentlayer compiled the
+  article successfully. One publication test then required the new draft to be
+  added to its explicit list of editorial sources outside the authority campaign.
+  That registration has been added without weakening its assertions. Full site
+  verification is being repeated with the registration in place.
 
 All executable verification and rendering ran in the existing Content safety
 workflow with its runner selection unchanged. No builds, tests, typechecks, or
