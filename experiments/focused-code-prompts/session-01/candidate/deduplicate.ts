@@ -1,9 +1,7 @@
 import { normalizeEmail } from "./normalize-email.ts";
 import type { ContactRow, DeduplicationResult } from "./types.ts";
 
-export function deduplicateContacts(
-  rows: readonly ContactRow[]
-): DeduplicationResult {
+export function deduplicateContacts(rows: readonly ContactRow[]): DeduplicationResult {
   const result: DeduplicationResult = { unique: [], duplicates: [] };
   const firstRowNumbers = new Map<string, number>();
 

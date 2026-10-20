@@ -48,3 +48,8 @@ test("an export with only a header produces an empty preview", () => {
   assert.doesNotMatch(preview.html, /data-source-row=/);
   assert.doesNotMatch(preview.html, /<li>/);
 });
+
+test("unsupported multiline fields cannot be mistaken for independent email records", () => {
+  const multiline = 'email\n"first line\nana@example.com\nlast line"\n';
+  assert.throws(() => previewContactExport(multiline), /single-line CSV fields/);
+});

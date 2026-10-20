@@ -22,7 +22,10 @@ export function parseContactExport(csv: string): ParsedExport {
     if (record.trim() === "") continue;
 
     const quoted = /^"(?:[^"]|"")*"$/.test(record);
-    if (!quoted && /[,"\r]/.test(record)) {
+    if (!quoted && /["\r]/.test(record)) {
+      throw new Error("Only single-line CSV fields are supported");
+    }
+    if (!quoted && record.includes(",")) {
       invalidRowNumbers.push(index + 1);
       continue;
     }

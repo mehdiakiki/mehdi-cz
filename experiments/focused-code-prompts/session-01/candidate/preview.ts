@@ -11,11 +11,7 @@ export function renderImportPreview(result: DeduplicationResult): string {
       h(
         "table",
         null,
-        h(
-          "thead",
-          null,
-          h("tr", null, h("th", null, "Source row"), h("th", null, "Email"))
-        ),
+        h("thead", null, h("tr", null, h("th", null, "Source row"), h("th", null, "Email"))),
         h(
           "tbody",
           null,
@@ -34,11 +30,7 @@ export function renderImportPreview(result: DeduplicationResult): string {
         "ul",
         null,
         ...result.duplicates.map(({ rowNumber, firstRowNumber }) =>
-          h(
-            "li",
-            { key: rowNumber },
-            `Row ${rowNumber} matches row ${firstRowNumber}`
-          )
+          h("li", { key: rowNumber }, `Row ${rowNumber} matches row ${firstRowNumber}`)
         )
       )
     )

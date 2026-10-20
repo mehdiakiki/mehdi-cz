@@ -34,6 +34,13 @@ The first request deliberately leaves the preview unchanged. A failing preview
 check at that stage means the feature is incomplete, not that the worker broke
 its assigned contract. Any later follow-up and output are retained separately.
 
+After the two captured worker responses, the coordinator found a problem in the
+seed parser: splitting an unsupported multiline field could treat an interior
+line as a separate address. The working parser now rejects an unmatched quoted
+record, and a regression covers that input. This correction belongs to the
+coordinator, not the recorded worker. The original seed and worker snapshots
+remain unchanged.
+
 ## Verification
 
 All builds, tests, typechecks, and rendering run through the existing GitHub
