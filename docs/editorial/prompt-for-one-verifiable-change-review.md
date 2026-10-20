@@ -60,8 +60,11 @@ complete tool-event trace; the capture states those limits.
   example checks, rendering, and formatting passed. Contentlayer compiled the
   article successfully. One publication test then required the new draft to be
   added to its explicit list of editorial sources outside the authority campaign.
-  That registration has been added without weakening its assertions. Full site
-  verification is being repeated with the registration in place.
+  That registration was added without weakening its assertions.
+- [Fourth run](https://github.com/mehdiakiki/mehdi-cz/actions/runs/39417906145),
+  revision `8b6a416addc52b7565b219e473ce76ccad27a907`: strict typechecking, all ten
+  example checks, formatting, publication checks, and the full site build passed.
+  The final article records this verified revision explicitly.
 
 All executable verification and rendering ran in the existing Content safety
 workflow with its runner selection unchanged. No builds, tests, typechecks, or
@@ -89,7 +92,7 @@ and source row numbers through the preview caller.
 
 ## Remaining editorial work
 
-Review the final CI result and its generated preview artifact, retain the draft
-flags, and let the author assess the voice before publication. A broader model
-comparison or another example is optional future work, not evidence supplied by
-this case study. Deno remains a separate article opportunity.
+The final CI result and static preview artifact have been inspected. Retain the
+draft flags and let the author assess the voice before publication. A broader
+model comparison or another example is optional future work, not evidence
+supplied by this case study. Deno remains a separate article opportunity.
