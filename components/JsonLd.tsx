@@ -72,6 +72,8 @@ interface ArticleJsonLdProps {
   url: string;
   tags: string[];
   images?: string[];
+  authors?: Array<{ name: string; url?: string }>;
+  collection?: { name: string; url: string };
 }
 
 export function ArticleJsonLd({
@@ -82,20 +84,19 @@ export function ArticleJsonLd({
   url,
   tags,
   images = [],
+  authors = [{ name: siteMetadata.author, url: siteMetadata.siteUrl }],
+  collection,
 }: ArticleJsonLdProps) {
   const articleSchema = {
     "@context": "https://schema.org",
     "@type": "Article",
+    "@id": `${url}#article`,
     headline: title,
     description: description,
     image: images.length > 0 ? images : [`${siteMetadata.siteUrl}${siteMetadata.socialBanner}`],
     datePublished: date,
     dateModified: lastmod || date,
-    author: {
-      "@type": "Person",
-      name: siteMetadata.author,
-      url: siteMetadata.siteUrl,
-    },
+    author: authors.map((author) => ({ "@type": "Person", ...author })),
     publisher: {
       "@type": "Person",
       name: siteMetadata.author,
@@ -107,6 +108,7 @@ export function ArticleJsonLd({
     },
     keywords: tags.join(", "),
     url: url,
+    ...(collection ? { isPartOf: { "@type": "CollectionPage", ...collection } } : {}),
   };
 
   return <JsonLd data={articleSchema} />;

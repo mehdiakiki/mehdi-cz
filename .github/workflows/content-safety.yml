@@ -12,6 +12,9 @@ on:
       - "scripts/**"
       - "tests/**"
       - "experiments/focused-code-prompts/**"
+      - "experiments/editorial-ci/**"
+      - "experiments/practical-engineering/**"
+      - "experiments/agent-security/**"
       - "contentlayer.config.ts"
       - "package.json"
       - "yarn.lock"
@@ -27,6 +30,18 @@ jobs:
   verify:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    services:
+      postgres:
+        image: pgvector/pgvector:0.8.7-pg18-bookworm
+        env:
+          POSTGRES_USER: editorial
+          POSTGRES_PASSWORD: disposable-fixture-only
+          POSTGRES_DB: editorial
+        options: >-
+          --health-cmd "pg_isready -U editorial -d editorial"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
     steps:
       - uses: actions/checkout@v4
 
@@ -36,6 +51,86 @@ jobs:
 
       - run: corepack enable && corepack prepare yarn@4.18.0 --activate
       - run: yarn install --immutable
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Install isolated article fixture dependencies
+        run: |
+          if [ ! -f experiments/editorial-ci/package-lock.json ]; then
+            npm install --package-lock-only --prefix experiments/editorial-ci --ignore-scripts --no-audit --no-fund
+          fi
+          npm ci --prefix experiments/editorial-ci --ignore-scripts --no-audit --no-fund
+          if [ ! -f experiments/practical-engineering/package-lock.json ]; then
+            npm install --package-lock-only --prefix experiments/practical-engineering --ignore-scripts --no-audit --no-fund
+          fi
+          npm ci --prefix experiments/practical-engineering --ignore-scripts --no-audit --no-fund
+          if [ ! -f experiments/agent-security/rust/Cargo.lock ]; then
+            cargo generate-lockfile --manifest-path experiments/agent-security/rust/Cargo.toml
+          fi
+          npm exec --prefix experiments/editorial-ci -- playwright install --with-deps chromium
+
+      - name: Format the article batch and preserve any required patch
+        run: |
+          mkdir -p /tmp/editorial-evidence
+          mapfile -t article_paths < <(node --input-type=module -e 'import { editorialSeries } from "./data/editorial-series.mjs"; console.log(editorialSeries.flatMap(series => series.parts.map(slug => "data/blog/" + slug + ".mdx")).join("\n"))')
+          yarn prettier --write "${article_paths[@]}" \
+            components/ArticleLink.tsx components/EditorialSeriesIndex.tsx components/EditorialSeriesNav.tsx \
+            components/MDXComponents.tsx components/JsonLd.tsx \
+            'app/(site)/blog/page.tsx' 'app/(site)/blog/[...slug]/page.tsx' 'app/(site)/blog/series/[series]/page.tsx' \
+            app/sitemap.ts data/editorial-series.mjs data/editorial-series.d.mts data/writing-tiers.mjs data/rust-systems-atlas.mjs \
+            lib/editorial-navigation.mjs lib/editorial-navigation.d.mts tests/editorial-navigation.test.mjs \
+            tests/authority-campaign.test.mjs scripts/render-editorial-previews.mjs package.json \
+            'experiments/editorial-ci/*.{mjs,json,md}' 'experiments/practical-engineering/*.{mjs,ts,tsx,json,md}'
+          cargo fmt --manifest-path experiments/agent-security/rust/Cargo.toml
+          rustfmt --edition 2021 experiments/practical-engineering/shared_counter.rs
+          git add --intent-to-add experiments/editorial-ci/package-lock.json experiments/practical-engineering/package-lock.json experiments/agent-security/rust/Cargo.lock
+          git diff --binary > /tmp/editorial-evidence/required-format-and-lockfiles.patch
+
+      - name: Verify CI article examples
+        run: |
+          set -o pipefail
+          node --test experiments/editorial-ci/*.test.mjs | tee /tmp/editorial-evidence/ci-examples.txt
+          npm exec --prefix experiments/editorial-ci -- playwright test --config experiments/editorial-ci/playwright.config.mjs | tee /tmp/editorial-evidence/playwright.txt
+
+      - name: Verify practical engineering examples
+        env:
+          POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
+        run: |
+          set -o pipefail
+          node --test experiments/practical-engineering/*.test.mjs | tee /tmp/editorial-evidence/practical-examples.txt
+          yarn exec tsc --noEmit --strict --skipLibCheck --target ES2022 --module ESNext --moduleResolution Bundler --jsx react-jsx experiments/practical-engineering/tagging.ts experiments/practical-engineering/report-history.ts experiments/practical-engineering/ReportPicker.tsx experiments/practical-engineering/next-report-page.tsx
+          node experiments/practical-engineering/check-webllm-sdk.mjs | tee /tmp/editorial-evidence/webllm-sdk.txt
+          rustc --edition=2021 -O experiments/practical-engineering/shared_counter.rs -o /tmp/practical-shared-counter
+          /tmp/practical-shared-counter | tee /tmp/editorial-evidence/shared-counter.txt
+          docker exec -i "$POSTGRES_CONTAINER" psql --no-psqlrc --set ON_ERROR_STOP=1 -U editorial -d editorial < experiments/practical-engineering/postgres-search-trial.sql | tee /tmp/editorial-evidence/postgres-search.txt
+
+      - name: Verify bounded agent security examples
+        run: |
+          set -o pipefail
+          yarn exec tsc --noEmit --strict --skipLibCheck --target ES2022 --module ESNext --moduleResolution Bundler experiments/agent-security/dns_policy.ts experiments/agent-security/control_plane.ts experiments/agent-security/capability_gate.ts
+          for example in host_helper process_inheritance argument_boundary job_timeout job_state; do
+            python3 "experiments/agent-security/$example.py" | tee "/tmp/editorial-evidence/$example.txt"
+          done
+          for example in dns_policy control_plane capability_gate; do
+            node "experiments/agent-security/$example.ts" | tee "/tmp/editorial-evidence/$example.txt"
+          done
+          cargo run --locked --manifest-path experiments/agent-security/rust/Cargo.toml --bin capability_directory | tee /tmp/editorial-evidence/capability-directory.txt
+          cargo run --locked --manifest-path experiments/agent-security/rust/Cargo.toml --bin runtime_approval | tee /tmp/editorial-evidence/runtime-approval.txt
+
+      - name: Preserve the editorial example evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: editorial-series-evidence
+          path: |
+            /tmp/editorial-evidence/
+            experiments/editorial-ci/package-lock.json
+            experiments/practical-engineering/package-lock.json
+            experiments/agent-security/rust/Cargo.lock
+            experiments/editorial-ci/test-results/
+          if-no-files-found: warn
 
       - name: Typecheck the recorded prompting example
         run: yarn tsc --project experiments/focused-code-prompts/tsconfig.json
@@ -80,3 +175,21 @@ jobs:
       # `build` runs the campaign audit, generates content, then runs the
       # publication safety suite before Next.js builds the site.
       - run: yarn build
+
+      - name: Render held drafts for editorial review
+        run: node scripts/render-editorial-previews.mjs
+
+      - name: Preserve rendered draft previews
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: editorial-rendered-previews
+          path: /tmp/editorial-evidence/previews/
+          if-no-files-found: warn
+
+      - name: Require formatted sources and reviewed lockfiles in the commit
+        run: |
+          if [ -s /tmp/editorial-evidence/required-format-and-lockfiles.patch ]; then
+            echo "Apply the preserved formatting and lockfile patch, then rerun verification."
+            exit 1
+          fi

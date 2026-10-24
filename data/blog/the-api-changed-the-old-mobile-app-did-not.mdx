@@ -1,0 +1,94 @@
+---
+title: "How to Roll Out API Changes to Old Mobile Apps"
+date: "2026-11-11T13:00:00Z"
+tags: ["api", "compatibility", "typescript", "mobile"]
+draft: true
+reviewed: false
+cluster: "reliable-data-integrations"
+campaign: "editorial"
+summary: "Negotiate a new order response, retain the old mobile decoder in CI, and stop an API rollout from sending unsupported states to installed apps."
+---
+
+The new order screen works in the browser. The backend can return `processing`, and the updated client displays it. Then somebody opens a mobile app they installed six months ago.
+
+That binary still knows only `pending` and `paid`. Deploying the server again will not add a fallback to it. Asking everyone to update immediately is not much of a rollout plan either.
+
+Let's keep this to one problem: how does the server introduce the new response while older apps are still in use? The example below is a constructed API and a retained JavaScript decoder standing in for an old client. It is not a claim about a particular mobile SDK or an incident that happened to this site.
+
+## Find what the released app can actually receive
+
+Save the response contract and decoder from the supported release. Don't regenerate the decoder from the new schema before running the check. That would quietly turn the old client into a new one.
+
+Our fictional version one has two existing behaviors. It displays a successful order response containing `pending` or `paid`. For an error response, it reads `error.message` and shows its normal error screen. Those details matter: a new error shape can break an old app just as easily as a new success value.
+
+Directly giving it this body fails:
+
+```json
+{ "id": "order-7", "status": "processing" }
+```
+
+The longer explanation of <ArticleLink slug="how-an-unknown-enum-value-breaks-an-otherwise-compatible-consumer">unknown enum values and conservative domain decisions</ArticleLink> covers that boundary. Here, the difficult part is serving an installed client that cannot be changed during the rollout.
+
+Ask the product owner what the older app must still be able to do. If every order must remain viewable, an update message is insufficient. You need an honest legacy representation or you must delay enabling the new state for that client population. A test that shows no crash does not establish that the experience is acceptable.
+
+## Make the representation an explicit choice
+
+In this small protocol, a newer client sends `X-Order-Status-Contract: 2026-11-processing`. Missing and unrecognized values use the legacy contract. This header describes what the client says it can understand; it does not grant access to an order.
+
+After normal authentication and ownership authorization, the presenter chooses the response:
+
+```js
+const PROCESSING_CONTRACT = "2026-11-processing";
+
+function presentOrder(order, contract) {
+  if (order.status === "processing" && contract !== PROCESSING_CONTRACT) {
+    return {
+      status: 409,
+      body: {
+        error: {
+          code: "CLIENT_UPDATE_REQUIRED",
+          message: "Update the app to view this order.",
+        },
+      },
+    };
+  }
+  return { status: 200, body: { id: order.id, status: order.status } };
+}
+```
+
+The complete fixture also rejects unexpected domain states. It does not turn every unrecognized status into `paid`. For this protocol, 409 uses the older app's established error envelope when the order's state cannot be represented to that client. This is an example product decision, not a universal API-versioning rule.
+
+The retained decoder must already handle that status and envelope without an uncontrolled retry. If it does not, this strategy cannot repair it. Check the real binary's error handler, cached response handling, and retry behavior before selecting the transition.
+
+The fixture returns `Cache-Control: private, no-store` and identifies `X-Order-Status-Contract` in `Vary`. Review every cache on the actual path. An old client must not receive a response prepared for a newer contract because a shared cache ignored the header. Background notifications and offline data can have another serialization path to inspect.
+
+Google's [API compatibility guidance](https://google.aip.dev/180) explains why keeping the same JSON field types does not guarantee that old clients still work. Contract selection should preserve meaning, not just produce a string the decoder accepts.
+
+## Keep the old decoder in the rollout checks
+
+The source in [released-v1-decoder.mjs](https://github.com/mehdiakiki/mehdi-cz/blob/aa3ea07386d828fda077d626020d6ca7565aa5e0/experiments/practical-engineering/released-v1-decoder.mjs) is kept unchanged while the presenter evolves. Its companion test first demonstrates that direct `processing` exposure fails. Then it checks the negotiated behavior:
+
+| Stored state        | Client contract                       | Response checked by CI                             |
+| ------------------- | ------------------------------------- | -------------------------------------------------- |
+| `pending` or `paid` | Missing legacy header                 | Original success shape and meaning                 |
+| `processing`        | Missing or unrecognized header        | Existing error envelope the V1 decoder can display |
+| `processing`        | Exact supported new contract          | New success response                               |
+| Any supported state | Another user's authenticated identity | Access denied before presenting the order          |
+
+These are expected assertions, not reported results from deployed apps. The executable fixture separates trusted actor identity from the requested contract. A caller claiming the new contract still cannot read another user's order.
+
+For a real release, retain the actual generated bindings or released decoder package, plus a small fixture response. Run the released and candidate client versions against the relevant server responses through CI. Include the surrounding screen behavior, not only JSON parsing. An “update required” screen that loses the user's draft or retries forever is still a bad rollout.
+
+Keep the contract identifier with captured test cases. If you later support a third representation, do not reinterpret the old identifier to mean whatever the current client supports. That makes observations and rollback much harder to explain.
+
+## Enable writers after the serving paths are ready
+
+First deploy a server that understands the contract choice while continuing to write old states. Then verify supported clients, caches, notifications, and the error path. Enable the new state for a small controlled group only after the product has accepted the legacy behavior.
+
+Record responses and failures by app version and negotiated contract, using counts rather than private order bodies. Look for versions that stop making successful requests, not only versions that report errors. A client can crash before it sends telemetry.
+
+Define a stop condition in advance. For example, pause new-state creation if a supported client cannot open the order or if the legacy error path starts retrying. Choose the threshold from the product's support policy; do not borrow a percentage from a rollout guide and call it safe.
+
+Rollback needs a data decision too. Turning off the writer does not remove orders already stored as `processing`. Keep the compatible presenter deployed while those rows exist, or provide a separate recovery path. The older server may be unable to read them as well.
+
+The useful result is a small serving matrix, a retained old client check, and a decision about when the writer may start. That is how a mobile rollout stays manageable when users update on their own schedule.

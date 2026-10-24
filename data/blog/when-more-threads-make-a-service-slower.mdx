@@ -1,0 +1,117 @@
+---
+title: "Why a Shared Atomic Counter Can Slow Rust Threads"
+date: "2026-11-06T13:00:00Z"
+tags: ["rust", "performance", "concurrency", "cpu"]
+draft: true
+reviewed: false
+cluster: "rust-under-the-hood"
+campaign: "editorial"
+summary: "Compare shared atomic increments with per-worker totals in Rust, check equal work, and separate contention from false sharing before benchmarking."
+---
+
+Suppose a service processes independent records. One worker is too slow, so you add more. CPU usage rises. Requests don't finish any sooner.
+
+Before buying a larger machine, look for the work the workers still share. A counter, a queue lock, or a small allocation can turn an independent-looking loop into a line of threads waiting for the same thing.
+
+Let's take a counter. It is a small example, but the decision appears in real code whenever every worker updates one progress value.
+
+## Count how often workers touch shared state
+
+This Rust function has every worker update the same atomic value:
+
+```rust
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
+
+fn shared_count(workers: usize, each: u64) -> u64 {
+    let total = AtomicU64::new(0);
+    thread::scope(|scope| {
+        for _ in 0..workers {
+            let total = &total;
+            scope.spawn(move || {
+                for _ in 0..each {
+                    total.fetch_add(1, Ordering::Relaxed);
+                }
+            });
+        }
+    });
+    total.load(Ordering::Relaxed)
+}
+```
+
+`Relaxed` is enough here because the counter doesn't publish any other data. It is not a general replacement for stronger ordering. [Rust's atomic ordering reference](https://doc.rust-lang.org/std/sync/atomic/enum.Ordering.html) describes the distinction.
+
+The <ArticleLink slug="when-relaxed-atomics-are-enough-and-what-they-never-guarantee">separate explanation of relaxed atomics</ArticleLink> covers that correctness question in more detail. Here, the problem is how often workers write the same location, even when the ordering is suitable.
+
+The increment is still a shared write. Relaxing the memory ordering doesn't make several cores update the same location independently. Every record pays for another update.
+
+Now ask what the product really needs. Does another thread need an exact live count after every record? Or is a final count enough? The answer changes the implementation more than another tweak to the atomic ordering.
+
+## Keep a local result and combine it once
+
+If only the final count matters, each worker can return its own count:
+
+```rust
+use std::hint::black_box;
+
+fn reduced_count(workers: usize, each: u64) -> u64 {
+    thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for _ in 0..workers {
+            handles.push(scope.spawn(move || {
+                let mut local = 0_u64;
+                for _ in 0..each {
+                    local += black_box(1_u64);
+                }
+                local
+            }));
+        }
+        handles.into_iter().map(|h| h.join().unwrap()).sum()
+    })
+}
+```
+
+This replaces many shared updates with one returned result per worker. [Scoped threads](https://doc.rust-lang.org/std/thread/fn.scope.html) are joined before the scope returns. The first snippet's imports also apply to this one.
+
+The `black_box` call discourages the compiler from replacing this artificial counting loop with a constant calculation, but it adds overhead of its own. These loops show where shared updates happen; they don't predict a speedup for your service. Put the actual parsing or transformation in both versions, compare the same outputs, and measure that work before choosing an implementation.
+
+There is a tradeoff. The reduced version doesn't provide an exact live total while workers run. If the UI needs progress, consider occasional batch updates. Decide how stale the progress display may be and keep the final count exact.
+
+## Keep the amount of work fixed
+
+Here is an easy benchmarking mistake: run one worker with a million records, then eight workers with a million records each. The second case did eight times the work.
+
+Choose a fixed total and divide it between workers. Handle the remainder, or choose totals divisible by every worker count in the comparison. Check that every record is processed once and that every version returns the same result before comparing durations.
+
+For example, this checks a fixed total with several equal allocations. It is a correctness check, not a benchmark:
+
+```rust
+let total = 10_000_u64;
+for workers in [1_usize, 2, 4, 8] {
+    let each = total / workers as u64;
+    assert_eq!(shared_count(workers, each), total);
+    assert_eq!(reduced_count(workers, each), total);
+}
+```
+
+The standalone source in [shared_counter.rs](https://github.com/mehdiakiki/mehdi-cz/blob/aa3ea07386d828fda077d626020d6ca7565aa5e0/experiments/practical-engineering/shared_counter.rs) includes both functions and this check for CI. Its small total keeps verification cheap; it tells us nothing about production throughput. Use a separate, realistic workload for that question.
+
+Measure through the project's CI benchmark setup. Record the optimized build, machine, available CPU, worker counts, and competing workload. Thread creation matters for tiny jobs; a long-running service with a worker pool has different costs from these short functions.
+
+Try several counts, including one. Run enough repetitions to see variation. A single fast run on a quiet shared machine is weak evidence for a production change.
+
+Keep the raw results. If a new implementation is quicker but returns a different total, stop there. It hasn't completed the same job.
+
+For the real service, keep a second measurement at the request level. Record how many requests finish per second, and how long the slower requests take, under the same incoming load. A loop can finish sooner while requests wait longer for a full worker pool. Include both a small request and the larger batch that motivated the change, since their thread-management costs may be quite different.
+
+Also record the CPU quota visible to the process. Eight logical CPUs reported by the host don't necessarily mean the job can use eight CPUs continuously. Match the worker count to the resources the deployed service actually receives.
+
+## Padding won't fix one shared counter
+
+You may hear that this is false sharing. In the first example, workers really do write the same variable. That is shared contention, even if you give the counter its own cache line.
+
+False sharing is different: workers touch different values that occupy the same cache line. One worker's writes can make another core reload data it didn't change. The [Linux kernel guide](https://docs.kernel.org/kernel-hacking/false-sharing.html) gives examples and tools for investigating that case.
+
+If separate per-worker counters are still slow, their layout may be worth inspecting. But don't start adding padding to every structure. Padding consumes space, can reduce useful cache density, and may fix a problem your workload doesn't have.
+
+For this loop, first remove the shared update that the product doesn't need. Then measure again. If the service is still slow, inspect the queue, allocations, and I/O. More workers can only help the part of the job they are actually free to do at the same time.

@@ -1,0 +1,99 @@
+---
+title: "PostgreSQL Chose a Sequential Scan: What to Check First"
+date: "2026-11-05T13:00:00Z"
+tags: ["postgresql", "sql", "performance", "databases"]
+draft: true
+reviewed: false
+cluster: "reliable-data-integrations"
+campaign: "editorial"
+summary: "Read an orders query plan, compare estimated rows and buffers, and decide whether statistics, query shape, or an index needs investigation."
+---
+
+The index is still there. The query is still the same. But the endpoint has become slow, and the plan now says `Seq Scan`.
+
+It is tempting to force the index and move on. Sometimes that helps explain the problem. It is a poor first permanent fix, though. PostgreSQL may have changed its plan because the data changed, and the new choice may even be reasonable.
+
+Let's use a simple case: an orders page that shows one tenant's recent unpaid orders. We want to find out which part of that request became expensive.
+
+## Capture the actual query and values
+
+Start with the SQL the application sends, including its parameter types. An integer compared with text, an extra cast, or a different ordering can matter. The query copied from a ticket may not be the query running in production.
+
+Here is the shape we are investigating:
+
+```sql
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT id, created_at
+FROM orders
+WHERE tenant_id = 42
+  AND status = 'unpaid'
+ORDER BY created_at DESC
+LIMIT 50;
+```
+
+Use representative data in a controlled database. `EXPLAIN ANALYZE` executes the statement. For a costly read, that still means real work; for a write, it means real side effects. Start with plain `EXPLAIN` if running the query is not yet acceptable.
+
+In the output, compare estimated rows with actual rows at each node. Find where they first become very different. Also read `loops`: a cheap operation repeated many times can dominate the request. [PostgreSQL's EXPLAIN guide](https://www.postgresql.org/docs/18/using-explain.html) explains these fields and why node timings cannot simply be added together.
+
+Consider this shortened teaching example from the scan below the sort and limit. Its numbers are invented to explain the fields; this is not recorded output or a performance result:
+
+```text
+Seq Scan on orders (cost=0.00..2400.00 rows=100 width=16)
+  (actual time=0.020..18.000 rows=20000 loops=1)
+  Filter: ((tenant_id = 42) AND (status = 'unpaid'))
+  Rows Removed by Filter: 80000
+  Buffers: shared hit=960 read=40
+```
+
+The estimate was 100 matching rows; the scan produced 20,000. That difference makes statistics worth investigating. It is not proof that the scan itself was the wrong choice. The filter also discarded 80,000 rows, so ask whether an index could avoid enough of that reading and the later sort.
+
+The buffer line describes 960 shared-buffer hits and 40 reads into shared buffers. It doesn't mean 1,000 distinct disk reads, and a read can still be served by the operating system's cache. Compare buffer work alongside elapsed time. Parent nodes include their children's buffer activity, so don't add every line as if it were separate work. The [EXPLAIN reference](https://www.postgresql.org/docs/18/sql-explain.html) defines these counters.
+
+When `loops` is greater than one, displayed actual rows and time are averages per execution. Read them together with the loop count. Keep the complete plan: this fragment alone cannot tell you how expensive the sort or the complete request was.
+
+Save the plan with the query, parameter values, database version, and relevant settings. Keep private identifiers out of shared examples. A screenshot of just the top line leaves out much of what you need next.
+
+## Check whether the planner knows the data
+
+Suppose tenant 42 has far more unpaid orders than most tenants. A plan based on a small average tenant may behave badly for this one.
+
+[Planner statistics](https://www.postgresql.org/docs/18/planner-stats.html) are estimates, not a live count of every combination of values. They can also be out of date after a large import or a change in how rows are distributed.
+
+Look at when the table was last analyzed:
+
+```sql
+SELECT last_analyze, last_autoanalyze, n_mod_since_analyze
+FROM pg_stat_user_tables
+WHERE relid = 'public.orders'::regclass;
+```
+
+If a large data change happened after that, a targeted `ANALYZE public.orders` may be worth trying in the controlled investigation. It refreshes statistics; it does not rebuild the index. Read the [ANALYZE documentation](https://www.postgresql.org/docs/18/sql-analyze.html) before choosing where and when to run it.
+
+Then capture the plan again. Did estimates improve? Did the scan change? Did elapsed time improve for the same values? Keep the earlier plan instead of overwriting it. Otherwise it becomes difficult to explain what changed.
+
+If the estimates are still wrong for related columns, extended statistics may help. That deserves its own small comparison. Don't raise every statistics target or add every possible statistic at once.
+
+## Ask what work an index would avoid
+
+An index is useful when it avoids enough reading or sorting to pay for its own work. A sequential scan isn't automatically a mistake. Reading much of a table through an index can be more expensive than reading it directly.
+
+For our query, a possible index to investigate is:
+
+```sql
+CREATE INDEX orders_tenant_status_created_idx
+ON orders (tenant_id, status, created_at DESC);
+```
+
+This is a candidate for the example, not an instruction to add it to every orders table. Check existing indexes first. Test other common queries and account for the extra write and storage cost. Building an index on a busy production table also needs a deployment plan; the plain command above is for a controlled fixture.
+
+Check the query itself too. Is the sort necessary? Is the application asking for all columns when it only displays two? Is the slow tenant missing a selective condition? Adding an index before answering those questions can make the schema larger without fixing the request.
+
+## Try the other tenants too
+
+A result for one tenant is not enough. Compare a small tenant, a large tenant, an empty result, and the values from the original slow request. If the application uses prepared statements, inspect its behavior as well as a query pasted into an interactive session. If the query is fast but the endpoint is still slow, <ArticleLink slug="following-one-slow-request-through-an-app">separate database connection waiting from query time</ArticleLink> before changing another index.
+
+For a retrieval endpoint, changing the search method is a separate question from repairing a bad plan. The <ArticleLink slug="does-this-search-need-a-vector-database">PostgreSQL lexical and vector trial</ArticleLink> compares exact candidate lists before proposing another database.
+
+PostgreSQL 19's release candidate includes work on planner advice. It is still a [release candidate as of October 24](https://www.postgresql.org/about/news/postgresql-19-rc-1-released-3409/). New controls may be useful, but they don't remove the need to understand the query and data.
+
+Keep the two plans beside each other with the same SQL and parameter values. If `ANALYZE` improved estimates but the request is still slow, say that. It tells the next person to investigate the remaining read or sort work instead of repeating the statistics update.

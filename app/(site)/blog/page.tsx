@@ -1,6 +1,7 @@
 import { allBlogs, type Blog } from "contentlayer/generated";
 import { allCoreContent } from "pliny/utils/contentlayer";
 import Link from "@/components/WritingIndexIntentLink";
+import EditorialSeriesIndex from "@/components/EditorialSeriesIndex";
 import { BreadcrumbJsonLd } from "@/components/JsonLd";
 import { contentClusters } from "@/data/content-clusters.mjs";
 import siteMetadata from "@/data/siteMetadata";
@@ -272,6 +273,8 @@ export default function Writing() {
           ))}
         </div>
       </section>
+
+      <EditorialSeriesIndex />
 
       <section
         id="archive"

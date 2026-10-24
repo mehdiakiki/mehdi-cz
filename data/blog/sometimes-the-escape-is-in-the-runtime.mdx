@@ -1,0 +1,103 @@
+---
+title: "Maintain the Container Runtime Behind an AI Sandbox"
+date: "2026-11-22T13:00:00Z"
+tags: ["ai", "security", "agent-security", "rust", "containers"]
+draft: true
+reviewed: false
+cluster: "reliable-ai-systems"
+campaign: "editorial"
+summary: "Inventory the actual host and runtime, evaluate advisories, stop assigning work to affected workers, and verify replacement before resuming jobs."
+---
+
+You have narrowed the file tools, blocked unnecessary network access, and stopped passing credentials into generated code. There is still another question: what if the code exploits the software providing the isolation?
+
+This is the kind of problem people usually imagine when they hear “sandbox escape.” It crosses the execution boundary itself. It needs a different response from fixing an overly helpful API.
+
+Adding checks to the Python wrapper does not update a vulnerable host kernel. If you operate the execution service, you need to maintain its runtime and host software as well as the application.
+
+The <ArticleLink slug="sandboxing-model-generated-code-is-a-systems-problem">sandbox architecture overview</ArticleLink> maps the whole execution service. This article follows the operator's job when the component supplying isolation needs an update. A <ArticleLink slug="the-sandbox-stayed-closed-the-file-helper-did-not">privileged file helper accepting an unsafe path</ArticleLink> is a different problem, even if both incidents are called escapes.
+
+## Read the setting as carefully as the result
+
+On October 23, 2026, [OpenAI reported findings from its internal training environment](https://openai.com/index/securing-our-frontier-model-training-environment/), including chained vulnerabilities that escaped microVMs. These were adversarial research settings with conditions different from customer products.
+
+That result deserves attention. It does not establish that every hosted agent can escape its sandbox on demand, or give us a general escape rate. The useful engineering question is which isolation components you depend on and how you learn when they need an update.
+
+A tool audit alone won't answer that. You need an inventory of the host kernel, container runtime or hypervisor, sandbox configuration, and the services reachable after a compromise.
+
+## Don't flatten different advisories into one scary headline
+
+The [November 2025 runc advisory](https://github.com/opencontainers/runc/security/advisories/GHSA-qw9x-cqr3-wc7r) describes a high-severity container escape involving `/dev/console` and mount-related behavior. The [June 2026 advisory](https://github.com/opencontainers/runc/security/advisories/GHSA-xjvp-4fhw-gc47) describes limited host filesystem integrity effects from a malicious `/dev` symlink and rates that issue low.
+
+Those are different findings. Calling both “full host takeover” would hide the conditions an operator actually needs to check.
+
+The June advisory also says that attack is not exploitable under the Docker setup it describes, because Docker's preparation of the root filesystem masks the malicious link. The surrounding runtime changes whether the affected code can be reached in the required way.
+
+Read the affected versions, prerequisites, distribution backports, and remediation for the deployed package. Historical fixed versions tell you when a particular flaw was addressed; they are not a recommendation to install that old release today.
+
+Also check where the runtime lives. Updating the image used for the agent's Python code does not automatically update the host's runc binary or kernel.
+
+## Inventory the worker that actually runs jobs
+
+Start with the machine and runtime used by the job launcher, rather than the packages inside the agent's image. A useful inventory record includes:
+
+| Field                             | Why the operator needs it                                            |
+| --------------------------------- | -------------------------------------------------------------------- |
+| Worker identity and boot identity | Associate the observation with the machine currently serving work    |
+| Agent image digest                | Identify the application artifact                                    |
+| Runtime package and build         | Match the deployed package to its vendor's advisory                  |
+| Running kernel and package build  | Check the host layer as well as the container image                  |
+| Isolation profile                 | Identify mounts, namespaces, privileges, and other reviewed settings |
+| Collection time                   | Reject an old observation after the environment may have changed     |
+
+Collect these through trusted infrastructure. A version string printed by agent code is not proof of which binary the host launcher uses. For distribution packages, retain the package release and security advisory, because backported fixes may not be obvious from the upstream version alone. Record the evidence behind the approval rather than inventing a universal greater-than version comparison.
+
+## Stop admission before replacing affected workers
+
+Once an advisory applies, remove the affected workers from new-job assignment. Keep that decision in the scheduler or launcher that owns admission. A dashboard label does nothing if another queue consumer still accepts jobs on the old machine.
+
+Then decide what happens to active work. Some updates allow a bounded drain; an actively exploitable condition may require terminating jobs sooner. Set a deadline, record interrupted jobs, and let the supervisor end remaining work. Denying new assignments hasn't terminated processes already running. The <ArticleLink slug="the-timeout-ended-one-process-not-the-job">job lifetime example</ArticleLink> explains that separate responsibility.
+
+Replace or update the host through the existing infrastructure process. Collect fresh inventory from the replacement, check its actual configuration, and run the approved staging checks before enabling admission. Keep the old pool disabled until it is empty and retired. A rollback must pass the current approval policy too; the last working image can still contain the vulnerability being repaired.
+
+The [complete Rust model](https://github.com/mehdiakiki/mehdi-cz/blob/aa3ea07386d828fda077d626020d6ca7565aa5e0/experiments/agent-security/rust/src/bin/runtime_approval.rs) makes those scheduling decisions inspectable with dummy inventory. Its admission check includes:
+
+```rust
+fn may_start(worker: &Worker<'_>, approval: &Approval<'_>, now: u64) -> bool {
+    let observed = &worker.inventory;
+    worker.accepting_jobs
+        && !observed.worker_id.is_empty()
+        && !observed.boot_id.is_empty()
+        && now >= observed.collected_at
+        && now - observed.collected_at <= approval.max_inventory_age
+        && now < approval.expires_at
+        && observed.image == approval.image
+        && observed.runtime_package == approval.runtime_package
+        && observed.kernel_package == approval.kernel_package
+        && observed.profile == approval.profile
+}
+```
+
+Its old worker begins with two active jobs and an unapproved runtime package. The selfcheck expects zero new assignments. Disabling admission still leaves those two jobs active; retirement becomes possible only after both completions are recorded. A replacement with the approved inventory accepts one job. Changed image, kernel, or profile values, stale inventory, and expired approval all deny admission.
+
+This is an in-memory model of admission and draining. It doesn't collect inventory, install a patch, terminate a real job, or prove the machine uses the named settings. Its package names are dummy identifiers, not recommended releases. The operator must establish those facts before issuing approval; comparing strings cannot establish them afterward.
+
+In a real deployment, make the inventory freshness check and assignment part of one trusted admission path. Otherwise a worker could be approved, changed, and still assigned work using the earlier decision. Recollect after replacement or reboot, and stop admission when required evidence is missing.
+
+## Keep the consequences of a failure smaller
+
+Patching is essential, but it doesn't remove the need for restricted mounts, reduced process privileges, network controls, and separation from management credentials. The [Docker security documentation](https://docs.docker.com/engine/security/) explains several of these components and their different roles.
+
+Avoid mounting the host container-management socket into an untrusted job. Review any privileged mode or host namespace access against the task's actual need. A job that can manage its own host has already received a very large grant before a vulnerability is involved.
+
+Also review <ArticleLink slug="localhost-is-not-an-admin-password">authentication on reachable control endpoints</ArticleLink>. Updating the runtime won't remove an administrative capability that the application deliberately exposes to the job.
+
+For workloads needing stronger separation, evaluate a VM boundary and the host services around it. A VM is another maintained security component, not a promise that runtime bugs no longer exist.
+
+## Rehearse the decision, including old workers
+
+In staging, start with a small dummy pool containing both approved and old inventory. Submit harmless jobs and inspect which worker received them. Disable admission on one approved worker and check again while it drains. Expire the approval or age the inventory, then verify that new assignments stop. Finally, replace the worker and confirm that fresh evidence is required before it returns.
+
+Those checks exercise the real scheduler and update process. Keep the Rust selfcheck alongside them as a small regression for the decision rules. Neither needs a real escape payload. An advisory describes the vulnerability; the deployment evidence should show that affected workers no longer receive jobs and that the replacement is the one you reviewed.
+
+Save the inventory, approval, assignment decisions, and retirement result together. That record answers the practical incident question: which workers could still run the affected stack, and when did each stop serving work?
