@@ -99,4 +99,6 @@ assert.equal(articleSchemas.length, 1, "A production article must emit one Artic
 assert.equal(articleSchemas[0].url, articleUrl);
 assert.equal(articleSchemas[0]["@id"], `${articleUrl}#article`);
 assert.ok(articleSchemas[0].author.length > 0);
-console.log(`Rendered ${records.length} series review copies, checked article links, and verified production canonical and Article metadata.`);
+console.log(
+  `Rendered ${records.length} series review copies, checked article links, and verified production canonical and Article metadata.`
+);
