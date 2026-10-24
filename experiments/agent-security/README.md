@@ -18,7 +18,7 @@ agent sandbox. No demonstration has been executed or compiled locally.
 | Scope state by current job/generation, then collect expired state as operator | [job_state.py](job_state.py) |
 | Model runtime inventory admission, draining, and replacement | [runtime_approval.rs](rust/src/bin/runtime_approval.rs) |
 
-For later GitHub CI verification, use the project's existing workflow and runner
+For GitHub CI verification, use the project's existing workflow and runner
 selection. Do not run these commands on the workstation:
 
 ```sh
@@ -40,8 +40,8 @@ requires Linux >=5.3, Python >=3.9 with `os.pidfd_open`,
 skipping descendant observations when those interfaces are unavailable.
 TypeScript requires
 a Node version with built-in type stripping, such as the existing CI's Node 24.
-The Rust dependency is pinned directly; a reviewed lockfile must be generated
-and retained in remote verification before release.
+The Rust dependency is pinned directly, and its reviewed CI-generated lockfile
+is retained for locked verification.
 
 DNS and control API examples never open sockets. File examples only touch their
 own temporary fixture. The shell demonstration creates one harmless marker in
@@ -83,3 +83,7 @@ record that execution passed. Record the actual GitHub run URL, exact commit,
 stdout, exit status, and any platform failures in the editorial verification
 record after remote execution. Match article source links to that verified
 commit before release.
+
+## Recorded verification
+
+[GitHub CI run 40134144275](https://github.com/mehdiakiki/mehdi-cz/actions/runs/40134144275) passed for PR head `aa3ea07386d828fda077d626020d6ca7565aa5e0` merged with its base. The [verification record](../../docs/editorial/evidence/length-seo-2026-10-24/verification.json) names the actual checkout and fixture hashes, with preserved stdout beside it. This verifies the bounded checks described here, without extending their stated limits. The articles remain held.

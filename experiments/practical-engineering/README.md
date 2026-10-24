@@ -98,3 +98,7 @@ Next.js import example shows a small static report-history dependency, without
 invented bundle-byte or interaction improvements. Production before/after
 measurements, a real WebLLM device trial, and Deno Sandbox service-level permission
 checks still require their own CI evidence before publishing measured claims.
+
+## Recorded verification
+
+[GitHub CI run 40134144275](https://github.com/mehdiakiki/mehdi-cz/actions/runs/40134144275) passed for PR head `aa3ea07386d828fda077d626020d6ca7565aa5e0` merged with its base. The [verification record](../../docs/editorial/evidence/length-seo-2026-10-24/verification.json) names the actual checkout and fixture hashes, with preserved stdout beside it. This verifies the bounded checks described here, without extending their stated limits. The articles remain held.

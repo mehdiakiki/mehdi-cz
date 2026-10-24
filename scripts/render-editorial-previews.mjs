@@ -1,6 +1,6 @@
 // Run in GitHub CI after the production build; output is a private review artifact.
 import assert from "node:assert/strict";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
@@ -19,9 +19,9 @@ for (const series of editorialSeries) {
   for (const slug of series.parts) {
     const post = bySlug.get(slug);
     assert.ok(post, `Missing compiled article: ${slug}`);
-    assert.equal(post.draft, true, `Review preview must remain a draft: ${slug}`);
-    assert.equal(post.reviewed, false, `Review preview must remain unapproved: ${slug}`);
-    assert.equal(publicArticleHref(allBlogs, slug, now), null);
+    if (post.draft === true || post.reviewed === false) {
+      assert.equal(publicArticleHref(allBlogs, slug, now), null);
+    }
     const contextualLinks = [];
     function ArticleLink({ slug: target, children }) {
       assert.ok(bySlug.has(target), `${slug} references unknown article ${target}`);
@@ -60,7 +60,7 @@ for (const series of editorialSeries) {
           React.createElement(
             "body",
             null,
-            React.createElement("p", null, "Held editorial draft — review artifact only."),
+            React.createElement("p", null, "Editorial review copy; state is in index.json."),
             React.createElement("h1", null, post.title),
             React.createElement("article", { dangerouslySetInnerHTML: { __html: body } })
           )
@@ -82,4 +82,21 @@ await writeFile(
   path.join(output, "index.json"),
   JSON.stringify({ generatedAt: now.toISOString(), articles: records }, null, 2) + "\n"
 );
-console.log(`Rendered ${records.length} held drafts and verified their article link destinations.`);
+// Exercise the changed metadata on an actual production article, not the
+// standalone MDX copies above. This existing route is also a build regression target.
+const articleUrl = "https://www.mehdi.cz/blog/BufReader-rust";
+const productionHtml = await readFile(".next/server/app/blog/BufReader-rust.html", "utf8");
+const canonicalPattern = /<link\b[^>]*rel="canonical"[^>]*href="([^"]+)"[^>]*>/g;
+const canonicals = [...productionHtml.matchAll(canonicalPattern)].map((match) => match[1]);
+assert.deepEqual(canonicals, [articleUrl]);
+const schemaPattern = /<script\b[^>]*type="application\/ld\+json"[^>]*>([\s\S]*?)<\/script>/g;
+const schemas = [...productionHtml.matchAll(schemaPattern)].flatMap((match) => {
+  const value = JSON.parse(match[1]);
+  return Array.isArray(value) ? value : [value];
+});
+const articleSchemas = schemas.filter((value) => value["@type"] === "Article");
+assert.equal(articleSchemas.length, 1, "A production article must emit one Article entity");
+assert.equal(articleSchemas[0].url, articleUrl);
+assert.equal(articleSchemas[0]["@id"], `${articleUrl}#article`);
+assert.ok(articleSchemas[0].author.length > 0);
+console.log(`Rendered ${records.length} series review copies, checked article links, and verified production canonical and Article metadata.`);

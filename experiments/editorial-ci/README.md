@@ -66,10 +66,9 @@ failure trace if present. Installing system browser dependencies must fit the
 existing runner environment; if it cannot, report the CI blocker rather than
 moving execution to the workstation or changing runner selection.
 
-Record the immutable source revision and run URL before describing these new
-examples as verified. Until then, the articles describe intended assertions.
-Existing historical deployment and focused-prompting runs remain separate
-evidence and do not verify these new fixture files.
+The recorded run below identifies the immutable fixture source and actual
+checkout. Existing historical deployment and focused-prompting runs remain
+separate evidence and do not verify these new fixture files.
 
 ## Retrieving the historical timing evidence
 
@@ -84,3 +83,7 @@ gh api repos/mehdiakiki/mehdi-cz/actions/runs/40096015210/jobs --jq '.jobs[] | {
 The article links the run and the source API endpoints are retained in the JSON.
 This captured run finished successfully; retrieving it does not execute a new
 build or establish typical performance across other runs.
+
+## Recorded verification
+
+[GitHub CI run 40134144275](https://github.com/mehdiakiki/mehdi-cz/actions/runs/40134144275) passed for PR head `aa3ea07386d828fda077d626020d6ca7565aa5e0` merged with its base. The [verification record](../../docs/editorial/evidence/length-seo-2026-10-24/verification.json) names the actual checkout and fixture hashes, with preserved stdout beside it. This verifies the bounded checks described here, without extending their stated limits. The articles remain held.
