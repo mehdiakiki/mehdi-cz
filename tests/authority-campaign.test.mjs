@@ -227,6 +227,7 @@ test("the repository maps every written campaign source without counting unrelat
       "eval-scores-move-between-runs-how-to-compare-two-versions-honestly",
       "how-async-rust-works-under-the-hood",
       "pattern-shape-simd-search-performance-rust",
+      "prompt-for-one-verifiable-change",
       "reuse-compiled-aho-corasick-searchers-rust",
       "runtime-type-tags-what-dynamic-languages-keep-that-static-ones-throw-away",
       "rust-bufread-slices-memory-mapping-copying",
