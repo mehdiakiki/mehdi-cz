@@ -1,12 +1,12 @@
 # Prompt for One Verifiable Change editorial review
 
-Date: 2026-10-20
+Date: 2026-10-24
 
 Article: [Prompt for One Verifiable Change](../../data/blog/prompt-for-one-verifiable-change.mdx)
 
-Status: work in progress. Keep `draft: true` and `reviewed: false`. The article
-now includes a recorded coding session and GitHub verification of its example.
-It has not been approved for publication.
+Status: approved for publication by the author on 2026-10-24. The article
+includes a recorded coding session and GitHub verification of its example.
+Release metadata now sets `draft: false`, `reviewed: true`, and the content review hash.
 
 ## Directional verdict
 
@@ -70,7 +70,8 @@ All executable verification and rendering ran in the existing Content safety
 workflow with its runner selection unchanged. No builds, tests, typechecks, or
 development servers ran locally. Source was committed through the GitHub API on
 the isolated `wip/focused-code-prompts` branch; formatting checks run remotely.
-No production branch was changed and no deployment was requested.
+Those verification runs did not change production. The author has since requested publication;
+the release revision must pass CI before merging and deploying.
 
 ## Coordinator corrections and scope
 
@@ -90,9 +91,9 @@ comparing to the input only afterward could miss replacements with equal-valued
 objects. The checks preserve values, identity, ordering, first-occurrence reports,
 and source row numbers through the preview caller.
 
-## Remaining editorial work
+## Publication decision
 
-The final CI result and static preview artifact have been inspected. Retain the
-draft flags and let the author assess the voice before publication. A broader
+The verified CI result and static preview artifact have been inspected, and the
+author has requested publication. A broader
 model comparison or another example is optional future work, not evidence
 supplied by this case study. Deno remains a separate article opportunity.

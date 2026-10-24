@@ -21,6 +21,10 @@ test("publication check-only dispatch cannot build or deploy", async () => {
   assert.equal(guardedSteps.length, 4);
   assert.match(workflow, /Fail when check-only finds missing publications/);
   assert.match(workflow, /inputs.check_only == true && steps.publication.outputs.deploy == 'true'/);
+  for (const action of ["docker/setup-buildx-action", "docker/login-action", "docker/build-push-action", "appleboy/ssh-action"]) {
+    const actionBlock = workflow.split(/\n      - /).find((block) => block.includes(action));
+    assert.match(actionBlock, /inputs.check_only != true/);
+  }
 });
 
 test("pre-pull cleanup preserves rollback and in-use images and never forces removal", async () => {
@@ -31,13 +35,19 @@ test("pre-pull cleanup preserves rollback and in-use images and never forces rem
   const docker = path.join(directory, "docker");
   await writeFile(log, "");
   await writeFile(docker, `#!/usr/bin/env bash
-if [ "$1 $2" = "image ls" ]; then
-  [ "$5" = "mast2133/mehdicz-site" ] || exit 90
-  printf '%s\\n' "$IMAGE_PROTECTED" "$IMAGE_UNUSED" "$IMAGE_BUSY"
+if [ "$1 $2" = "ps --all" ]; then
+  printf '%s\\n' 'active-container'
+elif [ "$1 $2" = "container inspect" ]; then
+  [ "$3" = 'active-container' ] || exit 93
+  printf '%s\\n' "$IMAGE_BUSY"
+elif [ "$1 $2" = "image ls" ]; then
+  [ "$6" = "mast2133/mehdicz-site" ] || exit 90
+  printf '%s\\n' "$IMAGE_PROTECTED mast2133/mehdicz-site:latest" "$IMAGE_UNUSED mast2133/mehdicz-site:old-a" "$IMAGE_UNUSED mast2133/mehdicz-site:old-b" "$IMAGE_BUSY mast2133/mehdicz-site:busy" "$IMAGE_UNUSED other/site:untouched"
 elif [ "$1 $2" = "image rm" ]; then
   [ "$#" = 3 ] || exit 91
   printf '%s\\n' "$3" >> "$CLEANUP_LOG"
-  [ "$3" != "$IMAGE_BUSY" ]
+  # Removing an ID with multiple tags would fail; remove repository tags instead.
+  case "$3" in mast2133/mehdicz-site:old-*) exit 0 ;; *) exit 94 ;; esac
 else
   exit 92
 fi
@@ -54,8 +64,8 @@ fi
     },
   });
   assert.deepEqual((await readFile(log, "utf8")).trim().split("\n").sort(), [
-    "sha256:busy",
-    "sha256:unused",
+    "mast2133/mehdicz-site:old-a",
+    "mast2133/mehdicz-site:old-b",
   ]);
   assert.ok(workflow.indexOf("# END SITE IMAGE CLEANUP") < workflow.indexOf('docker pull "$DEPLOY_IMAGE"'));
 });
