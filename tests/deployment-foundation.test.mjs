@@ -63,20 +63,16 @@ fi
 `
   );
   await chmod(docker, 0o755);
-  await promisify(execFile)(
-    "sh",
-    ["-e", "-c", 'previous_image="$IMAGE_PROTECTED"\n' + cleanup],
-    {
-      env: {
-        ...process.env,
-        PATH: directory + path.delimiter + process.env.PATH,
-        IMAGE_PROTECTED: "sha256:protected",
-        IMAGE_UNUSED: "sha256:unused",
-        IMAGE_BUSY: "sha256:busy",
-        CLEANUP_LOG: log,
-      },
-    }
-  );
+  await promisify(execFile)("sh", ["-e", "-c", 'previous_image="$IMAGE_PROTECTED"\n' + cleanup], {
+    env: {
+      ...process.env,
+      PATH: directory + path.delimiter + process.env.PATH,
+      IMAGE_PROTECTED: "sha256:protected",
+      IMAGE_UNUSED: "sha256:unused",
+      IMAGE_BUSY: "sha256:busy",
+      CLEANUP_LOG: log,
+    },
+  });
   assert.deepEqual((await readFile(log, "utf8")).trim().split("\n").sort(), [
     "mast2133/mehdicz-site:old-a",
     "mast2133/mehdicz-site:old-b",
