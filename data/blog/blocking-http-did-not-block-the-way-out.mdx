@@ -1,0 +1,97 @@
+---
+title: "Reject Disallowed Hosts Before DNS in an Agent Egress Broker"
+date: "2026-11-14T13:00:00Z"
+tags: ["ai", "security", "agent-security", "dns", "typescript"]
+draft: true
+reviewed: false
+cluster: "reliable-ai-systems"
+campaign: "editorial"
+summary: "Reject a model-selected hostname before lookup, check every returned address, and preserve the chosen IP and TLS hostname in a Node HTTPS request."
+---
+
+A trusted broker accepts a URL from an agent. The agent only needs one report API, so the broker has an allowlist. Where should that check happen?
+
+If the broker resolves the hostname first, a later denial may be too late to prevent that lookup. The hostname itself can contain information. A query can reach a resolver or authoritative server before an HTTP connection is even attempted.
+
+This article builds that broker's decision path. It doesn't configure a sandbox's network boundary. The <ArticleLink slug="sandboxing-model-generated-code-is-a-systems-problem">sandbox execution overview</ArticleLink> explains why the agent must also be prevented from bypassing the broker with its own sockets.
+
+## The research and the later fix
+
+BeyondTrust's [AgentCore Code Interpreter report](https://www.beyondtrust.com/blog/entry/pwning-aws-agentcore-code-interpreter) described DNS communication from a sandbox mode that blocked the expected external connection. BeyondTrust published the finding in March 2026. Its April update says AWS had blocked this DNS exfiltration route.
+
+The general question is still useful: does your network policy cover the resolver as well as the application protocol?
+
+Write the allowed path down. If the job needs no network, say so. If it needs one external API, list how the hostname is resolved, which addresses may be contacted, and which service enforces the decision.
+
+Don't make the model responsible for following that policy. Code that can open its own socket can bypass a polite instruction to use a broker.
+
+## Reject the hostname before looking it up
+
+The [complete TypeScript example](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/agent-security/dns_policy.ts) uses a fake resolver and transport. The resolver records names without sending queries. This makes the order of the policy check and lookup easy to inspect without operating an exfiltration endpoint.
+
+This lets a CI check answer one narrow question: was a denied hostname rejected before resolution?
+
+```ts
+const url = new URL(value);
+if (
+  url.protocol !== "https:" || url.username || url.password ||
+  (url.port !== "" && url.port !== "443") ||
+  !allowedHosts.has(url.hostname)
+) {
+  throw new Error("destination denied before DNS");
+}
+const addresses = await resolve(url.hostname);
+```
+
+It supplies a dummy name under `.invalid` and expects zero calls to the resolver. The allowed case uses an address reserved for documentation. Both cases stay inside the process; you can inspect which names reached resolution without contacting a real server.
+
+For an allowed name, the next check handles the returned addresses. The example rejects an empty answer, a denied address, a mixed allowed/denied answer, and an answer containing a hostname instead of a numeric IP. None may reach the transport. A host allowlist should not become permission to connect to every address a resolver happens to return.
+
+## Don't throw away the address decision
+
+After resolution, the broker also checks the returned addresses against its trusted address policy. If the check succeeds and an ordinary HTTP client resolves the name again, you may be connecting to a different address from the one you approved.
+
+The broker keeps both identities: the approved IP for the connection, and the original hostname for TLS and HTTP. The Node options builder has this core:
+
+```ts
+return {
+  hostname: target.address,
+  port: 443,
+  method: "GET",
+  path: target.path,
+  servername: target.serverName,
+  headers: { Host: target.serverName },
+  rejectUnauthorized: true,
+  checkServerIdentity: (_name, certificate) =>
+    checkServerIdentity(target.serverName, certificate),
+  agent: false,
+};
+```
+
+The complete source imports `checkServerIdentity` from `node:tls` and rejects nonnumeric destination addresses before building these options. `hostname` therefore selects the approved address. `servername` supplies the TLS server name, while `Host` names the HTTP service. Certificate verification stays enabled, and the identity check uses the original hostname. Node documents these settings in its [HTTPS request options](https://nodejs.org/api/https.html#httpsrequestoptions-callback) and [TLS identity check](https://nodejs.org/api/tls.html#tlscheckserveridentityhostname-cert).
+
+The fake transport captures that exact options object. Its assertions check the numeric destination, server name, Host header, path, and verification settings. This checks the adapter contract, not an actual TLS handshake. A real adapter must pass those settings through unchanged and bound response bytes while streaming, along with connection and request time. Replacing it with a convenience client that resolves the URL again would discard the address decision.
+
+The broker also rejects redirect responses. An application needing redirects must send each new destination through the same checks; simply forwarding `Location` would introduce an unchecked second request.
+
+An allowlist of exact addresses keeps this small example easy to inspect. A production service with changing provider addresses needs a maintained policy rather than a copied example IP.
+
+Also restrict what the allowed API can do. A destination may be approved while one of its endpoints accepts arbitrary uploads. Reaching an allowed host isn't the same as being authorized to send every piece of job data there.
+
+## Know which boundary this check protects
+
+These checks protect requests routed through this broker. They cannot establish whether a deployed VM can make direct DNS queries. Look at package installation, subprocesses, telemetry clients, and runtime libraries. They may resolve names without using your application's fetch helper.
+
+A subprocess can also receive an already-open socket from its launcher. <ArticleLink slug="the-child-process-inherited-the-secret">Inspecting environment and descriptor inheritance</ArticleLink> covers that separate way to grant a communication path.
+
+Inspect the resolver path from the same environment used by the agent. A test run on the host can miss a container-specific rule. Logging only successful HTTP requests can miss denied connections and earlier DNS traffic.
+
+For a no-network job, test that the relevant outbound paths are blocked at the environment boundary. For a brokered job, verify that the agent cannot simply bypass the broker. Keep any test endpoints under your control and send only canary data.
+
+## Make network failure visible
+
+If an allowlist or resolver configuration cannot load, the job should not fall back to unrestricted access to keep working. Report that it couldn't establish the required policy and stop that operation.
+
+Keep enough audit detail to identify the job, destination decision, and reason for denial. Avoid storing secret-bearing URLs as raw logs.
+
+Keep the broker cases separate in a regression report: denied hostname means zero resolver calls; denied address means zero connection calls; an allowed request preserves its IP and logical server name; a redirect produces a denial. Then verify network enforcement independently in the deployed environment. A passing fake-resolver check answers a useful application question, but it cannot certify that the environment is offline.

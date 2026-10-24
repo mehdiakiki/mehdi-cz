@@ -1,0 +1,108 @@
+---
+title: "Try PostgreSQL Search Before Adding a Vector Database"
+date: "2026-11-12T13:00:00Z"
+tags: ["search", "postgresql", "embeddings", "ai"]
+draft: true
+reviewed: false
+cluster: "reliable-ai-systems"
+campaign: "editorial"
+summary: "Build a small PostgreSQL search trial with exact identifiers, full-text search, pgvector, and lifecycle checks before choosing another database."
+---
+
+One person searches for `E_UPLOAD_17`. Another asks how to continue after a broken connection. A third remembers the function name `resumeUpload`.
+
+Before choosing another database, I would put those three searches next to the documents they should find. The question is whether we can build and operate the search the product needs. A nice nearest-neighbor demo answers only part of that.
+
+This trial keeps the documents and vectors in PostgreSQL. It starts with a deliberately tiny fixture, so we can inspect every row and check the query paths. It does not pretend that four rows can predict production speed or that hand-written vectors measure a model's understanding.
+
+## Put three questions beside four documents
+
+The complete SQL is in `experiments/practical-engineering/postgres-search-trial.sql`. It runs in an isolated CI database with pgvector available, creates temporary tables inside a transaction, and rolls back at the end.
+
+Our imaginary documentation contains:
+
+| ID | Account | Identifier | Document purpose |
+| --- | --- | --- | --- |
+| 1 | 7 | `E_UPLOAD_17` | Resume an upload session after a disconnect |
+| 2 | 7 | `upload-recovery` | Restart a failed transfer using its session |
+| 3 | 7 | `resumeUpload` | Describe the function and its argument |
+| 4 | 8 | `E_UPLOAD_17` | Private instructions for another customer |
+
+Account 7's query set is also part of the fixture:
+
+| Search | Labeled useful IDs | Reason |
+| --- | --- | --- |
+| `E_UPLOAD_17` | 1 | Exact error identifier |
+| `continue after a broken connection` | 1 or 2 | Recovery guidance despite different wording |
+| `resumeUpload` | 3 | Exact function name |
+
+These labels express the intended answers. They are not observed retrieval results. Row 4 is deliberately similar but forbidden to this caller. A ranking improvement cannot compensate for returning it.
+
+The table stores an exact `symbol`, the body, a generated English `tsvector`, and a `vector(3)` column. The fixture assigns simple coordinates by hand, such as `[1,0,0]` for the upload error. That lets the CI check exercise vector SQL without downloading an embedding model. It says nothing about real semantic relevance.
+
+## Keep an exact path alongside text search
+
+Identifiers deserve a direct comparison. Language tokenization can split or normalize a code in ways the user did not expect. The baseline combines the exact symbol with full-text matching:
+
+```sql
+SELECT id
+FROM trial_documents
+WHERE tenant_id = $1
+  AND (symbol = $2 OR search @@ websearch_to_tsquery('english', $2))
+ORDER BY (symbol = $2) DESC,
+         ts_rank_cd(search, websearch_to_tsquery('english', $2)) DESC,
+         id
+LIMIT 3;
+```
+
+The application binds the authenticated account as `$1` and the search text as `$2`. An agent or browser cannot choose an unchecked account ID. The fixture fixes account 7 explicitly so its assertions are easy to read.
+
+The generated text-search value and GIN index avoid rebuilding every document's text vector for each request. PostgreSQL's [text-search documentation](https://www.postgresql.org/docs/18/textsearch-controls.html) explains the query and ranking functions. Choose the language configuration for the actual documents; English is a fixture choice, not a multilingual policy.
+
+When this path misses, inspect the document and tokens before adding infrastructure. A missing page, a stale index, or the wrong account filter will also hurt a vector search.
+
+## Exercise the vector path without claiming a model result
+
+The second query uses cosine distance:
+
+```sql
+SELECT id
+FROM trial_documents
+WHERE tenant_id = $1
+ORDER BY embedding <=> $2::vector, id
+LIMIT 3;
+```
+
+Here `$2` is a query vector. In the fixture it is another hand-written three-dimensional value. For a real comparison, replace both document and query coordinates with outputs from the same compatible embedding model and preprocessing, then use that model's actual dimension. Keep model identity and text revision with the embedding job.
+
+The [pgvector reference](https://github.com/pgvector/pgvector) documents the operator and exact versus approximate search. This trial creates no approximate index. Start with the exact path as a correctness reference, then compare any approximate index against it using the same authorized corpus.
+
+The script also prints a fused ranking using a fixed reciprocal-rank constant of 60. The calculation combines list positions rather than adding incompatible raw scores. The separate <ArticleLink slug="hybrid-retrieval-when-keywords-rescue-embeddings">explanation of hybrid retrieval</ArticleLink> covers the theory. We need it here only as a third query path to inspect.
+
+An approximate index can interact with filtering and return fewer useful results than expected. Repeat account-filtered checks after adding it. pgvector's [filtering guide](https://github.com/pgvector/pgvector#filtering) describes iterative scans and other options; selecting one needs measurements from your data distribution.
+
+## Check edits and deletion before comparing latency
+
+The SQL assertions check that the exact code resolves to account 7's row, neither search path returns another account's private content, edited body text changes its generated text-search value, and a deleted document disappears from exact and vector results.
+
+Updating body text does not automatically regenerate a model embedding. The fixture's hand-written vector remains a fixture value. In the real ingestion path, decide when an edited document becomes searchable with its new vector. Publish text and embedding revisions together, or explicitly exclude stale vectors until the replacement is ready.
+
+Deleting the shared PostgreSQL row removes it from these two queries. That does not prove a separate cache, replica, or external index has processed the deletion. Include those systems in a real lifecycle check. The <ArticleLink slug="a-retrieval-index-needs-an-invalidation-strategy">retrieval index invalidation guide</ArticleLink> goes further into that problem.
+
+## Leave the trial with a database decision
+
+Once the mechanics pass, use real model embeddings and a representative corpus to compare useful results, latency, update delay, and operational cost. Keep the three query families separate, then add unanswerable questions and larger account sizes. The <ArticleLink slug="evaluate-retrieval-separately-from-answer-generation">retrieval evaluation guide</ArticleLink> explains how to label those cases without mixing them with answer-generation quality.
+
+A short decision record helps keep the infrastructure choice honest:
+
+| Question | Evidence to retain |
+| --- | --- |
+| Does either method find the required passages? | Returned IDs against reviewed query labels |
+| Can PostgreSQL serve the request within the product budget? | End-to-end timings and query plans under the intended concurrent load |
+| Do updates and deletions reach every serving path? | Revision and deletion checks, including caches |
+| Does the search workload harm existing transactions? | Database resource and latency measurements during the trial |
+| Would another service reduce a measured constraint? | The constraint, proposed change, and added backup, access and synchronization work |
+
+There are no performance numbers from this toy corpus to fill those cells. A separate database may be justified by isolation, capacity, operations, or required features. It may also introduce another permission model and another delayed copy of the documents.
+
+Keep PostgreSQL if it meets the measured need and fits the team's operating model. Investigate another system when you can name the constraint it must solve. The small trial gives that discussion a concrete starting point: the documents, three query paths, and the failures you can reproduce.

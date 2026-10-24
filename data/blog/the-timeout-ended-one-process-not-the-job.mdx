@@ -1,0 +1,99 @@
+---
+title: "Python Subprocess Timeouts and Descendant Cleanup"
+date: "2026-11-20T13:00:00Z"
+tags: ["ai", "security", "agent-security", "python", "processes"]
+draft: true
+reviewed: false
+cluster: "reliable-ai-systems"
+campaign: "editorial"
+summary: "Compare waiting for one process with cleanup on completion, timeout, cancellation, and launcher failure. Give the whole job an independent supervisor."
+---
+
+The agent's command exceeded its deadline. The UI shows a timeout, so the user starts another attempt.
+
+Meanwhile a child process from the first attempt is still writing files. Or the original process ended successfully after starting background work. The launcher thinks the job is finished because the one process it waited for has gone away.
+
+These are different events. A request can stop waiting while computation continues. A process can exit while descendants remain. For agent jobs, the launcher has to define which event actually ends the job.
+
+The <ArticleLink slug="sandboxing-model-generated-code-is-a-systems-problem">sandbox execution overview</ArticleLink> lists the required resource and lifecycle controls. Here we inspect one failure directly: a leader exits while its single child keeps running.
+
+## Observe the descendant, not just the return value
+
+The [complete Python example](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/agent-security/job_timeout.py) uses fixed, bounded programs. Each case starts only a leader and one worker that sleeps for eight seconds. The leader reports the worker's PID through a small readiness message, then either waits or exits. There is no network or resource-exhaustion payload.
+
+The first case only waits for the leader. After its successful exit, the selfcheck expects the worker to remain running. It then terminates that known worker. This gives the article's opening failure an observable condition: the process the launcher waited for is gone, but the descendant has not terminated.
+
+The other cases use a group-cleanup helper. The launcher starts the leader with `start_new_session=True`, making its PID the new process-group ID. The helper observes exit without collecting the leader first:
+
+```python
+deadline = time.monotonic() + timeout
+reason = "timeout"
+try:
+    while True:
+        if cancelled():
+            reason = "cancelled"
+            break
+        exited = os.waitid(
+            os.P_PID, child.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT
+        )
+        if exited is not None:
+            reason = "completed"
+            break
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.005)
+finally:
+    try:
+        os.killpg(child.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    code = child.wait(timeout=5)
+```
+
+This is Linux code, with one waiter owning the leader. `WNOWAIT` leaves an exited child waitable; a later `wait` collects its status. The helper therefore retains the leader's PID while addressing its group. Calling `poll` or `wait` earlier would change that reasoning, because collecting the leader allows its PID to be reused. Python documents [waitid and WNOWAIT](https://docs.python.org/3/library/os.html#os.waitid).
+
+Cleanup runs after ordinary leader exit too, and an exception from the cancellation callback still enters `finally`. The returned exit code remains separate from the reason the loop ended. Here `completed` means the leader exited; callers still inspect its code and cleanup outcome before deciding the product's final status.
+
+The selfcheck opens a Linux pidfd for the worker before the measured wait begins. The leader reports its child's PID, then waits for an acknowledgment before exiting or collecting that child. Even if the worker finishes early, it remains waitable under the leader until the parent opens the pidfd. This closes the gap where a printed PID could otherwise be reused before handle acquisition. The acknowledgment is sent only after the handle is open and the worker is observed running.
+
+That handle then lets the selfcheck observe termination without treating a reused numeric PID as the same process. The fixed leader and parent follow this handshake; it is not a general way to acquire a safe handle from an arbitrary reported PID. The selfcheck asserts these outcomes and prints them as JSON:
+
+| Case | Descendant after the handler returns |
+| --- | --- |
+| Wait for the leader only | Still running |
+| Group cleanup after normal exit | Terminated |
+| Group cleanup after timeout | Terminated |
+| Group cleanup after cancellation | Terminated |
+| Group cleanup after an injected launcher error | Terminated |
+
+## A process group still has a boundary
+
+The observer checks termination of this known descendant, including a terminated process whose status has not yet been collected by its parent. It doesn't prove that the machine has no other work. Every example worker has a fixed lifetime, and the selfcheck has a separate cleanup backstop using its pidfd.
+
+A descendant that creates a separate session can leave the group. The example deliberately doesn't do that. This helper suits cooperative commands that remain in the group; it cannot confine arbitrary generated code or keep cleaning up after the launcher itself is killed.
+
+For untrusted code, put the whole job under a supervisor that owns its process lifetime. On Linux, a protected cgroup gives the supervisor a group of processes it can monitor and terminate together. The agent must not be able to move processes out or change the controller configuration. See the [cgroup v2 documentation](https://docs.kernel.org/admin-guide/cgroup-v2.html) for the actual interfaces and controller behavior.
+
+The supervisor's lifecycle should be explicit: create the protected job boundary before execution, launch into it, record the deadline and cancellation state, end remaining work on every terminal outcome, then observe that the boundary is empty before removing scratch storage. With cgroup v2, the supervisor can use the documented kill and populated-state interfaces. The small Python example never creates or modifies a cgroup.
+
+If termination or the emptiness check fails, keep the job in a cleanup-failed state and stop reusing its workspace. “Sent a signal” is not evidence that all work stopped. A supervisor independent of the request worker must also handle a lost connection or crashed launcher.
+
+## Wall time is only one limit
+
+A command can create trouble in a fraction of its allowed minute. It might allocate memory, fill an output buffer, create too many processes, or write until the job's volume is full.
+
+Decide those limits separately. The supervisor should bound memory and process count, the storage layer should bound writable space, and the output collector should stop accepting bytes after its budget. CPU quota and wall-clock deadline answer different questions too.
+
+The worker's stdout and stderr are discarded. The leader's pipe carries only the small, fixed readiness message, which the parent bounds before parsing. If the product needs command logs, use a bounded streaming collector. Capturing arbitrary output into one in-memory string can turn a helpful diagnostic feature into a separate resource problem.
+
+Keep the job's final status separate from the command's exit code. A nonzero code, a deadline, a user cancellation, and a resource-limit termination each tell the operator something different. Save that small status record before deleting temporary files, and include whether cleanup completed. Otherwise the next retry can erase the only evidence that the previous job ended because of a memory limit rather than a Python exception.
+
+## Cleanup also needs a failure path
+
+What happens if the HTTP request disconnects? What if the application worker crashes before its cleanup block runs? What if the normal command finishes but a background process remains?
+
+Those cases are why cleanup belongs to a supervisor with its own lifecycle, not only a `finally` block in a request handler. A separate owner can expire the job, terminate remaining work, and remove its temporary resources.
+
+Keep a deployment check for each outcome: normal completion, timeout, cancellation, launcher failure, and remaining background work. Use bounded jobs through the configured remote verification environment. Pair the descendant observations with the supervisor's own empty-boundary and cleanup records; a passing Python group check doesn't verify the deployed supervisor. <ArticleLink slug="the-next-agent-read-the-previous-jobs-files">Job-state expiry and operator cleanup</ArticleLink> covers the stored data left after processes stop.
+
+The user should be able to trust what “finished” means. If it means only that the browser stopped waiting, the next retry may be sharing a workspace and resource budget with work everyone thought had already ended.

@@ -1,0 +1,129 @@
+---
+title: "Debug a Slow Node.js Request With OpenTelemetry"
+date: "2026-11-09T13:00:00Z"
+tags: ["opentelemetry", "observability", "performance", "typescript"]
+draft: true
+reviewed: false
+cluster: "reliable-data-integrations"
+campaign: "editorial"
+summary: "Separate PostgreSQL connection acquisition from query time with OpenTelemetry spans, then investigate queueing or connection setup before changing SQL."
+---
+
+The user says opening an order is slow. The API dashboard says requests are slow too. So far, the dashboard has repeated the complaint.
+
+What you need next is a breakdown. Did the request wait for authentication, a database connection, the query itself, or a response from another service?
+
+For this example, we will follow one order request. A few well-placed spans are enough to start. There is no need to instrument every helper function before learning anything.
+
+## Draw the work before adding spans
+
+Write the steps you expect the request to take:
+
+```text
+GET /orders/:id
+  auth.check
+  orders.lookup
+    db.pool.acquire
+    db.query
+  response.serialize
+```
+
+These are the spans we want to add. With only a timer around the whole lookup, we still wouldn't know whether the request waited for a connection or ran a slow query.
+
+[OpenTelemetry traces](https://opentelemetry.io/docs/concepts/signals/traces/) connect spans that belong to the same operation. A span has a start, an end, and context connecting it to the surrounding work. The useful part is being able to follow the request rather than search several unrelated logs.
+
+Start with the HTTP request and the slowest-looking dependency. Add another span when it will help choose between two possible fixes.
+
+## Keep the span open until the work ends
+
+With an OpenTelemetry SDK and asynchronous context handling already initialized, a wrapper around the database lookup can look like this:
+
+```ts
+import { trace, SpanStatusCode } from "@opentelemetry/api";
+
+const tracer = trace.getTracer("orders-service");
+
+async function inSpan<T>(name: string, work: () => Promise<T>): Promise<T> {
+  return tracer.startActiveSpan(name, async (span) => {
+    try {
+      return await work();
+    } catch (error) {
+      span.setStatus({ code: SpanStatusCode.ERROR });
+      throw error;
+    } finally {
+      span.end();
+    }
+  });
+}
+```
+
+The `await` matters. Without it, the `finally` block could end the span before the returned promise finishes. Keep the application's error behavior too: the wrapper reports the failure and rethrows it.
+
+This example doesn't copy the error message into the trace. Database errors can contain values you don't want in telemetry. If you record exceptions, review and redact the fields first.
+
+The API package alone does not configure exporting. Follow the [JavaScript instrumentation guide](https://opentelemetry.io/docs/languages/js/instrumentation/) for the SDK setup appropriate to your application, and initialize it before the modules that need instrumentation. Otherwise the code can run while producing no useful exported trace.
+
+Now put the two database operations in different spans. With a [node-postgres pool](https://node-postgres.com/apis/pool), the connection is acquired before the query can start:
+
+```ts
+import type { Pool } from "pg";
+
+async function lookupOrder(pool: Pool, orderId: string, tenantId: string) {
+  return inSpan("orders.lookup", async () => {
+    const client = await inSpan("db.pool.acquire", () => pool.connect());
+    try {
+      return await inSpan("db.query", () => client.query(
+        "SELECT id, status FROM orders WHERE id = $1 AND tenant_id = $2",
+        [orderId, tenantId],
+      ));
+    } finally {
+      client.release();
+    }
+  });
+}
+```
+
+Here `pool` is the application's initialized pool, and `tenantId` comes from its trusted authorization context. Use the driver's actual pool types in the application. The span names don't authorize the SQL. A failed query must still release its acquired connection; otherwise the instrumentation example can create the waiting problem we are investigating.
+
+The acquisition span is broader than queue waiting. `pool.connect()` can return an idle connection, wait for a checked-out one, or create a new connection. Its time can therefore include connection setup and authentication. The span separates acquisition from SQL execution; it doesn't identify the acquisition delay by itself.
+
+The standalone adapter in `experiments/practical-engineering/traced-lookup.mjs` verifies the ordering and failure paths with fake spans and a fake pool. It cannot establish that your SDK exports context correctly. Keep one integration check using the actual driver and exporter as a separate step.
+
+## Follow the context across the next service
+
+If the API calls an inventory service, the second service needs the incoming trace context. Without that link, you get two traces and have to guess whether they describe the same request.
+
+Use the framework's supported HTTP instrumentation and check propagation with one controlled request. The [context propagation guide](https://opentelemetry.io/docs/concepts/context-propagation/) explains how trace information travels between processes.
+
+Check asynchronous jobs separately. A request may enqueue work and return before a worker begins. The response time and the background completion time are different measurements. Don't make the user-facing request look as though it spent all that time waiting if it actually returned earlier.
+
+Trace headers are not user authentication. Another service still needs its normal authorization, and a caller-supplied trace ID must not grant access to data.
+
+## Read a few slow traces against ordinary ones
+
+One slow trace gives you a lead. Compare it with ordinary requests using the same route and similar inputs. Is time concentrated in connection waiting, query execution, or an external call? Does the pattern occur for one tenant or across the service?
+
+These two patterns are illustrative, not captured timings:
+
+| Pattern | Connection acquisition | Query | Next question |
+| --- | --- | --- | --- |
+| A | Long | Short | Are requests queued, or is a new connection slow to establish? |
+| B | Short | Long | What work does this SQL plan perform for these parameters? |
+
+For pattern B, <ArticleLink slug="why-postgresql-stopped-using-the-index">read the query plan and buffer work</ArticleLink>. For pattern A, compare the pool's queued-request count with new-connection events. A queue suggests inspecting connection leases and concurrency; slow setup suggests inspecting the connection path. Increasing the pool size without checking the database's capacity can move the queue into the database.
+
+If the wait is inside CPU work rather than the database, the <ArticleLink slug="when-more-threads-make-a-service-slower">Rust shared-counter comparison</ArticleLink> shows why more threads can add coordination instead of useful work. That calls for a different measurement from a SQL plan.
+
+Then choose a narrower investigation. Long acquisition suggests checking queueing and connection setup separately. Long query spans suggest reading plans and data access. A missing span between two known steps may mean instrumentation is incomplete, not that the time disappeared.
+
+Don't add all child durations together. Some work overlaps, and a parent often includes its children's time. Read the timeline and the operation boundaries.
+
+Keep names stable, such as `GET /orders/:id`, rather than a separate span name for each order ID. Avoid full request bodies, tokens, or private documents in attributes. Useful telemetry needs enough context to debug without becoming another store of customer data.
+
+## Use the trace to choose the next fix
+
+After the first investigation, save a sanitized request example, the release version, and a trace showing the suspected delay. Make one change and compare the same kind of request again.
+
+Check how traces are sampled and retained before concluding that a problem stopped happening. A trace you didn't collect cannot show you a healthy request.
+
+If most of the delay is in `db.pool.acquire`, inspect acquisition before rewriting the query. If it is in `db.query`, save the SQL and parameters and investigate its plan. The trace has done its first job once it tells you which of those to investigate.
