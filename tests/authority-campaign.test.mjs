@@ -263,6 +263,7 @@ test("the repository maps every written campaign source without counting unrelat
       "the-unit-of-rebuild-when-you-split-a-rust-workspace",
       "two-ways-to-make-a-type-disappear-erasure-and-monomorphization",
       "types-as-proofs-what-the-checker-knows-that-the-binary-forgets",
+      "what-breaks-when-rust-reaches-1-100",
       "what-can-an-ai-agent-reach-from-its-sandbox",
       "what-evidence-an-ai-feature-needs-before-you-ship-it",
       "what-is-a-type-a-set-of-values-a-promise-about-operations-or-both",

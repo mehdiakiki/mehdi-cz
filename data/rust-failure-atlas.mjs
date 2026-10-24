@@ -902,7 +902,7 @@ export const rustFailureAtlasEntries = [
       "use struct after moving field Rust",
       "partial move borrow whole value",
     ],
-    evidence: ["Rust 1.98.1 compile failure", "field-state table", "borrowed-field repair"],
+    evidence: ["Rust 1.99.1 compile failure", "field-state table", "borrowed-field repair"],
     caseSlug: "partial-move-borrows-whole-value",
   },
   {
@@ -919,7 +919,7 @@ export const rustFailureAtlasEntries = [
       "values values len index borrow error",
       "Rust vec last element assignment borrow",
     ],
-    evidence: ["Rust 1.98.1 compile failure", "evaluation-order reduction", "local-index repair"],
+    evidence: ["Rust 1.99.1 compile failure", "evaluation-order reduction", "local-index repair"],
     caseSlug: "indexing-vec-borrows-it-twice",
   },
   {
@@ -936,7 +936,7 @@ export const rustFailureAtlasEntries = [
       "cannot borrow map mutable more than once return",
       "Rust get or insert mutable reference borrow checker",
     ],
-    evidence: ["Rust 1.98.1 compile failure", "borrow-lifetime trace", "Entry API repair"],
+    evidence: ["Rust 1.99.1 compile failure", "borrow-lifetime trace", "Entry API repair"],
     caseSlug: "hashmap-get-mut-then-insert-borrow",
   },
   {
@@ -953,7 +953,7 @@ export const rustFailureAtlasEntries = [
       "return str from local String Rust",
       "static lifetime does not make value live longer",
     ],
-    evidence: ["Rust 1.98.1 compile failure", "owner-lifetime timeline", "owned return repair"],
+    evidence: ["Rust 1.99.1 compile failure", "owner-lifetime timeline", "owned return repair"],
     caseSlug: "return-reference-to-local-string",
   },
   {
@@ -970,7 +970,7 @@ export const rustFailureAtlasEntries = [
       "String as_bytes temporary lifetime",
       "consider using a let binding longer lived value",
     ],
-    evidence: ["Rust 1.98.1 compile failure", "temporary-scope timeline", "owner-binding repair"],
+    evidence: ["Rust 1.99.1 compile failure", "temporary-scope timeline", "owner-binding repair"],
     caseSlug: "temporary-value-dropped-while-borrowed",
   },
   {
@@ -988,7 +988,7 @@ export const rustFailureAtlasEntries = [
       "Rust Result different error types question mark",
     ],
     evidence: [
-      "Rust 1.98.1 compile failure",
+      "Rust 1.99.1 compile failure",
       "desugared propagation",
       "From implementation repair",
     ],
@@ -1009,7 +1009,7 @@ export const rustFailureAtlasEntries = [
       "cannot infer type for into Rust",
     ],
     evidence: [
-      "Rust 1.98.1 compile failure",
+      "Rust 1.99.1 compile failure",
       "candidate-type inventory",
       "two explicit-type repairs",
     ],
@@ -1029,7 +1029,7 @@ export const rustFailureAtlasEntries = [
       "trait implemented but not in scope method",
       "items from traits can only be used if trait is in scope",
     ],
-    evidence: ["Rust 1.98.1 compile failure", "method-candidate comparison", "trait-import repair"],
+    evidence: ["Rust 1.99.1 compile failure", "method-candidate comparison", "trait-import repair"],
     caseSlug: "trait-method-not-found-import",
   },
   {
@@ -1046,7 +1046,7 @@ export const rustFailureAtlasEntries = [
       "trait cannot be made into an object vtable",
       "Rust object safety method has generic type parameters",
     ],
-    evidence: ["Rust 1.98.1 compile failure", "vtable-slot model", "object-safe interface repair"],
+    evidence: ["Rust 1.99.1 compile failure", "vtable-slot model", "object-safe interface repair"],
     caseSlug: "trait-not-dyn-compatible-generic-method",
   },
   {
@@ -1063,7 +1063,7 @@ export const rustFailureAtlasEntries = [
       "impl Trait different concrete types branches",
       "expected Range found IntoIter Rust",
     ],
-    evidence: ["Rust 1.98.1 compile failure", "concrete-type comparison", "boxed iterator repair"],
+    evidence: ["Rust 1.99.1 compile failure", "concrete-type comparison", "boxed iterator repair"],
     caseSlug: "impl-trait-branches-different-types",
   },
   {
@@ -1080,7 +1080,7 @@ export const rustFailureAtlasEntries = [
       "return closure borrows local variable",
       "move closure owned value Rust",
     ],
-    evidence: ["Rust 1.98.1 compile failure", "capture-mode comparison", "move closure repair"],
+    evidence: ["Rust 1.99.1 compile failure", "capture-mode comparison", "move closure repair"],
     caseSlug: "returned-closure-borrows-local-value",
   },
   {
@@ -1098,7 +1098,7 @@ export const rustFailureAtlasEntries = [
       "Vec reference closure value escapes",
     ],
     evidence: [
-      "Rust 1.98.1 compile failure",
+      "Rust 1.99.1 compile failure",
       "inferred-lifetime comparison",
       "annotation removal repair",
     ],
@@ -1118,7 +1118,7 @@ export const rustFailureAtlasEntries = [
       "impl Trait lifetime does not appear in bounds",
       "Rust use lifetime precise capture iterator",
     ],
-    evidence: ["Rust 1.98.1 compile failure", "hidden-type expansion", "precise-capture repair"],
+    evidence: ["Rust 1.99.1 compile failure", "hidden-type expansion", "precise-capture repair"],
     caseSlug: "impl-iterator-hidden-type-captures-lifetime",
   },
   {
@@ -1136,7 +1136,7 @@ export const rustFailureAtlasEntries = [
       "trait object associated type Rust",
     ],
     evidence: [
-      "Rust 1.98.1 compile failure",
+      "Rust 1.99.1 compile failure",
       "vtable-signature comparison",
       "associated-type binding repair",
     ],
@@ -1156,7 +1156,7 @@ export const rustFailureAtlasEntries = [
       "chain iter into_iter item type mismatch",
       "IntoIter Item equals reference Rust error",
     ],
-    evidence: ["Rust 1.98.1 compile failure", "associated-item table", "copied iterator repair"],
+    evidence: ["Rust 1.99.1 compile failure", "associated-item table", "copied iterator repair"],
     caseSlug: "iterator-chain-reference-value-item-mismatch",
   },
   {
@@ -1174,7 +1174,7 @@ export const rustFailureAtlasEntries = [
       "recursion_limit does not fix trait overflow",
     ],
     evidence: [
-      "Rust 1.98.1 compile failure",
+      "Rust 1.99.1 compile failure",
       "obligation expansion",
       "structurally decreasing repair",
     ],
@@ -1194,7 +1194,7 @@ export const rustFailureAtlasEntries = [
       "blanket impl conflicts with specific impl future",
       "Rust coherence newtype overlap",
     ],
-    evidence: ["Rust 1.98.1 compile failure", "future-overlap proof", "local-newtype repair"],
+    evidence: ["Rust 1.99.1 compile failure", "future-overlap proof", "local-newtype repair"],
     caseSlug: "blanket-impl-conflicts-with-specific-impl",
   },
   {
@@ -1212,7 +1212,7 @@ export const rustFailureAtlasEntries = [
       "move generic parameter from impl to method",
     ],
     evidence: [
-      "Rust 1.98.1 compile failure",
+      "Rust 1.99.1 compile failure",
       "selection-boundary comparison",
       "generic-method repair",
     ],
@@ -1233,7 +1233,7 @@ export const rustFailureAtlasEntries = [
       "Rust orphan rule From local generic wrapper",
     ],
     evidence: [
-      "Rust 1.98.1 compile failure",
+      "Rust 1.99.1 compile failure",
       "impl-header ordering",
       "local-target conversion repair",
     ],
@@ -1253,7 +1253,7 @@ export const rustFailureAtlasEntries = [
       "move field out of struct with destructor",
       "Option take field Drop type Rust",
     ],
-    evidence: ["Rust 1.98.1 compile failure", "destructor-state model", "Option take repair"],
+    evidence: ["Rust 1.99.1 compile failure", "destructor-state model", "Option take repair"],
     caseSlug: "cannot-move-field-out-of-drop-type",
   },
   {
@@ -1270,7 +1270,7 @@ export const rustFailureAtlasEntries = [
       "expected Fn instead of FnMut callback",
       "closure mutate captured variable trait bound",
     ],
-    evidence: ["Rust 1.98.1 compile failure", "closure receiver model", "FnMut bound repair"],
+    evidence: ["Rust 1.99.1 compile failure", "closure receiver model", "FnMut bound repair"],
     caseSlug: "closure-mutates-capture-but-api-requires-fn",
   },
   {
@@ -1287,7 +1287,7 @@ export const rustFailureAtlasEntries = [
       "FnMut closure consume captured String",
       "change callback to FnOnce Rust",
     ],
-    evidence: ["Rust 1.98.1 compile failure", "call-trait comparison", "FnOnce repair"],
+    evidence: ["Rust 1.99.1 compile failure", "call-trait comparison", "FnOnce repair"],
     caseSlug: "fnmut-closure-cannot-consume-captured-value",
   },
   {
@@ -1304,7 +1304,7 @@ export const rustFailureAtlasEntries = [
       "recursive async function infinitely sized future",
       "Box pin recursive future Rust",
     ],
-    evidence: ["Rust 1.98.1 compile failure", "future-size expansion", "boxed-future repair"],
+    evidence: ["Rust 1.99.1 compile failure", "future-size expansion", "boxed-future repair"],
     caseSlug: "recursive-async-fn-requires-boxing",
   },
   {
@@ -1322,7 +1322,7 @@ export const rustFailureAtlasEntries = [
       "where to call await Rust executor boundary",
     ],
     evidence: [
-      "Rust 1.98.1 compile failure",
+      "Rust 1.99.1 compile failure",
       "surrounding-state-machine model",
       "async-boundary repair",
     ],
@@ -1343,7 +1343,7 @@ export const rustFailureAtlasEntries = [
       "generic transmute size equality Rust",
     ],
     evidence: [
-      "Rust 1.98.1 compile failure",
+      "Rust 1.99.1 compile failure",
       "validity-contract audit",
       "typed byte conversion repair",
     ],
@@ -1364,7 +1364,7 @@ export const rustFailureAtlasEntries = [
       "fat pointer str address metadata",
     ],
     evidence: [
-      "Rust 1.98.1 compile failure",
+      "Rust 1.99.1 compile failure",
       "pointer-component model",
       "thin data-pointer repair",
     ],
@@ -1384,7 +1384,7 @@ export const rustFailureAtlasEntries = [
       "const evaluation panic compile time Rust",
       "attempt to divide by zero constant",
     ],
-    evidence: ["Rust 1.98.1 compile failure", "const evaluation trace", "checked const repair"],
+    evidence: ["Rust 1.99.1 compile failure", "const evaluation trace", "checked const repair"],
     caseSlug: "constant-evaluation-failed-on-invalid-operation",
   },
   {
@@ -1401,7 +1401,7 @@ export const rustFailureAtlasEntries = [
       "function result known but const initializer fails",
       "make helper const fn Rust",
     ],
-    evidence: ["Rust 1.98.1 compile failure", "const-context boundary", "const fn repair"],
+    evidence: ["Rust 1.99.1 compile failure", "const-context boundary", "const fn repair"],
     caseSlug: "constant-cannot-call-ordinary-function",
   },
   {
@@ -1418,7 +1418,7 @@ export const rustFailureAtlasEntries = [
       "String field in Rust union",
       "union active field manual drop safety",
     ],
-    evidence: ["Rust 1.98.1 compile failure", "active-field invariant", "ManuallyDrop repair"],
+    evidence: ["Rust 1.99.1 compile failure", "active-field invariant", "ManuallyDrop repair"],
     caseSlug: "union-string-field-needs-manuallydrop",
   },
   {
@@ -1436,7 +1436,7 @@ export const rustFailureAtlasEntries = [
       "unsafe_op_in_unsafe_fn deny migration",
     ],
     evidence: [
-      "Rust 1.98.1 edition-2024 failure",
+      "Rust 1.99.1 edition-2024 failure",
       "unsafe-boundary audit",
       "documented unsafe block repair",
     ],
@@ -1456,7 +1456,7 @@ export const rustFailureAtlasEntries = [
       "expected identifier found reserved keyword gen",
       "cargo fix edition gen keyword raw identifier",
     ],
-    evidence: ["Rust 1.98.1 edition-2024 failure", "edition comparison", "identifier repair"],
+    evidence: ["Rust 1.99.1 edition-2024 failure", "edition comparison", "identifier repair"],
     caseSlug: "gen-keyword-breaks-2024-edition-build",
   },
   {
@@ -1473,7 +1473,7 @@ export const rustFailureAtlasEntries = [
       "Rust 2024 unsafe no_mangle migration",
       "wrap attribute in unsafe no_mangle",
     ],
-    evidence: ["Rust 1.98.1 edition-2024 failure", "symbol invariant", "unsafe-attribute repair"],
+    evidence: ["Rust 1.99.1 edition-2024 failure", "symbol invariant", "unsafe-attribute repair"],
     caseSlug: "unsafe-attribute-required-for-no-mangle",
   },
   {
@@ -1490,7 +1490,7 @@ export const rustFailureAtlasEntries = [
       "unsafe extern C migration Rust",
       "missing unsafe on extern block",
     ],
-    evidence: ["Rust 1.98.1 edition-2024 failure", "declaration audit", "unsafe-extern repair"],
+    evidence: ["Rust 1.99.1 edition-2024 failure", "declaration audit", "unsafe-extern repair"],
     caseSlug: "extern-block-must-be-unsafe-in-rust-2024",
   },
   {
@@ -1508,7 +1508,7 @@ export const rustFailureAtlasEntries = [
       "environment mutation multithreaded Rust safety",
     ],
     evidence: [
-      "Rust 1.98.1 edition-2024 failure",
+      "Rust 1.99.1 edition-2024 failure",
       "thread-lifecycle invariant",
       "documented unsafe repair",
     ],
@@ -1529,7 +1529,7 @@ export const rustFailureAtlasEntries = [
       "binding modifier not allowed when implicitly borrowing",
     ],
     evidence: [
-      "Rust 1.98.1 edition-2024 failure",
+      "Rust 1.99.1 edition-2024 failure",
       "binding-mode trace",
       "fully explicit pattern repair",
     ],
@@ -1549,7 +1549,7 @@ export const rustFailureAtlasEntries = [
       "future is not Send value used across await",
       "Tokio spawn Rc not Send scope",
     ],
-    evidence: ["Rust 1.98.1 compile failure", "future-state boundary", "scope-shortening repair"],
+    evidence: ["Rust 1.99.1 compile failure", "future-state boundary", "scope-shortening repair"],
     caseSlug: "rc-across-await-makes-future-not-send",
   },
   {
@@ -1567,7 +1567,7 @@ export const rustFailureAtlasEntries = [
       "future cannot be sent MutexGuard await",
     ],
     evidence: [
-      "Rust 1.98.1 compile failure",
+      "Rust 1.99.1 compile failure",
       "suspension-state inspection",
       "pre-await unlock repair",
     ],
@@ -1587,7 +1587,7 @@ export const rustFailureAtlasEntries = [
       "Box pin future not Unpin",
       "Pin new requires Unpin async future",
     ],
-    evidence: ["Rust 1.98.1 compile failure", "pinning contract", "Box::pin repair"],
+    evidence: ["Rust 1.99.1 compile failure", "pinning contract", "Box::pin repair"],
     caseSlug: "async-block-cannot-be-unpinned-with-pin-new",
   },
   {
@@ -1604,7 +1604,7 @@ export const rustFailureAtlasEntries = [
       "thread spawn closure requires static str",
       "move borrowed value into Rust thread",
     ],
-    evidence: ["Rust 1.98.1 compile failure", "thread lifetime boundary", "owned-transfer repair"],
+    evidence: ["Rust 1.99.1 compile failure", "thread lifetime boundary", "owned-transfer repair"],
     caseSlug: "thread-spawn-borrowed-value-escapes",
   },
   {
@@ -1621,7 +1621,7 @@ export const rustFailureAtlasEntries = [
       "async move local String future",
       "impl Future borrows local variable",
     ],
-    evidence: ["Rust 1.98.1 compile failure", "capture-state model", "async-move repair"],
+    evidence: ["Rust 1.99.1 compile failure", "capture-state model", "async-move repair"],
     caseSlug: "returned-async-block-borrows-local-value",
   },
   {
@@ -1638,7 +1638,7 @@ export const rustFailureAtlasEntries = [
       "shared static must implement Sync",
       "replace Cell static with AtomicU64",
     ],
-    evidence: ["Rust 1.98.1 compile failure", "Sync requirement", "atomic counter repair"],
+    evidence: ["Rust 1.99.1 compile failure", "Sync requirement", "atomic counter repair"],
     caseSlug: "cell-in-static-does-not-implement-sync",
   },
   {
@@ -1656,7 +1656,7 @@ export const rustFailureAtlasEntries = [
       "Arc Mutex shared mutable vector",
     ],
     evidence: [
-      "Rust 1.98.1 compile failure",
+      "Rust 1.99.1 compile failure",
       "ownership-versus-mutation matrix",
       "Arc Mutex repair",
     ],
@@ -1676,7 +1676,7 @@ export const rustFailureAtlasEntries = [
       "RefCell not Sync thread spawn E0277",
       "Arc does not make inner type thread safe",
     ],
-    evidence: ["Rust 1.98.1 compile failure", "Send Sync composition", "Arc Mutex repair"],
+    evidence: ["Rust 1.99.1 compile failure", "Send Sync composition", "Arc Mutex repair"],
     caseSlug: "arc-refcell-cannot-cross-thread",
   },
   {
@@ -1694,7 +1694,7 @@ export const rustFailureAtlasEntries = [
       "read unaligned packed struct field",
     ],
     evidence: [
-      "Rust 1.98.1 compile failure",
+      "Rust 1.99.1 compile failure",
       "alignment calculation",
       "by-value field copy repair",
     ],
@@ -1715,7 +1715,7 @@ export const rustFailureAtlasEntries = [
       "union active field validity invariant",
     ],
     evidence: [
-      "Rust 1.98.1 compile failure",
+      "Rust 1.99.1 compile failure",
       "active-field invariant",
       "narrow unsafe read repair",
     ],
@@ -1735,7 +1735,7 @@ export const rustFailureAtlasEntries = [
       "FFI call site safety contract",
     ],
     evidence: [
-      "Rust 1.98.1 compile failure",
+      "Rust 1.99.1 compile failure",
       "call-site precondition audit",
       "documented unsafe call repair",
     ],
@@ -1756,7 +1756,7 @@ export const rustFailureAtlasEntries = [
       "extern C varargs declaration",
     ],
     evidence: [
-      "Rust 1.98.1 compile failure",
+      "Rust 1.99.1 compile failure",
       "ABI compatibility check",
       "extern-C declaration repair",
     ],
@@ -1777,7 +1777,7 @@ export const rustFailureAtlasEntries = [
       "Cargo feature disabled missing item",
     ],
     evidence: [
-      "Rust 1.98.1 compile failure",
+      "Rust 1.99.1 compile failure",
       "cfg branch inventory",
       "fallback implementation repair",
     ],
@@ -1797,7 +1797,7 @@ export const rustFailureAtlasEntries = [
       "env macro missing build variable",
       "option_env optional compile time variable",
     ],
-    evidence: ["Rust 1.98.1 compile failure", "build-environment contract", "option_env repair"],
+    evidence: ["Rust 1.99.1 compile failure", "build-environment contract", "option_env repair"],
     caseSlug: "env-macro-missing-build-variable",
   },
   {
@@ -1814,7 +1814,7 @@ export const rustFailureAtlasEntries = [
       "include_str path relative to source file",
       "Cargo embed file at compile time missing",
     ],
-    evidence: ["Rust 1.98.1 compile failure", "source-relative path check", "tracked-file repair"],
+    evidence: ["Rust 1.99.1 compile failure", "source-relative path check", "tracked-file repair"],
     caseSlug: "include-str-path-resolves-from-source-file",
   },
   {
@@ -1832,7 +1832,7 @@ export const rustFailureAtlasEntries = [
       "cargo tree duplicate crate versions",
     ],
     evidence: [
-      "Cargo 1.98.1 workspace failure",
+      "Cargo 1.99.1 workspace failure",
       "duplicate crate identity",
       "single-version repair",
     ],
@@ -1853,7 +1853,7 @@ export const rustFailureAtlasEntries = [
       "why are both Rust crate features enabled",
     ],
     evidence: [
-      "Cargo 1.98.1 workspace failure",
+      "Cargo 1.99.1 workspace failure",
       "transitive feature union",
       "additive-feature repair",
     ],
@@ -1873,7 +1873,7 @@ export const rustFailureAtlasEntries = [
       "Cargo optional dependency feature not enabled",
       "use of unresolved module optional dependency",
     ],
-    evidence: ["Cargo 1.98.1 E0433 failure", "inactive path dependency", "feature-gated repair"],
+    evidence: ["Cargo 1.99.1 E0433 failure", "inactive path dependency", "feature-gated repair"],
     caseSlug: "optional-dependency-disabled-but-rust-code-imports-it",
   },
   {
@@ -1891,7 +1891,7 @@ export const rustFailureAtlasEntries = [
       "Cargo sys crate links same library conflict",
     ],
     evidence: [
-      "Cargo 1.98.1 resolver failure",
+      "Cargo 1.99.1 resolver failure",
       "duplicate native ownership",
       "shared-sys-crate repair",
     ],
@@ -1911,7 +1911,7 @@ export const rustFailureAtlasEntries = [
       "Rust crates circular dependency",
       "break Cargo dependency cycle",
     ],
-    evidence: ["Cargo 1.98.1 resolution failure", "two-package cycle", "one-direction repair"],
+    evidence: ["Cargo 1.99.1 resolution failure", "two-package cycle", "one-direction repair"],
     caseSlug: "cyclic-cargo-package-dependency",
   },
   {
@@ -1929,8 +1929,8 @@ export const rustFailureAtlasEntries = [
       "dependency requires Rust newer compiler",
     ],
     evidence: [
-      "Cargo 1.98.1 version failure",
-      "Rust 1.99 package contract",
+      "Cargo 1.99.1 version failure",
+      "Rust 1.100 package contract",
       "verified MSRV repair",
     ],
     caseSlug: "package-rust-version-newer-than-compiler",
@@ -1949,7 +1949,7 @@ export const rustFailureAtlasEntries = [
       "Rust proc macro public helper error",
       "proc-macro crate types currently cannot export",
     ],
-    evidence: ["Cargo 1.98.1 compile failure", "ordinary public export", "private-helper repair"],
+    evidence: ["Cargo 1.99.1 compile failure", "ordinary public export", "private-helper repair"],
     caseSlug: "proc-macro-crate-cannot-export-ordinary-items",
   },
   {
@@ -1966,7 +1966,7 @@ export const rustFailureAtlasEntries = [
       "Rust proc macro same crate defines it",
       "test proc macro separate crate",
     ],
-    evidence: ["Cargo 1.98.1 self-use failure", "compiler-stage boundary", "two-crate repair"],
+    evidence: ["Cargo 1.99.1 self-use failure", "compiler-stage boundary", "two-crate repair"],
     caseSlug: "procedural-macro-cannot-be-used-in-defining-crate",
   },
   {
@@ -1984,7 +1984,7 @@ export const rustFailureAtlasEntries = [
       "Rust dep colon feature syntax",
     ],
     evidence: [
-      "Cargo 1.98.1 manifest failure",
+      "Cargo 1.99.1 manifest failure",
       "invalid dep activation",
       "optional-dependency repair",
     ],
@@ -2005,7 +2005,7 @@ export const rustFailureAtlasEntries = [
       "Cargo workspace true inheritance missing",
     ],
     evidence: [
-      "Cargo 1.98.1 manifest failure",
+      "Cargo 1.99.1 manifest failure",
       "missing root policy",
       "explicit inheritance repair",
     ],
@@ -2025,7 +2025,7 @@ export const rustFailureAtlasEntries = [
       "mpsc receiver hangs after all messages",
       "recv_timeout timeout instead of disconnected",
     ],
-    evidence: ["Rust 1.98.1 runtime failure", "live-sender state", "explicit-drop repair"],
+    evidence: ["Rust 1.99.1 runtime failure", "live-sender state", "explicit-drop repair"],
     caseSlug: "rust-channel-never-disconnects-sender-still-alive",
   },
   {
@@ -2042,7 +2042,7 @@ export const rustFailureAtlasEntries = [
       "zero capacity channel no room rendezvous",
       "TrySendError Full sync_channel 0",
     ],
-    evidence: ["Rust 1.98.1 runtime failure", "zero-capacity rendezvous", "blocking-send repair"],
+    evidence: ["Rust 1.99.1 runtime failure", "zero-capacity rendezvous", "blocking-send repair"],
     caseSlug: "zero-capacity-sync-channel-try-send-is-full",
   },
   {
@@ -2059,7 +2059,7 @@ export const rustFailureAtlasEntries = [
       "OnceLock set returns Err value",
       "Rust global initialized more than once",
     ],
-    evidence: ["Rust 1.98.1 runtime panic", "second-set rejection", "handled-result repair"],
+    evidence: ["Rust 1.99.1 runtime panic", "second-set rejection", "handled-result repair"],
     caseSlug: "oncelock-second-set-returns-error",
   },
   {
@@ -2076,7 +2076,7 @@ export const rustFailureAtlasEntries = [
       "BorrowMutError second mutable borrow",
       "RefCell borrow_mut runtime panic",
     ],
-    evidence: ["Rust 1.98.1 runtime panic", "overlapping RefMut guards", "scoped-guard repair"],
+    evidence: ["Rust 1.99.1 runtime panic", "overlapping RefMut guards", "scoped-guard repair"],
     caseSlug: "refcell-second-mutable-borrow-panics",
   },
   {
@@ -2093,7 +2093,7 @@ export const rustFailureAtlasEntries = [
       "Rust cannot unwrap Arc multiple owners",
       "Arc strong_count try_unwrap race",
     ],
-    evidence: ["Rust 1.98.1 runtime failure", "remaining strong owner", "final-owner repair"],
+    evidence: ["Rust 1.99.1 runtime failure", "remaining strong owner", "final-owner repair"],
     caseSlug: "arc-try-unwrap-fails-strong-clone-remains",
   },
   {
@@ -2110,7 +2110,7 @@ export const rustFailureAtlasEntries = [
       "call function with target_feature requires unsafe",
       "is_x86_feature_detected AVX2 dispatch",
     ],
-    evidence: ["Rust 1.98.1 E0133", "AVX2 safety boundary", "runtime-dispatch repair"],
+    evidence: ["Rust 1.99.1 E0133", "AVX2 safety boundary", "runtime-dispatch repair"],
     caseSlug: "target-feature-function-call-requires-unsafe",
   },
   {
@@ -2127,7 +2127,7 @@ export const rustFailureAtlasEntries = [
       "repr packed align together",
       "type conflicting representation hints Rust",
     ],
-    evidence: ["Rust 1.98.1 E0587", "layout-contract conflict", "single-policy repair"],
+    evidence: ["Rust 1.99.1 E0587", "layout-contract conflict", "single-policy repair"],
     caseSlug: "repr-packed-and-align-conflict",
   },
   {
@@ -2144,7 +2144,7 @@ export const rustFailureAtlasEntries = [
       "repr transparent multiple fields",
       "transparent struct needs at most one non-zero field",
     ],
-    evidence: ["Rust 1.98.1 E0690", "two storage fields", "single-carrier repair"],
+    evidence: ["Rust 1.99.1 E0690", "two storage fields", "single-carrier repair"],
     caseSlug: "repr-transparent-multiple-nonzero-fields",
   },
   {
@@ -2161,7 +2161,7 @@ export const rustFailureAtlasEntries = [
       "static_mut_refs deny by default",
       "creating reference to static mut error",
     ],
-    evidence: ["Rust 1.98.1 edition failure", "invalid reference creation", "atomic-global repair"],
+    evidence: ["Rust 1.99.1 edition failure", "invalid reference creation", "atomic-global repair"],
     caseSlug: "rust-2024-static-mut-reference-denied",
   },
   {
@@ -2179,7 +2179,7 @@ export const rustFailureAtlasEntries = [
       "lifetime may not live long enough incoming stored",
     ],
     evidence: [
-      "Rust 1.98.1 lifetime failure",
+      "Rust 1.99.1 lifetime failure",
       "mutable replacement model",
       "valid-outlives repair",
     ],
@@ -2199,7 +2199,7 @@ export const rustFailureAtlasEntries = [
       "one type is more general than the other Fn",
       "for a closure lifetime may not live long enough",
     ],
-    evidence: ["Rust 1.98.1 E0308", "higher-ranked callback", "function-item repair"],
+    evidence: ["Rust 1.99.1 E0308", "higher-ranked callback", "function-item repair"],
     caseSlug: "closure-not-general-enough-for-higher-ranked-bound",
   },
   {
@@ -2216,7 +2216,7 @@ export const rustFailureAtlasEntries = [
       "generic associated type where Self outlives lifetime",
       "LendingIterator Item where Self a",
     ],
-    evidence: ["Rust 1.98.1 required-bound failure", "lending type family", "Self-outlives repair"],
+    evidence: ["Rust 1.99.1 required-bound failure", "lending type family", "Self-outlives repair"],
     caseSlug: "gat-missing-required-self-outlives-bound",
   },
   {
@@ -2233,7 +2233,7 @@ export const rustFailureAtlasEntries = [
       "wrapper cannot be sent between threads PhantomData",
       "PhantomData affects Send Sync",
     ],
-    evidence: ["Rust 1.98.1 E0277", "whole-wrapper transfer", "owned-marker repair"],
+    evidence: ["Rust 1.99.1 E0277", "whole-wrapper transfer", "owned-marker repair"],
     caseSlug: "phantomdata-raw-pointer-makes-wrapper-not-send",
   },
   {
@@ -2250,7 +2250,7 @@ export const rustFailureAtlasEntries = [
       "repr C struct u8 u32 size 8",
       "E0080 struct layout assert",
     ],
-    evidence: ["Rust 1.98.1 E0080", "repr(C) padding calculation", "target-layout repair"],
+    evidence: ["Rust 1.99.1 E0080", "repr(C) padding calculation", "target-layout repair"],
     caseSlug: "const-layout-assertion-fails-padding",
   },
   {
@@ -2267,7 +2267,7 @@ export const rustFailureAtlasEntries = [
       "linking with cc failed missing extern C symbol",
       "Rust extern declaration does not link library",
     ],
-    evidence: ["Rust 1.98.1 link failure", "undefined native symbol", "supplied-symbol repair"],
+    evidence: ["Rust 1.99.1 link failure", "undefined native symbol", "supplied-symbol repair"],
     caseSlug: "extern-function-compiles-but-linker-symbol-missing",
   },
   {
@@ -2284,7 +2284,7 @@ export const rustFailureAtlasEntries = [
       "Drop implementation bound not on struct Rust",
       "Rust conditional Drop generic type",
     ],
-    evidence: ["Rust 1.98.1 E0367", "generic destructor contract", "type-level-bound repair"],
+    evidence: ["Rust 1.99.1 E0367", "generic destructor contract", "type-level-bound repair"],
     caseSlug: "drop-impl-bound-must-match-struct",
   },
   {
@@ -2302,7 +2302,7 @@ export const rustFailureAtlasEntries = [
       "return boxed trait object with lifetime",
     ],
     evidence: [
-      "Rust 1.98.1 lifetime failure",
+      "Rust 1.99.1 lifetime failure",
       "default object lifetime",
       "explicit-object-lifetime repair",
     ],
@@ -2322,7 +2322,7 @@ export const rustFailureAtlasEntries = [
       "derived Default generic type overconstrained",
       "PhantomData default without generic Default",
     ],
-    evidence: ["Rust 1.98.1 E0277", "derive-added generic bound", "manual-Default repair"],
+    evidence: ["Rust 1.99.1 E0277", "derive-added generic bound", "manual-Default repair"],
     caseSlug: "derive-default-adds-unneeded-generic-bound",
   },
   {
@@ -2339,7 +2339,7 @@ export const rustFailureAtlasEntries = [
       "derived Clone generic wrapper overconstrained",
       "Arc clone without T Clone manual impl",
     ],
-    evidence: ["Rust 1.98.1 E0599", "derive-added Clone bound", "manual-Clone repair"],
+    evidence: ["Rust 1.99.1 E0599", "derive-added Clone bound", "manual-Clone repair"],
     caseSlug: "derive-clone-adds-unneeded-generic-bound",
   },
   {
@@ -2356,7 +2356,7 @@ export const rustFailureAtlasEntries = [
       "if branches two functions return impl Iterator mismatch",
       "return position impl Trait type identity",
     ],
-    evidence: ["Rust 1.98.1 E0308", "distinct opaque identities", "boxed-iterator repair"],
+    evidence: ["Rust 1.99.1 E0308", "distinct opaque identities", "boxed-iterator repair"],
     caseSlug: "separate-impl-trait-functions-return-distinct-opaque-types",
   },
   {
@@ -2373,7 +2373,7 @@ export const rustFailureAtlasEntries = [
       "BufWriter write_all succeeds data not written error",
       "Rust buffered writer explicit flush before drop",
     ],
-    evidence: ["Rust 1.98.1 runtime failure", "ignored drop-time error", "explicit-flush repair"],
+    evidence: ["Rust 1.99.1 runtime failure", "ignored drop-time error", "explicit-flush repair"],
     caseSlug: "bufwriter-drop-ignores-write-error",
   },
   {
@@ -2391,7 +2391,7 @@ export const rustFailureAtlasEntries = [
       "Hash Eq changes while key in HashMap",
     ],
     evidence: [
-      "Rust 1.98.1 runtime failure",
+      "Rust 1.99.1 runtime failure",
       "broken hash-key invariant",
       "remove-and-reinsert repair",
     ],
@@ -2412,7 +2412,7 @@ export const rustFailureAtlasEntries = [
       "Rust heap item changed but peek wrong",
     ],
     evidence: [
-      "Rust 1.98.1 runtime failure",
+      "Rust 1.99.1 runtime failure",
       "broken heap-order invariant",
       "rebuild-after-change repair",
     ],
@@ -2432,7 +2432,7 @@ export const rustFailureAtlasEntries = [
       "Once instance has previously been poisoned call_once",
       "call_once_force recover poisoned Once",
     ],
-    evidence: ["Rust 1.98.1 runtime panic", "persistent Once poison", "call_once_force repair"],
+    evidence: ["Rust 1.99.1 runtime panic", "persistent Once poison", "call_once_force repair"],
     caseSlug: "once-poisoned-after-initializer-panic",
   },
   {
@@ -2449,7 +2449,7 @@ export const rustFailureAtlasEntries = [
       "forgotten MutexGuard keeps mutex locked",
       "Rust safe mem forget resource leak lock",
     ],
-    evidence: ["Rust 1.98.1 runtime failure", "suppressed guard destructor", "lexical-drop repair"],
+    evidence: ["Rust 1.99.1 runtime failure", "suppressed guard destructor", "lexical-drop repair"],
     caseSlug: "forgotten-mutexguard-keeps-lock-held",
   },
   {
@@ -2466,7 +2466,7 @@ export const rustFailureAtlasEntries = [
       "Copy not allowed on types with Drop Rust",
       "derive Copy fails after implementing Drop",
     ],
-    evidence: ["Rust 1.98.1 E0184", "implicit-copy lifecycle conflict", "explicit-Clone repair"],
+    evidence: ["Rust 1.99.1 E0184", "implicit-copy lifecycle conflict", "explicit-Clone repair"],
     caseSlug: "copy-cannot-be-implemented-for-drop-type",
   },
   {
@@ -2483,7 +2483,7 @@ export const rustFailureAtlasEntries = [
       "move field out mutable reference non Default",
       "std mem take trait bound Default not satisfied",
     ],
-    evidence: ["Rust 1.98.1 E0277", "replacement-initialization contract", "mem-replace repair"],
+    evidence: ["Rust 1.99.1 E0277", "replacement-initialization contract", "mem-replace repair"],
     caseSlug: "mem-take-requires-default-use-replace",
   },
   {
@@ -2500,7 +2500,7 @@ export const rustFailureAtlasEntries = [
       "&mut may not be safely transferred across unwind boundary",
       "AssertUnwindSafe mutable closure Rust",
     ],
-    evidence: ["Rust 1.98.1 E0277", "mutable unwind boundary", "narrow AssertUnwindSafe repair"],
+    evidence: ["Rust 1.99.1 E0277", "mutable unwind boundary", "narrow AssertUnwindSafe repair"],
     caseSlug: "catch-unwind-mutable-reference-not-unwindsafe",
   },
   {
@@ -2517,7 +2517,7 @@ export const rustFailureAtlasEntries = [
       "TypeId of requires static generic bound",
       "std any TypeId borrowed lifetime",
     ],
-    evidence: ["Rust 1.98.1 E0310", "TypeId static requirement", "explicit-static-bound repair"],
+    evidence: ["Rust 1.99.1 E0310", "TypeId static requirement", "explicit-static-bound repair"],
     caseSlug: "typeid-of-requires-static-generic-type",
   },
   {
@@ -2534,7 +2534,7 @@ export const rustFailureAtlasEntries = [
       "macro_rules forwarded expr cannot match literal",
       "opaque AST fragment tt exception Rust macro",
     ],
-    evidence: ["Rust 1.98.1 macro diagnostic", "opaque expr forwarding", "tt-fragment repair"],
+    evidence: ["Rust 1.99.1 macro diagnostic", "opaque expr forwarding", "tt-fragment repair"],
     caseSlug: "macro-forwarded-expr-cannot-match-literal",
   },
   {
@@ -2568,7 +2568,7 @@ export const rustFailureAtlasEntries = [
       "Weak pointer prevents Arc get_mut",
       "Arc get_mut requires no Weak pointers",
     ],
-    evidence: ["Rust 1.98.1 runtime assertion", "surviving Weak observer", "drop-Weak repair"],
+    evidence: ["Rust 1.99.1 runtime assertion", "surviving Weak observer", "drop-Weak repair"],
     caseSlug: "arc-get-mut-fails-while-weak-pointer-exists",
   },
   {
@@ -2586,7 +2586,7 @@ export const rustFailureAtlasEntries = [
       "Arc self reference construction weak pointer",
     ],
     evidence: [
-      "Rust 1.98.1 runtime assertion",
+      "Rust 1.99.1 runtime assertion",
       "pre-construction Weak state",
       "post-construction-upgrade repair",
     ],
@@ -2607,7 +2607,7 @@ export const rustFailureAtlasEntries = [
       "Mutex try_lock WouldBlock inside while let",
     ],
     evidence: [
-      "Rust 1.98.1 deterministic WouldBlock",
+      "Rust 1.99.1 deterministic WouldBlock",
       "while-let temporary scope",
       "separate-statement repair",
     ],
@@ -2628,7 +2628,7 @@ export const rustFailureAtlasEntries = [
       "double panic while unwinding Rust process abort",
     ],
     evidence: [
-      "Rust 1.98.1 aborting runtime case",
+      "Rust 1.99.1 aborting runtime case",
       "second destructor panic",
       "infallible-cleanup repair",
     ],
@@ -2648,7 +2648,7 @@ export const rustFailureAtlasEntries = [
       "forgetting Drain leaks vector elements",
       "Vec drain destructor not called result",
     ],
-    evidence: ["Rust 1.98.1 runtime assertion", "forgotten Drain iterator", "explicit-drop repair"],
+    evidence: ["Rust 1.99.1 runtime assertion", "forgotten Drain iterator", "explicit-drop repair"],
     caseSlug: "forgetting-vec-drain-leaves-vector-in-partial-state",
   },
   {
@@ -2665,7 +2665,7 @@ export const rustFailureAtlasEntries = [
       "map_while iterator not fused",
       "Iterator fuse after map_while None",
     ],
-    evidence: ["Rust 1.98.1 runtime assertion", "post-None next call", "Iterator::fuse repair"],
+    evidence: ["Rust 1.99.1 runtime assertion", "post-None next call", "Iterator::fuse repair"],
     caseSlug: "map-while-is-not-fused-after-none",
   },
   {
@@ -2682,7 +2682,7 @@ export const rustFailureAtlasEntries = [
       "get_mut does not clear mutex poison",
       "clear_poison after Mutex get_mut repair",
     ],
-    evidence: ["Rust 1.98.1 caught panic", "persistent poison flag", "validate-and-clear repair"],
+    evidence: ["Rust 1.99.1 caught panic", "persistent poison flag", "validate-and-clear repair"],
     caseSlug: "mutex-get-mut-still-reports-poison",
   },
   {
@@ -2699,7 +2699,7 @@ export const rustFailureAtlasEntries = [
       "cannot get mutable reference pinned Unpin",
       "safe field update Pin PhantomPinned",
     ],
-    evidence: ["Rust 1.98.1 E0277", "PhantomPinned negative auto trait", "Pin receiver repair"],
+    evidence: ["Rust 1.99.1 E0277", "PhantomPinned negative auto trait", "Pin receiver repair"],
     caseSlug: "pin-get-mut-requires-unpin",
   },
   {
@@ -2716,7 +2716,7 @@ export const rustFailureAtlasEntries = [
       "macro_rules zip two repetitions",
       "metavariable repetition count mismatch",
     ],
-    evidence: ["Rust 1.98.1 macro diagnostic", "two-versus-one repetition", "paired-input repair"],
+    evidence: ["Rust 1.99.1 macro diagnostic", "two-versus-one repetition", "paired-input repair"],
     caseSlug: "macro-repetition-metavariables-repeat-different-times",
   },
   {
@@ -2733,7 +2733,7 @@ export const rustFailureAtlasEntries = [
       "Rust unit tests fail broken example",
       "cargo test example compiled not run",
     ],
-    evidence: ["Cargo 1.98.1 E0432", "healthy library test", "repaired example target"],
+    evidence: ["Cargo 1.99.1 E0432", "healthy library test", "repaired example target"],
     caseSlug: "cargo-test-compiles-examples-by-default",
   },
   {
@@ -2750,7 +2750,7 @@ export const rustFailureAtlasEntries = [
       "let_underscore_lock lint MutexGuard",
       "non-binding let synchronization lock error",
     ],
-    evidence: ["Rust 1.98.1 deny-by-default lint", "immediate guard drop", "named-binding repair"],
+    evidence: ["Rust 1.99.1 deny-by-default lint", "immediate guard drop", "named-binding repair"],
     caseSlug: "let-underscore-lock-drops-guard-immediately",
   },
   {
@@ -2767,7 +2767,7 @@ export const rustFailureAtlasEntries = [
       "Read read_to_string does not clear buffer",
       "Rust reused String prefix duplicate input",
     ],
-    evidence: ["Rust 1.98.1 runtime assertion", "pre-populated String", "clear-before-read repair"],
+    evidence: ["Rust 1.99.1 runtime assertion", "pre-populated String", "clear-before-read repair"],
     caseSlug: "read-to-string-appends-instead-of-replacing",
   },
   {
@@ -2785,7 +2785,7 @@ export const rustFailureAtlasEntries = [
       "get_key_value returns original key Rust",
     ],
     evidence: [
-      "Rust 1.98.1 runtime assertion",
+      "Rust 1.99.1 runtime assertion",
       "identity-only equality",
       "remove-then-insert repair",
     ],
@@ -2806,7 +2806,7 @@ export const rustFailureAtlasEntries = [
       "String is_char_boundary safe truncate",
     ],
     evidence: [
-      "Rust 1.98.1 runtime panic",
+      "Rust 1.99.1 runtime panic",
       "multi-byte leading character",
       "char_indices boundary repair",
     ],
@@ -2826,7 +2826,7 @@ export const rustFailureAtlasEntries = [
       "HashSet insert versus replace canonical value",
       "HashSet replace stores new equal element",
     ],
-    evidence: ["Rust 1.98.1 runtime assertion", "identity-only equality", "HashSet::insert repair"],
+    evidence: ["Rust 1.99.1 runtime assertion", "identity-only equality", "HashSet::insert repair"],
     caseSlug: "hashset-replace-stores-new-equal-value",
   },
   {
@@ -2844,7 +2844,7 @@ export const rustFailureAtlasEntries = [
       "Option take_if rollback mutation",
     ],
     evidence: [
-      "Rust 1.98.1 runtime assertion",
+      "Rust 1.99.1 runtime assertion",
       "false mutating predicate",
       "separate-decision repair",
     ],
@@ -2864,7 +2864,7 @@ export const rustFailureAtlasEntries = [
       "peek calls next side effects Rust iterator",
       "Peekable first peek fills cache",
     ],
-    evidence: ["Rust 1.98.1 counted next calls", "first-peek cache fill", "cache-aware repair"],
+    evidence: ["Rust 1.99.1 counted next calls", "first-peek cache fill", "cache-aware repair"],
     caseSlug: "peekable-peek-advances-underlying-iterator",
   },
   {
@@ -2881,7 +2881,7 @@ export const rustFailureAtlasEntries = [
       "iterator by_ref take_while missing boundary",
       "preserve rejected item after take_while",
     ],
-    evidence: ["Rust 1.98.1 runtime assertion", "consumed boundary item", "Peekable loop repair"],
+    evidence: ["Rust 1.99.1 runtime assertion", "consumed boundary item", "Peekable loop repair"],
     caseSlug: "take-while-consumes-first-rejected-item",
   },
   {
@@ -2898,7 +2898,7 @@ export const rustFailureAtlasEntries = [
       "invalid_atomic_ordering AtomicUsize load",
       "Ordering Release not valid for load",
     ],
-    evidence: ["Rust 1.98.1 invalid_atomic_ordering", "pure-load operation", "Acquire load repair"],
+    evidence: ["Rust 1.99.1 invalid_atomic_ordering", "pure-load operation", "Acquire load repair"],
     caseSlug: "atomic-load-cannot-use-release-ordering",
   },
   {
@@ -2916,7 +2916,7 @@ export const rustFailureAtlasEntries = [
       "invalid_atomic_ordering compare_exchange failure",
     ],
     evidence: [
-      "Rust 1.98.1 compiler diagnostic",
+      "Rust 1.99.1 compiler diagnostic",
       "failed-path load semantics",
       "Acquire failure repair",
     ],
@@ -2937,7 +2937,7 @@ export const rustFailureAtlasEntries = [
       "Weak invalid after clone on write Arc",
     ],
     evidence: [
-      "Rust 1.98.1 runtime assertion",
+      "Rust 1.99.1 runtime assertion",
       "one-strong one-weak allocation",
       "retained-snapshot repair",
     ],
@@ -2958,7 +2958,7 @@ export const rustFailureAtlasEntries = [
       "how to cancel std thread Rust",
     ],
     evidence: [
-      "Rust 1.98.1 channel coordination",
+      "Rust 1.99.1 channel coordination",
       "detached worker completion",
       "explicit-join repair",
     ],
@@ -2979,7 +2979,7 @@ export const rustFailureAtlasEntries = [
       "Write write versus write_all",
     ],
     evidence: [
-      "Rust 1.98.1 deterministic short writer",
+      "Rust 1.99.1 deterministic short writer",
       "three-byte write limit",
       "write_all repair",
     ],
@@ -3000,7 +3000,7 @@ export const rustFailureAtlasEntries = [
       "from_bytes_until_nul versus with_nul",
     ],
     evidence: [
-      "Rust 1.98.1 InteriorNul error",
+      "Rust 1.99.1 InteriorNul error",
       "trailing buffer bytes",
       "from_bytes_until_nul repair",
     ],
@@ -3021,7 +3021,7 @@ export const rustFailureAtlasEntries = [
       "Vec dedup_by removes which element",
     ],
     evidence: [
-      "Rust 1.98.1 callback trace",
+      "Rust 1.99.1 callback trace",
       "two distinct adjacent values",
       "role-named closure repair",
     ],
@@ -3041,7 +3041,7 @@ export const rustFailureAtlasEntries = [
       "Cursor Vec append starts position zero",
       "set Cursor position to end before write",
     ],
-    evidence: ["Rust 1.98.1 runtime assertion", "pre-populated byte vector", "set_position repair"],
+    evidence: ["Rust 1.99.1 runtime assertion", "pre-populated byte vector", "set_position repair"],
     caseSlug: "cursor-new-starts-at-position-zero",
   },
   {
@@ -3059,7 +3059,7 @@ export const rustFailureAtlasEntries = [
       "is_poisoned false after read guard panic",
     ],
     evidence: [
-      "Rust 1.98.1 caught reader panic",
+      "Rust 1.99.1 caught reader panic",
       "shared read guard",
       "non-poison expectation repair",
     ],
@@ -3079,7 +3079,7 @@ export const rustFailureAtlasEntries = [
       "scoped thread panic propagation join handle",
       "catch panic from std thread scope",
     ],
-    evidence: ["Rust 1.98.1 caught scope panic", "unjoined scoped child", "explicit-join repair"],
+    evidence: ["Rust 1.99.1 caught scope panic", "unjoined scoped child", "explicit-join repair"],
     caseSlug: "thread-scope-propagates-unjoined-child-panic",
   },
   {
@@ -3096,7 +3096,7 @@ export const rustFailureAtlasEntries = [
       "$crate does not bypass privacy macro_rules",
       "macro helper private downstream crate",
     ],
-    evidence: ["Cargo 1.98.1 two-crate E0603", "$crate helper path", "public hidden-helper repair"],
+    evidence: ["Cargo 1.99.1 two-crate E0603", "$crate helper path", "public hidden-helper repair"],
     caseSlug: "exported-macro-cannot-access-private-item-through-crate",
   },
   {
@@ -3114,7 +3114,7 @@ export const rustFailureAtlasEntries = [
       "Rust safe join relative path containment",
     ],
     evidence: [
-      "Rust 1.98.1 x86_64 Linux assertion",
+      "Rust 1.99.1 x86_64 Linux assertion",
       "absolute Unix candidate",
       "reject-absolute repair",
     ],
@@ -3135,7 +3135,7 @@ export const rustFailureAtlasEntries = [
       "convert UTF-8 byte offset to char index",
     ],
     evidence: [
-      "Rust 1.98.1 UTF-8 assertion",
+      "Rust 1.99.1 UTF-8 assertion",
       "two-byte leading character",
       "prefix-char-count repair",
     ],
@@ -3156,7 +3156,7 @@ export const rustFailureAtlasEntries = [
       "Command output Result does not mean success",
     ],
     evidence: [
-      "Rust 1.98.1 Unix child exit 7",
+      "Rust 1.99.1 Unix child exit 7",
       "successful process transport",
       "explicit-status repair",
     ],
@@ -3177,7 +3177,7 @@ export const rustFailureAtlasEntries = [
       "OnceLock wait for another thread initializer",
     ],
     evidence: [
-      "Rust 1.98.1 channel-coordinated initialization",
+      "Rust 1.99.1 channel-coordinated initialization",
       "non-blocking get",
       "OnceLock::wait repair",
     ],
@@ -3198,7 +3198,7 @@ export const rustFailureAtlasEntries = [
       "Weak upgrade None after try_unwrap",
     ],
     evidence: [
-      "Rust 1.98.1 runtime assertion",
+      "Rust 1.99.1 runtime assertion",
       "one strong plus one weak",
       "clone-with-owner repair",
     ],
@@ -3219,7 +3219,7 @@ export const rustFailureAtlasEntries = [
       "Rust partition_point lower bound equal values",
     ],
     evidence: [
-      "Rust 1.98.1 duplicate slice",
+      "Rust 1.99.1 duplicate slice",
       "returned index 3 instead of 1",
       "partition_point lower-bound repair",
     ],
@@ -3239,7 +3239,7 @@ export const rustFailureAtlasEntries = [
       "BufRead read_line clear buffer",
       "Rust read_line does not replace contents",
     ],
-    evidence: ["Rust 1.98.1 Cursor fixture", "pre-populated String", "explicit clear repair"],
+    evidence: ["Rust 1.99.1 Cursor fixture", "pre-populated String", "explicit clear repair"],
     caseSlug: "bufread-read-line-appends-to-string",
   },
   {
@@ -3257,7 +3257,7 @@ export const rustFailureAtlasEntries = [
       "transactional fixed length read Rust",
     ],
     evidence: [
-      "Rust 1.98.1 controlled short reader",
+      "Rust 1.99.1 controlled short reader",
       "sentinel-buffer mutation",
       "staging-buffer repair",
     ],
@@ -3278,7 +3278,7 @@ export const rustFailureAtlasEntries = [
       "OpenOptions write without truncate Rust",
     ],
     evidence: [
-      "Rust 1.98.1 temporary file",
+      "Rust 1.99.1 temporary file",
       "zero-length observation after open",
       "explicit OpenOptions repair",
     ],
@@ -3298,7 +3298,7 @@ export const rustFailureAtlasEntries = [
       "Path try_exists permission error Rust",
       "Rust exists false symlink loop",
     ],
-    evidence: ["Rust 1.98.1 Unix symlink loop", "FilesystemLoop error", "try_exists Result repair"],
+    evidence: ["Rust 1.99.1 Unix symlink loop", "FilesystemLoop error", "try_exists Result repair"],
     caseSlug: "path-exists-coerces-errors-to-false",
   },
   {
@@ -3315,7 +3315,7 @@ export const rustFailureAtlasEntries = [
       "VecDeque wrapped storage contiguous slice",
       "VecDeque make_contiguous allocation",
     ],
-    evidence: ["Rust 1.98.1 capacity-four wrap", "two-slice layout", "make_contiguous repair"],
+    evidence: ["Rust 1.99.1 capacity-four wrap", "two-slice layout", "make_contiguous repair"],
     caseSlug: "vecdeque-as-slices-may-split-storage",
   },
   {
@@ -3333,7 +3333,7 @@ export const rustFailureAtlasEntries = [
       "difference Arc into_inner try_unwrap ok",
     ],
     evidence: [
-      "Rust 1.98.1 two-clone fixture",
+      "Rust 1.99.1 two-clone fixture",
       "first None then final Some",
       "one-winner assertion repair",
     ],
@@ -3353,7 +3353,7 @@ export const rustFailureAtlasEntries = [
       "get_disjoint_mut overlapping keys",
       "multiple mutable HashMap values safely Rust",
     ],
-    evidence: ["Rust 1.98.1 duplicate-key panic", "two equal queries", "distinct-key repair"],
+    evidence: ["Rust 1.99.1 duplicate-key panic", "two equal queries", "distinct-key repair"],
     caseSlug: "hashmap-get-disjoint-mut-panics-duplicate-keys",
   },
   {
@@ -3371,7 +3371,7 @@ export const rustFailureAtlasEntries = [
       "validate dynamic RangeBounds Rust",
     ],
     evidence: [
-      "Rust 1.98.1 inverted integer range",
+      "Rust 1.99.1 inverted integer range",
       "documented runtime panic",
       "pre-validation repair",
     ],
@@ -3392,7 +3392,7 @@ export const rustFailureAtlasEntries = [
       "Rust reject non canonical duration fields",
     ],
     evidence: [
-      "Rust 1.98.1 1.5-billion-nanosecond input",
+      "Rust 1.99.1 1.5-billion-nanosecond input",
       "2.5-second normalized result",
       "canonical-input repair",
     ],
@@ -3413,7 +3413,7 @@ export const rustFailureAtlasEntries = [
       "fill_buf does not advance reader Rust",
     ],
     evidence: [
-      "Rust 1.98.1 three-byte BufReader",
+      "Rust 1.99.1 three-byte BufReader",
       "repeated abc observation",
       "consume-before-refill repair",
     ],
@@ -3434,7 +3434,7 @@ export const rustFailureAtlasEntries = [
       "Vec extract_if only removes first match",
     ],
     evidence: [
-      "Rust 1.98.1 partial iteration",
+      "Rust 1.99.1 partial iteration",
       "unvisited even values retained",
       "collect-to-exhaust repair",
     ],
@@ -3455,7 +3455,7 @@ export const rustFailureAtlasEntries = [
       "try_recv Empty vs Disconnected Rust",
     ],
     evidence: [
-      "Rust 1.98.1 channel state timeline",
+      "Rust 1.99.1 channel state timeline",
       "live sender after temporary emptiness",
       "explicit TryRecvError repair",
     ],
@@ -3475,7 +3475,7 @@ export const rustFailureAtlasEntries = [
       "Entry or_insert expensive default called",
       "or_insert vs or_insert_with lazy",
     ],
-    evidence: ["Rust 1.98.1 occupied entry", "atomic Drop counter", "closure-based repair"],
+    evidence: ["Rust 1.99.1 occupied entry", "atomic Drop counter", "closure-based repair"],
     caseSlug: "hashmap-entry-or-insert-eagerly-evaluates-default",
   },
   {
@@ -3492,7 +3492,7 @@ export const rustFailureAtlasEntries = [
       "sort_by_key expensive closure repeated",
       "sort_by_cached_key versus sort_by_key",
     ],
-    evidence: ["Rust 1.98.1 six-element slice", "counted key evaluations", "cached-key repair"],
+    evidence: ["Rust 1.99.1 six-element slice", "counted key evaluations", "cached-key repair"],
     caseSlug: "slice-sort-by-key-recomputes-keys",
   },
   {
@@ -3510,7 +3510,7 @@ export const rustFailureAtlasEntries = [
       "recover remainder after Iterator zip",
     ],
     evidence: [
-      "Rust 1.98.1 non-exact iterator",
+      "Rust 1.99.1 non-exact iterator",
       "one unpaired item consumed",
       "shorter-first repair",
     ],
@@ -3531,7 +3531,7 @@ export const rustFailureAtlasEntries = [
       "partial iteration String Drain behavior",
     ],
     evidence: [
-      "Rust 1.98.1 ASCII boundary fixture",
+      "Rust 1.99.1 ASCII boundary fixture",
       "single yielded character",
       "range-sized repair",
     ],
@@ -3552,7 +3552,7 @@ export const rustFailureAtlasEntries = [
       "max heap into_sorted_vec order Rust",
     ],
     evidence: [
-      "Rust 1.98.1 four-element heap",
+      "Rust 1.99.1 four-element heap",
       "ascending conversion result",
       "pop-order alternative",
     ],
@@ -3573,7 +3573,7 @@ export const rustFailureAtlasEntries = [
       "Rust path prefix directory containment",
     ],
     evidence: [
-      "Rust 1.98.1 lexical path fixture",
+      "Rust 1.99.1 lexical path fixture",
       "sibling-name rejection",
       "child-component repair",
     ],
@@ -3593,7 +3593,7 @@ export const rustFailureAtlasEntries = [
       "try_clone file offset changed",
       "independent file cursor Rust",
     ],
-    evidence: ["Rust 1.98.1 temporary file", "shared sequential reads", "second-open repair"],
+    evidence: ["Rust 1.99.1 temporary file", "shared sequential reads", "second-open repair"],
     caseSlug: "file-try-clone-shares-cursor",
   },
   {
@@ -3611,7 +3611,7 @@ export const rustFailureAtlasEntries = [
       "OpenOptions create truncate create_new precedence",
     ],
     evidence: [
-      "Rust 1.98.1 temporary file",
+      "Rust 1.99.1 temporary file",
       "AlreadyExists without truncation",
       "explicit overwrite repair",
     ],
@@ -3632,7 +3632,7 @@ export const rustFailureAtlasEntries = [
       "splice replacement iterator consumed when dropped",
     ],
     evidence: [
-      "Rust 1.98.1 four-element vector",
+      "Rust 1.99.1 four-element vector",
       "partial removed-value iteration",
       "range-sized repair",
     ],
@@ -3652,7 +3652,7 @@ export const rustFailureAtlasEntries = [
       "BTreeMap append overwrite conflict",
       "merge BTreeMap keep existing value",
     ],
-    evidence: ["Rust 1.98.1 duplicate-key maps", "other-map value wins", "Entry-based repair"],
+    evidence: ["Rust 1.99.1 duplicate-key maps", "other-map value wins", "Entry-based repair"],
     caseSlug: "btreemap-append-overwrites-conflicting-values",
   },
   {
@@ -3669,7 +3669,7 @@ export const rustFailureAtlasEntries = [
       "Path parent Some empty string",
       "one component relative path parent Rust",
     ],
-    evidence: ["Rust 1.98.1 relative path", "Some empty parent", "current-directory normalization"],
+    evidence: ["Rust 1.99.1 relative path", "Some empty parent", "current-directory normalization"],
     caseSlug: "path-parent-one-component-is-empty",
   },
   {
@@ -3686,7 +3686,7 @@ export const rustFailureAtlasEntries = [
       "str lines final newline omitted",
       "Rust lines versus split newline",
     ],
-    evidence: ["Rust 1.98.1 terminated string", "omitted final empty item", "split-based repair"],
+    evidence: ["Rust 1.99.1 terminated string", "omitted final empty item", "split-based repair"],
     caseSlug: "str-lines-omits-trailing-empty-line",
   },
   {
@@ -3704,7 +3704,7 @@ export const rustFailureAtlasEntries = [
       "split BTreeMap keep key on left",
     ],
     evidence: [
-      "Rust 1.98.1 three-key map",
+      "Rust 1.99.1 three-key map",
       "inclusive returned boundary",
       "explicit partition repair",
     ],
@@ -3724,7 +3724,7 @@ export const rustFailureAtlasEntries = [
       "file cursor past EOF after truncate Rust",
       "set_len stream_position Rust",
     ],
-    evidence: ["Rust 1.98.1 temporary file", "cursor beyond new EOF", "explicit seek repair"],
+    evidence: ["Rust 1.99.1 temporary file", "cursor beyond new EOF", "explicit seek repair"],
     caseSlug: "file-set-len-leaves-cursor-unchanged",
   },
   {
@@ -3741,7 +3741,7 @@ export const rustFailureAtlasEntries = [
       "OpenOptions append writes at EOF after seek",
       "Rust overwrite file byte append false",
     ],
-    evidence: ["Rust 1.98.1 temporary file", "seek followed by EOF write", "write-mode repair"],
+    evidence: ["Rust 1.99.1 temporary file", "seek followed by EOF write", "write-mode repair"],
     caseSlug: "openoptions-append-writes-at-eof-after-seek",
   },
   {
@@ -3759,7 +3759,7 @@ export const rustFailureAtlasEntries = [
       "resize versus resize_with Rust",
     ],
     evidence: [
-      "Rust 1.98.1 three-slot vector",
+      "Rust 1.99.1 three-slot vector",
       "repeated prototype identity",
       "per-slot closure repair",
     ],
@@ -3779,7 +3779,7 @@ export const rustFailureAtlasEntries = [
       "Option insert versus get_or_insert_with",
       "insert Option only if None Rust",
     ],
-    evidence: ["Rust 1.98.1 occupied Option", "unconditional replacement", "lazy fallback repair"],
+    evidence: ["Rust 1.99.1 occupied Option", "unconditional replacement", "lazy fallback repair"],
     caseSlug: "option-insert-replaces-existing-value",
   },
   {
@@ -3797,7 +3797,7 @@ export const rustFailureAtlasEntries = [
       "Result FromIterator short circuit remaining items",
     ],
     evidence: [
-      "Rust 1.98.1 three-item iterator",
+      "Rust 1.99.1 three-item iterator",
       "unvisited post-error value",
       "exhaustive loop repair",
     ],
@@ -3817,7 +3817,7 @@ export const rustFailureAtlasEntries = [
       "HashMap drain release memory Rust",
       "empty HashMap still allocated after drain",
     ],
-    evidence: ["Rust 1.98.1 reserved map", "retained empty capacity", "mem::take ownership repair"],
+    evidence: ["Rust 1.99.1 reserved map", "retained empty capacity", "mem::take ownership repair"],
     caseSlug: "hashmap-drain-retains-capacity",
   },
   {
@@ -3835,7 +3835,7 @@ export const rustFailureAtlasEntries = [
       "Rust nth element slice still unsorted",
     ],
     evidence: [
-      "Rust 1.98.1 twenty-value slice",
+      "Rust 1.99.1 twenty-value slice",
       "correct pivot with unsorted sides",
       "sort-or-partition repair",
     ],
@@ -3856,7 +3856,7 @@ export const rustFailureAtlasEntries = [
       "Rust keep first maximum iterator",
     ],
     evidence: [
-      "Rust 1.98.1 tied candidates",
+      "Rust 1.99.1 tied candidates",
       "last-maximum selection",
       "explicit first-wins reduction",
     ],
@@ -3877,7 +3877,7 @@ export const rustFailureAtlasEntries = [
       "Rust flatten keep errors",
     ],
     evidence: [
-      "Rust 1.98.1 mixed outcomes",
+      "Rust 1.99.1 mixed outcomes",
       "error removed by flatten",
       "explicit outcome partition",
     ],
@@ -3897,7 +3897,7 @@ export const rustFailureAtlasEntries = [
       "str match_indices skips overlap",
       "find overlapping substring positions Rust",
     ],
-    evidence: ["Rust 1.98.1 ababa fixture", "only byte zero reported", "boundary scan repair"],
+    evidence: ["Rust 1.99.1 ababa fixture", "only byte zero reported", "boundary scan repair"],
     caseSlug: "str-match-indices-skips-overlapping-matches",
   },
   {
@@ -3915,7 +3915,7 @@ export const rustFailureAtlasEntries = [
       "BufWriter buffer versus get_ref",
     ],
     evidence: [
-      "Rust 1.98.1 in-memory writer",
+      "Rust 1.99.1 in-memory writer",
       "three internally buffered bytes",
       "explicit flush repair",
     ],
@@ -3935,7 +3935,7 @@ export const rustFailureAtlasEntries = [
       "destructor skipped std process exit",
       "Rust clean shutdown return ExitCode",
     ],
-    evidence: ["Rust 1.98.1 parent-child fixture", "missing Drop marker", "ExitCode return repair"],
+    evidence: ["Rust 1.99.1 parent-child fixture", "missing Drop marker", "ExitCode return repair"],
     caseSlug: "process-exit-skips-destructors",
   },
   {
@@ -3953,7 +3953,7 @@ export const rustFailureAtlasEntries = [
       "round Duration up milliseconds",
     ],
     evidence: [
-      "Rust 1.98.1 1999-microsecond duration",
+      "Rust 1.99.1 1999-microsecond duration",
       "whole-millisecond truncation",
       "integer ceiling repair",
     ],
@@ -3974,7 +3974,7 @@ export const rustFailureAtlasEntries = [
       "Unicode uppercase expands string Rust",
     ],
     evidence: [
-      "Rust 1.98.1 sharp-s fixture",
+      "Rust 1.99.1 sharp-s fixture",
       "one-to-two scalar expansion",
       "String output repair",
     ],
@@ -3994,7 +3994,7 @@ export const rustFailureAtlasEntries = [
       "trim removes ideographic space Rust",
       "trim_ascii versus trim Rust",
     ],
-    evidence: ["Rust 1.98.1 U+3000 fixture", "Unicode boundary removal", "ASCII-only repair"],
+    evidence: ["Rust 1.99.1 U+3000 fixture", "Unicode boundary removal", "ASCII-only repair"],
     caseSlug: "str-trim-removes-unicode-whitespace",
   },
   {
@@ -4012,7 +4012,7 @@ export const rustFailureAtlasEntries = [
       "Rust file_stem multiple extensions",
     ],
     evidence: [
-      "Rust 1.98.1 lexical paths",
+      "Rust 1.99.1 lexical paths",
       "dotfile and final-suffix rules",
       "stem-extension repair",
     ],
@@ -4033,7 +4033,7 @@ export const rustFailureAtlasEntries = [
       "ChunksExact remainder Rust",
     ],
     evidence: [
-      "Rust 1.98.1 five-element slice",
+      "Rust 1.99.1 five-element slice",
       "one omitted tail value",
       "remainder-chain repair",
     ],
@@ -4054,7 +4054,7 @@ export const rustFailureAtlasEntries = [
       "fs copy AlreadyExists create_new",
     ],
     evidence: [
-      "Rust 1.98.1 temporary files",
+      "Rust 1.99.1 temporary files",
       "existing bytes replaced",
       "exclusive-create copy repair",
     ],
@@ -4075,7 +4075,7 @@ export const rustFailureAtlasEntries = [
       "find original index consumed iterator Rust",
     ],
     evidence: [
-      "Rust 1.98.1 stateful iterator",
+      "Rust 1.99.1 stateful iterator",
       "one consumed prefix item",
       "explicit source-offset repair",
     ],
@@ -4096,7 +4096,7 @@ export const rustFailureAtlasEntries = [
       "split string into Unicode characters Rust",
     ],
     evidence: [
-      "Rust 1.98.1 UTF-8 string",
+      "Rust 1.99.1 UTF-8 string",
       "leading and trailing empty fields",
       "chars traversal repair",
     ],
@@ -4116,7 +4116,7 @@ export const rustFailureAtlasEntries = [
       "circled digit to_digit Rust",
     ],
     evidence: [
-      "Rust 1.98.1 circled digit",
+      "Rust 1.99.1 circled digit",
       "Unicode classification versus radix parsing",
       "ASCII parsing repair",
     ],
@@ -4137,7 +4137,7 @@ export const rustFailureAtlasEntries = [
       "u8 checked_shl Some 254",
     ],
     evidence: [
-      "Rust 1.98.1 u8 maximum",
+      "Rust 1.99.1 u8 maximum",
       "valid shift distance with discarded bit",
       "widen-and-convert repair",
     ],
@@ -4158,7 +4158,7 @@ export const rustFailureAtlasEntries = [
       "Rust in memory sparse write zeros",
     ],
     evidence: [
-      "Rust 1.98.1 in-memory cursor",
+      "Rust 1.99.1 in-memory cursor",
       "position beyond Vec length",
       "append-position repair",
     ],
@@ -4179,7 +4179,7 @@ export const rustFailureAtlasEntries = [
       "swap_remove_front result order",
     ],
     evidence: [
-      "Rust 1.98.1 four-item deque",
+      "Rust 1.99.1 four-item deque",
       "constant-time replacement from front",
       "stable remove repair",
     ],
@@ -4200,7 +4200,7 @@ export const rustFailureAtlasEntries = [
       "Rust channel application acknowledgement",
     ],
     evidence: [
-      "Rust 1.98.1 asynchronous channel",
+      "Rust 1.99.1 asynchronous channel",
       "successful enqueue before receiver drop",
       "explicit receive-and-process repair",
     ],
@@ -4221,7 +4221,7 @@ export const rustFailureAtlasEntries = [
       "sort floats Rust negative zero NaN",
     ],
     evidence: [
-      "Rust 1.98.1 signed-zero bit patterns",
+      "Rust 1.99.1 signed-zero bit patterns",
       "IEEE total order",
       "domain normalization repair",
     ],
@@ -4241,7 +4241,7 @@ export const rustFailureAtlasEntries = [
       "conditional Option construction Rust side effect",
     ],
     evidence: [
-      "Rust 1.98.1 Cell counter",
+      "Rust 1.99.1 Cell counter",
       "false condition with eager argument",
       "lazy closure repair",
     ],
@@ -4262,7 +4262,7 @@ export const rustFailureAtlasEntries = [
       "SystemTime versus Instant elapsed Rust",
     ],
     evidence: [
-      "Rust 1.98.1 future wall-clock value",
+      "Rust 1.99.1 future wall-clock value",
       "direction-bearing SystemTimeError",
       "monotonic Instant repair",
     ],
@@ -4283,7 +4283,7 @@ export const rustFailureAtlasEntries = [
       "peek nth item without consuming iterator",
     ],
     evidence: [
-      "Rust 1.98.1 four-item iterator",
+      "Rust 1.99.1 four-item iterator",
       "nth followed by next",
       "slice observation repair",
     ],
@@ -4304,7 +4304,7 @@ export const rustFailureAtlasEntries = [
       "rotate empty VecDeque safely",
     ],
     evidence: [
-      "Rust 1.98.1 three-item deque",
+      "Rust 1.99.1 three-item deque",
       "out-of-range rotation panic",
       "explicit modulo repair",
     ],
@@ -4325,7 +4325,7 @@ export const rustFailureAtlasEntries = [
       "parse case insensitive boolean Rust",
     ],
     evidence: [
-      "Rust 1.98.1 FromStr parser",
+      "Rust 1.99.1 FromStr parser",
       "uppercase rejected input",
       "opt-in ASCII normalization repair",
     ],
@@ -4346,7 +4346,7 @@ export const rustFailureAtlasEntries = [
       "Duration try_from_secs_f64 NaN",
     ],
     evidence: [
-      "Rust 1.98.1 negative float",
+      "Rust 1.99.1 negative float",
       "captured constructor panic",
       "fallible conversion repair",
     ],
@@ -4367,7 +4367,7 @@ export const rustFailureAtlasEntries = [
       "run once after Barrier Rust",
     ],
     evidence: [
-      "Rust 1.98.1 three-thread rendezvous",
+      "Rust 1.99.1 three-thread rendezvous",
       "atomic leader count",
       "exactly-one invariant repair",
     ],
@@ -4387,7 +4387,7 @@ export const rustFailureAtlasEntries = [
       "is_finished versus join Rust",
       "check thread completed successfully without blocking",
     ],
-    evidence: ["Rust 1.98.1 panicking worker", "true completion state", "join-result repair"],
+    evidence: ["Rust 1.99.1 panicking worker", "true completion state", "join-result repair"],
     caseSlug: "joinhandle-is-finished-does-not-report-success",
   },
   {
@@ -4404,7 +4404,7 @@ export const rustFailureAtlasEntries = [
       "thread park unpark tokens accumulate",
       "lost wakeup park unpark Rust",
     ],
-    evidence: ["Rust 1.98.1 current-thread token", "bounded second park", "fresh-unpark repair"],
+    evidence: ["Rust 1.99.1 current-thread token", "bounded second park", "fresh-unpark repair"],
     caseSlug: "thread-unpark-tokens-do-not-accumulate",
   },
   {
@@ -4422,7 +4422,7 @@ export const rustFailureAtlasEntries = [
       "canonicalize IpAddr mapped address",
     ],
     evidence: [
-      "Rust 1.98.1 mapped localhost",
+      "Rust 1.99.1 mapped localhost",
       "family-specific loopback predicate",
       "to_canonical repair",
     ],
@@ -4443,7 +4443,7 @@ export const rustFailureAtlasEntries = [
       "preallocate String UTF-8 length",
     ],
     evidence: [
-      "Rust 1.98.1 two-scalar UTF-8 text",
+      "Rust 1.99.1 two-scalar UTF-8 text",
       "two-byte reservation growth",
       "byte-length reservation repair",
     ],
@@ -4464,7 +4464,7 @@ export const rustFailureAtlasEntries = [
       "convert Cow str into owned String Rust",
     ],
     evidence: [
-      "Rust 1.98.1 valid and invalid byte slices",
+      "Rust 1.99.1 valid and invalid byte slices",
       "Cow variant comparison",
       "explicit ownership repair",
     ],
@@ -4484,7 +4484,7 @@ export const rustFailureAtlasEntries = [
       "string slice get UTF-8 character boundary",
       "safe substring byte index Rust",
     ],
-    evidence: ["Rust 1.98.1 multibyte text", "in-bounds non-boundary range", "char_indices repair"],
+    evidence: ["Rust 1.99.1 multibyte text", "in-bounds non-boundary range", "char_indices repair"],
     caseSlug: "str-get-returns-none-at-non-char-boundary",
   },
   {
@@ -4502,7 +4502,7 @@ export const rustFailureAtlasEntries = [
       "slice copy_from_slice panics",
     ],
     evidence: [
-      "Rust 1.98.1 fixed arrays",
+      "Rust 1.99.1 fixed arrays",
       "captured unequal-length panic",
       "explicit destination-window repair",
     ],
@@ -4523,7 +4523,7 @@ export const rustFailureAtlasEntries = [
       "Unicode scalar value surrogate Rust",
     ],
     evidence: [
-      "Rust 1.98.1 surrogate input",
+      "Rust 1.99.1 surrogate input",
       "safe conversion rejection",
       "valid scalar comparison",
     ],
@@ -4544,7 +4544,7 @@ export const rustFailureAtlasEntries = [
       "u32 safe division checked_div",
     ],
     evidence: [
-      "Rust 1.98.1 unsigned division",
+      "Rust 1.99.1 unsigned division",
       "captured zero-divisor panic",
       "explicit domain validation repair",
     ],
@@ -4565,7 +4565,7 @@ export const rustFailureAtlasEntries = [
       "validate floating point clamp bounds",
     ],
     evidence: [
-      "Rust 1.98.1 NaN lower bound",
+      "Rust 1.99.1 NaN lower bound",
       "captured invalid-interval panic",
       "checked-boundary repair",
     ],
@@ -4585,7 +4585,7 @@ export const rustFailureAtlasEntries = [
       "map_or vs map_or_else Result",
       "lazy fallback for Result Rust",
     ],
-    evidence: ["Rust 1.98.1 Ok result", "atomic fallback call count", "map_or_else repair"],
+    evidence: ["Rust 1.99.1 Ok result", "atomic fallback call count", "map_or_else repair"],
     caseSlug: "result-map-or-evaluates-default-eagerly",
   },
   {
@@ -4602,7 +4602,7 @@ export const rustFailureAtlasEntries = [
       "set vector length and fill Rust",
       "Vec truncate versus resize",
     ],
-    evidence: ["Rust 1.98.1 one-element vector", "larger truncate no-op", "resize growth repair"],
+    evidence: ["Rust 1.99.1 one-element vector", "larger truncate no-op", "resize growth repair"],
     caseSlug: "vec-truncate-does-not-grow-vector",
   },
   {
@@ -4620,7 +4620,7 @@ export const rustFailureAtlasEntries = [
       "starts_with multiple characters Rust",
     ],
     evidence: [
-      "Rust 1.98.1 banana input",
+      "Rust 1.99.1 banana input",
       "char-slice Pattern result",
       "string-pattern comparison",
     ],
@@ -4641,7 +4641,7 @@ export const rustFailureAtlasEntries = [
       "checked integer exponentiation domain Rust",
     ],
     evidence: [
-      "Rust 1.98.1 integer exponentiation",
+      "Rust 1.99.1 integer exponentiation",
       "zero-exponent assertion",
       "domain-validation wrapper",
     ],
@@ -4662,7 +4662,7 @@ export const rustFailureAtlasEntries = [
       "round capacity to power of two Rust",
     ],
     evidence: [
-      "Rust 1.98.1 u32 maximum",
+      "Rust 1.99.1 u32 maximum",
       "checked overflow result",
       "representable-boundary comparison",
     ],
@@ -4682,7 +4682,7 @@ export const rustFailureAtlasEntries = [
       "chunks chunk_size must be nonzero Rust",
       "split slice dynamic chunk size safely",
     ],
-    evidence: ["Rust 1.98.1 three-byte slice", "captured zero-size panic", "validated-size repair"],
+    evidence: ["Rust 1.99.1 three-byte slice", "captured zero-size panic", "validated-size repair"],
     caseSlug: "slice-chunks-panics-on-zero-size",
   },
   {
@@ -4700,7 +4700,7 @@ export const rustFailureAtlasEntries = [
       "split string at most n parts Rust",
     ],
     evidence: [
-      "Rust 1.98.1 colon-delimited input",
+      "Rust 1.99.1 colon-delimited input",
       "zero-field result",
       "one-and-two limit comparison",
     ],
@@ -4720,7 +4720,7 @@ export const rustFailureAtlasEntries = [
       "step_by step must be nonzero Rust",
       "validate dynamic iterator stride",
     ],
-    evidence: ["Rust 1.98.1 integer range", "captured zero-step panic", "positive-step repair"],
+    evidence: ["Rust 1.99.1 integer range", "captured zero-step panic", "positive-step repair"],
     caseSlug: "iterator-step-by-panics-on-zero",
   },
   {
@@ -4738,7 +4738,7 @@ export const rustFailureAtlasEntries = [
       "Option xor loses conflict information",
     ],
     evidence: [
-      "Rust 1.98.1 two present strings",
+      "Rust 1.99.1 two present strings",
       "both-Some result",
       "explicit conflict Result repair",
     ],
@@ -4758,7 +4758,7 @@ export const rustFailureAtlasEntries = [
       "Result and vs and_then eager",
       "short circuit fallible operations Rust",
     ],
-    evidence: ["Rust 1.98.1 initial Err", "atomic second-operation count", "and_then repair"],
+    evidence: ["Rust 1.99.1 initial Err", "atomic second-operation count", "and_then repair"],
     caseSlug: "result-and-evaluates-second-argument-eagerly",
   },
   {
@@ -4776,7 +4776,7 @@ export const rustFailureAtlasEntries = [
       "create static reference Box leak safely",
     ],
     evidence: [
-      "Rust 1.98.1 tracked destructor",
+      "Rust 1.99.1 tracked destructor",
       "zero observed drops",
       "ordinary Box ownership repair",
     ],
@@ -4797,7 +4797,7 @@ export const rustFailureAtlasEntries = [
       "char MAX_LEN_UTF8 Rust",
     ],
     evidence: [
-      "Rust 1.98.1 accented scalar",
+      "Rust 1.99.1 accented scalar",
       "captured short-buffer panic",
       "maximum-width buffer repair",
     ],
@@ -4817,7 +4817,7 @@ export const rustFailureAtlasEntries = [
       "ilog2 zero panic Rust",
       "integer log2 bucket zero value",
     ],
-    evidence: ["Rust 1.98.1 unsigned zero", "checked domain result", "positive boundary table"],
+    evidence: ["Rust 1.99.1 unsigned zero", "checked domain result", "positive boundary table"],
     caseSlug: "checked-ilog2-zero-returns-none",
   },
   {
@@ -4834,7 +4834,7 @@ export const rustFailureAtlasEntries = [
       "does is_multiple_of panic divisor zero Rust",
       "0 multiple of 0 Rust integer API",
     ],
-    evidence: ["Rust 1.98.1 zero pair", "total predicate result", "zero-and-nonzero comparison"],
+    evidence: ["Rust 1.99.1 zero pair", "total predicate result", "zero-and-nonzero comparison"],
     caseSlug: "is-multiple-of-zero-special-case",
   },
   {
@@ -4852,7 +4852,7 @@ export const rustFailureAtlasEntries = [
       "why 2.5 round is 3 Rust",
     ],
     evidence: [
-      "Rust 1.98.1 positive and negative halves",
+      "Rust 1.99.1 positive and negative halves",
       "tie-policy comparison",
       "round_ties_even repair",
     ],
@@ -4873,7 +4873,7 @@ export const rustFailureAtlasEntries = [
       "what happens to iterator after collect Err",
     ],
     evidence: [
-      "Rust 1.98.1 three-result iterator",
+      "Rust 1.99.1 three-result iterator",
       "first error collection",
       "unvisited trailing item",
     ],
@@ -4893,7 +4893,7 @@ export const rustFailureAtlasEntries = [
       "does iterator all visit every item",
       "all predicate stops first false Rust",
     ],
-    evidence: ["Rust 1.98.1 three-number iterator", "first-false stop", "visible remaining item"],
+    evidence: ["Rust 1.99.1 three-number iterator", "first-false stop", "visible remaining item"],
     caseSlug: "iterator-all-short-circuits-leaves-remainder",
   },
   {
@@ -4910,7 +4910,7 @@ export const rustFailureAtlasEntries = [
       "parse char multibyte Unicode Rust",
       "ParseCharError empty multiple characters",
     ],
-    evidence: ["Rust 1.98.1 ASCII pair", "single accented scalar", "empty-and-multiple rejection"],
+    evidence: ["Rust 1.99.1 ASCII pair", "single accented scalar", "empty-and-multiple rejection"],
     caseSlug: "parse-char-requires-one-unicode-scalar",
   },
   {
@@ -4927,7 +4927,7 @@ export const rustFailureAtlasEntries = [
       "remove repeated string prefix Rust",
       "strip_prefix loop empty prefix",
     ],
-    evidence: ["Rust 1.98.1 repeated prefix", "single removal result", "progressing loop repair"],
+    evidence: ["Rust 1.99.1 repeated prefix", "single removal result", "progressing loop repair"],
     caseSlug: "str-strip-prefix-removes-exactly-once",
   },
   {
@@ -4945,7 +4945,7 @@ export const rustFailureAtlasEntries = [
       "checked_abs vs unsigned_abs",
     ],
     evidence: [
-      "Rust 1.98.1 checked-overflow execution",
+      "Rust 1.99.1 checked-overflow execution",
       "captured minimum panic",
       "checked and unsigned repairs",
     ],
@@ -4966,7 +4966,7 @@ export const rustFailureAtlasEntries = [
       "is_sorted stops first inversion Rust",
     ],
     evidence: [
-      "Rust 1.98.1 four-number iterator",
+      "Rust 1.99.1 four-number iterator",
       "first inversion detection",
       "visible trailing item",
     ],
@@ -4987,7 +4987,7 @@ export const rustFailureAtlasEntries = [
       "channel disconnect drain pending messages Rust",
     ],
     evidence: [
-      "Rust 1.98.1 buffered channel",
+      "Rust 1.99.1 buffered channel",
       "sender drop before receive",
       "message-then-RecvError sequence",
     ],
@@ -5008,7 +5008,7 @@ export const rustFailureAtlasEntries = [
       "does Cursor clamp position Rust",
     ],
     evidence: [
-      "Rust 1.98.1 vector Cursor",
+      "Rust 1.99.1 vector Cursor",
       "position ten over length three",
       "zero-byte read and unchanged position",
     ],
@@ -5029,7 +5029,7 @@ export const rustFailureAtlasEntries = [
       "lexically normalize path Rust without filesystem",
     ],
     evidence: [
-      "Rust 1.98.1 relative path",
+      "Rust 1.99.1 relative path",
       "removed internal CurDir",
       "preserved ParentDir component",
     ],
@@ -5049,7 +5049,7 @@ export const rustFailureAtlasEntries = [
       "does Vec append move or clone elements",
       "keep second vector after append Rust",
     ],
-    evidence: ["Rust 1.98.1 two small vectors", "destination concatenation", "empty source state"],
+    evidence: ["Rust 1.99.1 two small vectors", "destination concatenation", "empty source state"],
     caseSlug: "vec-append-empties-source",
   },
   {
@@ -5067,7 +5067,7 @@ export const rustFailureAtlasEntries = [
       "which vector contains split_off index Rust",
     ],
     evidence: [
-      "Rust 1.98.1 four-element vector",
+      "Rust 1.99.1 four-element vector",
       "split at index two",
       "two explicit half-open ranges",
     ],
@@ -5088,7 +5088,7 @@ export const rustFailureAtlasEntries = [
       "maximum radix char from_digit Rust",
     ],
     evidence: [
-      "Rust 1.98.1 caught radix-37 panic",
+      "Rust 1.99.1 caught radix-37 panic",
       "out-of-range digit returns None",
       "explicit radix validation repair",
     ],
@@ -5109,7 +5109,7 @@ export const rustFailureAtlasEntries = [
       "validate dynamic integer base Rust",
     ],
     evidence: [
-      "Rust 1.98.1 caught radix-one panic",
+      "Rust 1.99.1 caught radix-one panic",
       "ordinary invalid digit ParseIntError",
       "2-through-36 validation wrapper",
     ],
@@ -5130,7 +5130,7 @@ export const rustFailureAtlasEntries = [
       "Euclidean integer division Rust remainder",
     ],
     evidence: [
-      "Rust 1.98.1 negative dividend",
+      "Rust 1.99.1 negative dividend",
       "slash and Euclidean quotient comparison",
       "quotient-remainder identity repair",
     ],
@@ -5150,7 +5150,7 @@ export const rustFailureAtlasEntries = [
       "u32 zero bit length Rust stable",
       "leading_zeros calculate bit width zero",
     ],
-    evidence: ["Rust 1.98.1 zero u32", "full 32-bit zero count", "stable width calculation"],
+    evidence: ["Rust 1.99.1 zero u32", "full 32-bit zero count", "stable width calculation"],
     caseSlug: "leading-zeros-of-zero-equals-integer-width",
   },
   {
@@ -5168,7 +5168,7 @@ export const rustFailureAtlasEntries = [
       "mutate Cursor Vec reset position Rust",
     ],
     evidence: [
-      "Rust 1.98.1 Vec-backed Cursor",
+      "Rust 1.99.1 Vec-backed Cursor",
       "buffer truncated through get_mut",
       "explicit position clamp repair",
     ],
@@ -5189,7 +5189,7 @@ export const rustFailureAtlasEntries = [
       "OpenOptions create requires write append Rust",
     ],
     evidence: [
-      "Rust 1.98.1 unique temporary path",
+      "Rust 1.99.1 unique temporary path",
       "InvalidInput open failure",
       "explicit read-write creation repair",
     ],
@@ -5210,7 +5210,7 @@ export const rustFailureAtlasEntries = [
       "Take reader remaining limit EOF Rust",
     ],
     evidence: [
-      "Rust 1.98.1 six-byte slice reader",
+      "Rust 1.99.1 six-byte slice reader",
       "three-plus-one bounded reads",
       "zero remaining limit assertion",
     ],
@@ -5231,7 +5231,7 @@ export const rustFailureAtlasEntries = [
       "String len decreases by two after pop Rust",
     ],
     evidence: [
-      "Rust 1.98.1 a-plus-accented-e string",
+      "Rust 1.99.1 a-plus-accented-e string",
       "one scalar and two-byte removal",
       "len_utf8 repair assertion",
     ],
@@ -5252,7 +5252,7 @@ export const rustFailureAtlasEntries = [
       "set_extension empty extension still Some Rust",
     ],
     evidence: [
-      "Rust 1.98.1 multi-suffix PathBuf",
+      "Rust 1.99.1 multi-suffix PathBuf",
       "single final-suffix removal",
       "repeated explicit removal repair",
     ],
@@ -5273,7 +5273,7 @@ export const rustFailureAtlasEntries = [
       "Rust custom Reader returns zero then data chain",
     ],
     evidence: [
-      "Rust 1.98.1 controlled two-stage reader",
+      "Rust 1.99.1 controlled two-stage reader",
       "first Ok(0) transition",
       "second reader output only",
     ],
@@ -5294,7 +5294,7 @@ export const rustFailureAtlasEntries = [
       "write_all partially writes before error fixed buffer",
     ],
     evidence: [
-      "Rust 1.98.1 two-byte mutable slice",
+      "Rust 1.99.1 two-byte mutable slice",
       "three-byte write_all",
       "WriteZero after partial prefix",
     ],
@@ -5315,7 +5315,7 @@ export const rustFailureAtlasEntries = [
       "Rust split_inclusive versus split trailing delimiter",
     ],
     evidence: [
-      "Rust 1.98.1 comma-terminated text",
+      "Rust 1.99.1 comma-terminated text",
       "two inclusive pieces",
       "ordinary split empty tail contrast",
     ],
@@ -5335,7 +5335,7 @@ export const rustFailureAtlasEntries = [
       "floating point range NaN empty Rust",
       "Range f64 incomparable endpoints is_empty",
     ],
-    evidence: ["Rust 1.98.1 Range f64", "NaN endpoint", "explicit finite-bound validation"],
+    evidence: ["Rust 1.99.1 Range f64", "NaN endpoint", "explicit finite-bound validation"],
     caseSlug: "range-is-empty-treats-nan-as-incomparable",
   },
   {
@@ -5353,7 +5353,7 @@ export const rustFailureAtlasEntries = [
       "when does Cow become Owned Rust",
     ],
     evidence: [
-      "Rust 1.98.1 borrowed Cow str",
+      "Rust 1.99.1 borrowed Cow str",
       "uppercase owned result",
       "unchanged borrowed source",
     ],
@@ -5374,7 +5374,7 @@ export const rustFailureAtlasEntries = [
       "retrieve owned representative HashSet Rust",
     ],
     evidence: [
-      "Rust 1.98.1 custom equality by id",
+      "Rust 1.99.1 custom equality by id",
       "different query and stored labels",
       "stored representative removed",
     ],
@@ -5395,7 +5395,7 @@ export const rustFailureAtlasEntries = [
       "preserve empty product as None Rust",
     ],
     evidence: [
-      "Rust 1.98.1 typed empty u32 iterator",
+      "Rust 1.99.1 typed empty u32 iterator",
       "product identity one",
       "reduce returns None contrast",
     ],
@@ -5416,7 +5416,7 @@ export const rustFailureAtlasEntries = [
       "fract versus rem_euclid Rust",
     ],
     evidence: [
-      "Rust 1.98.1 negative floating value",
+      "Rust 1.99.1 negative floating value",
       "approximately negative 0.6 fract",
       "approximately positive 0.4 Euclidean remainder",
     ],
@@ -5437,7 +5437,7 @@ export const rustFailureAtlasEntries = [
       "Duration checked division Option Rust",
     ],
     evidence: [
-      "Rust 1.98.1 five-second Duration",
+      "Rust 1.99.1 five-second Duration",
       "zero divisor returns None",
       "domain error wrapper",
     ],
@@ -5458,7 +5458,7 @@ export const rustFailureAtlasEntries = [
       "IPv6 address with port Rust syntax",
     ],
     evidence: [
-      "Rust 1.98.1 IPv6 loopback",
+      "Rust 1.99.1 IPv6 loopback",
       "unbracketed parse failure",
       "bracketed socket endpoint repair",
     ],
@@ -5479,7 +5479,7 @@ export const rustFailureAtlasEntries = [
       "skip NUL terminated field BufRead",
     ],
     evidence: [
-      "Rust 1.98.1 Cursor input",
+      "Rust 1.99.1 Cursor input",
       "three payload bytes plus delimiter",
       "remaining stream assertion",
     ],
@@ -5500,7 +5500,7 @@ export const rustFailureAtlasEntries = [
       "Iterator None temporary unavailable Rust",
     ],
     evidence: [
-      "Rust 1.98.1 custom reviving iterator",
+      "Rust 1.99.1 custom reviving iterator",
       "first-call None",
       "only second-side value collected",
     ],
@@ -5520,7 +5520,7 @@ export const rustFailureAtlasEntries = [
       "exhausted inclusive range endpoints unspecified",
       "RangeInclusive is_empty after collect",
     ],
-    evidence: ["Rust 1.98.1 inclusive integer range", "complete exhaustion", "is_empty repair"],
+    evidence: ["Rust 1.99.1 inclusive integer range", "complete exhaustion", "is_empty repair"],
     caseSlug: "range-inclusive-endpoints-unspecified-after-exhaustion",
   },
   {
@@ -5537,7 +5537,7 @@ export const rustFailureAtlasEntries = [
       "panic hook runs before catch_unwind",
       "silence expected caught panic Rust test",
     ],
-    evidence: ["Rust 1.98.1 custom panic hook", "caught unwind payload", "exactly one hook call"],
+    evidence: ["Rust 1.99.1 custom panic hook", "caught unwind payload", "exactly one hook call"],
     caseSlug: "catch-unwind-runs-panic-hook-before-catching",
   },
   {
@@ -5554,7 +5554,7 @@ export const rustFailureAtlasEntries = [
       "RefCell swap with itself",
       "avoid RefCell self swap ptr eq",
     ],
-    evidence: ["Rust 1.98.1 single RefCell", "caught self-swap panic", "pointer-identity guard"],
+    evidence: ["Rust 1.99.1 single RefCell", "caught self-swap panic", "pointer-identity guard"],
     caseSlug: "refcell-swap-with-itself-panics",
   },
   {
@@ -5572,7 +5572,7 @@ export const rustFailureAtlasEntries = [
       "MaybeUninit reinitialize resource safely",
     ],
     evidence: [
-      "Rust 1.98.1 drop-counted values",
+      "Rust 1.99.1 drop-counted values",
       "second write into live slot",
       "one leaked destructor obligation",
     ],
@@ -5593,7 +5593,7 @@ export const rustFailureAtlasEntries = [
       "get contained TypeId Box dyn Any",
     ],
     evidence: [
-      "Rust 1.98.1 boxed u32",
+      "Rust 1.99.1 boxed u32",
       "direct receiver mismatch",
       "dereferenced trait-object match",
     ],
@@ -5613,7 +5613,7 @@ export const rustFailureAtlasEntries = [
       "swap_remove last element moves to index",
       "Vec constant time removal preserve order",
     ],
-    evidence: ["Rust 1.98.1 four-element Vec", "middle removal", "last element moved into hole"],
+    evidence: ["Rust 1.99.1 four-element Vec", "middle removal", "last element moved into hole"],
     caseSlug: "vec-swap-remove-does-not-preserve-order",
   },
   {
@@ -5631,7 +5631,7 @@ export const rustFailureAtlasEntries = [
       "Command spawn piped stdin wait_with_output Rust",
     ],
     evidence: [
-      "Rust 1.98.1 self-spawned process",
+      "Rust 1.99.1 self-spawned process",
       "default child stdin EOF",
       "explicit piped input repair",
     ],
@@ -5652,7 +5652,7 @@ export const rustFailureAtlasEntries = [
       "normalize old Mac line endings Rust",
     ],
     evidence: [
-      "Rust 1.98.1 mixed line endings",
+      "Rust 1.99.1 mixed line endings",
       "lone CR retained",
       "ordered normalization repair",
     ],
@@ -5673,7 +5673,7 @@ export const rustFailureAtlasEntries = [
       "with_capacity ZST ignores requested capacity",
     ],
     evidence: [
-      "Rust 1.98.1 Vec<()> fixture",
+      "Rust 1.99.1 Vec<()> fixture",
       "requested capacity eight",
       "growth without element allocation",
     ],
@@ -5693,7 +5693,7 @@ export const rustFailureAtlasEntries = [
       "Option UnsafeCell NonNull 16 bytes",
       "UnsafeCell memory layout outer enum niche",
     ],
-    evidence: ["Rust 1.98.1 64-bit layout", "plain NonNull Option", "UnsafeCell-wrapped Option"],
+    evidence: ["Rust 1.99.1 64-bit layout", "plain NonNull Option", "UnsafeCell-wrapped Option"],
     caseSlug: "unsafecell-disables-outer-niche-optimization",
   },
   {
@@ -5711,7 +5711,7 @@ export const rustFailureAtlasEntries = [
       "resume_unwind logging missing Rust",
     ],
     evidence: [
-      "Rust 1.98.1 custom hook",
+      "Rust 1.99.1 custom hook",
       "caught original payload",
       "zero hook calls while resuming",
     ],
@@ -5732,7 +5732,7 @@ export const rustFailureAtlasEntries = [
       "repeat_n value cloning semantics",
     ],
     evidence: [
-      "Rust 1.98.1 stateful Clone",
+      "Rust 1.99.1 stateful Clone",
       "three repeated outputs",
       "clone-clone-original order",
     ],
@@ -5753,7 +5753,7 @@ export const rustFailureAtlasEntries = [
       "integer square root signed input Rust",
     ],
     evidence: [
-      "Rust 1.98.1 signed integer",
+      "Rust 1.99.1 signed integer",
       "negative-one unwind",
       "checked square-boundary results",
     ],
@@ -5774,7 +5774,7 @@ export const rustFailureAtlasEntries = [
       "check symbolic link without following Rust",
     ],
     evidence: [
-      "Rust 1.98.1 Unix directory",
+      "Rust 1.99.1 Unix directory",
       "relative symbolic link",
       "followed and unfollowed file types",
     ],
@@ -5794,7 +5794,7 @@ export const rustFailureAtlasEntries = [
       "Command arg replace existing args",
       "std process Command builder reused state",
     ],
-    evidence: ["Rust 1.98.1 Command builder", "two arg mutations", "fresh builder per request"],
+    evidence: ["Rust 1.99.1 Command builder", "two arg mutations", "fresh builder per request"],
     caseSlug: "command-builder-reuse-accumulates-arguments",
   },
   {
@@ -5812,7 +5812,7 @@ export const rustFailureAtlasEntries = [
       "retain UTF-8 multibyte character Rust",
     ],
     evidence: [
-      "Rust 1.98.1 a-é-b string",
+      "Rust 1.99.1 a-é-b string",
       "four bytes and three chars",
       "ordered retain visitation",
     ],
@@ -5832,7 +5832,7 @@ export const rustFailureAtlasEntries = [
       "minus zero signum returns minus one",
       "f64 sign bit zero equality Rust",
     ],
-    evidence: ["Rust 1.98.1 f64", "both signed zeros", "signum and NaN behavior"],
+    evidence: ["Rust 1.99.1 f64", "both signed zeros", "signum and NaN behavior"],
     caseSlug: "f64-signum-distinguishes-negative-zero",
   },
   {
@@ -5850,7 +5850,7 @@ export const rustFailureAtlasEntries = [
       "rsplit_once empty pattern behavior",
     ],
     evidence: [
-      "Rust 1.98.1 string pattern",
+      "Rust 1.99.1 string pattern",
       "first and final empty boundary",
       "non-empty validation wrapper",
     ],
@@ -5870,7 +5870,7 @@ export const rustFailureAtlasEntries = [
       "scan iterator not fused",
       "Iterator scan closure None resume",
     ],
-    evidence: ["Rust 1.98.1 three-item scan", "middle None", "fused permanent exhaustion"],
+    evidence: ["Rust 1.99.1 three-item scan", "middle None", "fused permanent exhaustion"],
     caseSlug: "iterator-scan-can-resume-after-none",
   },
   {
@@ -5887,7 +5887,7 @@ export const rustFailureAtlasEntries = [
       "try_fold consumes failing item",
       "continue iterator after try_fold short circuit",
     ],
-    evidence: ["Rust 1.98.1 four-item range", "error on item three", "item four remains"],
+    evidence: ["Rust 1.99.1 four-item range", "error on item three", "item four remains"],
     caseSlug: "try-fold-consumes-short-circuiting-item",
   },
   {
@@ -5905,7 +5905,7 @@ export const rustFailureAtlasEntries = [
       "iterate heap descending Rust",
     ],
     evidence: [
-      "Rust 1.98.1 four-element heap",
+      "Rust 1.99.1 four-element heap",
       "underlying iteration order",
       "repeated-pop priority order",
     ],
@@ -5926,7 +5926,7 @@ export const rustFailureAtlasEntries = [
       "BinaryHeap peek_mut guard must drop",
     ],
     evidence: [
-      "Rust 1.98.1 four-element heap",
+      "Rust 1.99.1 four-element heap",
       "forgotten mutated guard",
       "normal Drop restoration",
     ],
@@ -5946,7 +5946,7 @@ export const rustFailureAtlasEntries = [
       "set_len memory leak Drop elements",
       "Vec truncate versus unsafe set_len",
     ],
-    evidence: ["Rust 1.98.1 drop-counted values", "length reduction", "truncate destructor repair"],
+    evidence: ["Rust 1.99.1 drop-counted values", "length reduction", "truncate destructor repair"],
     caseSlug: "vec-set-len-downward-does-not-drop-elements",
   },
   {
@@ -5963,7 +5963,7 @@ export const rustFailureAtlasEntries = [
       "intersection equal elements either set",
       "HashSet representative metadata intersection",
     ],
-    evidence: ["Rust 1.98.1 unequal set sizes", "ID-only equality", "explicit left representative"],
+    evidence: ["Rust 1.99.1 unequal set sizes", "ID-only equality", "explicit left representative"],
     caseSlug: "hashset-intersection-may-yield-either-representative",
   },
   {
@@ -5980,7 +5980,7 @@ export const rustFailureAtlasEntries = [
       "Permissions set_readonly chmod a+w",
       "restore owner writable Rust permissions",
     ],
-    evidence: ["Rust 1.98.1 Unix file", "0444 starting mode", "0666 versus explicit 0644"],
+    evidence: ["Rust 1.99.1 Unix file", "0444 starting mode", "0666 versus explicit 0644"],
     caseSlug: "permissions-set-readonly-false-enables-all-unix-write-bits",
   },
   {
@@ -5998,7 +5998,7 @@ export const rustFailureAtlasEntries = [
       "DirEntry metadata versus fs metadata",
     ],
     evidence: [
-      "Rust 1.98.1 Unix directory",
+      "Rust 1.99.1 Unix directory",
       "relative link DirEntry",
       "entry and target type comparison",
     ],
@@ -6019,7 +6019,7 @@ export const rustFailureAtlasEntries = [
       "BufWriter flush versus into_inner",
     ],
     evidence: [
-      "Rust 1.98.1 counting writer",
+      "Rust 1.99.1 counting writer",
       "buffered bytes delivered",
       "explicit lower flush repair",
     ],
@@ -6039,7 +6039,7 @@ export const rustFailureAtlasEntries = [
       "child process exit code 134 None Rust",
       "ExitStatusExt signal process abort",
     ],
-    evidence: ["Rust 1.98.1 self-spawned child", "abort signal", "None code with Some signal"],
+    evidence: ["Rust 1.99.1 self-spawned child", "abort signal", "None code with Some signal"],
     caseSlug: "exitstatus-code-is-none-after-unix-signal",
   },
   {
@@ -6057,7 +6057,7 @@ export const rustFailureAtlasEntries = [
       "Rust minimum ignore NaN",
     ],
     evidence: [
-      "Rust 1.98.1 numeric and NaN pair",
+      "Rust 1.99.1 numeric and NaN pair",
       "both operand orders",
       "explicit NaN propagation repair",
     ],
@@ -6078,7 +6078,7 @@ export const rustFailureAtlasEntries = [
       "fused multiply add versus multiply then add Rust",
     ],
     evidence: [
-      "Rust 1.98.1 epsilon example",
+      "Rust 1.99.1 epsilon example",
       "fused single-round result",
       "separate double-round result",
     ],
@@ -6099,7 +6099,7 @@ export const rustFailureAtlasEntries = [
       "signed midpoint floor Rust",
     ],
     evidence: [
-      "Rust 1.98.1 negative odd sum",
+      "Rust 1.99.1 negative odd sum",
       "symmetric operand order",
       "full-range overflow-safe midpoint",
     ],
@@ -6120,7 +6120,7 @@ export const rustFailureAtlasEntries = [
       "round up alignment zero Rust",
     ],
     evidence: [
-      "Rust 1.98.1 zero divisor panic",
+      "Rust 1.99.1 zero divisor panic",
       "checked zero result",
       "checked arithmetic overflow result",
     ],
@@ -6141,7 +6141,7 @@ export const rustFailureAtlasEntries = [
       "Rust Unicode case folding standard library",
     ],
     evidence: [
-      "Rust 1.98.1 ASCII comparison",
+      "Rust 1.99.1 ASCII comparison",
       "non-ASCII uppercase lowercase pair",
       "explicit limited lowercase transformation",
     ],
@@ -6162,7 +6162,7 @@ export const rustFailureAtlasEntries = [
       "String replacement multi byte character Rust",
     ],
     evidence: [
-      "Rust 1.98.1 a-é-b string",
+      "Rust 1.99.1 a-é-b string",
       "interior UTF-8 byte endpoint",
       "find and len_utf8 boundary repair",
     ],
@@ -6183,7 +6183,7 @@ export const rustFailureAtlasEntries = [
       "OsString invalid UTF-8 bytes",
     ],
     evidence: [
-      "Rust 1.98.1 Unix OsString",
+      "Rust 1.99.1 Unix OsString",
       "explicit invalid UTF-8 byte",
       "lossy display and exact-byte recovery",
     ],
@@ -6204,7 +6204,7 @@ export const rustFailureAtlasEntries = [
       "call_once_force is_poisoned Rust",
     ],
     evidence: [
-      "Rust 1.98.1 panicking initializer thread",
+      "Rust 1.99.1 panicking initializer thread",
       "false completion after poison",
       "call_once_force recovery state",
     ],
@@ -6225,7 +6225,7 @@ export const rustFailureAtlasEntries = [
       "RwLock clear_poison after write panic",
     ],
     evidence: [
-      "Rust 1.98.1 writer thread panic",
+      "Rust 1.99.1 writer thread panic",
       "partially changed protected integer",
       "PoisonError recovery and clear_poison",
     ],
@@ -6246,7 +6246,7 @@ export const rustFailureAtlasEntries = [
       "does into_inner ignore mutex poison",
     ],
     evidence: [
-      "Rust 1.98.1 worker panic",
+      "Rust 1.99.1 worker panic",
       "consumed uniquely owned Mutex",
       "owned value recovered from PoisonError",
     ],
@@ -6267,7 +6267,7 @@ export const rustFailureAtlasEntries = [
       "unread buffer discarded into_inner Rust",
     ],
     evidence: [
-      "Rust 1.98.1 Cursor source",
+      "Rust 1.99.1 Cursor source",
       "one consumed byte with five buffered",
       "complete buffered read repair",
     ],
@@ -6288,7 +6288,7 @@ export const rustFailureAtlasEntries = [
       "BufWriter direct write ordering",
     ],
     evidence: [
-      "Rust 1.98.1 Vec writer",
+      "Rust 1.99.1 Vec writer",
       "pending buffered prefix",
       "explicit flush before direct write",
     ],
@@ -6309,7 +6309,7 @@ export const rustFailureAtlasEntries = [
       "LazyLock force always panics after poison",
     ],
     evidence: [
-      "Rust 1.98.1 local LazyLock",
+      "Rust 1.99.1 local LazyLock",
       "first initializer panic",
       "second force poison panic and OnceLock contrast",
     ],
@@ -6330,7 +6330,7 @@ export const rustFailureAtlasEntries = [
       "checked_duration_since None Rust",
     ],
     evidence: [
-      "Rust 1.98.1 derived later instant",
+      "Rust 1.99.1 derived later instant",
       "reversed saturating zero",
       "checked direction-sensitive repair",
     ],
@@ -6351,7 +6351,7 @@ export const rustFailureAtlasEntries = [
       "Duration nanoseconds overflow u64",
     ],
     evidence: [
-      "Rust 1.98.1 Duration maximum seconds",
+      "Rust 1.99.1 Duration maximum seconds",
       "u128 to u64 narrowing",
       "seconds and subsecond reconstruction",
     ],
@@ -6372,7 +6372,7 @@ export const rustFailureAtlasEntries = [
       "f64 to integer cast overflow Rust",
     ],
     evidence: [
-      "Rust 1.98.1 f64 to u8 casts",
+      "Rust 1.99.1 f64 to u8 casts",
       "upper and lower saturation",
       "NaN and fractional truncation",
     ],
@@ -6393,7 +6393,7 @@ export const rustFailureAtlasEntries = [
       "U+000B whitespace Rust parser",
     ],
     evidence: [
-      "Rust 1.98.1 ASCII vertical-tab input",
+      "Rust 1.99.1 ASCII vertical-tab input",
       "ASCII splitter single field",
       "Unicode splitter two fields",
     ],
@@ -6414,7 +6414,7 @@ export const rustFailureAtlasEntries = [
       "stream UTF-8 sequence across chunks Rust",
     ],
     evidence: [
-      "Rust 1.98.1 truncated euro-sign bytes",
+      "Rust 1.99.1 truncated euro-sign bytes",
       "valid two-byte ASCII prefix",
       "suffix completed by next byte",
     ],
@@ -6435,7 +6435,7 @@ export const rustFailureAtlasEntries = [
       "CString first zero terminator error",
     ],
     evidence: [
-      "Rust 1.98.1 interior-zero input",
+      "Rust 1.99.1 interior-zero input",
       "reported byte position",
       "original bytes recovered and valid CString built",
     ],
@@ -6456,7 +6456,7 @@ export const rustFailureAtlasEntries = [
       "VecDeque make_contiguous before binary_search",
     ],
     evidence: [
-      "Rust 1.98.1 capacity-eight wrapped deque",
+      "Rust 1.99.1 capacity-eight wrapped deque",
       "two physical slices",
       "logical index four search result",
     ],
@@ -6477,7 +6477,7 @@ export const rustFailureAtlasEntries = [
       "rewind BufReader before into_inner",
     ],
     evidence: [
-      "Rust 1.98.1 Cursor source",
+      "Rust 1.99.1 Cursor source",
       "logical position one and physical position six",
       "SeekFrom Current zero reconciliation",
     ],
@@ -6498,7 +6498,7 @@ export const rustFailureAtlasEntries = [
       "FusedIterator first None permanent",
     ],
     evidence: [
-      "Rust 1.98.1 custom resumable iterator",
+      "Rust 1.99.1 custom resumable iterator",
       "Some None Some source sequence",
       "explicit Pending item repair",
     ],
@@ -6519,7 +6519,7 @@ export const rustFailureAtlasEntries = [
       "checked_shl vs wrapping_shl",
     ],
     evidence: [
-      "Rust 1.98.1 i32 operations",
+      "Rust 1.99.1 i32 operations",
       "32 and 33 bit shift counts",
       "checked shift rejection",
     ],
@@ -6540,7 +6540,7 @@ export const rustFailureAtlasEntries = [
       "checked_abs saturating_abs unsigned_abs difference",
     ],
     evidence: [
-      "Rust 1.98.1 i32 minimum",
+      "Rust 1.99.1 i32 minimum",
       "four absolute-value policies",
       "exact unsigned magnitude",
     ],
@@ -6561,7 +6561,7 @@ export const rustFailureAtlasEntries = [
       "Receiver recv_timeout sender dropped",
     ],
     evidence: [
-      "Rust 1.98.1 standard mpsc channel",
+      "Rust 1.99.1 standard mpsc channel",
       "all senders dropped before receive",
       "live empty channel zero timeout contrast",
     ],
@@ -6582,7 +6582,7 @@ export const rustFailureAtlasEntries = [
       "Rust read file lossy UTF-8",
     ],
     evidence: [
-      "Rust 1.98.1 temporary file",
+      "Rust 1.99.1 temporary file",
       "ASCII prefix followed by byte FF",
       "byte read and explicit lossy conversion",
     ],
@@ -6603,7 +6603,7 @@ export const rustFailureAtlasEntries = [
       "read_link vs canonicalize Rust",
     ],
     evidence: [
-      "Rust 1.98.1 Unix temporary symlink",
+      "Rust 1.99.1 Unix temporary symlink",
       "stored target.txt path",
       "parent join and canonicalize repair",
     ],
@@ -6624,7 +6624,7 @@ export const rustFailureAtlasEntries = [
       "decode UTF-16 strict vs lossy Rust",
     ],
     evidence: [
-      "Rust 1.98.1 three-code-unit input",
+      "Rust 1.99.1 three-code-unit input",
       "Ok Err Ok output sequence",
       "replacement-character repair policy",
     ],
@@ -6645,7 +6645,7 @@ export const rustFailureAtlasEntries = [
       "Discriminant same variant different fields",
     ],
     evidence: [
-      "Rust 1.98.1 payload enum",
+      "Rust 1.99.1 payload enum",
       "equal same-variant discriminants",
       "derived value equality contrast",
     ],
@@ -6666,7 +6666,7 @@ export const rustFailureAtlasEntries = [
       "closure return control flow Rust",
     ],
     evidence: [
-      "Rust 1.98.1 nested closure",
+      "Rust 1.99.1 nested closure",
       "inner return one and outer result two",
       "explicit result propagation repair",
     ],
@@ -6687,7 +6687,7 @@ export const rustFailureAtlasEntries = [
       "mem take vs mem replace Rust",
     ],
     evidence: [
-      "Rust 1.98.1 custom Default implementation",
+      "Rust 1.99.1 custom Default implementation",
       "ready value replaced by warming",
       "explicit empty value installed with mem::replace",
     ],
@@ -6708,7 +6708,7 @@ export const rustFailureAtlasEntries = [
       "PeekMut value no longer heap root",
     ],
     evidence: [
-      "Rust 1.98.1 three-item BinaryHeap",
+      "Rust 1.99.1 three-item BinaryHeap",
       "root changed from nine to one",
       "eight promoted after PeekMut drop",
     ],
@@ -6729,7 +6729,7 @@ export const rustFailureAtlasEntries = [
       "force Unicode escape char Rust",
     ],
     evidence: [
-      "Rust 1.98.1 e-acute scalar",
+      "Rust 1.99.1 e-acute scalar",
       "visible debug escape result",
       "default and Unicode escape contrast",
     ],
@@ -6750,7 +6750,7 @@ export const rustFailureAtlasEntries = [
       "secondary comparison called when first not equal Rust",
     ],
     evidence: [
-      "Rust 1.98.1 atomic call counter",
+      "Rust 1.99.1 atomic call counter",
       "Less result with secondary call count one",
       "then_with skips and invokes closure according to equality",
     ],
@@ -6771,7 +6771,7 @@ export const rustFailureAtlasEntries = [
       "set_limit exceeds original Take limit Rust",
     ],
     evidence: [
-      "Rust 1.98.1 Cursor behind Take",
+      "Rust 1.99.1 Cursor behind Take",
       "three-byte read leaves limit two",
       "set_limit five permits bytes d through h",
     ],
@@ -6792,7 +6792,7 @@ export const rustFailureAtlasEntries = [
       "buffer vs fill_buf Rust",
     ],
     evidence: [
-      "Rust 1.98.1 in-memory Cursor source",
+      "Rust 1.99.1 in-memory Cursor source",
       "empty buffer immediately after construction",
       "fill_buf exposes ready and later confirms EOF",
     ],
@@ -6813,7 +6813,7 @@ export const rustFailureAtlasEntries = [
       "thread Builder spawn io Result still panics",
     ],
     evidence: [
-      "Rust 1.98.1 named thread Builder",
+      "Rust 1.99.1 named thread Builder",
       "interior NUL accepted by String",
       "spawn panic separated from OS io::Result",
     ],
@@ -6834,7 +6834,7 @@ export const rustFailureAtlasEntries = [
       "OnceLock set already initialized semantics",
     ],
     evidence: [
-      "Rust 1.98.1 local OnceLock",
+      "Rust 1.99.1 local OnceLock",
       "first value retained",
       "second String recovered from Err",
     ],
@@ -6855,7 +6855,7 @@ export const rustFailureAtlasEntries = [
       "handle panic inside thread scope",
     ],
     evidence: [
-      "Rust 1.98.1 scoped child thread",
+      "Rust 1.99.1 scoped child thread",
       "unjoined panic propagated by scope",
       "manual join observes failure",
     ],
@@ -6876,7 +6876,7 @@ export const rustFailureAtlasEntries = [
       "TryIter resumable iterator Rust",
     ],
     evidence: [
-      "Rust 1.98.1 live channel",
+      "Rust 1.99.1 live channel",
       "None then send then Some seven",
       "try_recv Empty and Disconnected distinction",
     ],
@@ -6897,7 +6897,7 @@ export const rustFailureAtlasEntries = [
       "keep remainder after draining heap",
     ],
     evidence: [
-      "Rust 1.98.1 three-item BinaryHeap",
+      "Rust 1.99.1 three-item BinaryHeap",
       "one Drain item consumed",
       "empty heap after iterator drop and pop contrast",
     ],
@@ -6918,7 +6918,7 @@ export const rustFailureAtlasEntries = [
       "String split_off UTF-8 byte index",
     ],
     evidence: [
-      "Rust 1.98.1 éclair input",
+      "Rust 1.99.1 éclair input",
       "byte offset one inside é",
       "char_indices derives byte offset two",
     ],
@@ -6939,7 +6939,7 @@ export const rustFailureAtlasEntries = [
       "retain predicate insertion order Rust",
     ],
     evidence: [
-      "Rust 1.98.1 BTreeMap",
+      "Rust 1.99.1 BTreeMap",
       "insertion sequence three one two",
       "predicate visit sequence one two three",
     ],
@@ -6960,7 +6960,7 @@ export const rustFailureAtlasEntries = [
       "large integer shift returns zero Rust",
     ],
     evidence: [
-      "Rust 1.98.1 i32 operations",
+      "Rust 1.99.1 i32 operations",
       "counts at 31 32 and 33",
       "checked and wrapping policy contrast",
     ],
@@ -6981,7 +6981,7 @@ export const rustFailureAtlasEntries = [
       "does overflowing_div panic on zero",
     ],
     evidence: [
-      "Rust 1.98.1 i32 operations",
+      "Rust 1.99.1 i32 operations",
       "MIN divided by negative one",
       "checked division and zero-divisor contrast",
     ],
@@ -7002,7 +7002,7 @@ export const rustFailureAtlasEntries = [
       "process deadlock waiting for stdin EOF",
     ],
     evidence: [
-      "Rust 1.98.1 self-spawned evidence process",
+      "Rust 1.99.1 self-spawned evidence process",
       "piped ChildStdin present before wait",
       "EOF-driven child exit and absent handle afterward",
     ],
@@ -7023,7 +7023,7 @@ export const rustFailureAtlasEntries = [
       "env vars vs vars_os",
     ],
     evidence: [
-      "Rust 1.98.1 Unix OsString",
+      "Rust 1.99.1 Unix OsString",
       "value bytes 6f 6b ff",
       "vars panic and vars_os byte recovery",
     ],
@@ -7044,7 +7044,7 @@ export const rustFailureAtlasEntries = [
       "invalid UTF-8 ownership Rust",
     ],
     evidence: [
-      "Rust 1.98.1 owned byte vector",
+      "Rust 1.99.1 owned byte vector",
       "invalid FF at byte two",
       "Utf8Error inspection and exact Vec recovery",
     ],
@@ -7065,7 +7065,7 @@ export const rustFailureAtlasEntries = [
       "combine two traits in dyn Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0225",
+      "Rust 1.99.1 E0225",
       "dyn Read plus Write rejection",
       "local supertrait and blanket implementation repair",
     ],
@@ -7086,7 +7086,7 @@ export const rustFailureAtlasEntries = [
       "Box dyn async trait method Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0038",
+      "Rust 1.99.1 E0038",
       "async method hidden Future diagnostic",
       "Pin Box dyn Future repair",
     ],
@@ -7107,7 +7107,7 @@ export const rustFailureAtlasEntries = [
       "replace associated const for dynamic dispatch",
     ],
     evidence: [
-      "Rust 1.98.1 E0038 compile failure",
+      "Rust 1.99.1 E0038 compile failure",
       "associated MAX constant",
       "object-safe receiver method repair",
     ],
@@ -7128,7 +7128,7 @@ export const rustFailureAtlasEntries = [
       "where Self Sized object safe method",
     ],
     evidence: [
-      "Rust 1.98.1 E0038 compile failure",
+      "Rust 1.99.1 E0038 compile failure",
       "Self return method",
       "Self Sized dispatch exclusion repair",
     ],
@@ -7149,7 +7149,7 @@ export const rustFailureAtlasEntries = [
       "explicit enum value collides with implicit zero",
     ],
     evidence: [
-      "Rust 1.98.1 E0081 compile failure",
+      "Rust 1.99.1 E0081 compile failure",
       "implicit zero and explicit zero",
       "unique repr u8 values repair",
     ],
@@ -7170,7 +7170,7 @@ export const rustFailureAtlasEntries = [
       "implicit enum discriminant does not wrap",
     ],
     evidence: [
-      "Rust 1.98.1 E0370 compile failure",
+      "Rust 1.99.1 E0370 compile failure",
       "repr u8 value 255 followed by implicit variant",
       "254 and 255 repair",
     ],
@@ -7191,7 +7191,7 @@ export const rustFailureAtlasEntries = [
       "Rust uninhabited type FFI opaque",
     ],
     evidence: [
-      "Rust 1.98.1 E0084 compile failure",
+      "Rust 1.99.1 E0084 compile failure",
       "zero-variant repr C enum",
       "Rust-only uninhabited enum repair",
     ],
@@ -7212,7 +7212,7 @@ export const rustFailureAtlasEntries = [
       "typed ID alias PhantomData Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0091 compile failure",
+      "Rust 1.99.1 E0091 compile failure",
       "CacheKey T alias to u64",
       "newtype with PhantomData repair",
     ],
@@ -7233,7 +7233,7 @@ export const rustFailureAtlasEntries = [
       "impl Trait only arguments return types",
     ],
     evidence: [
-      "Rust 1.98.1 E0562 compile failure",
+      "Rust 1.99.1 E0562 compile failure",
       "local impl Iterator annotation",
       "inference and Box dyn repairs",
     ],
@@ -7254,7 +7254,7 @@ export const rustFailureAtlasEntries = [
       "arithmetic vs logical unbounded shift Rust",
     ],
     evidence: [
-      "Rust 1.98.1 signed integer operations",
+      "Rust 1.99.1 signed integer operations",
       "negative i32 shifted by 32",
       "checked and unsigned policy contrast",
     ],
@@ -7275,7 +7275,7 @@ export const rustFailureAtlasEntries = [
       "checked_rem i32 MIN minus one",
     ],
     evidence: [
-      "Rust 1.98.1 i32 operations",
+      "Rust 1.99.1 i32 operations",
       "MIN remainder minus one yields zero true",
       "ordinary and checked remainder contrast",
     ],
@@ -7296,7 +7296,7 @@ export const rustFailureAtlasEntries = [
       "Rust PATH element contains colon",
     ],
     evidence: [
-      "Rust 1.98.1 Unix env path list",
+      "Rust 1.99.1 Unix env path list",
       "colon inside one element",
       "split_paths round-trip repair",
     ],
@@ -7317,7 +7317,7 @@ export const rustFailureAtlasEntries = [
       "move Sized bound from trait to method",
     ],
     evidence: [
-      "Rust 1.98.1 E0038 compile failure",
+      "Rust 1.99.1 E0038 compile failure",
       "trait-wide Sized supertrait",
       "method-local Sized repair",
     ],
@@ -7338,7 +7338,7 @@ export const rustFailureAtlasEntries = [
       "associated function where Self Sized trait object",
     ],
     evidence: [
-      "Rust 1.98.1 E0038 compile failure",
+      "Rust 1.99.1 E0038 compile failure",
       "receiver-free version function",
       "Self Sized exclusion repair",
     ],
@@ -7359,7 +7359,7 @@ export const rustFailureAtlasEntries = [
       "trait method impl Iterator Box dyn Iterator",
     ],
     evidence: [
-      "Rust 1.98.1 E0038 compile failure",
+      "Rust 1.99.1 E0038 compile failure",
       "receiver method returning impl Iterator",
       "boxed iterator repair",
     ],
@@ -7380,7 +7380,7 @@ export const rustFailureAtlasEntries = [
       "trait object generic supertrait Self",
     ],
     evidence: [
-      "Rust 1.98.1 E0038 compile failure",
+      "Rust 1.99.1 E0038 compile failure",
       "Tagged Self supertrait",
       "non-generic dyn-compatible supertrait repair",
     ],
@@ -7401,7 +7401,7 @@ export const rustFailureAtlasEntries = [
       "trait object supported receiver types Rc Self",
     ],
     evidence: [
-      "Rust 1.98.1 E0038 compile failure",
+      "Rust 1.99.1 E0038 compile failure",
       "nested Rc Box Self receiver",
       "direct Rc Self repair",
     ],
@@ -7422,7 +7422,7 @@ export const rustFailureAtlasEntries = [
       "fully qualified syntax trait method Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0034 compile failure",
+      "Rust 1.99.1 E0034 compile failure",
       "Left and Right label methods",
       "two explicit trait selections",
     ],
@@ -7443,7 +7443,7 @@ export const rustFailureAtlasEntries = [
       "fully qualified trait static method",
     ],
     evidence: [
-      "Rust 1.98.1 E0790 compile failure",
+      "Rust 1.99.1 E0790 compile failure",
       "one existing Factory implementation",
       "fully qualified implementation path repair",
     ],
@@ -7464,7 +7464,7 @@ export const rustFailureAtlasEntries = [
       "fully qualified associated type projection",
     ],
     evidence: [
-      "Rust 1.98.1 E0221 compile failure",
+      "Rust 1.99.1 E0221 compile failure",
       "two Item supertrait declarations",
       "qualified Left and Right projections",
     ],
@@ -7485,7 +7485,7 @@ export const rustFailureAtlasEntries = [
       "checked wrapping unbounded overflowing shr",
     ],
     evidence: [
-      "Rust 1.98.1 i32 operations",
+      "Rust 1.99.1 i32 operations",
       "negative value shifted by width",
       "four shift policy comparison",
     ],
@@ -7506,7 +7506,7 @@ export const rustFailureAtlasEntries = [
       "OsString into String failure Unix",
     ],
     evidence: [
-      "Rust 1.98.1 Unix OsString bytes",
+      "Rust 1.99.1 Unix OsString bytes",
       "invalid FF suffix",
       "Err ownership and lossy display contrast",
     ],
@@ -7527,7 +7527,7 @@ export const rustFailureAtlasEntries = [
       "overlap copy produces unexpected array",
     ],
     evidence: [
-      "Rust 1.98.1 five-element array",
+      "Rust 1.99.1 five-element array",
       "overlapping zero-to-three copy at index two",
       "original-source result assertion",
     ],
@@ -7548,7 +7548,7 @@ export const rustFailureAtlasEntries = [
       "clone Vec range to end Rust",
     ],
     evidence: [
-      "Rust 1.98.1 three-element Vec",
+      "Rust 1.99.1 three-element Vec",
       "source range zero through two",
       "single two-element cloned suffix",
     ],
@@ -7569,7 +7569,7 @@ export const rustFailureAtlasEntries = [
       "skip_while versus filter Rust",
     ],
     evidence: [
-      "Rust 1.98.1 three-item iterator",
+      "Rust 1.99.1 three-item iterator",
       "true false true predicate sequence",
       "two predicate calls and filter contrast",
     ],
@@ -7590,7 +7590,7 @@ export const rustFailureAtlasEntries = [
       "conditional consume iterator Rust",
     ],
     evidence: [
-      "Rust 1.98.1 two-item Peekable",
+      "Rust 1.99.1 two-item Peekable",
       "predicate rejects first value",
       "first value remains then next_if_eq consumes second",
     ],
@@ -7611,7 +7611,7 @@ export const rustFailureAtlasEntries = [
       "replace old value destructor Rust",
     ],
     evidence: [
-      "Rust 1.98.1 custom Drop counter",
+      "Rust 1.99.1 custom Drop counter",
       "zero drops during replacement",
       "separate old and destination destruction",
     ],
@@ -7632,7 +7632,7 @@ export const rustFailureAtlasEntries = [
       "stateful array construction Rust",
     ],
     evidence: [
-      "Rust 1.98.1 four-element array",
+      "Rust 1.99.1 four-element array",
       "recorded closure indices",
       "zero one two three visit order",
     ],
@@ -7653,7 +7653,7 @@ export const rustFailureAtlasEntries = [
       "expensive sort key Rust",
     ],
     evidence: [
-      "Rust 1.98.1 three-element Vec",
+      "Rust 1.99.1 three-element Vec",
       "shared key-call counter",
       "three calls and sorted result",
     ],
@@ -7674,7 +7674,7 @@ export const rustFailureAtlasEntries = [
       "Iterator cmp short circuit Rust",
     ],
     evidence: [
-      "Rust 1.98.1 paired iterators",
+      "Rust 1.99.1 paired iterators",
       "mismatch at second pair",
       "third values remain on both sides",
     ],
@@ -7684,18 +7684,18 @@ export const rustFailureAtlasEntries = [
     id: "RFA-398",
     area: "upgrades-compatibility",
     symptom:
-      "Iterator::next_chunk produces E0658 on stable Rust 1.98.1 even though its documentation describes partial-item preservation.",
+      "Iterator::next_chunk produces E0658 on stable Rust 1.99.1 even though its documentation describes partial-item preservation.",
     likelyCause:
       "The API remains behind the iter_next_chunk feature gate on this stable toolchain; documentation presence does not imply stable availability.",
     firstCheck:
       "Check the stability badge for the pinned toolchain and replace the call with take plus Vec-to-array conversion when stable support is required.",
     searchTerms: [
-      "Rust next_chunk unstable E0658 1.98",
+      "Rust next_chunk unstable E0658 1.99",
       "iter_next_chunk stable alternative",
       "collect iterator fixed array preserve partial",
     ],
     evidence: [
-      "Rust 1.98.1 E0658 compile failure",
+      "Rust 1.99.1 E0658 compile failure",
       "iter_next_chunk feature gate",
       "stable take and Vec conversion helper",
     ],
@@ -7705,18 +7705,18 @@ export const rustFailureAtlasEntries = [
     id: "RFA-399",
     area: "upgrades-compatibility",
     symptom:
-      "Iterator::advance_by produces E0658 on stable Rust 1.98.1 despite appearing in current standard-library documentation.",
+      "Iterator::advance_by produces E0658 on stable Rust 1.99.1 despite appearing in current standard-library documentation.",
     likelyCause:
       "The method is documented but still guarded by iter_advance_by, so stable code must express advancement and shortfall with existing Iterator::next operations.",
     firstCheck:
       "Read the stability marker for the exact toolchain and implement a small next loop when the remaining shortfall must be reported portably.",
     searchTerms: [
-      "Rust advance_by unstable E0658 1.98",
+      "Rust advance_by unstable E0658 1.99",
       "iter_advance_by stable replacement",
       "advance iterator report remaining steps",
     ],
     evidence: [
-      "Rust 1.98.1 E0658 compile failure",
+      "Rust 1.99.1 E0658 compile failure",
       "iter_advance_by feature gate",
       "stable explicit-next loop",
     ],
@@ -7737,7 +7737,7 @@ export const rustFailureAtlasEntries = [
       "Drop Wrapper Special same generic parameters",
     ],
     evidence: [
-      "Rust 1.98.1 E0366 compile failure",
+      "Rust 1.99.1 E0366 compile failure",
       "concrete generic instantiation",
       "uniform generic Drop repair",
     ],
@@ -7758,7 +7758,7 @@ export const rustFailureAtlasEntries = [
       "repr packed nested repr align Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0588 compile failure",
+      "Rust 1.99.1 E0588 compile failure",
       "nested align-eight field",
       "repr C aligned repair",
     ],
@@ -7779,7 +7779,7 @@ export const rustFailureAtlasEntries = [
       "enum tuple variant discriminant repr u8",
     ],
     evidence: [
-      "Rust 1.98.1 E0732 compile failure",
+      "Rust 1.99.1 E0732 compile failure",
       "unit and tuple variants with explicit values",
       "repr u8 repair",
     ],
@@ -7799,7 +7799,7 @@ export const rustFailureAtlasEntries = [
       "dropping references lint referent not dropped",
       "force destructor through shared reference Rust",
     ],
-    evidence: ["Rust 1.98.1 Drop counter", "shared-reference drop call", "owned-value drop repair"],
+    evidence: ["Rust 1.99.1 Drop counter", "shared-reference drop call", "owned-value drop repair"],
     caseSlug: "dropping-a-reference-does-not-drop-its-referent",
   },
   {
@@ -7817,7 +7817,7 @@ export const rustFailureAtlasEntries = [
       "extract Arc value clone only if shared",
     ],
     evidence: [
-      "Rust 1.98.1 custom Clone counter",
+      "Rust 1.99.1 custom Clone counter",
       "two strong owners clone branch",
       "unique owner move branch",
     ],
@@ -7838,7 +7838,7 @@ export const rustFailureAtlasEntries = [
       "reserve argument capacity or length Rust",
     ],
     evidence: [
-      "Rust 1.98.1 length-two capacity-ten Vec",
+      "Rust 1.99.1 length-two capacity-ten Vec",
       "nine additional elements request",
       "capacity at least eleven assertion",
     ],
@@ -7859,7 +7859,7 @@ export const rustFailureAtlasEntries = [
       "f64 midpoint versus a plus b over two",
     ],
     evidence: [
-      "Rust 1.98.1 f64 MAX operands",
+      "Rust 1.99.1 f64 MAX operands",
       "infinite naive intermediate",
       "finite midpoint result",
     ],
@@ -7880,7 +7880,7 @@ export const rustFailureAtlasEntries = [
       "buffered writer seek error flush Rust",
     ],
     evidence: [
-      "Rust 1.98.1 instrumented writer",
+      "Rust 1.99.1 instrumented writer",
       "buffered one-byte write",
       "write-before-seek event trace",
     ],
@@ -7901,7 +7901,7 @@ export const rustFailureAtlasEntries = [
       "read_until returned count delimiter byte",
     ],
     evidence: [
-      "Rust 1.98.1 Cursor input",
+      "Rust 1.99.1 Cursor input",
       "prepopulated destination Vec",
       "delimiter-inclusive append and remaining suffix",
     ],
@@ -7922,7 +7922,7 @@ export const rustFailureAtlasEntries = [
       "Vec capacity lost boxed slice conversion",
     ],
     evidence: [
-      "Rust 1.98.1 capacity-thirty-two Vec",
+      "Rust 1.99.1 capacity-thirty-two Vec",
       "three initialized elements",
       "boxed-slice round-trip capacity three",
     ],
@@ -7943,7 +7943,7 @@ export const rustFailureAtlasEntries = [
       "wide pointer equality slice metadata",
     ],
     evidence: [
-      "Rust 1.98.1 shared array storage",
+      "Rust 1.99.1 shared array storage",
       "same first-element address",
       "different slice lengths and pointer equality",
     ],
@@ -7964,7 +7964,7 @@ export const rustFailureAtlasEntries = [
       "size bytes unsized slice Rust",
     ],
     evidence: [
-      "Rust 1.98.1 three-u32 slice",
+      "Rust 1.99.1 three-u32 slice",
       "twelve-byte dynamic value",
       "reference-size contrast",
     ],
@@ -7985,7 +7985,7 @@ export const rustFailureAtlasEntries = [
       "needs_drop inner type implements Drop",
     ],
     evidence: [
-      "Rust 1.98.1 custom Drop type",
+      "Rust 1.99.1 custom Drop type",
       "false outer needs_drop result",
       "explicit ManuallyDrop destruction counter",
     ],
@@ -8006,7 +8006,7 @@ export const rustFailureAtlasEntries = [
       "dangling pointer sentinel may equal valid address",
     ],
     evidence: [
-      "Rust 1.98.1 NonNull u64",
+      "Rust 1.99.1 NonNull u64",
       "nonzero aligned address",
       "no dereference in repaired fixture",
     ],
@@ -8027,7 +8027,7 @@ export const rustFailureAtlasEntries = [
       "binary fields split delimiter Rust",
     ],
     evidence: [
-      "Rust 1.98.1 Cursor a comma b comma",
+      "Rust 1.99.1 Cursor a comma b comma",
       "two delimiter-free fields",
       "no synthetic trailing item",
     ],
@@ -8048,7 +8048,7 @@ export const rustFailureAtlasEntries = [
       "line buffered writer newline inner output Rust",
     ],
     evidence: [
-      "Rust 1.98.1 Vec inner writer",
+      "Rust 1.99.1 Vec inner writer",
       "partial line remains buffered",
       "newline forwards complete line",
     ],
@@ -8069,7 +8069,7 @@ export const rustFailureAtlasEntries = [
       "seek_relative preserve internal buffer Rust",
     ],
     evidence: [
-      "Rust 1.98.1 capacity-four BufReader",
+      "Rust 1.99.1 capacity-four BufReader",
       "two consumed and two buffered bytes",
       "empty buffer followed by correct reread",
     ],
@@ -8089,7 +8089,7 @@ export const rustFailureAtlasEntries = [
       "base of integer logarithm must be at least 2",
       "checked_ilog invalid base returns None",
     ],
-    evidence: ["Rust 1.98.1 u32 ilog panic", "base-one input", "checked_ilog None repair"],
+    evidence: ["Rust 1.99.1 u32 ilog panic", "base-one input", "checked_ilog None repair"],
     caseSlug: "integer-ilog-panics-when-the-base-is-below-two",
   },
   {
@@ -8107,7 +8107,7 @@ export const rustFailureAtlasEntries = [
       "let else return or match Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0308 compile failure",
+      "Rust 1.99.1 E0308 compile failure",
       "non-diverging integer else block",
       "early-return repair",
     ],
@@ -8128,7 +8128,7 @@ export const rustFailureAtlasEntries = [
       "while true break return value",
     ],
     evidence: [
-      "Rust 1.98.1 E0571 compile failure",
+      "Rust 1.99.1 E0571 compile failure",
       "while true with break payload",
       "loop expression repair",
     ],
@@ -8149,7 +8149,7 @@ export const rustFailureAtlasEntries = [
       "trait implementation cannot add where bound",
     ],
     evidence: [
-      "Rust 1.98.1 E0276 compile failure",
+      "Rust 1.99.1 E0276 compile failure",
       "generic Copy bound added only in impl",
       "shared trait-bound repair",
     ],
@@ -8170,7 +8170,7 @@ export const rustFailureAtlasEntries = [
       "trait method signature must match implementation",
     ],
     evidence: [
-      "Rust 1.98.1 E0053 compile failure",
+      "Rust 1.99.1 E0053 compile failure",
       "u16 trait versus i16 implementation",
       "exact-signature repair",
     ],
@@ -8191,7 +8191,7 @@ export const rustFailureAtlasEntries = [
       "Rust static trait function versus method",
     ],
     evidence: [
-      "Rust 1.98.1 E0185 compile failure",
+      "Rust 1.99.1 E0185 compile failure",
       "receiver-free trait declaration",
       "matching associated-function repair",
     ],
@@ -8212,7 +8212,7 @@ export const rustFailureAtlasEntries = [
       "typed ID generic marker Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0392 compile failure",
+      "Rust 1.99.1 E0392 compile failure",
       "generic typed handle without T field",
       "PhantomData marker repair",
     ],
@@ -8233,7 +8233,7 @@ export const rustFailureAtlasEntries = [
       "impl Contains impl Token named generic",
     ],
     evidence: [
-      "Rust 1.98.1 E0666 compile failure",
+      "Rust 1.99.1 E0666 compile failure",
       "nested argument-position impl Trait",
       "named inner generic repair",
     ],
@@ -8254,7 +8254,7 @@ export const rustFailureAtlasEntries = [
       "lifetime-bearing struct async argument underscore",
     ],
     evidence: [
-      "Rust 1.98.1 E0726 compile failure",
+      "Rust 1.99.1 E0726 compile failure",
       "lifetime omitted from async container argument",
       "Content underscore lifetime repair",
     ],
@@ -8275,7 +8275,7 @@ export const rustFailureAtlasEntries = [
       "impl Trait versus Box dyn Trait return",
     ],
     evidence: [
-      "Rust 1.98.1 E0746 compile failure",
+      "Rust 1.99.1 E0746 compile failure",
       "bare dyn Label return type",
       "single concrete impl Trait repair",
     ],
@@ -8296,7 +8296,7 @@ export const rustFailureAtlasEntries = [
       "edition 2024 reference trait without dyn",
     ],
     evidence: [
-      "Rust 1.98.1 E0782 compile failure",
+      "Rust 1.99.1 E0782 compile failure",
       "bare trait behind shared reference",
       "explicit dyn trait-object repair",
     ],
@@ -8317,7 +8317,7 @@ export const rustFailureAtlasEntries = [
       "why Vec is Clone but not Copy Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0204 compile failure",
+      "Rust 1.99.1 E0204 compile failure",
       "Vec field inside Copy derive",
       "explicit Clone repair",
     ],
@@ -8338,7 +8338,7 @@ export const rustFailureAtlasEntries = [
       "slice_from_raw_parts pointer length metadata",
     ],
     evidence: [
-      "Rust 1.98.1 E0607 compile failure",
+      "Rust 1.99.1 E0607 compile failure",
       "thin u8 pointer cast to wide slice pointer",
       "slice_from_raw_parts metadata construction",
     ],
@@ -8359,7 +8359,7 @@ export const rustFailureAtlasEntries = [
       "const generic value type from type parameter",
     ],
     evidence: [
-      "Rust 1.98.1 E0770 compile failure",
+      "Rust 1.99.1 E0770 compile failure",
       "const N typed by generic T",
       "concrete usize const parameter repair",
     ],
@@ -8380,7 +8380,7 @@ export const rustFailureAtlasEntries = [
       "named generic versus impl Trait trait method",
     ],
     evidence: [
-      "Rust 1.98.1 E0643 compile failure",
+      "Rust 1.99.1 E0643 compile failure",
       "anonymous trait parameter versus named impl generic",
       "matching named-generic repair",
     ],
@@ -8401,7 +8401,7 @@ export const rustFailureAtlasEntries = [
       "numeric method requires type annotation Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0689 compile failure",
+      "Rust 1.99.1 E0689 compile failure",
       "unsuffixed integer method call",
       "explicit u8 binding repair",
     ],
@@ -8422,7 +8422,7 @@ export const rustFailureAtlasEntries = [
       "when should Rust trait be unsafe",
     ],
     evidence: [
-      "Rust 1.98.1 E0199 compile failure",
+      "Rust 1.99.1 E0199 compile failure",
       "safe Ready trait with unsafe impl",
       "ordinary safe impl repair",
     ],
@@ -8443,7 +8443,7 @@ export const rustFailureAtlasEntries = [
       "unsafe trait safety contract implementation",
     ],
     evidence: [
-      "Rust 1.98.1 E0200 compile failure",
+      "Rust 1.99.1 E0200 compile failure",
       "ordinary impl of unsafe trait",
       "documented unsafe impl repair",
     ],
@@ -8464,7 +8464,7 @@ export const rustFailureAtlasEntries = [
       "inner function generic scope Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0401 compile failure",
+      "Rust 1.99.1 E0401 compile failure",
       "inner fn refers to outer T",
       "independent inner generic repair",
     ],
@@ -8485,7 +8485,7 @@ export const rustFailureAtlasEntries = [
       "require associated type Clone trait",
     ],
     evidence: [
-      "Rust 1.98.1 E0774 compile failure",
+      "Rust 1.99.1 E0774 compile failure",
       "derive attribute on associated type",
       "Clone associated-type bound repair",
     ],
@@ -8506,7 +8506,7 @@ export const rustFailureAtlasEntries = [
       "associated item duplicate generic name Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0403 compile failure",
+      "Rust 1.99.1 E0403 compile failure",
       "trait T shadowed by method T",
       "renamed independent method generic repair",
     ],
@@ -8516,7 +8516,7 @@ export const rustFailureAtlasEntries = [
     id: "RFA-438",
     area: "upgrades-compatibility",
     symptom:
-      "Declaring const fn version inside a trait fails with E0379 on Rust 1.98.1 because stable trait function declarations cannot carry const.",
+      "Declaring const fn version inside a trait fails with E0379 on Rust 1.99.1 because stable trait function declarations cannot carry const.",
     likelyCause:
       "Const-callability and trait polymorphism are separate contracts, and ordinary stable trait syntax does not promise that an implementation can be invoked by the const evaluator.",
     firstCheck:
@@ -8527,7 +8527,7 @@ export const rustFailureAtlasEntries = [
       "associated const versus const trait function",
     ],
     evidence: [
-      "Rust 1.98.1 E0379 compile failure",
+      "Rust 1.99.1 E0379 compile failure",
       "const trait function declaration",
       "ordinary associated-function repair",
     ],
@@ -8548,7 +8548,7 @@ export const rustFailureAtlasEntries = [
       "compiler automatically implements Sized trait",
     ],
     evidence: [
-      "Rust 1.98.1 E0322 compile failure",
+      "Rust 1.99.1 E0322 compile failure",
       "explicit Sized impl for record",
       "implicit compiler implementation repair",
     ],
@@ -8569,7 +8569,7 @@ export const rustFailureAtlasEntries = [
       "Rust pattern State Failed not covered",
     ],
     evidence: [
-      "Rust 1.98.1 E0004 compile failure",
+      "Rust 1.99.1 E0004 compile failure",
       "Ready-only match over two-state enum",
       "explicit Failed arm repair",
     ],
@@ -8590,7 +8590,7 @@ export const rustFailureAtlasEntries = [
       "plain let requires irrefutable pattern Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0005 compile failure",
+      "Rust 1.99.1 E0005 compile failure",
       "Some pattern over Option value",
       "diverging let-else repair",
     ],
@@ -8611,7 +8611,7 @@ export const rustFailureAtlasEntries = [
       "ignore tuple variant fields Rust pattern",
     ],
     evidence: [
-      "Rust 1.98.1 E0023 compile failure",
+      "Rust 1.99.1 E0023 compile failure",
       "one-position pattern for two-field Move",
       "two-field destructuring repair",
     ],
@@ -8632,7 +8632,7 @@ export const rustFailureAtlasEntries = [
       "rename struct fields while destructuring Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0025 compile failure",
+      "Rust 1.99.1 E0025 compile failure",
       "two local names for source field x",
       "x and y field repair",
     ],
@@ -8653,7 +8653,7 @@ export const rustFailureAtlasEntries = [
       "struct pattern field before colon binding after",
     ],
     evidence: [
-      "Rust 1.98.1 E0026 compile failure",
+      "Rust 1.99.1 E0026 compile failure",
       "nonexistent z shorthand field",
       "y colon z rename repair",
     ],
@@ -8674,7 +8674,7 @@ export const rustFailureAtlasEntries = [
       "ignore remaining struct fields pattern Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0027 compile failure",
+      "Rust 1.99.1 E0027 compile failure",
       "Record id pattern missing payload",
       "explicit rest-pattern repair",
     ],
@@ -8695,7 +8695,7 @@ export const rustFailureAtlasEntries = [
       "range pattern must be non-empty",
     ],
     evidence: [
-      "Rust 1.98.1 E0030 compile failure",
+      "Rust 1.99.1 E0030 compile failure",
       "reversed 10 through 5 pattern",
       "ordered 5 through 10 repair",
     ],
@@ -8716,7 +8716,7 @@ export const rustFailureAtlasEntries = [
       "match against constructor function Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0164 compile failure",
+      "Rust 1.99.1 E0164 compile failure",
       "associated function call in arm pattern",
       "enum variant pattern repair",
     ],
@@ -8737,7 +8737,7 @@ export const rustFailureAtlasEntries = [
       "bracket destructuring pattern Rust type",
     ],
     evidence: [
-      "Rust 1.98.1 E0529 compile failure",
+      "Rust 1.99.1 E0529 compile failure",
       "two-element slice pattern over f32",
       "two-element array repair",
     ],
@@ -8758,7 +8758,7 @@ export const rustFailureAtlasEntries = [
       "const versus static pattern matching",
     ],
     evidence: [
-      "Rust 1.98.1 E0530 compile failure",
+      "Rust 1.99.1 E0530 compile failure",
       "LIMIT static used as bare arm pattern",
       "LIMIT const path-pattern repair",
     ],
@@ -8779,7 +8779,7 @@ export const rustFailureAtlasEntries = [
       "match alternatives must bind same variables",
     ],
     evidence: [
-      "Rust 1.98.1 E0408 compile failure",
+      "Rust 1.99.1 E0408 compile failure",
       "Data value missing from Empty alternative",
       "separate match-arm repair",
     ],
@@ -8800,7 +8800,7 @@ export const rustFailureAtlasEntries = [
       "or pattern same binding mode Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0409 compile failure",
+      "Rust 1.99.1 E0409 compile failure",
       "ref versus by-value alternatives",
       "consistent ref binding repair",
     ],
@@ -8821,7 +8821,7 @@ export const rustFailureAtlasEntries = [
       "repeated variable name pattern Rust guard",
     ],
     evidence: [
-      "Rust 1.98.1 E0416 compile failure",
+      "Rust 1.99.1 E0416 compile failure",
       "duplicate value tuple binding",
       "unique bindings plus guard repair",
     ],
@@ -8842,7 +8842,7 @@ export const rustFailureAtlasEntries = [
       "import enum variant for destructuring Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0531 compile failure",
+      "Rust 1.99.1 E0531 compile failure",
       "unresolved Packet tuple pattern",
       "declared tuple-struct repair",
     ],
@@ -8863,7 +8863,7 @@ export const rustFailureAtlasEntries = [
       "tuple variant pattern parentheses Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0532 compile failure",
+      "Rust 1.99.1 E0532 compile failure",
       "Failed String variant matched as unit",
       "payload destructuring repair",
     ],
@@ -8884,7 +8884,7 @@ export const rustFailureAtlasEntries = [
       "match value returned by method Rust guard",
     ],
     evidence: [
-      "Rust 1.98.1 E0533 compile failure",
+      "Rust 1.99.1 E0533 compile failure",
       "associated function item used as path pattern",
       "guarded function-call comparison repair",
     ],
@@ -8905,7 +8905,7 @@ export const rustFailureAtlasEntries = [
       "match first elements fixed array dot dot",
     ],
     evidence: [
-      "Rust 1.98.1 E0527 compile failure",
+      "Rust 1.99.1 E0527 compile failure",
       "two-element pattern over four-element array",
       "prefix plus rest-pattern repair",
     ],
@@ -8926,7 +8926,7 @@ export const rustFailureAtlasEntries = [
       "slice prefix match minimum length Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0528 compile failure",
+      "Rust 1.99.1 E0528 compile failure",
       "three-position minimum over two-element array",
       "two-element exact-pattern repair",
     ],
@@ -8947,7 +8947,7 @@ export const rustFailureAtlasEntries = [
       "qualify enum variant in match Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0170 denied lint failure",
+      "Rust 1.99.1 E0170 denied lint failure",
       "bare Get creates pattern binding",
       "Method-qualified exhaustive repair",
     ],
@@ -8968,7 +8968,7 @@ export const rustFailureAtlasEntries = [
       "edition 2024 match ergonomics binding modes",
     ],
     evidence: [
-      "Rust 1.98.1 edition-2024 compile failure",
+      "Rust 1.99.1 edition-2024 compile failure",
       "mut binding under implicit shared borrow",
       "borrowed binding repair",
     ],
@@ -8989,7 +8989,7 @@ export const rustFailureAtlasEntries = [
       "type used in trait bound Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0404 compile failure",
+      "Rust 1.99.1 E0404 compile failure",
       "Encode struct used in impl header",
       "Encode trait implementation repair",
     ],
@@ -9010,7 +9010,7 @@ export const rustFailureAtlasEntries = [
       "implement external trait explicit path",
     ],
     evidence: [
-      "Rust 1.98.1 E0405 compile failure",
+      "Rust 1.99.1 E0405 compile failure",
       "unresolved Encodable impl trait",
       "local trait declaration repair",
     ],
@@ -9031,7 +9031,7 @@ export const rustFailureAtlasEntries = [
       "move method to inherent impl Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0407 compile failure",
+      "Rust 1.99.1 E0407 compile failure",
       "save absent from Store trait",
       "separate inherent implementation repair",
     ],
@@ -9052,7 +9052,7 @@ export const rustFailureAtlasEntries = [
       "cannot find type Self in this scope",
     ],
     evidence: [
-      "Rust 1.98.1 E0411 compile failure",
+      "Rust 1.99.1 E0411 compile failure",
       "free create function returns Self",
       "explicit Job return type repair",
     ],
@@ -9073,7 +9073,7 @@ export const rustFailureAtlasEntries = [
       "two parameters same name compile error",
     ],
     evidence: [
-      "Rust 1.98.1 E0415 compile failure",
+      "Rust 1.99.1 E0415 compile failure",
       "duplicate value u8 parameters",
       "left and right role-name repair",
     ],
@@ -9094,7 +9094,7 @@ export const rustFailureAtlasEntries = [
       "Packet brace constructor unresolved",
     ],
     evidence: [
-      "Rust 1.98.1 E0422 compile failure",
+      "Rust 1.99.1 E0422 compile failure",
       "undefined Packet struct literal",
       "declared Packet named-field repair",
     ],
@@ -9115,7 +9115,7 @@ export const rustFailureAtlasEntries = [
       "Config struct constructor syntax Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0423 compile failure",
+      "Rust 1.99.1 E0423 compile failure",
       "Config named struct called as function",
       "brace literal construction repair",
     ],
@@ -9136,7 +9136,7 @@ export const rustFailureAtlasEntries = [
       "expected value found module self Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0424 compile failure",
+      "Rust 1.99.1 E0424 compile failure",
       "current associated function reads self field",
       "shared receiver method repair",
     ],
@@ -9157,7 +9157,7 @@ export const rustFailureAtlasEntries = [
       "continue label not in scope",
     ],
     evidence: [
-      "Rust 1.98.1 E0426 compile failure",
+      "Rust 1.99.1 E0426 compile failure",
       "break targets undeclared outer label",
       "declared enclosing-loop label repair",
     ],
@@ -9178,7 +9178,7 @@ export const rustFailureAtlasEntries = [
       "Rust does not overload functions by signature",
     ],
     evidence: [
-      "Rust 1.98.1 E0428 compile failure",
+      "Rust 1.99.1 E0428 compile failure",
       "two decode function definitions",
       "role-specific function-name repair",
     ],
@@ -9199,7 +9199,7 @@ export const rustFailureAtlasEntries = [
       "use as alias duplicate import",
     ],
     evidence: [
-      "Rust 1.98.1 E0252 compile failure",
+      "Rust 1.99.1 E0252 compile failure",
       "first and second run import collision",
       "role-preserving alias repair",
     ],
@@ -9220,7 +9220,7 @@ export const rustFailureAtlasEntries = [
       "rename import that shadows crate Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0254 compile failure",
+      "Rust 1.99.1 E0254 compile failure",
       "helpers core import collides with core crate",
       "distinct CoreCapability trait repair",
     ],
@@ -9241,7 +9241,7 @@ export const rustFailureAtlasEntries = [
       "alias imported function Rust as",
     ],
     evidence: [
-      "Rust 1.98.1 E0255 compile failure",
+      "Rust 1.99.1 E0255 compile failure",
       "helpers run conflicts with local run",
       "run_helper alias repair",
     ],
@@ -9262,7 +9262,7 @@ export const rustFailureAtlasEntries = [
       "two dependencies same crate name Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0259 compile failure",
+      "Rust 1.99.1 E0259 compile failure",
       "std aliased to existing core name",
       "distinct standard alias repair",
     ],
@@ -9283,7 +9283,7 @@ export const rustFailureAtlasEntries = [
       "local module shadows extern crate",
     ],
     evidence: [
-      "Rust 1.98.1 E0260 compile failure",
+      "Rust 1.99.1 E0260 compile failure",
       "core struct conflicts with core crate",
       "CoreMarker local-name repair",
     ],
@@ -9304,7 +9304,7 @@ export const rustFailureAtlasEntries = [
       "re-export function from private module Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0364 compile failure",
+      "Rust 1.99.1 E0364 compile failure",
       "private connect function under pub use",
       "public underlying function repair",
     ],
@@ -9325,7 +9325,7 @@ export const rustFailureAtlasEntries = [
       "re-export module versus items Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0365 compile failure",
+      "Rust 1.99.1 E0365 compile failure",
       "private engine module public alias",
       "public module repair",
     ],
@@ -9346,7 +9346,7 @@ export const rustFailureAtlasEntries = [
       "dot dot base enum named fields Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0436 compile failure",
+      "Rust 1.99.1 E0436 compile failure",
       "enum Daily variant used as update base",
       "explicit variant-field reconstruction repair",
     ],
@@ -9367,7 +9367,7 @@ export const rustFailureAtlasEntries = [
       "hide individual enum variant Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0449 compile failure",
+      "Rust 1.99.1 E0449 compile failure",
       "pub qualifier on Ready variant",
       "enum-level visibility repair",
     ],
@@ -9388,7 +9388,7 @@ export const rustFailureAtlasEntries = [
       "public new function for private fields Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0451 compile failure",
+      "Rust 1.99.1 E0451 compile failure",
       "external literal sets private secret field",
       "public Config new constructor repair",
     ],
@@ -9409,7 +9409,7 @@ export const rustFailureAtlasEntries = [
       "closure versus inner fn capture",
     ],
     evidence: [
-      "Rust 1.98.1 E0434 compile failure",
+      "Rust 1.99.1 E0434 compile failure",
       "inner function reads local offset",
       "capturing closure repair",
     ],
@@ -9430,7 +9430,7 @@ export const rustFailureAtlasEntries = [
       "const versus let fixed array length",
     ],
     evidence: [
-      "Rust 1.98.1 E0435 compile failure",
+      "Rust 1.99.1 E0435 compile failure",
       "local width used in array type",
       "WIDTH const repair",
     ],
@@ -9451,7 +9451,7 @@ export const rustFailureAtlasEntries = [
       "trait impl extra type alias Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0437 compile failure",
+      "Rust 1.99.1 E0437 compile failure",
       "Decode impl invents Error type",
       "trait-declared associated type repair",
     ],
@@ -9472,7 +9472,7 @@ export const rustFailureAtlasEntries = [
       "inherent const versus trait const Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0438 compile failure",
+      "Rust 1.99.1 E0438 compile failure",
       "Window impl invents CAPACITY",
       "trait-declared constant repair",
     ],
@@ -9493,7 +9493,7 @@ export const rustFailureAtlasEntries = [
       "Trait Error type missing projection Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0576 compile failure",
+      "Rust 1.99.1 E0576 compile failure",
       "Decoder Error projection absent from trait",
       "declared Output projection repair",
     ],
@@ -9514,7 +9514,7 @@ export const rustFailureAtlasEntries = [
       "trait method missing associated type declaration",
     ],
     evidence: [
-      "Rust 1.98.1 E0220 compile failure",
+      "Rust 1.99.1 E0220 compile failure",
       "Source uses undeclared Self Error",
       "trait Error declaration repair",
     ],
@@ -9535,7 +9535,7 @@ export const rustFailureAtlasEntries = [
       "constrain both associated types where clause Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0222 compile failure",
+      "Rust 1.99.1 E0222 compile failure",
       "Vehicle and Container both define Color",
       "explicit dual supertrait bounds repair",
     ],
@@ -9556,7 +9556,7 @@ export const rustFailureAtlasEntries = [
       "fully qualified associated type projection Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0223 compile failure",
+      "Rust 1.99.1 E0223 compile failure",
       "standalone Source Item type",
       "Bytes implementation projection repair",
     ],
@@ -9577,7 +9577,7 @@ export const rustFailureAtlasEntries = [
       "trait object lifetime bound choose one",
     ],
     evidence: [
-      "Rust 1.98.1 E0226 compile failure",
+      "Rust 1.99.1 E0226 compile failure",
       "Read object with a and b bounds",
       "single object-lifetime alias repair",
     ],
@@ -9598,7 +9598,7 @@ export const rustFailureAtlasEntries = [
       "move associated type equality to where clause",
     ],
     evidence: [
-      "Rust 1.98.1 E0229 compile failure",
+      "Rust 1.99.1 E0229 compile failure",
       "Item equality embedded in projection",
       "where-clause equality repair",
     ],
@@ -9619,7 +9619,7 @@ export const rustFailureAtlasEntries = [
       "required associated items trait impl",
     ],
     evidence: [
-      "Rust 1.98.1 E0046 compile failure",
+      "Rust 1.99.1 E0046 compile failure",
       "Reporter impl missing report",
       "required method implementation repair",
     ],
@@ -9640,7 +9640,7 @@ export const rustFailureAtlasEntries = [
       "implement generic trait method concrete type",
     ],
     evidence: [
-      "Rust 1.98.1 E0049 compile failure",
+      "Rust 1.99.1 E0049 compile failure",
       "Convert impl removes generic T",
       "matching generic method repair",
     ],
@@ -9661,7 +9661,7 @@ export const rustFailureAtlasEntries = [
       "trait method parameter count mismatch",
     ],
     evidence: [
-      "Rust 1.98.1 E0050 compile failure",
+      "Rust 1.99.1 E0050 compile failure",
       "Window contains omits value parameter",
       "matching parameter-list repair",
     ],
@@ -9682,7 +9682,7 @@ export const rustFailureAtlasEntries = [
       "missing self receiver in trait impl Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0186 compile failure",
+      "Rust 1.99.1 E0186 compile failure",
       "Reset impl omits mutable receiver",
       "matching &mut self receiver repair",
     ],
@@ -9703,7 +9703,7 @@ export const rustFailureAtlasEntries = [
       "lifetime parameters bounds method trait declaration",
     ],
     evidence: [
-      "Rust 1.98.1 E0195 compile failure",
+      "Rust 1.99.1 E0195 compile failure",
       "Choose impl omits long outlives short bound",
       "matching lifetime relationship repair",
     ],
@@ -9724,7 +9724,7 @@ export const rustFailureAtlasEntries = [
       "Rust no function overloading impl methods",
     ],
     evidence: [
-      "Rust 1.98.1 E0201 compile failure",
+      "Rust 1.99.1 E0201 compile failure",
       "duplicate Encode encode methods",
       "single associated method repair",
     ],
@@ -9745,7 +9745,7 @@ export const rustFailureAtlasEntries = [
       "what does ?Sized mean Rust generic",
     ],
     evidence: [
-      "Rust 1.98.1 E0203 compile failure",
+      "Rust 1.99.1 E0203 compile failure",
       "duplicate ?Sized bounds on T",
       "single relaxed bound repair",
     ],
@@ -9766,7 +9766,7 @@ export const rustFailureAtlasEntries = [
       "trait associated constant versus method",
     ],
     evidence: [
-      "Rust 1.98.1 E0324 compile failure",
+      "Rust 1.99.1 E0324 compile failure",
       "Limits constant implemented as method",
       "associated-constant syntax repair",
     ],
@@ -9787,7 +9787,7 @@ export const rustFailureAtlasEntries = [
       "associated type versus associated constant",
     ],
     evidence: [
-      "Rust 1.98.1 E0325 compile failure",
+      "Rust 1.99.1 E0325 compile failure",
       "Limits constant implemented as associated type",
       "associated-constant value repair",
     ],
@@ -9808,7 +9808,7 @@ export const rustFailureAtlasEntries = [
       "expected bool found u8 trait const",
     ],
     evidence: [
-      "Rust 1.98.1 E0326 compile failure",
+      "Rust 1.99.1 E0326 compile failure",
       "FeatureFlag ENABLED uses u8 instead of bool",
       "matching boolean constant repair",
     ],
@@ -9829,7 +9829,7 @@ export const rustFailureAtlasEntries = [
       "Rust no truthy values",
     ],
     evidence: [
-      "Rust 1.98.1 E0054 compile failure",
+      "Rust 1.99.1 E0054 compile failure",
       "u8 as bool rejected",
       "explicit non-zero comparison repair",
     ],
@@ -9850,7 +9850,7 @@ export const rustFailureAtlasEntries = [
       "wrong number arguments function call Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0061 compile failure",
+      "Rust 1.99.1 E0061 compile failure",
       "schedule call omits retries",
       "two-argument call repair",
     ],
@@ -9871,7 +9871,7 @@ export const rustFailureAtlasEntries = [
       "struct literal same field twice",
     ],
     evidence: [
-      "Rust 1.98.1 E0062 compile failure",
+      "Rust 1.99.1 E0062 compile failure",
       "Limits retries field duplicated",
       "single field initializer repair",
     ],
@@ -9892,7 +9892,7 @@ export const rustFailureAtlasEntries = [
       "default remaining struct fields Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0063 compile failure",
+      "Rust 1.99.1 E0063 compile failure",
       "Limits initializer omits timeout_ms",
       "complete field initializer repair",
     ],
@@ -9913,7 +9913,7 @@ export const rustFailureAtlasEntries = [
       "place expression compound assignment Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0067 compile failure",
+      "Rust 1.99.1 E0067 compile failure",
       "integer literal used with +=",
       "mutable local place repair",
     ],
@@ -9934,7 +9934,7 @@ export const rustFailureAtlasEntries = [
       "place expression assignment Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0070 compile failure",
+      "Rust 1.99.1 E0070 compile failure",
       "assignment targets RETRIES const",
       "mutable local storage repair",
     ],
@@ -9955,7 +9955,7 @@ export const rustFailureAtlasEntries = [
       "cannot construct u64 with braces Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0071 compile failure",
+      "Rust 1.99.1 E0071 compile failure",
       "u64 alias used with named-field braces",
       "scalar alias initializer repair",
     ],
@@ -9976,7 +9976,7 @@ export const rustFailureAtlasEntries = [
       "why recursive struct cannot contain itself Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0072 compile failure",
+      "Rust 1.99.1 E0072 compile failure",
       "Chain variant stores Chain inline",
       "Box recursive edge repair",
     ],
@@ -9997,7 +9997,7 @@ export const rustFailureAtlasEntries = [
       "store str reference in struct Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0106 compile failure",
+      "Rust 1.99.1 E0106 compile failure",
       "View stores &str without lifetime",
       "named struct lifetime repair",
     ],
@@ -10018,7 +10018,7 @@ export const rustFailureAtlasEntries = [
       "generic parameter count Rust type",
     ],
     evidence: [
-      "Rust 1.98.1 E0107 compile failure",
+      "Rust 1.99.1 E0107 compile failure",
       "Envelope receives two type arguments",
       "single generic argument repair",
     ],
@@ -10039,7 +10039,7 @@ export const rustFailureAtlasEntries = [
       "u64 type parameter Rust error",
     ],
     evidence: [
-      "Rust 1.98.1 E0109 compile failure",
+      "Rust 1.99.1 E0109 compile failure",
       "u64 receives unsupported u8 argument",
       "plain builtin type repair",
     ],
@@ -10060,7 +10060,7 @@ export const rustFailureAtlasEntries = [
       "cannot impl foreign type inherent methods",
     ],
     evidence: [
-      "Rust 1.98.1 E0116 compile failure",
+      "Rust 1.99.1 E0116 compile failure",
       "inherent checksum method on Vec",
       "local extension trait repair",
     ],
@@ -10081,7 +10081,7 @@ export const rustFailureAtlasEntries = [
       "blanket inherent impl Rust not allowed",
     ],
     evidence: [
-      "Rust 1.98.1 E0118 compile failure",
+      "Rust 1.99.1 E0118 compile failure",
       "blanket inherent impl over T",
       "blanket local trait repair",
     ],
@@ -10102,7 +10102,7 @@ export const rustFailureAtlasEntries = [
       "RAII guard cleanup borrowed resource Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0120 compile failure",
+      "Rust 1.99.1 E0120 compile failure",
       "Drop impl targets mutable reference",
       "local guard Drop repair",
     ],
@@ -10123,7 +10123,7 @@ export const rustFailureAtlasEntries = [
       "FFI parameter pattern not allowed",
     ],
     evidence: [
-      "Rust 1.98.1 E0130 compile failure",
+      "Rust 1.99.1 E0130 compile failure",
       "tuple pattern in foreign declaration",
       "repr C named parameter repair",
     ],
@@ -10144,7 +10144,7 @@ export const rustFailureAtlasEntries = [
       "generic Rust program entry point",
     ],
     evidence: [
-      "Rust 1.98.1 E0131 compile failure",
+      "Rust 1.99.1 E0131 compile failure",
       "main declares generic T",
       "generic helper called from concrete main",
     ],
@@ -10165,7 +10165,7 @@ export const rustFailureAtlasEntries = [
       "match guard generic associated constant",
     ],
     evidence: [
-      "Rust 1.98.1 E0158 compile failure",
+      "Rust 1.99.1 E0158 compile failure",
       "P ACTIVE used as constant pattern",
       "guard comparison repair",
     ],
@@ -10186,7 +10186,7 @@ export const rustFailureAtlasEntries = [
       "Box dyn Trait consuming method Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0161 compile failure",
+      "Rust 1.99.1 E0161 compile failure",
       "Box dyn Consume calls self receiver",
       "borrowed receiver repair",
     ],
@@ -10207,7 +10207,7 @@ export const rustFailureAtlasEntries = [
       "Rust E0178 trait object plus precedence",
     ],
     evidence: [
-      "Rust 1.98.1 ambiguous-plus compile failure",
+      "Rust 1.99.1 ambiguous-plus compile failure",
       "Send plus Sync after borrowed dyn type",
       "parenthesised trait-object bound repair",
     ],
@@ -10228,7 +10228,7 @@ export const rustFailureAtlasEntries = [
       "rust-call ABI fn_traits unstable",
     ],
     evidence: [
-      "Rust 1.98.1 E0183 plus E0658 compile failure",
+      "Rust 1.99.1 E0183 plus E0658 compile failure",
       "manual FnOnce and rust-call ABI",
       "compiler-generated closure repair",
     ],
@@ -10249,7 +10249,7 @@ export const rustFailureAtlasEntries = [
       "where to put unsafe on impl",
     ],
     evidence: [
-      "Rust 1.98.1 E0197 compile failure",
+      "Rust 1.99.1 E0197 compile failure",
       "unsafe inherent Counter impl",
       "ordinary impl block repair",
     ],
@@ -10270,7 +10270,7 @@ export const rustFailureAtlasEntries = [
       "negative trait implementations stable Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0198 compile failure",
+      "Rust 1.99.1 E0198 compile failure",
       "unsafe negative Send impl",
       "stable type without unsafe negative impl",
     ],
@@ -10291,7 +10291,7 @@ export const rustFailureAtlasEntries = [
       "generic type syntax Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0214 compile failure",
+      "Rust 1.99.1 E0214 compile failure",
       "Vec receives parenthesized str type",
       "Vec angle-bracket repair",
     ],
@@ -10312,7 +10312,7 @@ export const rustFailureAtlasEntries = [
       "explicit dyn Trait object lifetime",
     ],
     evidence: [
-      "Rust 1.98.1 E0227 compile failure",
+      "Rust 1.99.1 E0227 compile failure",
       "Transfer derives source and target bounds",
       "explicit object lifetime repair",
     ],
@@ -10333,7 +10333,7 @@ export const rustFailureAtlasEntries = [
       "use of undeclared lifetime name",
     ],
     evidence: [
-      "Rust 1.98.1 E0261 compile failure",
+      "Rust 1.99.1 E0261 compile failure",
       "View impl uses undeclared a",
       "impl lifetime declaration repair",
     ],
@@ -10354,7 +10354,7 @@ export const rustFailureAtlasEntries = [
       "generic lifetime versus static",
     ],
     evidence: [
-      "Rust 1.98.1 E0262 compile failure",
+      "Rust 1.99.1 E0262 compile failure",
       "function declares built-in static name",
       "generic a lifetime repair",
     ],
@@ -10375,7 +10375,7 @@ export const rustFailureAtlasEntries = [
       "closure cannot break loop",
     ],
     evidence: [
-      "Rust 1.98.1 E0267 compile failure",
+      "Rust 1.99.1 E0267 compile failure",
       "break has no loop inside closure",
       "closure-local loop repair",
     ],
@@ -10396,7 +10396,7 @@ export const rustFailureAtlasEntries = [
       "break needs loop or labeled block",
     ],
     evidence: [
-      "Rust 1.98.1 E0268 compile failure",
+      "Rust 1.99.1 E0268 compile failure",
       "function-level break with no target",
       "early return from iteration repair",
     ],
@@ -10417,7 +10417,7 @@ export const rustFailureAtlasEntries = [
       "where to add Rust type annotation",
     ],
     evidence: [
-      "Rust 1.98.1 E0282 compile failure",
+      "Rust 1.99.1 E0282 compile failure",
       "unused Vec new has unknown element",
       "local Vec u8 annotation repair",
     ],
@@ -10438,7 +10438,7 @@ export const rustFailureAtlasEntries = [
       "intermediate type generic conversion Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0284 compile failure",
+      "Rust 1.99.1 E0284 compile failure",
       "u32 into result underconstrained before u64 addition",
       "typed u64 intermediate repair",
     ],
@@ -10459,7 +10459,7 @@ export const rustFailureAtlasEntries = [
       "method receiver must dereference to Self",
     ],
     evidence: [
-      "Rust 1.98.1 E0307 compile failure",
+      "Rust 1.99.1 E0307 compile failure",
       "Cache method receives Scheduler as self",
       "ordinary shared Cache receiver repair",
     ],
@@ -10480,7 +10480,7 @@ export const rustFailureAtlasEntries = [
       "struct generic lifetime bound Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0309 compile failure",
+      "Rust 1.99.1 E0309 compile failure",
       "associated Project output requires T outlive a",
       "Snapshot where T a repair",
     ],
@@ -10501,7 +10501,7 @@ export const rustFailureAtlasEntries = [
       "explicit lifetime fixes E0311 Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0311 compile failure",
+      "Rust 1.99.1 E0311 compile failure",
       "elided token lifetime lacks T outlives relation",
       "named lifetime and T bound repair",
     ],
@@ -10522,7 +10522,7 @@ export const rustFailureAtlasEntries = [
       "HRTB nested for lifetime Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0316 compile failure",
+      "Rust 1.99.1 E0316 compile failure",
       "nested for a and for b predicate",
       "single for a b binder repair",
     ],
@@ -10543,7 +10543,7 @@ export const rustFailureAtlasEntries = [
       "Add does not imply AddAssign Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0368 compile failure",
+      "Rust 1.99.1 E0368 compile failure",
       "Credits implements Add without AddAssign",
       "explicit AddAssign implementation repair",
     ],
@@ -10564,7 +10564,7 @@ export const rustFailureAtlasEntries = [
       "derive PartialOrd field order Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0369 compile failure",
+      "Rust 1.99.1 E0369 compile failure",
       "Version greater-than without PartialOrd",
       "derived total lexicographic ordering repair",
     ],
@@ -10585,7 +10585,7 @@ export const rustFailureAtlasEntries = [
       "trait object call supertrait method",
     ],
     evidence: [
-      "Rust 1.98.1 E0371 compile failure",
+      "Rust 1.99.1 E0371 compile failure",
       "Observable redundantly implemented for dyn Service",
       "concrete Api implements both contracts repair",
     ],
@@ -10606,7 +10606,7 @@ export const rustFailureAtlasEntries = [
       "Rust definite initialization control flow",
     ],
     evidence: [
-      "Rust 1.98.1 E0381 compile failure",
+      "Rust 1.99.1 E0381 compile failure",
       "endpoint address missing false-branch initialization",
       "if expression initializes one value repair",
     ],
@@ -10627,7 +10627,7 @@ export const rustFailureAtlasEntries = [
       "reassignment of immutable binding Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0384 compile failure",
+      "Rust 1.99.1 E0384 compile failure",
       "retries reassigned after immutable initialization",
       "separate configured and effective values repair",
     ],
@@ -10648,7 +10648,7 @@ export const rustFailureAtlasEntries = [
       "mutually dependent traits Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0391 compile failure",
+      "Rust 1.99.1 E0391 compile failure",
       "Reads and Writes cyclic supertrait predicates",
       "shared Resource base trait repair",
     ],
@@ -10669,7 +10669,7 @@ export const rustFailureAtlasEntries = [
       "newtype versus extension trait Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0390 compile failure",
+      "Rust 1.99.1 E0390 compile failure",
       "inherent retry-budget method on u64",
       "local extension trait implementation repair",
     ],
@@ -10690,7 +10690,7 @@ export const rustFailureAtlasEntries = [
       "borrow ends before closure creation Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0500 compile failure",
+      "Rust 1.99.1 E0500 compile failure",
       "Vec element borrow overlaps mutating closure capture",
       "finish read before closure construction repair",
     ],
@@ -10711,7 +10711,7 @@ export const rustFailureAtlasEntries = [
       "closure parameter instead of mutable capture Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0501 compile failure",
+      "Rust 1.99.1 E0501 compile failure",
       "captured Vec used directly before later closure call",
       "non-capturing closure parameter repair",
     ],
@@ -10732,7 +10732,7 @@ export const rustFailureAtlasEntries = [
       "last use mutable borrow Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0503 compile failure",
+      "Rust 1.99.1 E0503 compile failure",
       "direct count read before later mutable-reference use",
       "update through reference then direct read repair",
     ],
@@ -10753,7 +10753,7 @@ export const rustFailureAtlasEntries = [
       "finish borrow before ownership transfer Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0505 compile failure",
+      "Rust 1.99.1 E0505 compile failure",
       "string slice used after payload move",
       "finish event-id observation before archive repair",
     ],
@@ -10774,7 +10774,7 @@ export const rustFailureAtlasEntries = [
       "end borrow before reassignment Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0506 compile failure",
+      "Rust 1.99.1 E0506 compile failure",
       "str view remains live across String replacement",
       "observation scope ends before assignment repair",
     ],
@@ -10795,7 +10795,7 @@ export const rustFailureAtlasEntries = [
       "destructure array move elements Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0508 compile failure",
+      "Rust 1.99.1 E0508 compile failure",
       "indexed move from String array",
       "whole-array destructuring move repair",
     ],
@@ -10816,7 +10816,7 @@ export const rustFailureAtlasEntries = [
       "match guard side effects exhaustiveness",
     ],
     evidence: [
-      "Rust 1.98.1 E0510 compile failure",
+      "Rust 1.99.1 E0510 compile failure",
       "Option state assigned during its match guard",
       "mutation moved into selected arm repair",
     ],
@@ -10837,7 +10837,7 @@ export const rustFailureAtlasEntries = [
       "pass mutable state into closure Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0524 compile failure",
+      "Rust 1.99.1 E0524 compile failure",
       "reserve and commit both capture mutable total",
       "call-scoped mutable parameters repair",
     ],
@@ -10858,7 +10858,7 @@ export const rustFailureAtlasEntries = [
       "Fn FnMut FnOnce capture behaviour Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0525 compile failure",
+      "Rust 1.99.1 E0525 compile failure",
       "drop consumes captured payload in closure",
       "borrow-only repeated callback repair",
     ],
@@ -10879,7 +10879,7 @@ export const rustFailureAtlasEntries = [
       "dyn Trait generic parameter default Self",
     ],
     evidence: [
-      "Rust 1.98.1 E0393 compile failure",
+      "Rust 1.99.1 E0393 compile failure",
       "Convert T defaults to erased Self",
       "explicit dyn Convert usize repair",
     ],
@@ -10900,7 +10900,7 @@ export const rustFailureAtlasEntries = [
       "visibility associated type projection Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0446 compile failure",
+      "Rust 1.99.1 E0446 compile failure",
       "Decode Record aliases private InternalRecord",
       "public associated record repair",
     ],
@@ -10921,7 +10921,7 @@ export const rustFailureAtlasEntries = [
       "Rust lint reason attribute",
     ],
     evidence: [
-      "Rust 1.98.1 E0452 compile failure",
+      "Rust 1.99.1 E0452 compile failure",
       "string assigned directly to non_snake_case",
       "reason meta item repair",
     ],
@@ -10942,7 +10942,7 @@ export const rustFailureAtlasEntries = [
       "override forbidden lint attribute Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0453 compile failure",
+      "Rust 1.99.1 E0453 compile failure",
       "inner allow conflicts with crate forbid",
       "code follows locked lint policy repair",
     ],
@@ -10963,7 +10963,7 @@ export const rustFailureAtlasEntries = [
       "associated type nested lifetime outlives",
     ],
     evidence: [
-      "Rust 1.98.1 E0491 compile failure",
+      "Rust 1.99.1 E0491 compile failure",
       "outer reference to Handler carrying unconstrained inner lifetime",
       "inner outlives outer bound repair",
     ],
@@ -10984,7 +10984,7 @@ export const rustFailureAtlasEntries = [
       "Rust const versus static address identity",
     ],
     evidence: [
-      "Rust 1.98.1 E0492 compile failure",
+      "Rust 1.99.1 E0492 compile failure",
       "static reference borrows const AtomicUsize temporary",
       "shared static atomic repair",
     ],
@@ -11005,7 +11005,7 @@ export const rustFailureAtlasEntries = [
       "custom destructor const context Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0493 compile failure",
+      "Rust 1.99.1 E0493 compile failure",
       "tuple creates discarded Guard during static initialization",
       "direct Guard construction repair",
     ],
@@ -11026,7 +11026,7 @@ export const rustFailureAtlasEntries = [
       "rename nested lifetime parameters Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0496 compile failure",
+      "Rust 1.99.1 E0496 compile failure",
       "method redeclares impl lifetime a",
       "stored and input lifetime names repair",
     ],
@@ -11047,7 +11047,7 @@ export const rustFailureAtlasEntries = [
       "repr C does not serialize protocol Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0539 compile failure",
+      "Rust 1.99.1 E0539 compile failure",
       "unknown network representation hint",
       "supported repr C layout repair",
     ],
@@ -11068,7 +11068,7 @@ export const rustFailureAtlasEntries = [
       "resolved struct definition field mismatch",
     ],
     evidence: [
-      "Rust 1.98.1 E0560 compile failure",
+      "Rust 1.99.1 E0560 compile failure",
       "Limits initializer includes undeclared timeout_ms",
       "type definition includes intended field repair",
     ],
@@ -11089,7 +11089,7 @@ export const rustFailureAtlasEntries = [
       "function pointer parameter names Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0561 compile failure",
+      "Rust 1.99.1 E0561 compile failure",
       "mut pattern placed in Update fn alias",
       "mutation kept in function definition repair",
     ],
@@ -11110,7 +11110,7 @@ export const rustFailureAtlasEntries = [
       "conditional enum repr cfg_attr Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0566 compile failure",
+      "Rust 1.99.1 E0566 compile failure",
       "Status declares u16 and u32 repr",
       "single u16 representation repair",
     ],
@@ -11131,7 +11131,7 @@ export const rustFailureAtlasEntries = [
       "State Ready is not a type Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0573 compile failure",
+      "Rust 1.99.1 E0573 compile failure",
       "State Ready placed in return type position",
       "enclosing State return type repair",
     ],
@@ -11152,7 +11152,7 @@ export const rustFailureAtlasEntries = [
       "module used as struct literal Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0574 compile failure",
+      "Rust 1.99.1 E0574 compile failure",
       "protocol module used with record literal",
       "protocol Header path repair",
     ],
@@ -11173,7 +11173,7 @@ export const rustFailureAtlasEntries = [
       "restricted visibility enum path Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0577 compile failure",
+      "Rust 1.99.1 E0577 compile failure",
       "enum Boundary used as visibility scope",
       "ancestor boundary module repair",
     ],
@@ -11194,7 +11194,7 @@ export const rustFailureAtlasEntries = [
       "0 dot dot 0 pattern Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0579 compile failure",
+      "Rust 1.99.1 E0579 compile failure",
       "empty 0 through 0 exclusive pattern",
       "0 through 1 single-value range repair",
     ],
@@ -11215,7 +11215,7 @@ export const rustFailureAtlasEntries = [
       "parse command line port in main Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0580 compile failure",
+      "Rust 1.99.1 E0580 compile failure",
       "typed port parameter added to main",
       "zero-argument main parses environment repair",
     ],
@@ -11236,7 +11236,7 @@ export const rustFailureAtlasEntries = [
       "function pointer borrowed output lifetime source",
     ],
     evidence: [
-      "Rust 1.98.1 E0581 compile failure",
+      "Rust 1.99.1 E0581 compile failure",
       "higher-ranked lifetime appears only in fn return",
       "static provider return repair",
     ],
@@ -11257,7 +11257,7 @@ export const rustFailureAtlasEntries = [
       "higher ranked closure output borrowed from argument",
     ],
     evidence: [
-      "Rust 1.98.1 E0582 compile failure",
+      "Rust 1.99.1 E0582 compile failure",
       "Fn Output reference lifetime absent from u32 input",
       "borrowed input and output lifetime repair",
     ],
@@ -11278,7 +11278,7 @@ export const rustFailureAtlasEntries = [
       "Rust explicit alignment size padding",
     ],
     evidence: [
-      "Rust 1.98.1 E0589 compile failure",
+      "Rust 1.99.1 E0589 compile failure",
       "CacheLine requests alignment 24",
       "supported alignment 32 repair",
     ],
@@ -11299,7 +11299,7 @@ export const rustFailureAtlasEntries = [
       "Rust labeled loop condition",
     ],
     evidence: [
-      "Rust 1.98.1 E0590 compile failure",
+      "Rust 1.99.1 E0590 compile failure",
       "unlabeled break inside condition block",
       "explicit search-loop repair",
     ],
@@ -11320,7 +11320,7 @@ export const rustFailureAtlasEntries = [
       "function item coercion fn pointer Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0591 compile failure",
+      "Rust 1.99.1 E0591 compile failure",
       "named callback passed directly to transmute",
       "safe fn-pointer coercion repair",
     ],
@@ -11341,7 +11341,7 @@ export const rustFailureAtlasEntries = [
       "Rust inherent method overloading",
     ],
     evidence: [
-      "Rust 1.98.1 E0592 compile failure",
+      "Rust 1.99.1 E0592 compile failure",
       "connect repeated across Client impl blocks",
       "distinct connect and reconnect repair",
     ],
@@ -11362,7 +11362,7 @@ export const rustFailureAtlasEntries = [
       "Fn trait closure arity mismatch",
     ],
     evidence: [
-      "Rust 1.98.1 E0593 compile failure",
+      "Rust 1.99.1 E0593 compile failure",
       "zero-argument closure passed to Fn(u32)",
       "one-parameter transformation repair",
     ],
@@ -11383,7 +11383,7 @@ export const rustFailureAtlasEntries = [
       "borrow local variable outside scope Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0597 compile failure",
+      "Rust 1.99.1 E0597 compile failure",
       "str view escapes response owner block",
       "owner moved to enclosing scope repair",
     ],
@@ -11404,7 +11404,7 @@ export const rustFailureAtlasEntries = [
       "unary exclamation newtype Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0600 compile failure",
+      "Rust 1.99.1 E0600 compile failure",
       "Not absent for Enabled wrapper",
       "explicit Not implementation repair",
     ],
@@ -11425,7 +11425,7 @@ export const rustFailureAtlasEntries = [
       "Cargo bin target missing main",
     ],
     evidence: [
-      "Rust 1.98.1 E0601 compile failure",
+      "Rust 1.99.1 E0601 compile failure",
       "binary source defines only run_worker",
       "crate-level main calls worker repair",
     ],
@@ -11446,7 +11446,7 @@ export const rustFailureAtlasEntries = [
       "char from_u32 invalid scalar value",
     ],
     evidence: [
-      "Rust 1.98.1 E0604 compile failure",
+      "Rust 1.99.1 E0604 compile failure",
       "u32 crab code point cast with as",
       "char from_u32 validation repair",
     ],
@@ -11467,7 +11467,7 @@ export const rustFailureAtlasEntries = [
       "as cast versus From conversion Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0605 compile failure",
+      "Rust 1.99.1 E0605 compile failure",
       "u8 cast directly to Vec u8",
       "explicit one-element vector repair",
     ],
@@ -11488,7 +11488,7 @@ export const rustFailureAtlasEntries = [
       "struct square bracket indexing Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0608 compile failure",
+      "Rust 1.99.1 E0608 compile failure",
       "Point indexed without Index implementation",
       "explicit x and y field repair",
     ],
@@ -11509,7 +11509,7 @@ export const rustFailureAtlasEntries = [
       "available fields rustc diagnostic",
     ],
     evidence: [
-      "Rust 1.98.1 E0609 compile failure",
+      "Rust 1.99.1 E0609 compile failure",
       "Metrics has requests but code reads errors",
       "declared requests field repair",
     ],
@@ -11530,7 +11530,7 @@ export const rustFailureAtlasEntries = [
       "newtype for milliseconds Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0610 compile failure",
+      "Rust 1.99.1 E0610 compile failure",
       "value field requested from u64",
       "named Timeout struct repair",
     ],
@@ -11551,7 +11551,7 @@ export const rustFailureAtlasEntries = [
       "Deref operator expression type",
     ],
     evidence: [
-      "Rust 1.98.1 E0614 compile failure",
+      "Rust 1.99.1 E0614 compile failure",
       "star applied directly to u32",
       "reference then dereference repair",
     ],
@@ -11572,7 +11572,7 @@ export const rustFailureAtlasEntries = [
       "add parentheses call method Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0615 compile failure",
+      "Rust 1.99.1 E0615 compile failure",
       "Queue pending method selected as field",
       "pending method invocation repair",
     ],
@@ -11593,7 +11593,7 @@ export const rustFailureAtlasEntries = [
       "module privacy struct fields Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0616 compile failure",
+      "Rust 1.99.1 E0616 compile failure",
       "external access to private Balance cents",
       "public cents accessor repair",
     ],
@@ -11614,7 +11614,7 @@ export const rustFailureAtlasEntries = [
       "printf f32 f64 FFI Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0617 compile failure",
+      "Rust 1.99.1 E0617 compile failure",
       "f32 passed through C variadic ellipsis",
       "f64 promoted representation repair",
     ],
@@ -11635,7 +11635,7 @@ export const rustFailureAtlasEntries = [
       "local variable shadows function Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0618 compile failure",
+      "Rust 1.99.1 E0618 compile failure",
       "u8 value followed by call parentheses",
       "named retries function repair",
     ],
@@ -11656,7 +11656,7 @@ export const rustFailureAtlasEntries = [
       "dynamically sized type behind pointer",
     ],
     evidence: [
-      "Rust 1.98.1 E0620 compile failure",
+      "Rust 1.99.1 E0620 compile failure",
       "reference cast to bare usize slice",
       "borrowed slice coercion repair",
     ],
@@ -11677,7 +11677,7 @@ export const rustFailureAtlasEntries = [
       "function signature lifetime data flow mismatch",
     ],
     evidence: [
-      "Rust 1.98.1 E0621 compile failure",
+      "Rust 1.99.1 E0621 compile failure",
       "right branch returns unrelated borrowed input",
       "shared input and output lifetime repair",
     ],
@@ -11698,7 +11698,7 @@ export const rustFailureAtlasEntries = [
       "lifetime outlives bound conversion",
     ],
     evidence: [
-      "Rust 1.98.1 E0623 compile failure",
+      "Rust 1.99.1 E0623 compile failure",
       "unrelated input and output lifetimes in Relation",
       "input outlives output bound repair",
     ],
@@ -11719,7 +11719,7 @@ export const rustFailureAtlasEntries = [
       "public struct private method",
     ],
     evidence: [
-      "Rust 1.98.1 E0624 compile failure",
+      "Rust 1.99.1 E0624 compile failure",
       "external call to private Token rotate",
       "explicit public capability repair",
     ],
@@ -11740,7 +11740,7 @@ export const rustFailureAtlasEntries = [
       "closure parameter type annotation Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0631 compile failure",
+      "Rust 1.99.1 E0631 compile failure",
       "str closure given to integer callback",
       "matching i32 parameter repair",
     ],
@@ -11761,7 +11761,7 @@ export const rustFailureAtlasEntries = [
       "Rust packed alignment unaligned field",
     ],
     evidence: [
-      "Rust 1.98.1 E0634 compile failure",
+      "Rust 1.99.1 E0634 compile failure",
       "two packed hints on Header",
       "single repr C packed 2 repair",
     ],
@@ -11782,7 +11782,7 @@ export const rustFailureAtlasEntries = [
       "explicit lifetime required associated type reference",
     ],
     evidence: [
-      "Rust 1.98.1 E0637 compile failure",
+      "Rust 1.99.1 E0637 compile failure",
       "reserved underscore lifetime declared in generics",
       "named shared lifetime repair",
     ],
@@ -11803,7 +11803,7 @@ export const rustFailureAtlasEntries = [
       "raw pointer cast needs type information",
     ],
     evidence: [
-      "Rust 1.98.1 E0641 compile failure",
+      "Rust 1.99.1 E0641 compile failure",
       "zero integer cast to pointer with inferred pointee",
       "explicit const u8 pointer repair",
     ],
@@ -11824,7 +11824,7 @@ export const rustFailureAtlasEntries = [
       "patterns not allowed function without body Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0642 compile failure",
+      "Rust 1.99.1 E0642 compile failure",
       "tuple pattern in bodyless trait declaration",
       "whole parameter declaration and impl pattern repair",
     ],
@@ -11845,7 +11845,7 @@ export const rustFailureAtlasEntries = [
       "incompatible signature anonymous parameter Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0643 compile failure",
+      "Rust 1.99.1 E0643 compile failure",
       "trait anonymous iterator parameter implemented as I",
       "matching impl Trait syntax repair",
     ],
@@ -11866,7 +11866,7 @@ export const rustFailureAtlasEntries = [
       "move generic bounds out of main",
     ],
     evidence: [
-      "Rust 1.98.1 E0646 compile failure",
+      "Rust 1.99.1 E0646 compile failure",
       "Copy bound attached to main",
       "generic run helper called by fixed main repair",
     ],
@@ -11887,7 +11887,7 @@ export const rustFailureAtlasEntries = [
       "unsafe export_name edition 2024",
     ],
     evidence: [
-      "Rust 1.98.1 E0648 compile failure",
+      "Rust 1.99.1 E0648 compile failure",
       "embedded NUL in service export identity",
       "valid service_entry symbol repair",
     ],
@@ -11908,7 +11908,7 @@ export const rustFailureAtlasEntries = [
       "ambiguous public reexport Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0659 compile failure",
+      "Rust 1.99.1 E0659 compile failure",
       "primary and fallback run glob collision",
       "qualified module paths repair",
     ],
@@ -11929,7 +11929,7 @@ export const rustFailureAtlasEntries = [
       "manual Default payload enum",
     ],
     evidence: [
-      "Rust 1.98.1 E0665 compile failure",
+      "Rust 1.99.1 E0665 compile failure",
       "Mode has no selected default variant",
       "Passive default marker repair",
     ],
@@ -11950,7 +11950,7 @@ export const rustFailureAtlasEntries = [
       "name inner type parameter impl trait",
     ],
     evidence: [
-      "Rust 1.98.1 E0666 compile failure",
+      "Rust 1.99.1 E0666 compile failure",
       "Payload impl Trait nested inside Envelope",
       "named payload type parameter repair",
     ],
@@ -11971,7 +11971,7 @@ export const rustFailureAtlasEntries = [
       "specify f32 or f64 Rust literal",
     ],
     evidence: [
-      "Rust 1.98.1 E0689 compile failure",
+      "Rust 1.99.1 E0689 compile failure",
       "sqrt called on unconstrained float binding",
       "explicit f64 type repair",
     ],
@@ -11992,7 +11992,7 @@ export const rustFailureAtlasEntries = [
       "transparent wrapper one non zero sized field",
     ],
     evidence: [
-      "Rust 1.98.1 E0690 compile failure",
+      "Rust 1.99.1 E0690 compile failure",
       "generic unit field may have runtime size",
       "PhantomData unit marker repair",
     ],
@@ -12013,7 +12013,7 @@ export const rustFailureAtlasEntries = [
       "transparent newtype FFI ABI Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0692 compile failure",
+      "Rust 1.99.1 E0692 compile failure",
       "transparent and C applied to RequestId",
       "single transparent representation repair",
     ],
@@ -12034,7 +12034,7 @@ export const rustFailureAtlasEntries = [
       "Rust align attribute parentheses",
     ],
     evidence: [
-      "Rust 1.98.1 E0539 compile failure",
+      "Rust 1.99.1 E0539 compile failure",
       "name-value align representation hint",
       "align 16 list-syntax repair",
     ],
@@ -12055,7 +12055,7 @@ export const rustFailureAtlasEntries = [
       "labelled block return value Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0695 compile failure",
+      "Rust 1.99.1 E0695 compile failure",
       "bare break crosses labelled decision block",
       "explicit decision-block value repair",
     ],
@@ -12076,7 +12076,7 @@ export const rustFailureAtlasEntries = [
       "labeled block versus labeled loop",
     ],
     evidence: [
-      "Rust 1.98.1 E0696 compile failure",
+      "Rust 1.99.1 E0696 compile failure",
       "continue targets one-shot decision block",
       "explicit retry-loop repair",
     ],
@@ -12097,7 +12097,7 @@ export const rustFailureAtlasEntries = [
       "opaque type use capture Rust",
     ],
     evidence: [
-      "Rust 1.98.1 edition-2021 E0700 compile failure",
+      "Rust 1.99.1 edition-2021 E0700 compile failure",
       "Cell return captures undeclared data lifetime",
       "explicit data lifetime bound repair",
     ],
@@ -12118,7 +12118,7 @@ export const rustFailureAtlasEntries = [
       "extern C versus system Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0703 compile failure",
+      "Rust 1.99.1 E0703 compile failure",
       "domain word service used as ABI",
       "supported C ABI repair",
     ],
@@ -12139,7 +12139,7 @@ export const rustFailureAtlasEntries = [
       "pub storage invalid visibility",
     ],
     evidence: [
-      "Rust 1.98.1 E0704 compile failure",
+      "Rust 1.99.1 E0704 compile failure",
       "module name written directly inside pub",
       "pub in crate storage repair",
     ],
@@ -12160,7 +12160,7 @@ export const rustFailureAtlasEntries = [
       "register_tool scoped lint Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0710 compile failure",
+      "Rust 1.99.1 E0710 compile failure",
       "unknown clipp namespace",
       "known clippy namespace repair",
     ],
@@ -12181,7 +12181,7 @@ export const rustFailureAtlasEntries = [
       "Drop needs exclusive access borrowed field",
     ],
     evidence: [
-      "Rust 1.98.1 E0713 compile failure",
+      "Rust 1.99.1 E0713 compile failure",
       "consumed Guard returns borrow to data",
       "borrowed Guard signature repair",
     ],
@@ -12202,7 +12202,7 @@ export const rustFailureAtlasEntries = [
       "let binding longer lived temporary Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0716 compile failure",
+      "Rust 1.99.1 E0716 compile failure",
       "temporary String view saved after statement",
       "named owner local repair",
     ],
@@ -12223,7 +12223,7 @@ export const rustFailureAtlasEntries = [
       "trait object associated type binding Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0719 compile failure",
+      "Rust 1.99.1 E0719 compile failure",
       "Iterator Item rebound twice",
       "single Item binding repair",
     ],
@@ -12244,7 +12244,7 @@ export const rustFailureAtlasEntries = [
       "box recursive iterator Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0720 compile failure",
+      "Rust 1.99.1 E0720 compile failure",
       "iterator Chain recursively contains same opaque type",
       "boxed iterator indirection repair",
     ],
@@ -12265,7 +12265,7 @@ export const rustFailureAtlasEntries = [
       "propagate async versus block_on",
     ],
     evidence: [
-      "Rust 1.98.1 E0728 compile failure",
+      "Rust 1.99.1 E0728 compile failure",
       "await used in ordinary prepare function",
       "async function context repair",
     ],
@@ -12286,7 +12286,7 @@ export const rustFailureAtlasEntries = [
       "slice pattern const N Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0730 compile failure",
+      "Rust 1.99.1 E0730 compile failure",
       "prefix pattern against generic array length N",
       "slice-pattern repair",
     ],
@@ -12307,7 +12307,7 @@ export const rustFailureAtlasEntries = [
       "FFI status enum transparent invalid",
     ],
     evidence: [
-      "Rust 1.98.1 E0731 compile failure",
+      "Rust 1.99.1 E0731 compile failure",
       "two variants under transparent representation",
       "single Ready wrapper variant repair",
     ],
@@ -12328,7 +12328,7 @@ export const rustFailureAtlasEntries = [
       "explicit discriminants enum payload Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0732 compile failure",
+      "Rust 1.99.1 E0732 compile failure",
       "unit discriminant mixed with Data payload",
       "explicit repr u8 repair",
     ],
@@ -12349,7 +12349,7 @@ export const rustFailureAtlasEntries = [
       "async recursion future size Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0733 compile failure",
+      "Rust 1.99.1 E0733 compile failure",
       "direct await of recursive descend call",
       "Box pin indirection repair",
     ],
@@ -12370,7 +12370,7 @@ export const rustFailureAtlasEntries = [
       "recursive generic default Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0735 compile failure",
+      "Rust 1.99.1 E0735 compile failure",
       "Box Self used as struct parameter default",
       "independent unit default repair",
     ],
@@ -12391,7 +12391,7 @@ export const rustFailureAtlasEntries = [
       "caller location FFI wrapper Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0737 compile failure",
+      "Rust 1.99.1 E0737 compile failure",
       "track caller applied to extern C function",
       "foreign attribute removal repair",
     ],
@@ -12412,7 +12412,7 @@ export const rustFailureAtlasEntries = [
       "drop String inside Rust union",
     ],
     evidence: [
-      "Rust 1.98.1 E0740 compile failure",
+      "Rust 1.99.1 E0740 compile failure",
       "String placed directly in union storage",
       "ManuallyDrop field repair",
     ],
@@ -12433,7 +12433,7 @@ export const rustFailureAtlasEntries = [
       "Rust friend module visibility",
     ],
     evidence: [
-      "Rust 1.98.1 E0742 compile failure",
+      "Rust 1.99.1 E0742 compile failure",
       "visibility restricted from land to sibling sea",
       "item moved beneath named ancestor",
     ],
@@ -12454,7 +12454,7 @@ export const rustFailureAtlasEntries = [
       "raw pointer backing storage lifetime Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0745 compile failure",
+      "Rust 1.99.1 E0745 compile failure",
       "raw address taken from integer temporary",
       "named local backing storage repair",
     ],
@@ -12475,7 +12475,7 @@ export const rustFailureAtlasEntries = [
       "impl Trait versus Box dyn Trait return",
     ],
     evidence: [
-      "Rust 1.98.1 E0746 compile failure",
+      "Rust 1.99.1 E0746 compile failure",
       "unboxed dyn Transport return type",
       "Box dyn Transport repair",
     ],
@@ -12496,7 +12496,7 @@ export const rustFailureAtlasEntries = [
       "lifetime type const parameter order",
     ],
     evidence: [
-      "Rust 1.98.1 E0747 compile failure",
+      "Rust 1.99.1 E0747 compile failure",
       "type argument supplied before static lifetime",
       "declaration-order argument repair",
     ],
@@ -12517,7 +12517,7 @@ export const rustFailureAtlasEntries = [
       "Rust r sharp string literal close",
     ],
     evidence: [
-      "Rust 1.98.1 E0748 lexer failure",
+      "Rust 1.99.1 E0748 lexer failure",
       "two opening hashes and one closing hash",
       "matching two-hash delimiter repair",
     ],
@@ -12538,7 +12538,7 @@ export const rustFailureAtlasEntries = [
       "Rust synchronous main block_on future",
     ],
     evidence: [
-      "Rust 1.98.1 E0752 compile failure",
+      "Rust 1.99.1 E0752 compile failure",
       "program main declared directly async",
       "ordinary synchronous main repair",
     ],
@@ -12559,7 +12559,7 @@ export const rustFailureAtlasEntries = [
       "Rust slash bang versus triple slash docs",
     ],
     evidence: [
-      "Rust 1.98.1 E0753 compile failure",
+      "Rust 1.99.1 E0753 compile failure",
       "inner module documentation placed after a function",
       "outer item documentation repair",
     ],
@@ -12580,7 +12580,7 @@ export const rustFailureAtlasEntries = [
       "Rust out of line module file layout",
     ],
     evidence: [
-      "Rust 1.98.1 E0761 compile failure",
+      "Rust 1.99.1 E0761 compile failure",
       "transport rs and transport mod rs both present",
       "explicit path selects canonical source",
     ],
@@ -12601,7 +12601,7 @@ export const rustFailureAtlasEntries = [
       "ControlFlow closure early exit",
     ],
     evidence: [
-      "Rust 1.98.1 E0767 compile failure",
+      "Rust 1.99.1 E0767 compile failure",
       "closure attempts break to outer records label",
       "closure returns decision to labelled loop",
     ],
@@ -12622,7 +12622,7 @@ export const rustFailureAtlasEntries = [
       "match tuple struct as struct Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0769 compile failure",
+      "Rust 1.99.1 E0769 compile failure",
       "Message tuple variant matched with text field",
       "parenthesized tuple pattern repair",
     ],
@@ -12643,7 +12643,7 @@ export const rustFailureAtlasEntries = [
       "Rust const capacity usize generic",
     ],
     evidence: [
-      "Rust 1.98.1 E0770 compile failure",
+      "Rust 1.99.1 E0770 compile failure",
       "CAPACITY const type depends on T",
       "concrete usize const type repair",
     ],
@@ -12664,7 +12664,7 @@ export const rustFailureAtlasEntries = [
       "Rust attribute attached wrong item",
     ],
     evidence: [
-      "Rust 1.98.1 E0774 compile failure",
+      "Rust 1.99.1 E0774 compile failure",
       "Clone derive attached to refresh function",
       "derive moved to Refresh data type",
     ],
@@ -12685,7 +12685,7 @@ export const rustFailureAtlasEntries = [
       "dyn Trait versus impl Trait generic Rust",
     ],
     evidence: [
-      "Rust 1.98.1 edition-2024 E0782 compile failure",
+      "Rust 1.99.1 edition-2024 E0782 compile failure",
       "Store trait used as a bare reference type",
       "explicit reference to dyn Store repair",
     ],
@@ -12706,7 +12706,7 @@ export const rustFailureAtlasEntries = [
       "Rust union active field tag",
     ],
     evidence: [
-      "Rust 1.98.1 E0784 compile failure",
+      "Rust 1.99.1 E0784 compile failure",
       "integer and float supplied in one union expression",
       "single integer field initialization",
     ],
@@ -12727,7 +12727,7 @@ export const rustFailureAtlasEntries = [
       "trait static method implementation type",
     ],
     evidence: [
-      "Rust 1.98.1 E0790 compile failure",
+      "Rust 1.99.1 E0790 compile failure",
       "Identifier zero called without implementation",
       "fully qualified UserId implementation repair",
     ],
@@ -12748,7 +12748,7 @@ export const rustFailureAtlasEntries = [
       "copy packed field before formatting",
     ],
     evidence: [
-      "Rust 1.98.1 E0793 compile failure",
+      "Rust 1.99.1 E0793 compile failure",
       "formatting creates an implicit packed-field borrow",
       "by-value formatting expression repair",
     ],
@@ -12769,7 +12769,7 @@ export const rustFailureAtlasEntries = [
       "nested block comments generated Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0758 lexer failure",
+      "Rust 1.99.1 E0758 lexer failure",
       "migration note lacks closing star slash",
       "explicit closing delimiter repair",
     ],
@@ -12790,7 +12790,7 @@ export const rustFailureAtlasEntries = [
       "Rust hexadecimal octal literal syntax",
     ],
     evidence: [
-      "Rust 1.98.1 E0768 lexer failure",
+      "Rust 1.99.1 E0768 lexer failure",
       "binary prefix emitted without digits",
       "typed binary value repair",
     ],
@@ -12811,7 +12811,7 @@ export const rustFailureAtlasEntries = [
       "for a function pointer lifetime Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0794 compile failure",
+      "Rust 1.99.1 E0794 compile failure",
       "static supplied explicitly to identity function item",
       "higher-ranked function pointer repair",
     ],
@@ -12832,7 +12832,7 @@ export const rustFailureAtlasEntries = [
       "Rust struct update partial move",
     ],
     evidence: [
-      "Rust 1.98.1 E0797 compile failure",
+      "Rust 1.99.1 E0797 compile failure",
       "settings update lacks expression after dots",
       "named defaults base repair",
     ],
@@ -12853,7 +12853,7 @@ export const rustFailureAtlasEntries = [
       "Rust use bound generic parameters only",
     ],
     evidence: [
-      "Rust 1.98.1 E0799 compile failure",
+      "Rust 1.99.1 E0799 compile failure",
       "main function item named in use capture",
       "declared type parameter capture repair",
     ],
@@ -12874,7 +12874,7 @@ export const rustFailureAtlasEntries = [
       "precise capture stale generic name",
     ],
     evidence: [
-      "Rust 1.98.1 E0800 compile failure",
+      "Rust 1.99.1 E0800 compile failure",
       "use T without generic declaration",
       "declared T parameter repair",
     ],
@@ -12895,7 +12895,7 @@ export const rustFailureAtlasEntries = [
       "Rust self Rc Self receiver",
     ],
     evidence: [
-      "Rust 1.98.1 E0801 compile failure",
+      "Rust 1.99.1 E0801 compile failure",
       "method generic R used as self type",
       "concrete Rc Self receiver repair",
     ],
@@ -12916,7 +12916,7 @@ export const rustFailureAtlasEntries = [
       "DataAccess get_ref lifetime mismatch Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0803 compile failure",
+      "Rust 1.99.1 E0803 compile failure",
       "reference type argument omits relation to container lifetime",
       "explicit trait receiver and output lifetime repair",
     ],
@@ -12937,7 +12937,7 @@ export const rustFailureAtlasEntries = [
       "trait object auto trait vtable pointer Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0804 compile failure",
+      "Rust 1.99.1 E0804 compile failure",
       "Send added after Any pointer erasure",
       "Send preserved during original trait-object coercion",
     ],
@@ -12958,7 +12958,7 @@ export const rustFailureAtlasEntries = [
       "Rust built in attribute grammar",
     ],
     evidence: [
-      "Rust 1.98.1 E0805 compile failure",
+      "Rust 1.99.1 E0805 compile failure",
       "inline attribute has empty list input",
       "bare inline attribute repair",
     ],
@@ -12979,7 +12979,7 @@ export const rustFailureAtlasEntries = [
       "Vec drain iterator side effects",
     ],
     evidence: [
-      "Rust 1.98.1 runtime assertion",
+      "Rust 1.99.1 runtime assertion",
       "drain 1 through 3 dropped immediately",
       "vector retains only elements outside range",
     ],
@@ -13000,7 +13000,7 @@ export const rustFailureAtlasEntries = [
       "checked split vector at index",
     ],
     evidence: [
-      "Rust 1.98.1 runtime panic",
+      "Rust 1.99.1 runtime panic",
       "split index four exceeds length three",
       "checked optional split repair",
     ],
@@ -13021,7 +13021,7 @@ export const rustFailureAtlasEntries = [
       "is_char_boundary String byte index",
     ],
     evidence: [
-      "Rust 1.98.1 runtime panic",
+      "Rust 1.99.1 runtime panic",
       "byte one falls inside accented character",
       "char-boundary checked truncation repair",
     ],
@@ -13042,7 +13042,7 @@ export const rustFailureAtlasEntries = [
       "Rust Entry API insert if absent",
     ],
     evidence: [
-      "Rust 1.98.1 runtime assertion",
+      "Rust 1.99.1 runtime assertion",
       "second insert for job returns queued",
       "new value stored and previous value checked",
     ],
@@ -13063,7 +13063,7 @@ export const rustFailureAtlasEntries = [
       "ordered map chronological Rust",
     ],
     evidence: [
-      "Rust 1.98.1 runtime assertion",
+      "Rust 1.99.1 runtime assertion",
       "keys inserted two then one",
       "iterator yields ascending one then two",
     ],
@@ -13084,7 +13084,7 @@ export const rustFailureAtlasEntries = [
       "Iterator nth versus slice get Rust",
     ],
     evidence: [
-      "Rust 1.98.1 runtime assertion",
+      "Rust 1.99.1 runtime assertion",
       "nth one yields twenty",
       "slice get preserves later access",
     ],
@@ -13105,7 +13105,7 @@ export const rustFailureAtlasEntries = [
       "FromIterator Result visit count short circuit",
     ],
     evidence: [
-      "Rust 1.98.1 runtime assertion",
+      "Rust 1.99.1 runtime assertion",
       "mapping counter stops at third item",
       "first error and visited count asserted",
     ],
@@ -13126,7 +13126,7 @@ export const rustFailureAtlasEntries = [
       "Arc make_mut versus Mutex",
     ],
     evidence: [
-      "Rust 1.98.1 runtime assertion",
+      "Rust 1.99.1 runtime assertion",
       "two strong owners before mutation",
       "owners diverge with independent vector values",
     ],
@@ -13147,7 +13147,7 @@ export const rustFailureAtlasEntries = [
       "Arc Weak lifecycle cache",
     ],
     evidence: [
-      "Rust 1.98.1 runtime assertion",
+      "Rust 1.99.1 runtime assertion",
       "last strong owner dropped before upgrade",
       "Some while live and None after destruction",
     ],
@@ -13168,7 +13168,7 @@ export const rustFailureAtlasEntries = [
       "mutex poisoned after thread panic",
     ],
     evidence: [
-      "Rust 1.98.1 runtime panic",
+      "Rust 1.99.1 runtime panic",
       "worker panics while mutex guard is live",
       "PoisonError into_inner recovery",
     ],
@@ -13189,7 +13189,7 @@ export const rustFailureAtlasEntries = [
       "resize_with versus resize Rust",
     ],
     evidence: [
-      "Rust 1.98.1 runtime assertion",
+      "Rust 1.99.1 runtime assertion",
       "Arc fill values share one atomic allocation",
       "resize_with constructs independent allocations",
     ],
@@ -13210,7 +13210,7 @@ export const rustFailureAtlasEntries = [
       "constant time vector removal Rust",
     ],
     evidence: [
-      "Rust 1.98.1 runtime assertion",
+      "Rust 1.99.1 runtime assertion",
       "last element moves into removed index",
       "Vec remove preserves relative order",
     ],
@@ -13231,7 +13231,7 @@ export const rustFailureAtlasEntries = [
       "remove all duplicate vector values Rust",
     ],
     evidence: [
-      "Rust 1.98.1 runtime assertion",
+      "Rust 1.99.1 runtime assertion",
       "separated equal values remain",
       "sort then dedup produces global uniqueness",
     ],
@@ -13252,7 +13252,7 @@ export const rustFailureAtlasEntries = [
       "source destination slice lengths Rust",
     ],
     evidence: [
-      "Rust 1.98.1 runtime panic",
+      "Rust 1.99.1 runtime panic",
       "two-byte source and three-byte destination",
       "destination prefix with equal length repairs copy",
     ],
@@ -13273,7 +13273,7 @@ export const rustFailureAtlasEntries = [
       "empty slice cyclic rotation",
     ],
     evidence: [
-      "Rust 1.98.1 runtime panic",
+      "Rust 1.99.1 runtime panic",
       "rotation distance exceeds three-element length",
       "non-empty modulo normalization repair",
     ],
@@ -13294,7 +13294,7 @@ export const rustFailureAtlasEntries = [
       "ChunksExactMut recover mutable remainder",
     ],
     evidence: [
-      "Rust 1.98.1 runtime assertion",
+      "Rust 1.99.1 runtime assertion",
       "four of five values mutated through exact chunks",
       "into_remainder repairs the mutable tail",
     ],
@@ -13315,7 +13315,7 @@ export const rustFailureAtlasEntries = [
       "or_insert versus insert Rust",
     ],
     evidence: [
-      "Rust 1.98.1 runtime assertion",
+      "Rust 1.99.1 runtime assertion",
       "occupied entry retains ready state",
       "HashMap insert performs replacement",
     ],
@@ -13336,7 +13336,7 @@ export const rustFailureAtlasEntries = [
       "move all elements between vectors",
     ],
     evidence: [
-      "Rust 1.98.1 runtime assertion",
+      "Rust 1.99.1 runtime assertion",
       "source vector becomes empty after append",
       "extend_from_slice retains source values",
     ],
@@ -13357,7 +13357,7 @@ export const rustFailureAtlasEntries = [
       "linearise ring buffer Rust",
     ],
     evidence: [
-      "Rust 1.98.1 runtime assertion",
+      "Rust 1.99.1 runtime assertion",
       "wrapped deque order measured before and after",
       "one returned contiguous mutable slice",
     ],
@@ -13378,7 +13378,7 @@ export const rustFailureAtlasEntries = [
       "iterate heap in priority order Rust",
     ],
     evidence: [
-      "Rust 1.98.1 runtime assertion",
+      "Rust 1.99.1 runtime assertion",
       "same max-heap consumed by two APIs",
       "ascending and descending expectations asserted separately",
     ],
@@ -13399,7 +13399,7 @@ export const rustFailureAtlasEntries = [
       "recover previous Some value Rust",
     ],
     evidence: [
-      "Rust 1.98.1 runtime assertion",
+      "Rust 1.99.1 runtime assertion",
       "Drop counter advances during insert",
       "Option replace returns old value before drop",
     ],
@@ -13420,7 +13420,7 @@ export const rustFailureAtlasEntries = [
       "log and recover Result Rust",
     ],
     evidence: [
-      "Rust 1.98.1 runtime assertion",
+      "Rust 1.99.1 runtime assertion",
       "error logging closure executes",
       "unwrap_or supplies explicit fallback",
     ],
@@ -13441,7 +13441,7 @@ export const rustFailureAtlasEntries = [
       "move value out of mutable reference Rust",
     ],
     evidence: [
-      "Rust 1.98.1 runtime assertion",
+      "Rust 1.99.1 runtime assertion",
       "Drop counter remains zero after replacement",
       "explicit drops establish both destructor points",
     ],
@@ -13462,7 +13462,7 @@ export const rustFailureAtlasEntries = [
       "move struct field out mutable reference Rust",
     ],
     evidence: [
-      "Rust 1.98.1 runtime assertion",
+      "Rust 1.99.1 runtime assertion",
       "generation becomes derived default zero",
       "mem replace installs explicit next generation",
     ],
@@ -13483,7 +13483,7 @@ export const rustFailureAtlasEntries = [
       "apply multiple String edits reverse byte order",
     ],
     evidence: [
-      "Rust 1.98.1 runtime panic",
+      "Rust 1.99.1 runtime panic",
       "previously valid range shifted inside accented scalar",
       "current-revision char_indices repair",
     ],
@@ -13504,7 +13504,7 @@ export const rustFailureAtlasEntries = [
       "safe Unicode substring Rust",
     ],
     evidence: [
-      "Rust 1.98.1 runtime assertion",
+      "Rust 1.99.1 runtime assertion",
       "in-bounds byte endpoint is not char boundary",
       "char_indices creates valid two-byte prefix",
     ],
@@ -13525,7 +13525,7 @@ export const rustFailureAtlasEntries = [
       "NulError CString FFI Rust",
     ],
     evidence: [
-      "Rust 1.98.1 runtime assertion",
+      "Rust 1.99.1 runtime assertion",
       "embedded zero between alpha and omega",
       "valid CString has one trailing terminator",
     ],
@@ -13546,7 +13546,7 @@ export const rustFailureAtlasEntries = [
       "Path extension last dot behaviour",
     ],
     evidence: [
-      "Rust 1.98.1 runtime assertion",
+      "Rust 1.99.1 runtime assertion",
       "archive.tar.gz yields gz",
       "explicit full-name compound suffix extraction",
     ],
@@ -13567,7 +13567,7 @@ export const rustFailureAtlasEntries = [
       "saturating duration subtraction Rust",
     ],
     evidence: [
-      "Rust 1.98.1 runtime panic",
+      "Rust 1.99.1 runtime panic",
       "five seconds subtracted from two",
       "checked_sub exposes None underflow",
     ],
@@ -13588,7 +13588,7 @@ export const rustFailureAtlasEntries = [
       "checked_duration_since Rust",
     ],
     evidence: [
-      "Rust 1.98.1 runtime assertion",
+      "Rust 1.99.1 runtime assertion",
       "earlier asks duration since later",
       "correct order plus checked inversion",
     ],
@@ -13609,7 +13609,7 @@ export const rustFailureAtlasEntries = [
       "OnceLock first initialization wins",
     ],
     evidence: [
-      "Rust 1.98.1 runtime assertion",
+      "Rust 1.99.1 runtime assertion",
       "two sequential set attempts",
       "rejected replacement and retained primary value",
     ],
@@ -13630,7 +13630,7 @@ export const rustFailureAtlasEntries = [
       "OnceLock concurrent initializer",
     ],
     evidence: [
-      "Rust 1.98.1 runtime assertion",
+      "Rust 1.99.1 runtime assertion",
       "atomic counts initializer calls",
       "second closure skipped after publication",
     ],
@@ -13651,7 +13651,7 @@ export const rustFailureAtlasEntries = [
       "drop all Sender clones Rust",
     ],
     evidence: [
-      "Rust 1.98.1 runtime assertion",
+      "Rust 1.99.1 runtime assertion",
       "original sender dropped with clone retained",
       "dropping every sender yields Disconnected",
     ],
@@ -13672,7 +13672,7 @@ export const rustFailureAtlasEntries = [
       "rendezvous channel Rust std",
     ],
     evidence: [
-      "Rust 1.98.1 runtime assertion",
+      "Rust 1.99.1 runtime assertion",
       "try_send without waiting receiver returns Full",
       "blocking send completes with receiver rendezvous",
     ],
@@ -13693,7 +13693,7 @@ export const rustFailureAtlasEntries = [
       "RwLock write guard panic",
     ],
     evidence: [
-      "Rust 1.98.1 runtime panic",
+      "Rust 1.99.1 runtime panic",
       "worker panics while write guard lives",
       "PoisonError exposes read guard for chosen recovery",
     ],
@@ -13714,7 +13714,7 @@ export const rustFailureAtlasEntries = [
       "outer RwLock poison does not track atomic mutation",
     ],
     evidence: [
-      "Rust 1.98.1 runtime assertion",
+      "Rust 1.99.1 runtime assertion",
       "AtomicU8 changed under shared read guard",
       "mutation survives while outer lock stays unpoisoned",
     ],
@@ -13735,7 +13735,7 @@ export const rustFailureAtlasEntries = [
       "reusable Barrier rounds Rust",
     ],
     evidence: [
-      "Rust 1.98.1 four-thread runtime assertion",
+      "Rust 1.99.1 four-thread runtime assertion",
       "all participants complete one wait",
       "leader count equals one",
     ],
@@ -13756,7 +13756,7 @@ export const rustFailureAtlasEntries = [
       "compare_exchange retry loop ordering Rust",
     ],
     evidence: [
-      "Rust 1.98.1 runtime assertion",
+      "Rust 1.99.1 runtime assertion",
       "expected four while atomic contains five",
       "retry uses returned observation and succeeds",
     ],
@@ -13777,7 +13777,7 @@ export const rustFailureAtlasEntries = [
       "call_once_force is_poisoned",
     ],
     evidence: [
-      "Rust 1.98.1 caught initializer panic",
+      "Rust 1.99.1 caught initializer panic",
       "second call_once panics on poison",
       "call_once_force observes poison and completes",
     ],
@@ -13798,7 +13798,7 @@ export const rustFailureAtlasEntries = [
       "Once versus OnceLock poisoning",
     ],
     evidence: [
-      "Rust 1.98.1 caught initializer panic",
+      "Rust 1.99.1 caught initializer panic",
       "cell remains None after unwind",
       "later initializer publishes seven",
     ],
@@ -13819,7 +13819,7 @@ export const rustFailureAtlasEntries = [
       "weak_count prevents Rc mutation",
     ],
     evidence: [
-      "Rust 1.98.1 runtime assertion",
+      "Rust 1.99.1 runtime assertion",
       "one strong owner plus one Weak observer",
       "dropping Weak enables unique mutation",
     ],
@@ -13840,7 +13840,7 @@ export const rustFailureAtlasEntries = [
       "Arc weak pointer after inner value moved",
     ],
     evidence: [
-      "Rust 1.98.1 runtime assertion",
+      "Rust 1.99.1 runtime assertion",
       "one strong owner plus live Weak",
       "inner value recovered and later upgrade returns None",
     ],
@@ -13861,7 +13861,7 @@ export const rustFailureAtlasEntries = [
       "cargo rustc-cfg unexpected_cfgs deny",
     ],
     evidence: [
-      "Cargo 1.98.1 workspace fixture",
+      "Cargo 1.99.1 workspace fixture",
       "custom has_fast_path cfg rejected",
       "unconditional rustc-check-cfg repair",
     ],
@@ -13882,7 +13882,7 @@ export const rustFailureAtlasEntries = [
       "env macro build script environment variables",
     ],
     evidence: [
-      "Cargo 1.98.1 build-script compile failure",
+      "Cargo 1.99.1 build-script compile failure",
       "TARGET absent during build.rs compilation",
       "runtime environment lookup repair",
     ],
@@ -13903,7 +13903,7 @@ export const rustFailureAtlasEntries = [
       "forward DEP links metadata Cargo",
     ],
     evidence: [
-      "Cargo 1.98.1 three-package workspace",
+      "Cargo 1.99.1 three-package workspace",
       "transitive DEP variable absent",
       "wrapper links metadata forwarding repair",
     ],
@@ -13924,7 +13924,7 @@ export const rustFailureAtlasEntries = [
       "no_std entrypoint panic abort handler",
     ],
     evidence: [
-      "Rust 1.98.1 no_std Linux binary",
+      "Rust 1.99.1 no_std Linux binary",
       "missing panic_handler compile failure",
       "non-returning PanicInfo handler repair",
     ],
@@ -13945,7 +13945,7 @@ export const rustFailureAtlasEntries = [
       "no_std collections global allocator boundary",
     ],
     evidence: [
-      "Rust 1.98.1 no_std library",
+      "Rust 1.99.1 no_std library",
       "Vec missing from core prelude",
       "extern crate alloc and explicit Vec import",
     ],
@@ -13966,7 +13966,7 @@ export const rustFailureAtlasEntries = [
       "build script cached environment variable old value",
     ],
     evidence: [
-      "Cargo 1.98.1 two-build sequence",
+      "Cargo 1.99.1 two-build sequence",
       "unchanged target directory and changed RFA_BUILD_MODE",
       "tracked environment repair regenerates output",
     ],
@@ -13987,7 +13987,7 @@ export const rustFailureAtlasEntries = [
       "couldn't read OUT_DIR generated Rust file",
     ],
     evidence: [
-      "Cargo 1.98.1 generated-source fixture",
+      "Cargo 1.99.1 generated-source fixture",
       "successful write to package root but missing OUT_DIR file",
       "shared OUT_DIR path repair",
     ],
@@ -14008,7 +14008,7 @@ export const rustFailureAtlasEntries = [
       "find range of borrowed subslice Rust 1.98",
     ],
     evidence: [
-      "Rust 1.98.1 runtime assertion",
+      "Rust 1.99.1 runtime assertion",
       "equal values from a different array return None",
       "same-allocation derived subslice returns its range",
     ],
@@ -14029,7 +14029,7 @@ export const rustFailureAtlasEntries = [
       "substring byte range same allocation Rust",
     ],
     evidence: [
-      "Rust 1.98.1 runtime assertion",
+      "Rust 1.99.1 runtime assertion",
       "equal copied text returns None",
       "derived UTF-8 substring returns its byte range",
     ],
@@ -14050,7 +14050,7 @@ export const rustFailureAtlasEntries = [
       "integer format_into returned str lifetime Rust 1.98",
     ],
     evidence: [
-      "Rust 1.98.1 E0499 compile failure",
+      "Rust 1.99.1 E0499 compile failure",
       "two live format_into views share one mutable buffer",
       "sequential consumption repair without allocation",
     ],
@@ -14071,7 +14071,7 @@ export const rustFailureAtlasEntries = [
       "truncated UTF16 byte stream Rust decoder",
     ],
     evidence: [
-      "Rust 1.98.1 runtime error",
+      "Rust 1.99.1 runtime error",
       "one trailing byte produces OddBytes",
       "complete little-endian code units decode to AB",
     ],
@@ -14092,7 +14092,7 @@ export const rustFailureAtlasEntries = [
       "strip_circumfix non overlapping markers 1.98",
     ],
     evidence: [
-      "Rust 1.98.1 runtime panic",
+      "Rust 1.99.1 runtime panic",
       "individually matching markers overlap at one element",
       "disjoint frame markers return the body",
     ],
@@ -14113,7 +14113,7 @@ export const rustFailureAtlasEntries = [
       "mix atomic and non atomic access mutable slice Rust 1.98",
     ],
     evidence: [
-      "Rust 1.98.1 E0506 compile failure",
+      "Rust 1.99.1 E0506 compile failure",
       "ordinary assignment while atomic view remains live",
       "scoped atomic phase and later byte assertion",
     ],
@@ -14134,7 +14134,7 @@ export const rustFailureAtlasEntries = [
       "rustc-env compile time env macro runtime variable",
     ],
     evidence: [
-      "Cargo 1.98.1 paired execution fixture",
+      "Cargo 1.99.1 paired execution fixture",
       "Cargo-run and direct-process output differ",
       "compile-time env value produces identical output",
     ],
@@ -14155,7 +14155,7 @@ export const rustFailureAtlasEntries = [
       "Rust FFI function returning c_void use unit",
     ],
     evidence: [
-      "Rust 1.98.1 c_void_returns diagnostic",
+      "Rust 1.99.1 c_void_returns diagnostic",
       "extern C function returning c_void rejected under deny",
       "unit return type repair preserves C void intent",
     ],
@@ -14176,7 +14176,7 @@ export const rustFailureAtlasEntries = [
       "no_mangle memset wrong signature rustc lint",
     ],
     evidence: [
-      "Rust 1.98.1 deny-by-default runtime-symbol lint",
+      "Rust 1.99.1 deny-by-default runtime-symbol lint",
       "zero-argument memset export conflicts with required ABI",
       "application-specific symbol name compiles without collision",
     ],
@@ -14197,7 +14197,7 @@ export const rustFailureAtlasEntries = [
       "empty repr C marker transparent wrapper rejected",
     ],
     evidence: [
-      "Rust 1.98.1 E0690 compatibility diagnostic",
+      "Rust 1.99.1 E0690 compatibility diagnostic",
       "empty repr(C) marker is not a guaranteed trivial field",
       "ordinary zero-sized marker restores transparent wrapper",
     ],
@@ -14218,7 +14218,7 @@ export const rustFailureAtlasEntries = [
       "usage of unsafe link_section attribute lint",
     ],
     evidence: [
-      "Rust 1.98.1 unsafe_code lint diagnostic",
+      "Rust 1.99.1 unsafe_code lint diagnostic",
       "correct unsafe(link_section) syntax remains policy-rejected",
       "ordinary used static compiles under deny unsafe_code",
     ],
@@ -14239,7 +14239,7 @@ export const rustFailureAtlasEntries = [
       "collect environment variables before spawning thread Rust",
     ],
     evidence: [
-      "Rust 1.98.1 E0277 compile failure",
+      "Rust 1.99.1 E0277 compile failure",
       "lazy environment iterator moved into thread closure",
       "owned Vec snapshot crosses thread boundary successfully",
     ],
@@ -14260,7 +14260,7 @@ export const rustFailureAtlasEntries = [
       "partial_cmp differs from cmp wrapper after Rust upgrade",
     ],
     evidence: [
-      "Rust 1.98.1 runtime assertion",
+      "Rust 1.99.1 runtime assertion",
       "derived wrapper returns Ord result through PartialOrd",
       "consistent field implementation restores one ordering",
     ],
@@ -14281,7 +14281,7 @@ export const rustFailureAtlasEntries = [
       "cannot transmute aligned wrapper to generic pointer Rust 1.98",
     ],
     evidence: [
-      "Rust 1.98.1 E0512 compile failure",
+      "Rust 1.99.1 E0512 compile failure",
       "repr(align(16)) generic pointer wrapper has conditional size",
       "ordinary field extraction preserves fat-pointer metadata",
     ],
@@ -14302,7 +14302,7 @@ export const rustFailureAtlasEntries = [
       "expected Pin mut T found Pin mut reference",
     ],
     evidence: [
-      "Rust 1.98.1 E0308 compile failure",
+      "Rust 1.99.1 E0308 compile failure",
       "pinning &mut String preserves reference layer",
       "explicit Pin::new repair for Unpin String",
     ],
@@ -14323,7 +14323,7 @@ export const rustFailureAtlasEntries = [
       "CARGO_BUILD_WARNINGS warn allow deny Rust 1.97",
     ],
     evidence: [
-      "Cargo 1.98.1 local package fixture",
+      "Cargo 1.99.1 local package fixture",
       "build.warnings deny promotes dead_code to build failure",
       "warning-free source compiles under unchanged deny policy",
     ],
@@ -14333,7 +14333,7 @@ export const rustFailureAtlasEntries = [
     id: "RFA-715",
     area: "concurrency-memory",
     symptom:
-      "Converting an exhausted legacy RangeInclusive into the new std::range::RangeInclusive panics instead of producing an empty bounds value.",
+      "Converting an exhausted legacy RangeInclusive into std::range::RangeInclusive panicked on Rust 1.98.1 and returns an empty range on Rust 1.99.1, and neither result gives back the original bounds.",
     likelyCause:
       "The legacy inclusive range combines original bounds with iterator exhaustion state, while the new range value cannot portably reconstruct meaningful bounds after that state is consumed.",
     firstCheck:
@@ -14344,7 +14344,7 @@ export const rustFailureAtlasEntries = [
       "std range RangeInclusive from legacy empty conversion",
     ],
     evidence: [
-      "Rust 1.98.1 documented conversion panic",
+      "Rust 1.98.1 conversion panic versus Rust 1.99.1 empty result",
       "single-element legacy iterator exhausted before From",
       "is_empty guard avoids reconstructing consumed bounds",
     ],
@@ -14365,7 +14365,7 @@ export const rustFailureAtlasEntries = [
       "T associated type dyn Trait explicit lifetime Rust 1.98",
     ],
     evidence: [
-      "Rust 1.98.1 E0228 compile failure",
+      "Rust 1.99.1 E0228 compile failure",
       "fully elided dyn Inner inside a GAT projection",
       "explicit dyn Inner plus 'r repair",
     ],
@@ -14386,7 +14386,7 @@ export const rustFailureAtlasEntries = [
       "downstream zero sized type transparent wrapper Rust 1.98",
     ],
     evidence: [
-      "Rust 1.98.1 two-crate Cargo failure",
+      "Rust 1.99.1 two-crate Cargo failure",
       "dependency marker has a private unit field",
       "PhantomData repair keeps type information without storing the dependency type",
     ],
@@ -14407,7 +14407,7 @@ export const rustFailureAtlasEntries = [
       "repr transparent dependency FutureMarker Rust 1.98",
     ],
     evidence: [
-      "Rust 1.98.1 two-crate Cargo failure",
+      "Rust 1.99.1 two-crate Cargo failure",
       "non_exhaustive unit marker is rejected as an ignorable field",
       "PhantomData repair separates type tagging from stored layout",
     ],
@@ -14428,7 +14428,7 @@ export const rustFailureAtlasEntries = [
       "valid forms inline always never attribute",
     ],
     evidence: [
-      "Rust 1.98.1 E0539 compile failure",
+      "Rust 1.99.1 E0539 compile failure",
       "nested tokens inside inline(always(...)) are rejected",
       "plain inline(always) repair compiles",
     ],
@@ -14449,7 +14449,7 @@ export const rustFailureAtlasEntries = [
       "no_mangle strlen expected const i8 found mut f32",
     ],
     evidence: [
-      "Rust 1.98.1 suspicious runtime-symbol diagnostic",
+      "Rust 1.99.1 suspicious runtime-symbol diagnostic",
       "extern C strlen has matching pointer width but wrong pointee semantics",
       "application-specific exported name removes the accidental runtime collision",
     ],
@@ -14470,7 +14470,7 @@ export const rustFailureAtlasEntries = [
       "NonZero from_str_radix valid digits but error",
     ],
     evidence: [
-      "Rust 1.98.1 runtime panic after unwrapping zero",
+      "Rust 1.99.1 runtime panic after unwrapping zero",
       "ParseIntError reports IntErrorKind::Zero",
       "repaired parser preserves a domain-specific zero message and accepts twelve",
     ],
@@ -14491,7 +14491,7 @@ export const rustFailureAtlasEntries = [
       "bool ok_or versus ok_or_else Rust 1.98",
     ],
     evidence: [
-      "Rust 1.98.1 runtime assertion after eager error construction",
+      "Rust 1.99.1 runtime assertion after eager error construction",
       "true.ok_or returns Ok but increments the construction counter",
       "ok_or_else skips construction for true and invokes it once for false",
     ],
