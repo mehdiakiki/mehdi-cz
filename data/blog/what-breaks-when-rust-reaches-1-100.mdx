@@ -1,0 +1,127 @@
+---
+title: "What Breaks When Rust Reaches 1.100"
+date: "2026-10-28T15:20:00+01:00"
+lastmod: "2026-10-28T15:20:00+01:00"
+tags: ["rust", "cargo", "msrv", "ci"]
+draft: false
+reviewed: true
+reviewedHash: "6b35c79cd67e0a445e28f44f58692034ff6eaf5dac19a9f8e5746f640e3e28b2"
+cluster: "rust-under-the-hood"
+campaign: "editorial"
+summary: "Rust 1.100.0 comes on November 12, 2026. I made a small experiment: version checks that compare text or floats think it is older than Rust 1.80, YAML turns it into 1.1, and the usual build-script crates are fine."
+---
+
+A few days ago I moved the fixtures of my [Rust Failure Atlas](/rust-failure-atlas) to Rust 1.99.1. One of them is a package that must ask for a newer Rust than the compiler that runs it. So now it asks for Rust 1.100. Cargo read it correctly and refused the build, as it should. But it made me think about all the other code that reads the Rust version.
+
+Rust 1.100.0 is planned for [November 12, 2026](https://releases.rs/). It is the first time Rust has a minor version with three digits. For the compiler this changes nothing. But build scripts, CI steps, release tools, editor plugins, all of them read this version somewhere. And a lot of this code was written when every version looked like `1.xx`.
+
+So I made a small experiment. I took one simple question, is this compiler at least Rust 1.80, and asked it in many different ways. Every check got two versions. The first one is the real Rust 1.99.1. The second one is 1.100.0. The text checks get the version text directly. For the crates I needed a compiler, so I wrote a small fake `rustc`. It prints the version 1.100.0 in the normal format, and for everything else it calls the real 1.99.1. I tested also the crates on the real beta, which says `1.100.0-beta.7` when I write this. The scripts, the fake compiler and the crate probe are in [`experiments/rust-atlas/rust-1-100-version-checks`](https://github.com/mehdiakiki/mehdi-cz/tree/main/experiments/rust-atlas/rust-1-100-version-checks), and `run.sh` runs all of them again.
+
+## The results
+
+| Check | Rust 1.99.1 | Rust 1.100.0 |
+| --- | --- | --- |
+| bash `[[ "$v" > "1.80.0" ]]` | new enough | too old |
+| awk `$1 >= 1.80` | new enough | too old |
+| Python `v >= "1.80.0"` | `True` | `False` |
+| Python `float(major_minor)` | `1.99` | `1.1` |
+| JavaScript `parseFloat(v)` | `1.99` | `1.1` |
+| `grep -oE '1\.[0-9]{2}'` | `1.99` | `1.10` |
+| newest with `sort \| tail -n1` | `1.99.1` | `1.98.1` |
+| newest with `sort -V \| tail -n1` | `1.99.1` | `1.100.0` |
+| `cut -d. -f2`, then `-ge 80` | new enough | new enough |
+| Python tuple of integers | `True` | `True` |
+| autocfg `probe_rustc_version(1, 80)` | `true` | `true` |
+| version_check `is_min_version("1.80.0")` | `true` | `true` |
+| rustc_version `version() >= 1.80.0` | `true` | `true` |
+
+The two `sort` rows choose the newest of 1.97.0, 1.98.1 and the compiler version.
+
+So the first seven checks are wrong for 1.100. And none of them crash. They give back a normal value and the script continues with it. This is the part I do not like.
+
+## Why it goes wrong
+
+1.100 is bigger than 1.99, right? Not for a string.
+
+Text is compared character by character. `1.100.0` and `1.80.0` are the same for two characters, then `1` meets `8`, and `1` is smaller. So for a text comparison, `1.100.0` is older than every release from 1.11 to 1.99.
+
+With a float it is another problem, but the same result. `1.100` and `1.1` are the same number. So `parseFloat` and Python `float` think this is Rust 1.1, a release from 2015.
+
+The `grep` one is the most sneaky in my opinion. `[0-9]{2}` takes two digits and stops there, so `1.100.0` becomes `1.10`. And 1.10 is also a real version, from 2016, so the output looks completely normal.
+
+Why nobody noticed before? Because it was working for years. From 1.10 to 1.99 all minor versions have two digits, so text order and number order were the same. Actually the same break happened already one time, between 1.9 and 1.10 in 2016. But at that time much less code was reading Rust versions.
+
+## YAML is the worst one
+
+The second place is configuration files. Look at this small YAML:
+
+```yaml
+toolchain: 1.100
+quoted: "1.100"
+matrix: [1.99, 1.100]
+```
+
+YAML reads unquoted numbers as floats, that is, `1.100` becomes the number one point one. I tried PyYAML 6.0.3 and js-yaml 4.3.2, and both give the same thing:
+
+```text
+{'toolchain': 1.1, 'quoted': '1.100', 'matrix': [1.99, 1.1]}
+```
+
+This one was not obvious for me at first. If your CI job gives this value to rustup, it asks for a toolchain called 1.1. And rustup does not complain, it just installs Rust 1.1.0 from 2015. The build fails after, but the error says nothing about YAML. Python projects had exactly this surprise when [`3.10` became `3.1`](https://hugovk.dev/blog/2021/the-python-3-1-problem/) in their CI files. The fix is also the same: you write `"1.100"` with quotes.
+
+TOML has the same float rule. But here Cargo and rustup stop immediately. With `rust-version = 1.100` without quotes in `Cargo.toml`, Cargo 1.99.1 says:
+
+```text
+error: invalid type: floating point `1.1`, expected a semver or workspace
+```
+
+You can even see the `1.1` in the message, so it is easy to understand what happened. rustup also refuses a `rust-toolchain.toml` with `channel = 1.100`, with a TOML parse error. So with TOML you see the problem directly. With YAML you do not.
+
+## The crates are fine
+
+Good news here. The crates that most build scripts use already parse the version as numbers. With the fake 1.100.0 compiler:
+
+```text
+autocfg probe_rustc_version(1, 80) = true
+version_check reads Some("1.100.0"), is_min_version("1.80.0") = Some(true)
+rustc_version reads 1.100.0, >= 1.80.0 is true
+semver VersionReq ">=1.80" matches 1.100.0: true
+```
+
+This is autocfg 1.5.1, version_check 0.9.5, rustc_version 0.4.1 and semver 1.0.28. Cargo is fine too: a package with `rust-version = "1.100"` is [correctly seen as newer than 1.99.1](/rust/failures/package-rust-version-newer-than-compiler). And some projects prepared for it on purpose. The Linux kernel script [`scripts/rustc-version.sh`](https://github.com/torvalds/linux/blob/master/scripts/rustc-version.sh) uses one digit more than its other version scripts, and the comment explains why: `rustc` "will reach 1.100.0 in late 2026". I liked that.
+
+So the problem is really in the checks that people wrote by hand.
+
+## The fixes people try
+
+The first fix is a wider pattern, like `[0-9]{2,3}` or `[0-9]+`. OK, now `grep` works. But you still have text in your hand, and the next line can compare it as text again.
+
+The second fix is to compare only the minor number. In my table, `cut -d. -f2` with an integer test gave the correct answer. But it is still a parser written by hand, and it knows only one shape of input. If you read also the patch number, the beta breaks it: in `1.100.0-beta.7` the third field is `0-beta`, and bash stops with `integer expected`.
+
+The third fix is `sort -V`. It sorts versions correctly, only it puts `1.100.0-beta.7` after `1.100.0`. I use it anyway. But it helps only in the places where somebody remembered to use it.
+
+## What I do now
+
+I parse the version into integers one time, after I remove a suffix like `-beta.7`, and I compare them as a tuple: `(1, 100, 0) >= (1, 80, 0)`. In a build script I do not write this parser myself, version_check and rustc_version already do it.
+
+When it is possible, I do not read the number at all. autocfg can compile a small probe with `emit_path_cfg` or `emit_expression_cfg`, and it enables the `cfg` only if the probe compiles. Then the version number cannot be wrong, because you ask the compiler the real question.
+
+I put quotes on every version in YAML and TOML.
+
+And I run CI on the beta channel now, with `rustup toolchain install beta`. When I write this, it says 1.100.0-beta.7.
+
+But there are two traps with the beta. A semver range [does not match a pre-release](https://docs.rs/semver/latest/semver/struct.VersionReq.html), except when the range has a pre-release on the same 1.100.0, like `>=1.100.0-beta.1`. So `VersionReq ">=1.80"` says `false` for `1.100.0-beta.7`, and `true` for `1.100.0`. On the real beta compiler, it was the only one of the four crate checks for 1.80 that changed. This is a rule of semver ranges, not a bug of 1.100.
+
+The second trap is a check for 1.100 itself. The `>=` comparison of rustc_version has no problem with 1.80. But for semver, `1.100.0-beta.7` is still smaller than `1.100.0`, so a check for at least 1.100 says `false` on this beta. version_check and autocfg remove the beta part, so they say `true`. I added this case to the probe, and on the real beta it prints:
+
+```text
+at least 1.100: autocfg true, version_check Some(true), rustc_version false
+```
+
+## The tradeoffs
+
+Feature probes are slower. Every probe is one more small compilation in the build script, and in a big dependency graph it adds up. A version check is only one process call.
+
+And even a correct version check is still a guess. A distribution can backport a fix, and a nightly can have a feature before the release number says so. For most code I accept this and I just parse the version properly. When a wrong answer would change the behavior silently, then I probe the feature.
+
+If you want to find these checks in your repository, search for the places that read the version: `rustc --version`, `rustc -V`, `rustc -vV`, `parseFloat`, `sort | tail`, `sort -n`, and patterns like `[0-9]{2}`. Then search your CI files for versions without quotes. It does not take long, and there are only two weeks left before November 12.

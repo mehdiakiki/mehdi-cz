@@ -11,7 +11,8 @@ const blogDirectory = path.join(repositoryRoot, "data", "blog");
 
 // Editorial pillar-and-spoke clusters started in September 2026. Each pillar
 // goes live first; spokes follow on irregular editorial slots that never use
-// the 09:00 campaign baseline. Spokes link the pillar; nobody links forward.
+// the 09:00 campaign baseline. Spokes link the pillar; nobody links to an
+// article before it is live.
 export const editorialClusters = [
   {
     name: "async Rust",
@@ -75,6 +76,10 @@ function readArticle(slug) {
   return { source, ...matter(source) };
 }
 
+function proseWordCount(markdown) {
+  return markdownWordCount(markdown.replace(/\]\([^)\s]*\)/g, "]"));
+}
+
 function assertReleaseLocksAreConsistent(article, slug) {
   assert.equal(typeof article.data.draft, "boolean", slug);
   assert.equal(typeof article.data.reviewed, "boolean", slug);
@@ -111,7 +116,7 @@ for (const cluster of editorialClusters) {
     assertCommonRules(pillar, pillarSlug, cluster);
     assert.ok(pillar.content.includes(cluster.tagPath), `${pillarSlug} lacks ${cluster.tagPath}`);
     assert.ok(pillar.content.includes(`/blog/topics/${cluster.cluster}`), pillarSlug);
-    const words = markdownWordCount(pillar.content);
+    const words = proseWordCount(pillar.content);
     assert.ok(words >= 1800 && words <= 2400, `${pillarSlug} contains ${words} body words`);
   });
 
@@ -124,7 +129,7 @@ for (const cluster of editorialClusters) {
       assert.ok(new Date(date) > new Date(pillarDate), `${slug} is dated before the pillar`);
       assert.notEqual(date.slice(11, 16), "09:00", `${slug} collides with the campaign baseline`);
       assertCommonRules(article, slug, cluster);
-      const words = markdownWordCount(article.content);
+      const words = proseWordCount(article.content);
       const maxWords = options.maxWords ?? 1400;
       assert.ok(words >= 700 && words <= maxWords, `${slug} contains ${words} body words`);
       assert.match(article.content, new RegExp(`/blog/${pillarSlug}`), slug);
@@ -136,6 +141,7 @@ for (const cluster of editorialClusters) {
     for (const [slug, date] of scheduledFor) {
       if (!existsSync(articlePath(slug))) continue;
       const article = readArticle(slug);
+      const liveFrom = Math.max(new Date(date).getTime(), Date.now());
       const internalLinks = [...article.content.matchAll(/\]\(\/blog\/([a-z0-9-]+)/g)].map(
         (match) => match[1]
       );
@@ -144,7 +150,7 @@ for (const cluster of editorialClusters) {
         assert.ok(existsSync(articlePath(target)), `${slug} links to missing ${target}`);
         const targetDate = scheduledFor.get(target) ?? readArticle(target).data.date;
         assert.ok(
-          new Date(targetDate) <= new Date(date),
+          new Date(targetDate).getTime() <= liveFrom,
           `${slug} links early to ${target} (${targetDate})`
         );
       }

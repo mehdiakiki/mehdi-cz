@@ -10,8 +10,17 @@ import {
   filterWritingPosts,
   isNotePost,
 } from "../lib/content-format.mjs";
+import { publicationStatus } from "../lib/publication.mjs";
 
 const blogDirectory = path.resolve("data/blog");
+const blogRoutes = new Set(["page", "tags", "themes", "topics"]);
+const knownEarlyLinks = new Set([
+  "when-relaxed-atomics-are-enough-and-what-they-never-guarantee -> release-sequences-in-rust-the-rule-behind-a-surprising-acquire-load",
+  "what-schema-registry-compatibility-modes-actually-protect -> unknown-fields-are-the-quiet-engine-of-protobuf-evolution",
+  "a-canonical-id-is-an-internal-promise-not-a-provider-id -> entity-resolution-before-machine-learning-exact-normalized-and-reviewed-matches",
+  "why-semantic-versioning-does-not-describe-data-compatibility -> null-missing-empty-and-default-are-four-different-data-states",
+  "validating-a-knowledge-graph-at-its-product-boundary -> migrating-an-ontology-without-rewriting-reality-in-place",
+]);
 
 function blogArticles() {
   return readdirSync(blogDirectory)
@@ -117,4 +126,35 @@ test("existing short TIL entries are explicitly classified as notes", () => {
     .map(({ file }) => file);
 
   assert.deepEqual(unclassified, []);
+});
+
+test("articles only link to articles that are live by the time they are", () => {
+  const now = Date.now();
+  const articles = blogArticles().map((article) => ({
+    ...article,
+    slug: article.file.replace(/\.mdx$/, ""),
+  }));
+  const bySlug = new Map(articles.map((article) => [article.slug, article]));
+  const isOnCalendar = (article) =>
+    ["published", "scheduled"].includes(
+      publicationStatus({ ...article.data, slug: article.slug }, new Date(now))
+    );
+
+  const earlyLinks = articles.filter(isOnCalendar).flatMap((article) => {
+    const liveFrom = Math.max(new Date(article.data.date).getTime(), now);
+
+    return [...article.content.matchAll(/(?:\]\(|href=["'])\/blog\/([a-z0-9-]+)/g)]
+      .map((match) => match[1])
+      .filter((target) => !blogRoutes.has(target))
+      .filter((target) => {
+        const linked = bySlug.get(target);
+        return (
+          !linked || !isOnCalendar(linked) || new Date(linked.data.date).getTime() > liveFrom
+        );
+      })
+      .map((target) => `${article.slug} -> ${target}`)
+      .filter((link) => !knownEarlyLinks.has(link));
+  });
+
+  assert.deepEqual(earlyLinks, []);
 });
