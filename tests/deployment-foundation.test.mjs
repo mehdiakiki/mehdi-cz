@@ -43,7 +43,7 @@ test("pre-pull cleanup preserves rollback and in-use images and never forces rem
   await writeFile(log, "");
   await writeFile(
     docker,
-    `#!/usr/bin/env bash
+    `#!/bin/sh
 if [ "$1 $2" = "ps --all" ]; then
   printf '%s\\n' 'active-container'
 elif [ "$1 $2" = "container inspect" ]; then
@@ -64,8 +64,8 @@ fi
   );
   await chmod(docker, 0o755);
   await promisify(execFile)(
-    "bash",
-    ["-e", "-o", "pipefail", "-c", 'previous_image="$IMAGE_PROTECTED"\n' + cleanup],
+    "sh",
+    ["-e", "-c", 'previous_image="$IMAGE_PROTECTED"\n' + cleanup],
     {
       env: {
         ...process.env,
