@@ -24,6 +24,7 @@ export const rustSystemsAtlasEditorialSections = {
   "how-async-rust-works-under-the-hood": "async-concurrency",
   "async-fn-in-dyn-trait-what-the-box-costs-measured": "async-concurrency",
   "async-cleanup-in-rust-when-drop-cannot-await": "async-concurrency",
+  "when-more-threads-make-a-service-slower": "async-concurrency",
   "why-is-my-rust-build-slow-a-diagnostic-tree": "cargo-build-linking",
   "why-did-cargo-rebuild-this-crate-fingerprints-and-dirty-reasons": "cargo-build-linking",
   "the-unit-of-rebuild-when-you-split-a-rust-workspace": "cargo-build-linking",

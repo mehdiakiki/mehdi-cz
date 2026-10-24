@@ -30,7 +30,7 @@ for (const series of editorialSeries) {
       return React.createElement(href ? "a" : React.Fragment, href ? { href } : null, children);
     }
     const body = renderToStaticMarkup(
-      React.createElement(MDXLayoutRenderer, { code: post.body.code, components: { ArticleLink } }),
+      React.createElement(MDXLayoutRenderer, { code: post.body.code, components: { ArticleLink } })
     );
     assert.ok(body.includes("<h2"), `Expected article sections: ${slug}`);
     for (const [, href] of body.matchAll(/href="([^"]+)"/g)) {
@@ -39,23 +39,47 @@ for (const series of editorialSeries) {
       const match = url.pathname.match(/^\/blog\/([^/]+)\/?$/);
       if (!match) continue;
       const target = decodeURIComponent(match[1]);
-      assert.ok(publicArticleHref(allBlogs, target, now), `${slug} renders an unavailable blog link: ${href}`);
+      assert.ok(
+        publicArticleHref(allBlogs, target, now),
+        `${slug} renders an unavailable blog link: ${href}`
+      );
     }
-    const html = "<!doctype html>" + renderToStaticMarkup(
-      React.createElement("html", { lang: "en" },
-        React.createElement("head", null,
-          React.createElement("meta", { charSet: "utf-8" }),
-          React.createElement("title", null, post.title),
-          React.createElement("meta", { name: "robots", content: "noindex, nofollow" })),
-        React.createElement("body", null,
-          React.createElement("p", null, "Held editorial draft — review artifact only."),
-          React.createElement("h1", null, post.title),
-          React.createElement("article", { dangerouslySetInnerHTML: { __html: body } }))),
-    );
+    const html =
+      "<!doctype html>" +
+      renderToStaticMarkup(
+        React.createElement(
+          "html",
+          { lang: "en" },
+          React.createElement(
+            "head",
+            null,
+            React.createElement("meta", { charSet: "utf-8" }),
+            React.createElement("title", null, post.title),
+            React.createElement("meta", { name: "robots", content: "noindex, nofollow" })
+          ),
+          React.createElement(
+            "body",
+            null,
+            React.createElement("p", null, "Held editorial draft — review artifact only."),
+            React.createElement("h1", null, post.title),
+            React.createElement("article", { dangerouslySetInnerHTML: { __html: body } })
+          )
+        )
+      );
     await writeFile(path.join(output, `${slug}.html`), html);
-    records.push({ slug, title: post.title, date: post.date, draft: post.draft, reviewed: post.reviewed, contextualLinks });
+    records.push({
+      slug,
+      title: post.title,
+      date: post.date,
+      draft: post.draft,
+      reviewed: post.reviewed,
+      contextualLinks,
+    });
   }
 }
 assert.equal(records.length, 30);
-await writeFile(path.join(output, "index.json"), JSON.stringify({ generatedAt: now.toISOString(), articles: records }, null, 2) + "\n");
+await writeFile(
+  path.join(output, "index.json"),
+  JSON.stringify({ generatedAt: now.toISOString(), articles: records }, null, 2) + "\n"
+);
 console.log(`Rendered ${records.length} held drafts and verified their article link destinations.`);

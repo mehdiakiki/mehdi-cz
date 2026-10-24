@@ -12,7 +12,9 @@ export function presentOrder(order, contract) {
     return {
       status: 409,
       headers,
-      body: { error: { code: "CLIENT_UPDATE_REQUIRED", message: "Update the app to view this order." } },
+      body: {
+        error: { code: "CLIENT_UPDATE_REQUIRED", message: "Update the app to view this order." },
+      },
     };
   }
   return { status: 200, headers, body: { id: order.id, status: order.status } };
@@ -21,7 +23,11 @@ export function presentOrder(order, contract) {
 // actorId is supplied by trusted authentication middleware, never the JSON body.
 export function handleOrder({ actorId, order, contract }) {
   if (!actorId || order.ownerId !== actorId) {
-    return { status: 403, headers: { "Cache-Control": "private, no-store" }, body: { error: { code: "FORBIDDEN", message: "Order unavailable." } } };
+    return {
+      status: 403,
+      headers: { "Cache-Control": "private, no-store" },
+      body: { error: { code: "FORBIDDEN", message: "Order unavailable." } },
+    };
   }
   return presentOrder(order, contract);
 }

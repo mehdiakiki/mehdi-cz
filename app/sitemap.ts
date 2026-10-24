@@ -29,15 +29,17 @@ export default function sitemap(): MetadataRoute.Sitemap {
     return latest === undefined ? undefined : new Date(latest);
   };
   const latestBlogModification = latestModified(publishedWriting);
-  const editorialSeriesRoutes: MetadataRoute.Sitemap = availableEditorialSeries(publishedBlogs).map((series) => {
-    const lastModified = latestModified(publishedSeriesParts(series, publishedBlogs));
-    return {
-      url: `${siteUrl}/blog/series/${series.slug}`,
-      ...(lastModified ? { lastModified } : {}),
-      changeFrequency: "weekly",
-      priority: 0.7,
-    };
-  });
+  const editorialSeriesRoutes: MetadataRoute.Sitemap = availableEditorialSeries(publishedBlogs).map(
+    (series) => {
+      const lastModified = latestModified(publishedSeriesParts(series, publishedBlogs));
+      return {
+        url: `${siteUrl}/blog/series/${series.slug}`,
+        ...(lastModified ? { lastModified } : {}),
+        changeFrequency: "weekly",
+        priority: 0.7,
+      };
+    }
+  );
   const latestNotesModification = latestModified(publishedNotes);
   const latestRustModification = latestModified([
     ...publishedWriting.filter((post) => post.cluster === "rust-under-the-hood"),

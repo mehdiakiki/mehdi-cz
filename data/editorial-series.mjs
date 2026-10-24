@@ -2,8 +2,10 @@ export const editorialSeries = [
   {
     slug: "ci-and-coding-agents",
     title: "CI and coding agents",
-    description: "Find the delay, preserve the test, and connect each CI result to the code it checked.",
-    introduction: "A fast patch still needs an answer from CI and a decision from a reviewer. These articles follow the queues, tests, caches, and release steps between writing code and running it safely.",
+    description:
+      "Find the delay, preserve the test, and connect each CI result to the code it checked.",
+    introduction:
+      "A fast patch still needs an answer from CI and a decision from a reviewer. These articles follow the queues, tests, caches, and release steps between writing code and running it safely.",
     parts: [
       "the-agent-finished-the-pipeline-did-not",
       "the-build-was-green-and-nobody-understood-the-change",
@@ -20,8 +22,10 @@ export const editorialSeries = [
   {
     slug: "practical-engineering",
     title: "Practical engineering problems",
-    description: "Small investigations into slow requests, runtime changes, browser work, and data contracts.",
-    introduction: "Start with the symptom and choose one thing to inspect. Each article takes a specific engineering problem through a small example, the tradeoffs of a repair, and the checks that tell you whether it helped.",
+    description:
+      "Small investigations into slow requests, runtime changes, browser work, and data contracts.",
+    introduction:
+      "Start with the symptom and choose one thing to inspect. Each article takes a specific engineering problem through a small example, the tradeoffs of a repair, and the checks that tell you whether it helped.",
     parts: [
       "deno-joining-cloudflare-what-happens-to-your-app",
       "what-can-an-ai-agent-reach-from-its-sandbox",
@@ -38,8 +42,10 @@ export const editorialSeries = [
   {
     slug: "agent-security-boundaries",
     title: "Agent security boundaries",
-    description: "Follow the file, process, network, permission, and runtime boundaries around an agent.",
-    introduction: "An agent can cause damage through an overly powerful host tool even when its VM stays isolated. These articles separate that mistake from a runtime escape and show where to enforce the permission, lifecycle, or containment rule.",
+    description:
+      "Follow the file, process, network, permission, and runtime boundaries around an agent.",
+    introduction:
+      "An agent can cause damage through an overly powerful host tool even when its VM stays isolated. These articles separate that mistake from a runtime escape and show where to enforce the permission, lifecycle, or containment rule.",
     parts: [
       "the-sandbox-stayed-closed-the-file-helper-did-not",
       "blocking-http-did-not-block-the-way-out",

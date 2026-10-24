@@ -62,18 +62,31 @@ fn may_retire(worker: &Worker<'_>) -> bool {
 
 fn main() {
     let approval = Approval {
-        image: "dummy-image-B", runtime_package: "distro-runc-reviewed-build-B",
-        kernel_package: "distro-kernel-reviewed-build-K", profile: "isolated-job-v2",
-        expires_at: 200, max_inventory_age: 20,
+        image: "dummy-image-B",
+        runtime_package: "distro-runc-reviewed-build-B",
+        kernel_package: "distro-kernel-reviewed-build-K",
+        profile: "isolated-job-v2",
+        expires_at: 200,
+        max_inventory_age: 20,
     };
     let approved = Inventory {
-        worker_id: "worker-new", boot_id: "dummy-boot-new", image: approval.image,
-        runtime_package: approval.runtime_package, kernel_package: approval.kernel_package,
-        profile: approval.profile, collected_at: 100,
+        worker_id: "worker-new",
+        boot_id: "dummy-boot-new",
+        image: approval.image,
+        runtime_package: approval.runtime_package,
+        kernel_package: approval.kernel_package,
+        profile: approval.profile,
+        collected_at: 100,
     };
     let mut old = Worker {
-        inventory: Inventory { worker_id: "worker-old", boot_id: "dummy-boot-old", runtime_package: "distro-runc-old-build", ..approved },
-        accepting_jobs: true, active_jobs: 2,
+        inventory: Inventory {
+            worker_id: "worker-old",
+            boot_id: "dummy-boot-old",
+            runtime_package: "distro-runc-old-build",
+            ..approved
+        },
+        accepting_jobs: true,
+        active_jobs: 2,
     };
     assert!(!assign(&mut old, &approval, 100));
     assert_eq!(old.active_jobs, 2);
@@ -83,24 +96,51 @@ fn main() {
     record_completion(&mut old);
     assert!(may_retire(&old));
 
-    let mut replacement = Worker { inventory: approved, accepting_jobs: true, active_jobs: 0 };
+    let mut replacement = Worker {
+        inventory: approved,
+        accepting_jobs: true,
+        active_jobs: 0,
+    };
     assert!(assign(&mut replacement, &approval, 100));
     assert_eq!(replacement.active_jobs, 1);
     assert!(!may_start(&replacement, &approval, 121));
     assert!(!may_start(&replacement, &approval, 99));
     let fresh_but_expired = Worker {
-        inventory: Inventory { collected_at: 200, ..approved },
-        accepting_jobs: true, active_jobs: 0,
+        inventory: Inventory {
+            collected_at: 200,
+            ..approved
+        },
+        accepting_jobs: true,
+        active_jobs: 0,
     };
     assert!(!may_start(&fresh_but_expired, &approval, 200));
     for inventory in [
-        Inventory { image: "dummy-image-old", ..approved },
-        Inventory { kernel_package: "distro-kernel-old-build", ..approved },
-        Inventory { profile: "privileged", ..approved },
-        Inventory { worker_id: "", ..approved },
-        Inventory { boot_id: "", ..approved },
+        Inventory {
+            image: "dummy-image-old",
+            ..approved
+        },
+        Inventory {
+            kernel_package: "distro-kernel-old-build",
+            ..approved
+        },
+        Inventory {
+            profile: "privileged",
+            ..approved
+        },
+        Inventory {
+            worker_id: "",
+            ..approved
+        },
+        Inventory {
+            boot_id: "",
+            ..approved
+        },
     ] {
-        let changed = Worker { inventory, accepting_jobs: true, active_jobs: 0 };
+        let changed = Worker {
+            inventory,
+            accepting_jobs: true,
+            active_jobs: 0,
+        };
         assert!(!may_start(&changed, &approval, 100));
     }
     stop_assigning(&mut replacement);

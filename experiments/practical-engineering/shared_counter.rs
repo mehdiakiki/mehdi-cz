@@ -8,7 +8,9 @@ fn shared_count(workers: usize, each: u64) -> u64 {
         for _ in 0..workers {
             let total = &total;
             scope.spawn(move || {
-                for _ in 0..each { total.fetch_add(1, Ordering::Relaxed); }
+                for _ in 0..each {
+                    total.fetch_add(1, Ordering::Relaxed);
+                }
             });
         }
     });
@@ -21,11 +23,16 @@ fn reduced_count(workers: usize, each: u64) -> u64 {
         for _ in 0..workers {
             handles.push(scope.spawn(move || {
                 let mut local = 0_u64;
-                for _ in 0..each { local += black_box(1_u64); }
+                for _ in 0..each {
+                    local += black_box(1_u64);
+                }
                 local
             }));
         }
-        handles.into_iter().map(|handle| handle.join().unwrap()).sum()
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .sum()
     })
 }
 
