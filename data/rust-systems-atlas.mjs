@@ -43,6 +43,7 @@ export const rustSystemsAtlasEditorialSections = {
   "rust-bufread-slices-memory-mapping-copying": "types-memory-unsafe",
   "reuse-compiled-aho-corasick-searchers-rust": "types-memory-unsafe",
   "test-streaming-algorithms-every-chunk-boundary": "types-memory-unsafe",
+  "what-breaks-when-rust-reaches-1-100": "release-compatibility",
 };
 
 export const rustSystemsAtlasSections = [
