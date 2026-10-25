@@ -1,0 +1,418 @@
+---
+title: "Why Does My Rust Program Behave Differently on Another Target?"
+date: "2026-11-03T16:30:00+01:00"
+lastmod: "2026-11-03T16:30:00+01:00"
+tags: ["rust", "FFI", "C ABI", "linker", "systems programming"]
+draft: false
+reviewed: true
+reviewedHash: "8f8a61e3edf525e781a3053fcb396ea80ee25d11fcbec346238c27f6aefea4ca"
+cluster: "rust-under-the-hood"
+campaign: "editorial"
+summary: "When the same Rust code breaks on another target or another machine, I ask four questions in order. Here is the tree, with real outputs from rustc 1.99.1 for ten targets and from runs on my laptop and in three Linux containers."
+---
+
+`c_char`, the Rust type for a C `char`, is `i8` on my x86_64 laptop, `u8` on `aarch64-unknown-linux-gnu`, and `i8` again on `aarch64-apple-darwin`, the same CPU architecture. I checked it without any ARM machine, with rustc 1.99.1 itself.
+
+Differences like this are the [FFI and targets area](/rust-failure-atlas/area/ffi-targets) of my [Rust Failure Atlas](/rust-failure-atlas): 129 records where the host, the target, the linker, the ABI or the libc changes the result. 126 of them have a fixture, and these fixtures run on my x86_64 Linux laptop, so a passing fixture proves the case for this machine, not for the others. This article is the entry point to that area: a tree of questions, where each branch gives the first check and the pages that go deeper.
+
+The usual idea is that Rust code is portable once it compiles: no `int` of unknown size like in C, and the same std everywhere. For most pure Rust code this is true. But a target decides the size of a C `long`, the alignment of `u64`, the byte order, the atomics, how a C function receives its arguments, and which operating system answers when std asks for a file. Change the target and all these answers change together, and the compiler checks only the ones your code wrote down.
+
+So I made an experiment: I asked rustc 1.99.1 about ten targets without their machines, and I ran on my laptop what a laptop can show. Sources and outputs are in [`experiments/rust-atlas/ffi-target-differences`](https://github.com/mehdiakiki/mehdi-cz/tree/main/experiments/rust-atlas/ffi-target-differences), and `run.sh` produces all of them again.
+
+## Four questions, in order
+
+```text
+1. Is it the same compiler?
+   rustc -vV                                     (on each side that builds)
+
+2. Is it the same binary on another machine, or the same source for another target?
+   file ./app
+   rustc --print cfg --target <triple>
+
+3. Same binary: does it start?
+   readelf -lW ./app | grep interpreter
+   objdump -T ./app | grep -oE 'GLIBC_[0-9.]+' | sort -uV | tail -n 1
+
+4. Same source: does it build for the other target?
+   cargo check --target <triple>
+```
+
+The order matters: with two compilers every other comparison is noise, and a binary that does not start has no behavior to compare.
+
+## Question 1: is it the same compiler?
+
+This check is boring and easy to skip. When both sides build the source, run `rustc -vV` on both and compare `release` and `LLVM version`. A binary copied to another machine has only one compiler, so for it go to question 2.
+
+Even a patch version matters. In Rust 1.99.0 an `extern "C"` function returning `bool` could give back values other than 0 and 1 on x86_64, [rust-lang/rust#163911](https://github.com/rust-lang/rust/issues/163911). I compiled the function body from the issue with 1.98.0, 1.99.0 and 1.99.1. Only 1.99.0 drops the `andb $1, %al`, at every optimization level from 0 to 3:
+
+```text
+== rustc +1.99.0 -C opt-level=2, x86_64-unknown-linux-gnu, lowest_bit_is_set
+    movl    %edi, %eax
+    retq
+== rustc +1.99.1 -C opt-level=2, x86_64-unknown-linux-gnu, lowest_bit_is_set
+    movl    %edi, %eax
+    andb    $1, %al
+    retq
+```
+
+At `-O0` it drops even the comparison. The [1.99.1 announcement](https://blog.rust-lang.org/2026/10/15/Rust-1.99.1/) lists it as "Miscompilation of FFI bool return values on x86_64". The reporter saw the value masked on aarch64 and loongarch64, so the same source with the same compiler was correct on one target and wrong on another. The full story is in [How Rust 1.99.0 Returned 16 for false](/blog/how-rust-1-99-0-returned-16-for-false).
+
+## Question 2: the same binary, or the same source?
+
+`file ./app` says what a binary was built for, and `rustc --print cfg --target <triple>` what the compiler assumes for a target, with no machine of that target. Rust 1.99.1, one line per target:
+
+```text
+target                       arch       os       env   family  ptr  endian  panic   features  target_has_atomic
+x86_64-unknown-linux-gnu     x86_64     linux    gnu   unix    64   little  unwind  3         8,16,32,64,ptr
+aarch64-unknown-linux-gnu    aarch64    linux    gnu   unix    64   little  unwind  1         8,16,32,64,128,ptr
+i686-unknown-linux-gnu       x86        linux    gnu   unix    32   little  unwind  3         8,16,32,64,ptr
+x86_64-pc-windows-msvc       x86_64     windows  msvc  windows 64   little  unwind  5         8,16,32,64,128,ptr
+aarch64-apple-darwin         aarch64    macos    -     unix    64   little  unwind  28        8,16,32,64,128,ptr
+wasm32-unknown-unknown       wasm32     unknown  -     wasm    32   little  abort   6         8,16,32,64,ptr
+thumbv7em-none-eabi          arm        none     -     -       32   little  abort   0         8,16,32,ptr
+s390x-unknown-linux-gnu      s390x      linux    gnu   unix    64   big     unwind  0         8,16,32,64,128,ptr
+powerpc64-unknown-linux-gnu  powerpc64  linux    gnu   unix    64   big     unwind  0         8,16,32,64,ptr
+x86_64-unknown-linux-musl    x86_64     linux    musl  unix    64   little  unwind  4         8,16,32,64,ptr
+```
+
+Some lines come back in the branches below. `thumbv7em-none-eabi` has no operating system, no target family and no 64-bit atomics. Two targets abort on panic. s390x and powerpc64 are big-endian. And `features` counts the `target_feature` values that rustc may assume: on x86_64 Linux only `fxsr`, `sse` and `sse2`.
+
+Same binary on another machine: the next three branches. Same source for another target: the five after them.
+
+## Branch: the binary does not start
+
+I built one hello world for x86_64 glibc, x86_64 musl and aarch64 musl, and I started them on my laptop and in docker:
+
+```text
+hello-gnu:     ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2, for GNU/Linux 4.4.0, with debug_info, not stripped
+hello-musl:    ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), static-pie linked, with debug_info, not stripped
+hello-aarch64: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, with debug_info, not stripped
+
+== run hello-gnu, hello-musl, hello-aarch64 on this x86_64 machine
+bash: line 1: $WORK/bin/hello-aarch64: cannot execute binary file: Exec format error
+exit status: 126
+
+== docker image alpine:3.22 (sha256:24ab38714e94)
+ls: /lib64/ld-linux-x86-64.so.2: No such file or directory
+-- sh -c /w/hello-gnu
+sh: /w/hello-gnu: not found
+exit status: 127
+
+== docker image debian:bullseye-slim (sha256:d38033c65c2a)
+ldd (Debian GLIBC 2.31-13+deb11u14) 2.31
+-- sh -c /w/hello-gnu
+/w/hello-gnu: /lib/x86_64-linux-gnu/libc.so.6: version `GLIBC_2.32' not found (required by /w/hello-gnu)
+/w/hello-gnu: /lib/x86_64-linux-gnu/libc.so.6: version `GLIBC_2.33' not found (required by /w/hello-gnu)
+/w/hello-gnu: /lib/x86_64-linux-gnu/libc.so.6: version `GLIBC_2.34' not found (required by /w/hello-gnu)
+exit status: 1
+```
+
+Each message has another cause.
+
+`Exec format error`: the ELF header says `ARM aarch64`, and [execve(2)](https://man7.org/linux/man-pages/man2/execve.2.html) returns this error for an executable that "is for the wrong architecture". The header fields are in [What Is Inside an Executable File](/blog/what-is-inside-an-executable-file-elf-headers-segments-and-sections). With qemu-user registered in [binfmt_misc](https://docs.kernel.org/admin-guide/binfmt-misc.html) the same binary would start in the emulator, and my laptop has no such handler.
+
+`not found` for a file that is there? The missing file is the interpreter, `/lib64/ld-linux-x86-64.so.2`, and Alpine has only the musl loader. That article broke the interpreter path on purpose and got the same kind of error, and [What Happens When You Run a Program](/blog/what-happens-when-you-run-a-program-from-execve-to-main) shows who reads this line.
+
+`GLIBC_2.34 not found`: the [platform support](https://doc.rust-lang.org/rustc/platform-support.html) page says glibc 2.17+ for `x86_64-unknown-linux-gnu`, but my binary asks for this:
+
+```text
+== glibc symbol versions required by hello-gnu (objdump -T)
+GLIBC_2.2.5 GLIBC_2.3 GLIBC_2.3.4 GLIBC_2.14 GLIBC_2.16 GLIBC_2.18 GLIBC_2.28 GLIBC_2.30 GLIBC_2.32 GLIBC_2.33 GLIBC_2.34
+```
+
+The newest come from `__libc_start_main` and some pthread functions. The linker takes the [default version](https://sourceware.org/binutils/docs/ld/VERSION.html) of each function from the libc it links against, and the glibc 2.43 of my laptop has two versions of `__libc_start_main`:
+
+```text
+== versions of __libc_start_main in /usr/lib/libc.so.6 (objdump -T)
+0000000000027770 g    DF .text 0000000000000150  GLIBC_2.34  __libc_start_main
+0000000000027770 g    DF .text 0000000000000150 (GLIBC_2.2.5) __libc_start_main
+```
+
+The default is `GLIBC_2.34`, and the old `GLIBC_2.2.5` one is still there, but only for old binaries. So the glibc floor comes from the glibc of the build machine and from the functions the binary uses, not from the target name. Debian 12 with glibc 2.36 ran it, and the static musl binary ran in all three containers. For `cannot open shared object file`, see [How the Dynamic Loader Finds a Shared Library](/blog/how-the-dynamic-loader-finds-a-shared-library).
+
+## Branch: it starts, then dies with Illegal instruction
+
+I cannot bring an older CPU to my laptop. But I can make my laptop the older CPU:
+
+```text
+/proc/cpuinfo flag avx2: present
+/proc/cpuinfo flag avx512f: absent
+    native                  - Select the CPU of the current host (currently alderlake).
+
+== target_feature entries of x86-64-v4 that x86-64-v3 does not have
+target_feature="avx512bw"
+target_feature="avx512cd"
+target_feature="avx512dq"
+target_feature="avx512f"
+target_feature="avx512vl"
+```
+
+So `x86-64-v4` asks for five AVX-512 features, and this CPU does not even have `avx512f`. The dynamic loader knows it too, and this is the first check on a target machine: `/lib64/ld-linux-x86-64.so.2 --help` lists the x86-64 levels and marks the ones that the CPU supports:
+
+```text
+  x86-64-v4
+  x86-64-v3 (supported, searched)
+```
+
+I built a small `u64` dot product for `x86-64`, `native`, `x86-64-v3` and `x86-64-v4`. The first three printed the result here. The last one:
+
+```text
+== -C target-cpu=x86-64-v4: multiply instructions and registers in dot_u64
+5 vpmullq, 33 %xmm, 41 %ymm
+== -C target-cpu=x86-64-v4: run on this machine
+is_x86_feature_detected!("avx2") = true
+is_x86_feature_detected!("avx512f") = true
+bash: line 1: <pid> Illegal instruction        (core dumped) $WORK/cpu-x86-64-v4
+exit status: 132 (SIGILL)
+```
+
+The hot loop uses `vpmullq`, which the v3 build does not use, and the process died with SIGILL. The line before the crash is stranger: `is_x86_feature_detected!("avx512f")` said `true` on a CPU without AVX-512. How? The [documentation](https://doc.rust-lang.org/std/arch/macro.is_x86_feature_detected.html) explains it: "When the feature is known to be enabled at compile time (e.g. via `-Ctarget-feature`) the macro expands to `true`." So in a binary built for a higher level, the runtime check is not a runtime check anymore.
+
+And SIGILL is the friendly outcome. For x86 [the Reference](https://doc.rust-lang.org/reference/attributes/codegen.html) says: "Executing code with unsupported features is undefined behavior on this platform." `-C target-cpu=native` has the same risk, and its level is whatever CPU did the build. Runtime dispatch belongs in a binary built for the baseline, with only the fast function under `#[target_feature]`, as in [the target_feature case](/rust/failures/target-feature-function-call-requires-unsafe).
+
+## Branch: it starts, but the machine around it is different
+
+When the binary starts on both machines and only behaves differently, compare the environment before the code. The first check is `ldd ./app` and `env` on both machines. A dynamic Rust binary calls `malloc` from libc, so [a preloaded library](/blog/how-ld-preload-replaces-a-function-without-recompiling) changes what runs, and a static binary ignores it. In [What Is on the Stack When a Process Starts](/blog/what-is-on-the-stack-when-a-process-starts-argv-envp-and-auxv), 4,000 more characters of environment moved every local variable of `main` by 4,016 bytes. A static glibc binary that looks up a user who is not in `/etc/passwd` can still load shared NSS modules, and it crashed in [Static or Dynamic Linking](/blog/static-or-dynamic-linking-what-changes-in-the-binary-and-at-startup). For problems before the first line of `main`, see [The Code That Runs Before main](/blog/the-code-that-runs-before-main-start-constructors-and-init-array).
+
+## Branch: the source does not build for the other target
+
+This is the good case: the compiler tells you. I wrote a small library with the assumptions of x86_64 Linux left in the types and in one layout assertion, like code that never saw another target. The important lines:
+
+```rust
+use std::os::unix::fs::PermissionsExt;
+
+#[repr(C)]
+pub struct Header {
+    pub kind: u8,
+    pub len: u64,
+}
+
+const _: () = assert!(size_of::<Header>() == 16, "Header must be 16 bytes");
+
+unsafe extern "C" {
+    fn puts(s: *const i8) -> c_int;
+    fn labs(x: i64) -> i64;
+}
+
+pub fn greet(name: &CStr) -> c_int {
+    unsafe { puts(name.as_ptr()) }
+}
+
+pub fn frame_len(bytes: [u8; 8]) -> u64 {
+    u64::from_ne_bytes(bytes)
+}
+
+pub static REQUESTS: AtomicU64 = AtomicU64::new(0);
+
+pub fn make_private(file: &File) -> io::Result<()> {
+    file.set_permissions(Permissions::from_mode(0o600))
+}
+```
+
+Then `cargo check --target` for nine targets, with the first error of each:
+
+```text
+== cargo check --target x86_64-unknown-linux-gnu: ok
+== cargo check --target aarch64-unknown-linux-gnu: failed
+src/lib.rs:25:19: error[E0308]: mismatched types: expected `*const i8`, found `*const u8`
+== cargo check --target i686-unknown-linux-gnu: failed
+src/lib.rs:17:15: error[E0080]: evaluation panicked: Header must be 16 bytes: evaluation of `_` failed here
+== cargo check --target x86_64-pc-windows-msvc: failed
+src/lib.rs:8:14: error[E0433]: cannot find `unix` in `os`: could not find `unix` in `os`
+== cargo check --target aarch64-apple-darwin: ok
+== cargo check --target wasm32-unknown-unknown: failed
+src/lib.rs:8:14: error[E0433]: cannot find `unix` in `os`: could not find `unix` in `os`
+== cargo check --target thumbv7em-none-eabi: failed
+error[E0463]: can't find crate for `std`
+== cargo check --target s390x-unknown-linux-gnu: failed
+src/lib.rs:25:19: error[E0308]: mismatched types: expected `*const i8`, found `*const u8`
+== cargo check --target powerpc64-unknown-linux-gnu: failed
+src/lib.rs:25:19: error[E0308]: mismatched types: expected `*const i8`, found `*const u8`
+```
+
+Seven of nine targets refuse it, and each error is a branch:
+
+- E0308: `CStr::as_ptr` returns `*const c_char`, and `c_char` is `u8` on these three targets. Declare `c_char`, the boring boundary types of [A Rust FFI Boundary Is More Than repr(C)](/blog/rust-ffi-guide).
+- E0080: `Header` is 12 bytes on i686, see [the padding case](/rust/failures/const-layout-assertion-fails-padding).
+- E0433: `std::os::unix` exists only on Unix, and its permission model has its own traps, like [set_readonly(false)](/rust/failures/permissions-set-readonly-false-enables-all-unix-write-bits).
+- E0463: there is no std on bare metal. The atlas has the next steps: [one panic handler](/rust/failures/a-no-std-binary-needs-exactly-one-panic-handler) and [Vec from alloc](/rust/failures/vec-in-no-std-comes-from-the-alloc-crate).
+
+macOS accepted everything: Apple writes that on its arm64 platforms "The `char` type is a signed type".
+
+Some problems stay outside of `cargo check`. A build script can compile C code [for the host instead of the target](/rust/failures/native-dependency-built-for-host), and host tools can get [other features than target code](/blog/cargo-feature-unification-across-workspaces-host-tools-and-targets). And an `extern` block can compile and then fail at link time with [an undefined symbol](/rust/failures/extern-function-compiles-but-linker-symbol-missing), for the reason in [Why "Undefined Reference" Is a Linker Error, Not a Compiler Error](/blog/why-undefined-reference-is-a-linker-error-not-a-compiler-error).
+
+And `labs(i64)` and `from_ne_bytes` are wrong on some of these targets, but no target complained.
+
+## Branch: it builds, but a number is different
+
+`cargo check` sees types, `cfg` and `const` evaluation, not a wrong value. So I wanted the numbers of each target: a `no_std` probe computes them in `const` context and writes them as text into the object file. Nothing runs on the target, its compiler does the work:
+
+```text
+target                       c_char c_int c_long usize align_u64 align_f64 align_u128 align_AtomicU64 size_Header first_byte_of_0x01020304
+x86_64-unknown-linux-gnu     i8     4     8      8     8         8         16         8               16          04
+aarch64-unknown-linux-gnu    u8     4     8      8     8         8         16         8               16          04
+i686-unknown-linux-gnu       i8     4     4      4     4         4         16         8               12          04
+x86_64-pc-windows-msvc       i8     4     4      8     8         8         16         8               16          04
+aarch64-apple-darwin         i8     4     8      8     8         8         16         8               16          04
+wasm32-unknown-unknown       i8     4     4      4     8         8         16         8               16          04
+thumbv7em-none-eabi          u8     4     4      4     8         8         8          none            16          04
+s390x-unknown-linux-gnu      u8     4     8      8     8         8         8          8               16          01
+powerpc64-unknown-linux-gnu  u8     4     8      8     8         8         16         8               16          01
+```
+
+- `c_long` is 4 bytes on Windows x64, i686, wasm32 and thumbv7em. Its [documentation](https://doc.rust-lang.org/core/ffi/type.c_long.html) says it directly: "many Linux-based systems assume an `i64`, but Windows assumes `i32`".
+- On i686, `u64` and `f64` are aligned to 4, so `Header` is 12 bytes, while `AtomicU64` stays at 8. [The Reference](https://doc.rust-lang.org/reference/conditional-compilation.html) uses this case to explain `target_has_atomic_primitive_alignment`, which i686 does not set for 64.
+- On s390x and powerpc64, `0x01020304` starts with `01` in memory, so `from_ne_bytes` reads the same frame bytes as another number. The byte order belongs to the format, not to the machine.
+
+The layout rules are in [Where a Type Becomes a Layout](/blog/where-a-type-becomes-a-layout-fields-padding-and-reordering). Alignment also decides if [a packed field may be borrowed](/rust/failures/repr-packed-implicit-unaligned-reference), and an enum that crosses C needs [a representation both sides agree on](/rust/failures/ffi-enum-new-variant).
+
+## Branch: the C side disagrees
+
+A wrong declaration is the dangerous case, because it compiles everywhere. The first check is the C header of the target, next to the `extern` block: every `long`, `char` and `...` there must be `c_long`, `c_char` and `...` here. `fn labs(x: i64) -> i64` matches C on x86_64 Linux only because `long` is 8 bytes there. My laptop can run i686 binaries, so I tried it:
+
+```text
+== i686-unknown-linux-gnu, -C opt-level=0
+x86: c_long is 4 bytes, labs(-5000000000) declared with i64 returned -3028092405585415680
+exit status: 0
+LLVM IR lines that call labs or llvm.abs:
+    %2 = call i64 @labs(i64 %1) #8
+== i686-unknown-linux-gnu, -C opt-level=2
+x86: c_long is 4 bytes, labs(-5000000000) declared with i64 returned 5000000000
+exit status: 0
+LLVM IR lines that call labs or llvm.abs:
+    %1 = call i64 @llvm.abs.i64(i64 %0, i1 true)
+```
+
+The debug build gives a wrong number. The release build gives the right one only because the optimizer replaced the call with `llvm.abs.i64`, so the C function was never called. A release test on i686 passes with the wrong declaration. I did not expect this one.
+
+The wrong number is `0xd5fa0e002a05f200` in hex. Its low half is 705032704, the `labs` of the low 32 bits of -5000000000. Its high half is `0xd5fa0e00`, those low 32 bits themselves, which glibc's i386 `labs` leaves in `edx`.
+
+Variadic functions are worse, because the declaration decides how the call is made. I declared `printf` once with `...` and once with a fixed `c_int`. On aarch64 Linux the two calls are identical, and on x86_64 Linux they differ by one `xorl %eax, %eax`: for a variadic call, `%al` says how many vector registers carry arguments, here zero. On aarch64 macOS:
+
+```text
+== aarch64-apple-darwin, printf declared as (format, ...)
+    sub     sp, sp, #32
+    stp     x29, x30, [sp, #16]
+    add     x29, sp, #16
+    str     x0, [sp]
+    adrp    x0, l_anon.cf33152120f583e3d8cb86b98ba719ce.0@PAGE
+    add     x0, x0, l_anon.cf33152120f583e3d8cb86b98ba719ce.0@PAGEOFF
+    bl      _printf
+    ldp     x29, x30, [sp, #16]
+    add     sp, sp, #32
+    ret
+== aarch64-apple-darwin, printf declared as (format, value: c_int)
+    mov     x1, x0
+    adrp    x0, l_anon.cf33152120f583e3d8cb86b98ba719ce.0@PAGE
+    add     x0, x0, l_anon.cf33152120f583e3d8cb86b98ba719ce.0@PAGEOFF
+    b       _printf
+```
+
+The variadic call stores the value on the stack, `str x0, [sp]`, and the wrong declaration passes it in `x1`. [Apple's ARM64 documentation](https://developer.apple.com/documentation/xcode/writing-arm64-code-for-apple-platforms) puts each variadic argument in 8-byte stack slots, so printf reads a slot that this call never wrote. The rules: [a compatible ABI](/rust/failures/c-variadic-function-needs-compatible-abi) and [default argument promotions](/rust/failures/c-variadic-calls-require-default-argument-promotions). Defining C-variadic functions in Rust became stable in [Rust 1.99.0](https://blog.rust-lang.org/2026/10/01/Rust-1.99.0/), see [Defining C Variadic Functions in Rust 1.99](/blog/defining-c-variadic-functions-in-rust-1-99).
+
+Text changes shape at this boundary too. A `&str` is a pointer and a length, see [Where a Rust String Literal Actually Lives](/blog/rust-string-literal-under-the-hood), while a C string ends at its first zero byte. That is why [CString::new rejects interior NUL bytes](/rust/failures/cstring-new-rejects-interior-nul).
+
+Two contracts are not in the C signature. For the first one, Rust has a place in the ABI string: with `extern "C"` [a panic at the boundary aborts](/rust/failures/panic-crosses-extern-boundary), and `extern "C-unwind"` lets it unwind through C frames, but the C side of the signature has no place for it. For the second one there is no place at all: no signature says [which side frees a pointer](/rust/failures/ffi-memory-freed-wrong-allocator).
+
+## Branch: the concurrent test passes only on x86_64
+
+Here the build is the same everywhere. One atomic load, weak and strong:
+
+```text
+== x86_64-unknown-linux-gnu load_relaxed
+    movl    (%rdi), %eax
+    retq
+== x86_64-unknown-linux-gnu load_acquire
+    movl    (%rdi), %eax
+    retq
+== aarch64-unknown-linux-gnu load_relaxed
+    ldr     w0, [x0]
+    ret
+== aarch64-unknown-linux-gnu load_acquire
+    ldar    w0, [x0]
+    ret
+```
+
+On x86_64 both loads are the same `movl`, and the Relaxed and Release stores are the same too. On aarch64 they are `ldr` and `ldar`, `str` and `stlr`. So a test on x86_64 runs the same instruction for the wrong ordering and for the right one. The [Rustonomicon](https://doc.rust-lang.org/nomicon/atomics.html) says that guarantees which are too weak on strongly-ordered hardware are "more likely to _happen_ to work", and that concurrent algorithms "should be tested on weakly-ordered hardware". To choose the ordering from a proof instead of from the assembly, see [When Relaxed Atomics Are Enough](/blog/when-relaxed-atomics-are-enough-and-what-they-never-guarantee) and [Atomic Fences in Rust Without Hand-Waving](/blog/atomic-fences-in-rust-without-hand-waving).
+
+## Branch: the operating system says no
+
+`wasm32-unknown-unknown` has std, but no operating system behind it. My module asked node for zero imports, and this is what std did:
+
+```text
+imports requested by the module: 0
+std::fs::read -> Err(kind: Unsupported, message: "operation not supported on this platform")
+std::thread::Builder::spawn -> Err(kind: Unsupported, message: "operation not supported on this platform")
+SystemTime::now -> RuntimeError: unreachable
+  panic hook saw -> panicked: time not implemented on this platform
+```
+
+The build was green. The file and the thread are errors the code can handle. The clock is a panic, and with `panic="abort"` node sees only `unreachable`, so I needed a panic hook to read the message. On my Linux laptop, [What a System Call Costs](/blog/what-a-system-call-costs-and-why-some-calls-skip-the-kernel) measured `Instant::now()` at 14.9 ns, through the vDSO and without entering the kernel.
+
+Between Unix and Windows, the same std functions follow the platform rules for [joining a path](/rust/failures/path-join-absolute-component-replaces-base), for [a list of paths](/rust/failures/join-paths-rejects-an-element-containing-the-list-separator) and for [OS strings](/rust/failures/osstr-to-str-can-return-none-on-unix).
+
+## The patches people try
+
+Every branch has a quick patch.
+
+A cast. `name.as_ptr() as *const i8` removes the E0308 on aarch64, and `labs(x as c_long)` compiles without a warning. On i686, where `long` is 4 bytes like on Windows, the cast cut -5000000000 to 32 bits and the function returned 705032704. The error was the useful part.
+
+A `#[cfg(target_os = "linux")]` around the failing line. The build is green, and the other target has no code for this case.
+
+`-C target-cpu=native` in `.cargo/config.toml`, because the benchmark is faster. The v4 run shows what it means on a machine with fewer features.
+
+A CI only on x86_64 Linux. It has an 8-byte `long`, little-endian bytes and a strongly ordered CPU, so it confirms exactly the assumptions that the other targets break.
+
+## What I do now
+
+In the named version of the library, I wrote each assumption down: `c_char` and `c_long` in the declarations, `from_le_bytes` for a little-endian frame, an explicit encoding of `Header`, `cfg(unix)` with an `Unsupported` error elsewhere, and `compile_error!` without 64-bit atomics. One `cargo check` covers all its targets:
+
+```text
+== cargo +1.99.1 check --target x86_64-unknown-linux-gnu --target aarch64-unknown-linux-gnu --target i686-unknown-linux-gnu --target x86_64-pc-windows-msvc --target aarch64-apple-darwin --target wasm32-unknown-unknown --target s390x-unknown-linux-gnu --target powerpc64-unknown-linux-gnu
+    Checking named v0.1.0 (<fixture>/assumptions/named)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in <time>
+exit status: 0
+```
+
+`thumbv7em-none-eabi` still fails, and this is correct, the crate needs std:
+
+```text
+error[E0463]: can't find crate for `std`
+  |
+  = note: the `thumbv7em-none-eabi` target may not support the standard library
+  = note: `std` is required by `named` because it does not declare `#![no_std]`
+```
+
+My `compile_error!` guard for 64-bit atomics never fires there, because std fails first: without the prelude, even `compile_error` is not found.
+
+For binaries, the CPU level and the glibc floor should be choices. `x86-64-v3` is a level you can check, `native` depends on the machine that builds. Link in the oldest userland you support, or ship a static musl binary.
+
+The runtime branches need a run on the target. i686 is easy on x86_64 Linux with 32-bit glibc, the others need hardware or an emulator, and the atomics need weakly-ordered hardware.
+
+## The tradeoffs
+
+`cargo check --target` missed `labs(i64)` and `from_ne_bytes`, and a full build misses them too: the i686 `labs` probe compiled, linked and ran, because the linker matches the name `labs`, not its type. A check sees even less than a build. The [Cargo book](https://doc.rust-lang.org/cargo/commands/cargo-check.html) says that some errors appear only during code generation, and a check stops before code generation, so it also never reaches the linker.
+
+Each target costs a `rustup target add` and CI time, although eight targets were still one command. A static musl binary does not need the glibc of the machine, but it also loses what the dynamic loader offers, `LD_PRELOAD` for example. And a fixed CPU level excludes the older machines, on purpose this time.
+
+## The principle under all of this
+
+A target triple looks like a name, but it is a list of answers, and the machine adds more answers. My laptop gives one set: from the triple an 8-byte `long`, a signed `char`, `u64` aligned to 8, little-endian bytes and a strongly ordered CPU, and from the machine AVX2 and glibc 2.43. A fixture that passes on it proves its case under these answers, not under the others.
+
+So portable code is not code without assumptions. It is code that writes them down where a compiler can check them: `c_long` says what `i64` only guessed, and `from_le_bytes` names the byte order of the format. Then `cargo check --target` asks the compiler of each target the same questions, before the machine of a user does. The rest needs a run on the target, and even a run can miss it: on i686 the release build passed with the wrong `labs`.
+
+More on this cluster: the [Rust under the hood](/blog/topics/rust-under-the-hood) topic hub, and everything tagged [FFI](/blog/tags/ffi/page/1).
+
+## Sources
+
+- [Announcing Rust 1.99.1](https://blog.rust-lang.org/2026/10/15/Rust-1.99.1/) and [rust-lang/rust#163911](https://github.com/rust-lang/rust/issues/163911)
+- [Announcing Rust 1.99.0](https://blog.rust-lang.org/2026/10/01/Rust-1.99.0/)
+- [Platform support](https://doc.rust-lang.org/rustc/platform-support.html)
+- [Conditional compilation](https://doc.rust-lang.org/reference/conditional-compilation.html), [code generation attributes](https://doc.rust-lang.org/reference/attributes/codegen.html) and [unwinding](https://doc.rust-lang.org/reference/items/functions.html#unwinding)
+- [execve(2)](https://man7.org/linux/man-pages/man2/execve.2.html) and [binfmt_misc](https://docs.kernel.org/admin-guide/binfmt-misc.html)
+- [The ld VERSION command](https://sourceware.org/binutils/docs/ld/VERSION.html)
+- [The x86-64 psABI](https://gitlab.com/x86-psABIs/x86-64-ABI)
+- [`is_x86_feature_detected!`](https://doc.rust-lang.org/std/arch/macro.is_x86_feature_detected.html) and [`c_long`](https://doc.rust-lang.org/core/ffi/type.c_long.html)
+- [The Rustonomicon on atomics](https://doc.rust-lang.org/nomicon/atomics.html)
+- [Writing ARM64 code for Apple platforms](https://developer.apple.com/documentation/xcode/writing-arm64-code-for-apple-platforms)
+- [cargo check](https://doc.rust-lang.org/cargo/commands/cargo-check.html)

@@ -1,0 +1,240 @@
+---
+title: "How Rust 1.99.0 Returned 16 for false"
+date: "2026-10-26T16:40:00+01:00"
+lastmod: "2026-10-26T16:40:00+01:00"
+tags: ["rust", "ffi", "c-abi", "x86", "compiler"]
+draft: false
+reviewed: true
+reviewedHash: "30c219c62e5b72289bd547f57b9f0048283d1e8e61cba114f9c5b29fa255d03c"
+cluster: "rust-under-the-hood"
+campaign: "editorial"
+summary: "Rust 1.99.0 forgot one attribute on FFI functions that return bool on x86_64 Linux, and C callers got 16 where Rust computed false. I rebuilt the bug with three toolchains, gcc and clang, to see what this value does in C and how to tell a compiler bug from my own ABI mistake."
+---
+
+On Saturday I moved the 694 fixtures of my [Rust Failure Atlas](/rust-failure-atlas) to Rust 1.99.1. A point release means that something could not wait for Rust 1.100, so I read [why this one exists](https://blog.rust-lang.org/2026/10/15/Rust-1.99.1/). It fixes three regressions, and one of them is a miscompilation: on x86_64 Linux, a Rust function exported to C with a `bool` return type could give C a value that is not 0 and not 1.
+
+FFI and targets is one of the six areas of the atlas, so I wanted to understand this one completely. I made an experiment to see which builds get the wrong value and what C does with it. And I wanted to know how I would see that it is the compiler and not my own code.
+
+## The report
+
+Wesley Moore reported the bug on October 7 in [rust-lang/rust#163911](https://github.com/rust-lang/rust/issues/163911), with a small [reproduction](https://github.com/yeslogic/rust-bool-ffi). The Rust side is this function:
+
+```rust
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_fn_returning_bool(flags: u8) -> bool {
+    (flags & 0x1) == 0x1
+}
+```
+
+The C side declares it as `extern bool rust_fn_returning_bool(unsigned char);`, calls it with `0x10` and prints `(int)ret`. Bit 0 of `0x10` is zero, so the function computes `false`, and C should print 0. It printed 16, with gcc and with clang. The reporter reproduced it only on x86_64. On aarch64 and loongarch64 the value was masked before the return. He also posted the machine code of both versions: in 1.99.0, the `and` is missing.
+
+## Same type on both sides
+
+My first reaction was: how? A Rust `bool` is one byte with 0 or 1, and a C `bool` too. The signatures match, so there is nothing to convert. Right?
+
+But the type does not cross the boundary. The caller gets a register, `%rax` on x86_64, and a `bool` lives in its lowest byte, `%al`. A register has only bits, as I wrote for arithmetic in [The Processor Has No Types](/blog/the-processor-has-no-types-what-add-does-to-bits-it-does-not-understand). Which bits mean what is written in the ABI, and both compilers have to follow it.
+
+For x86_64 Linux this is the [System V psABI](https://gitlab.com/x86-psABIs/x86-64-ABI). For a value returned in a register, it says that "the excess bits that would not be present in the memory representation of the type" are unspecified. A footnote adds for `_Bool`: "the lowest 8 bits are significant, together forming the value 0 or 1". From 2010 to [March 2025](https://gitlab.com/x86-psABIs/x86-64-ABI/-/commit/e1ce098331da5dbd66e1ffc74162380bcc213236) the text was even more direct: "bit 0 contains the truth value and bits 1 to 7 shall be zero".
+
+So a function that returns a `bool` has one duty: the low byte must be `0x00` or `0x01`. The other 56 bits can be anything, and the caller can trust the low byte without checking it.
+
+## The experiment
+
+I built the function from the report as a static library with Cargo, with Rust 1.98.0, 1.99.0 and 1.99.1, in debug and in release. I linked each library with a small C program, compiled by gcc 15.2.1 and clang 21.1.8 at `-O0`, `-O1` and `-O2`. That makes 36 builds. Each one calls the function with four inputs: `0x00` and `0x01`, the values a normal test uses, and `0x10` and `0x11`, which set a bit that the function must ignore.
+
+The program prints two numbers. `ret` is `(int)ret`, like in the report. `al` is the byte that Rust left in the register. To get it, I declared the symbol a second time with an `unsigned char` return, through an asm label, so the C compiler reads the byte without any `bool` assumption.
+
+Everything ran on my x86_64 Linux machine. The sources, the results and a `run.sh` that runs it all again are in [`experiments/rust-atlas/rust-1-99-bool-ffi`](https://github.com/mehdiakiki/mehdi-cz/tree/main/experiments/rust-atlas/rust-1-99-bool-ffi).
+
+## Who sees 16
+
+The results for the input `0x10`:
+
+| Rust library | `al` | gcc `-O0`, `-O1`, `-O2` | clang `-O0` | clang `-O1`, `-O2` |
+| --- | --- | --- | --- | --- |
+| 1.98.0, debug and release | `0x00` | 0 | 0 | 0 |
+| 1.99.0, debug and release | `0x10` | 16 | 0 | 16 |
+| 1.99.1, debug and release | `0x00` | 0 | 0 | 0 |
+
+With `0x11` the correct answer is 1, and these builds print 17. The inputs `0x00` and `0x01` gave 0 and 1 in all 36 builds. So a test that checks only these two values passes on 1.99.0.
+
+Two results were not obvious for me. First, the debug build of 1.99.0 is broken too. I thought that without optimizations the function computes the `&` and the `==` one after the other and returns a clean result. It does not. Second, clang at `-O0` prints the correct 0, with the broken library. I come back to both below.
+
+## One missing word
+
+This is the release build of the function, from `objdump -d`:
+
+```text
+== rust 1.98.0 release
+0000000000000000 <rust_fn_returning_bool>:
+   0:	mov    %edi,%eax
+   2:	and    $0x1,%al
+   4:	ret
+== rust 1.99.0 release
+0000000000000000 <rust_fn_returning_bool>:
+   0:	mov    %edi,%eax
+   2:	ret
+```
+
+1.99.1 is identical to 1.98.0. The argument arrives in `%edi`. 1.98.0 copies it to `%eax`, and the `and` keeps only bit 0 of the low byte. 1.99.0 copies it and returns, so for `0x10` the register still holds `0x10`.
+
+The LLVM IR shows why the `and` is gone. If IR is new for you, I wrote about [how a Rust function becomes LLVM IR](/blog/how-a-rust-function-becomes-llvm-ir-without-losing-the-plot). This is the release function from `--emit=llvm-ir` in 1.99.0:
+
+```llvm
+define noundef i1 @rust_fn_returning_bool(i8 noundef zeroext %flags) unnamed_addr #0 !guid !4 {
+start:
+  %_0 = trunc i8 %flags to i1
+  ret i1 %_0
+}
+```
+
+And in 1.99.1:
+
+```llvm
+define noundef zeroext i1 @rust_fn_returning_bool(i8 noundef zeroext %flags) unnamed_addr #0 !guid !4 {
+start:
+  %_0 = trunc i8 %flags to i1
+  ret i1 %_0
+}
+```
+
+The body did not change: the return value is an `i1`, one bit, taken from the low bit of `flags`. The difference is one word in the first line, `zeroext` on the return type. In the [LLVM reference](https://llvm.org/docs/LangRef.html#parameter-attributes), it asks the callee to zero-extend the return value as far as the ABI requires, and for a `bool` on x86_64 this means a clean low byte. Without it, only bit 0 must be right, so LLVM leaves the other bits as they came in `%edi`. LLVM did nothing wrong. It did what the IR allowed.
+
+The debug build has the same problem. Its IR still has the `and` and the comparison, but the `define` line has no `zeroext` either. So only bit 0 of the result must be right, and bit 0 of `(flags & 1) == 1` is bit 0 of `flags`. LLVM uses this freedom even without optimizations:
+
+```text
+== rust 1.99.0 debug
+0000000000000000 <rust_fn_returning_bool>:
+   0:	mov    %dil,%al
+   3:	mov    %al,-0x1(%rsp)
+   7:	ret
+```
+
+The store is the copy of `flags` for the debugger. In 1.98.0 and 1.99.1, four more instructions follow it before the `ret`, and the last one is `and $0x1,%al`.
+
+One more detail convinced me. 1.99.0 and 1.99.1 use the same LLVM, 23.1.1, and their release IR bodies are identical. Only the `zeroext` and the machine code differ. So the change is in what rustc asks from LLVM, not in LLVM. With only 1.98.0, which has LLVM 22.1.8, I could not say this.
+
+And this is the other side of the call, how clang declares the function when it compiles my C program at `-O2`:
+
+```llvm
+declare zeroext i1 @rust_fn_returning_bool(i8 noundef zeroext) local_unnamed_addr #3
+```
+
+clang has the `zeroext`. So the caller was compiled for a promise that rustc 1.99.0 did not give. Two compilers describe one function, and the descriptions differ by one word.
+
+## What C does with 16
+
+If bits 1 to 7 are zero, a C compiler can test the whole byte or only bit 0, and the answer is the same. So each compiler chooses what it prefers. With 16, the choice changes the answer.
+
+I wrote one small C function per expression. Each one calls Rust and uses the result one time. For `0x10`, where Rust computed `false`, with the 1.99.0 release library:
+
+| Expression | Correct | gcc `-O0` | gcc `-O2` | clang `-O0` | clang `-O2` |
+| --- | --- | --- | --- | --- | --- |
+| `if (ret)` | else | then | then | else | then |
+| `if (!ret)` | then | then | else | then | else |
+| `if (ret == true)` | else | then | then | else | then |
+| `(int)ret` | 0 | 16 | 16 | 0 | 16 |
+| `!ret` | 1 | 17 | 17 | 1 | 17 |
+| `!!ret` | 0 | 16 | 16 | 0 | 16 |
+| `ret & 1` | 0 | 0 | 16 | 0 | 16 |
+
+`-O1` gave what `-O2` gave for both compilers, and the 1.99.0 debug library matched release.
+
+The machine code of the callers explains the table. gcc, and clang with optimizations, test the whole byte, for example with `test %al,%al`, so 16 is true. clang at `-O0` looks only at bit 0, with `test $0x1,%al` or `and $0x1,%al`, and bit 0 of 16 is zero, so clang finds the correct answer by accident. For `!ret`, gcc at every level and clang with optimizations flip bit 0 with `xor $0x1`. For 0 and 1 this is a correct negation, for 16 it gives 17.
+
+The column I like the least is gcc `-O0`: `if (ret)` and `if (!ret)` both go to `then`. The value is true, and its negation is true too. gcc computes `!ret` with `xor $0x1,%eax` and then tests the byte, and `0x10` with bit 0 flipped is `0x11`, not zero.
+
+## The patches that do not help
+
+The first idea is to clean the value in C. `!!ret` is the classic C way to turn any number into 0 or 1, and `ret & 1` keeps only the bit that matters. In the table both still give 16 with `-O2`. They are correct C, but for a `bool` they change nothing, so the compiler deletes them, and only a `movzbl %al,%eax` is left. gcc deletes `!!ret` even at `-O0`. The `& 1` survives at gcc `-O0` and gives 0, but code that is correct only without optimizations is not a fix. The normalization relies on the promise that is broken, so it cannot repair it.
+
+The second idea is a debug build of the Rust library. We saw that 1.99.0 debug also returns the raw byte.
+
+The third idea is the one I would try first in a real project: test the function from Rust. So I tested also a Rust caller. It declares the function in an `unsafe extern "C"` block, calls it and prints the result. I built it with each toolchain and linked it with the function compiled by each toolchain. Here are two of the blocks, where I kept only the line for `0x10`:
+
+```text
+== caller rust 1.99.0 opt-level=3, function compiled by rust 1.99.0
+flags=0x10 ret=false as_u8=0
+== caller rust 1.99.1 opt-level=3, function compiled by rust 1.99.0
+flags=0x10 ret=true as_u8=16
+```
+
+With 1.99.0 on both sides the answer is correct. The 1.99.0 caller declares the function without `zeroext` too, so it does not trust bits 1 to 7 and clears them itself, with an `and` after the call. The 1.99.1 caller uses `%al` as it is. From `--emit=asm`, where I kept the first of the four calls:
+
+```text
+== caller rust 1.99.0 opt-level=3
+	movq	rust_fn_returning_bool@GOTPCREL(%rip), %rbx
+	callq	*%rbx
+	andb	$1, %al
+== caller rust 1.99.1 opt-level=3
+	movq	rust_fn_returning_bool@GOTPCREL(%rip), %rbp
+	callq	*%rbp
+	movb	%al, 5(%rsp)
+```
+
+A caller is allowed to clear the bits, it only costs one instruction. So the 1.99.0 caller never uses the promise that the function breaks, and a Rust test of an FFI function, built by the same compiler as the function, cannot see this bug. Only a caller that uses the promise can see it, like most of the C builds, or a Rust caller from another version.
+
+The 1.99.1 result is worse. A caller from 1.99.1, linked with a function that 1.99.0 compiled, gets a Rust `bool` that holds 16. The [Reference](https://doc.rust-lang.org/reference/types/boolean.html) says: "It is undefined behavior for an object with the boolean type to have any other bit pattern." The caller from 1.98.0 also gets 16. So the upgrade is complete only when every library with such a function is rebuilt. If you shipped a static or shared library built with 1.99.0, its users need a new build.
+
+## Compiler bug or my own mistake?
+
+When C gets a strange value from my Rust function, my first suspect is not the compiler. It is me. A header that does not match the Rust code gives the same kind of strange values, and on every compiler. So I made a common `bool` mistake on purpose, to compare.
+
+`rust_fn_returning_bool_u32` is the same check on a `u32`, and its C header says `int` instead of `bool`. This happens with a header written by hand, or in a code base where booleans are integers, like GLib, where `gboolean` is a [`typedef` of `gint`](https://gitlab.gnome.org/GNOME/glib/-/blob/main/glib/gtypes.h), which is `int`. With the release libraries, for the word `0x12345601`:
+
+```text
+word=0x12345601 ret=305419777 ret==1:no
+```
+
+This line is identical for 1.98.0, 1.99.0 and 1.99.1, with gcc and clang at every level. The `int` reads all 32 bits of `%eax`, and the function leaves the upper bits of the input there, which is allowed for a `bool`. With the correct `bool` prototype, this call prints 1 in all 36 builds. Its low byte is `0x01`, so the 1.99.0 bug cannot show here.
+
+So the two bugs have different shapes. My own mistake is wrong on every toolchain. The compiler bug changes with the toolchain, with the same source and the same header. This gives me an order for the checks:
+
+1. Compare the two declarations type by type, including the return type. A `bool` on one side and an `int` on the other is my bug, whatever the compiler does.
+2. Build the library with two or three toolchains, for example the previous stable, the current stable and a nightly, and run the same C caller against each one. If the value changes from one toolchain to another, suspect the compiler. Do not wait for only one of them to be wrong: at the time of the report, the nightly had the bug too.
+3. Compare between these toolchains the `define` line of the function in `--emit=llvm-ir`, and the last instructions before the `ret` in `objdump -d --disassemble=<symbol>`. Here the whole difference was one `zeroext` and one `and`.
+4. Use inputs with bits that the function must ignore, like `0x10`, because `0x00` and `0x01` passed everywhere. My atlas case about [a Rust enum that crossed C](/rust/failures/ffi-enum-new-variant) has the same lesson: a test with only the known values cannot show a validity problem.
+5. Compile the C caller with more than one compiler and level. clang at `-O0` hid this bug.
+
+In [A Rust FFI Boundary Is More Than repr(C)](/blog/rust-ffi-guide) I recommended a real C harness in CI. This bug adds two details to it: inputs with bits that the function must ignore, and more than one C build.
+
+## What 1.99.1 changed
+
+Most of this story was found in the issue. Half an hour after the report, asquared31415 saw the missing `zeroext` in the IR and the UEFI target of the test, and a bit later they named the two changes behind it. I checked each part in the PRs and in the source of 1.99.0.
+
+Before 1.99, rustc had one general rule: a `bool` is always zero-extended, in every ABI. On AArch64 this rule promised too much. There the ABI leaves the unused bits of the register unspecified, and Rust code trusted bits of a C `bool` return that C does not have to clean ([#159244](https://github.com/rust-lang/rust/issues/159244)). The fix for that, [#159317](https://github.com/rust-lang/rust/pull/159317) in 1.99, kept the rule only for the Rust ABI and let the ABI code of each target decide for `extern "C"`.
+
+But the x86_64 System V code did not extend return values anymore. Since Rust 1.89 ([#142389](https://github.com/rust-lang/rust/pull/142389), a fix for the Cranelift backend that also changed this code) it does it only on Apple targets, because the psABI does not ask for it for integers, and GCC and Clang do not do it. For `bool` the psABI does ask for it, and after #159317 no code said so anymore. The Windows code and the Apple case still extend, so only Linux, the BSDs and the other System V targets lost the `zeroext`.
+
+In fact, #159317 itself added a `bool` case to a codegen test, and for x86_64 the test expects `zeroext i1`. But the x86_64 case of this test compiled for `x86_64-unknown-uefi`, as it did before. For rustc this target is Windows-like, so its `extern "C"` functions go through the Windows x64 ABI code, not the System V code of Linux, and the test passed. This part surprised me when I read the test.
+
+The fix is [#163917](https://github.com/rust-lang/rust/pull/163917), written by Ben Kimock, approved by Jieyou Xu and Nikita Popov, and merged on October 10. It adds a rule for `bool` returns to the x86_64 System V code, with this comment: "The x86_64 psABI requires bools to be zero-extended to 8-bits, with high bits unspecified." And it adds an `x86_64-unknown-linux-gnu` case to the test. It was backported in [#164232](https://github.com/rust-lang/rust/pull/164232), and Rust 1.99.1 came out on October 15, eleven days before this article.
+
+## If you cannot upgrade yet
+
+The real fix is 1.99.1, plus a rebuild of everything that 1.99.0 compiled. Staying on 1.98 also works for this bug. The matrix shows it for 1.98.0, and 1.98.1, which fixed a vtable miscompilation, did not change this ABI code. But then you lose the rest of 1.99. If you must stay on 1.99.0 for some time, I tested one workaround: do not return `bool` through the C ABI, return a `u8`.
+
+```rust
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_fn_returning_u8(flags: u8) -> u8 {
+    u8::from((flags & 0x1) == 0x1)
+}
+```
+
+The C header says `uint8_t`, and the C code tests `ret != 0`. All 36 builds printed the correct answer for the four inputs, 1.99.0 included. A `u8` has no extension rule that a compiler can forget: its 8 bits are the value, so the function must compute them. In release, 1.99.0 compiles it to the same three instructions that 1.98.0 and 1.99.1 produce for the `bool` version:
+
+```text
+== rust 1.99.0 release
+0000000000000000 <rust_fn_returning_u8>:
+   0:	mov    %edi,%eax
+   2:	and    $0x1,%al
+   4:	ret
+```
+
+OK, so at runtime it costs nothing. The cost is in the interface. The header changes from `bool` to `uint8_t`, so the promise "only 0 or 1" moves into the documentation and the tests. In your own repository this is easy, for a published library it is an API change. And it fixes only the functions you change. Every other `extern "C"` function that returns `bool`, in your code or in your dependencies, still needs the fixed compiler, and the upgrade fixes all of them at once. So for an existing `bool` API I would use the workaround only until the upgrade. For a new API, it is the boundary type that I recommended in [my FFI article](/blog/rust-ffi-guide): a `uint8_t` with documented values 0 and 1, and the strong Rust type only on the inside.
+
+## The rule under this bug
+
+A `bool` in a signature is information for the compiler that reads this signature. At an ABI boundary there are two compilers, and the only thing they share is a document about bits in registers. rustc 1.99.0 and clang both said `bool`, and they disagreed about seven bits. Only a caller that relied on those seven bits showed the problem, and only for inputs that put something in them.
+
+So two matching signatures are not enough for me. I test the boundary itself: the caller is built by a C compiler at more than one level, not only by the rustc that built the function, and the inputs set bits that the function must clean. When a result is wrong and the two declarations match, I read what crossed the boundary: the `define` line of the function, the `declare` line of the caller and the last instructions before `ret`. They show the promise that was really made, and a header cannot show it.
