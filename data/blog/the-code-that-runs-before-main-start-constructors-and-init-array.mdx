@@ -1,0 +1,223 @@
+---
+title: "The Code That Runs Before main: _start, Constructors and init_array"
+date: "2026-09-26T14:05:00+01:00"
+lastmod: "2026-09-26T14:05:00+01:00"
+tags: ["from source to process", "c", "rust", "linux", "debugging"]
+draft: false
+reviewed: true
+reviewedHash: "6e8b88d9200cec7ea96aa6f83e9c713082f651baaf918a734da74e5ec6e29d04"
+cluster: "rust-under-the-hood"
+campaign: "editorial"
+summary: "With gdb I followed what calls main, where constructors are called from, and in which order init_array and fini_array run. A program without libc starts in 56 microseconds instead of 143, and Rust std has its own function in init_array."
+---
+
+Here is a program that prints something at every place where code can run without being called by `main`:
+
+```text
+$ ./ctors_lib (the same program, linked with libinit.so)
+library constructor
+constructor 101
+constructor 102
+constructor without priority
+main
+atexit handler
+destructor without priority
+destructor 101
+library destructor
+```
+
+`main` is the fifth line. Four functions ran before it and four after it, and none of them was called by my code. In [the first part of this series](/blog/what-happens-when-you-run-a-program-from-execve-to-main) I saw the loader and libc work before `main` with strace. Here I want to know who calls what, in which order, and what is left when I remove all of it.
+
+## Who calls main
+
+The first instruction of my program is `_start`. It comes from `Scrt1.o`, one of the start files that gcc gives to the linker (the part about undefined references listed them). In the static binary, gdb knows every function name, so the backtrace at `main` is complete (with `set backtrace past-main on`, because gdb stops at `main` by default):
+
+```text
+Breakpoint 1, 0x0000000000402dd0 in main ()
+#0  0x0000000000402dd0 in main ()
+#1  0x0000000000403501 in __libc_start_call_main ()
+#2  0x00000000004057ed in __libc_start_main_impl ()
+#3  0x0000000000402e65 in _start ()
+```
+
+`_start` calls `__libc_start_main` and gives it the address of `main`. `__libc_start_main` prepares libc, runs the constructors of the program, and then calls `main` through `__libc_start_call_main`, which also passes the return value of `main` to `exit`. In the dynamic program, the frame between `main` and `__libc_start_main` has no name, because the shared libc does not export it, but the chain is the same:
+
+```text
+#0  0x00005555555550a0 in main ()
+#1  0x00007ffff7dc56c1 in ?? () from /usr/lib/libc.so.6
+#2  0x00007ffff7dc57f9 in __libc_start_main () from /usr/lib/libc.so.6
+#3  0x00005555555550e5 in _start ()
+```
+
+So `main` is not special for the processor. It is a function that libc calls, like any callback.
+
+## Who calls the constructors
+
+The program has three constructors made with `__attribute__((constructor))`, two with a priority and one without. Breaking in the one without priority:
+
+```text
+Breakpoint 1, 0x0000555555555080 in plain ()
+#0  0x0000555555555080 in plain ()
+#1  0x00007ffff7dc5874 in __libc_start_main () from /usr/lib/libc.so.6
+#2  0x00005555555550e5 in _start ()
+```
+
+The program's own constructors are called by `__libc_start_main`, after `_start`, a little before `main`. The constructor of the shared library is different:
+
+```text
+Breakpoint 1, 0x00007ffff7fb9050 in library_start () from libinit.so
+#0  0x00007ffff7fb9050 in library_start () from libinit.so
+#1  0x00007ffff7fcb2a7 in ?? () from /lib64/ld-linux-x86-64.so.2
+#2  0x00007ffff7fcb37d in ?? () from /lib64/ld-linux-x86-64.so.2
+#3  0x00007ffff7fe3ca0 in ?? () from /lib64/ld-linux-x86-64.so.2
+```
+
+There is no `_start` and no libc in this stack. The loader itself calls the constructors of the libraries, before it jumps to my program. Frame #3 is at 0x7ffff7fe3ca0, only 0x60 bytes after 0x7ffff7fe3c40, where gdb stopped the loader's first instruction in the first part. The `LD_DEBUG=libs` output of the part about the library search has the same order in words, after the search (I did not quote these lines there): "calling init" for the loader, libc and the library, and only then "initialize program" and "transferring control". This is why "library constructor" is the first line of the output.
+
+## The two arrays
+
+How does libc know which constructors exist? The compiler puts their addresses into a section called `.init_array`, and the linker joins the arrays of all object files. Here is the one of my program:
+
+```text
+$ readelf -x .init_array ctors
+
+Hex dump of section '.init_array':
+  0x00003da0 60100000 00000000 70100000 00000000 `.......p.......
+  0x00003db0 b0110000 00000000 80100000 00000000 ................
+
+$ nm ctors (the functions in the two arrays)
+0000000000001160 t __do_global_dtors_aux
+0000000000001060 t first
+00000000000011b0 t frame_dummy
+0000000000001040 t last
+0000000000001080 t plain
+0000000000001050 t plain_end
+0000000000001070 t second
+```
+
+Four little-endian 8-byte addresses: 0x1060, 0x1070, 0x11b0, 0x1080. That is `first` (priority 101), `second` (102), `frame_dummy`, then `plain`. The GCC manual says that "a constructor with a smaller priority number runs before a constructor with a larger priority number", and the linker sorts the entries with a priority before the others. `frame_dummy` is not mine: it comes from `crtbeginS.o`, that is one more of the start files. libc calls the entries one after the other, from the first to the last.
+
+(This is a PIE, so these offsets become real addresses only after the loader applies a `R_X86_64_RELATIVE` relocation to each entry, exactly like the `.init_array` entries in the part about relocations.)
+
+`.fini_array` works in the other direction:
+
+```text
+$ readelf -x .fini_array ctors
+
+Hex dump of section '.fini_array':
+  0x00003dc0 40100000 00000000 60110000 00000000 @.......`.......
+  0x00003dd0 50100000 00000000                   P.......
+```
+
+0x1040 is `last` (destructor 101), 0x1160 is `__do_global_dtors_aux` from the start files, 0x1050 is `plain_end`. The destructors run from the end of the array to the start, so `plain_end` first and `last` at the very end. For destructors the manual says that "the opposite relationship holds": the small priority number runs last. The output at the top agrees.
+
+The atexit handler is the last surprise of the output: I registered it inside a constructor, and it ran before all destructors. At exit, glibc runs the registered handlers in the reverse order of registration, and the code that calls the destructors of the program and of the libraries was registered earlier than my handler, before the constructors even ran. So it runs later.
+
+## A program with nothing before main
+
+What if I remove all of this? With `-nostartfiles -nostdlib -static`, gcc gives the linker no start files and no libc. Then I must write `_start` myself:
+
+```c
+__attribute__((noreturn)) void _start(void)
+{
+    __asm__ volatile("syscall" : : "a"(60), "D"(STATUS));
+    __builtin_unreachable();
+}
+```
+
+60 is the number of the `exit` system call on x86-64, and `STATUS` is given on the command line (42 here). The whole program is three instructions:
+
+```text
+$ objdump -d tiny
+0000000000401000 <_start>:
+  401000:	b8 3c 00 00 00       	mov    $0x3c,%eax
+  401005:	bf 2a 00 00 00       	mov    $0x2a,%edi
+  40100a:	0f 05                	syscall
+...
+$ strace ./tiny
+execve("./tiny", ["./tiny"], 0x7fff75e8a670 /* 115 vars */) = 0
+exit(42)                                = ?
++++ exited with 42 +++
+$ wc -c tiny tiny_small
+ 9168 tiny
+ 1048 tiny_small
+10216 total
+```
+
+Two system calls in the whole life of the process: the `execve` that starts it and the `exit`. The file is 9,168 bytes, mostly padding between segments, as in the second part of this series. Stripped and linked with `-z noseparate-code`, it is 1,048 bytes and still works.
+
+This program cannot do much. No libc means no `printf`, no `malloc`, and even no `errno`, because there is no thread area. But it gives a useful number: the cost of a process with nothing inside. With the launcher of the first part, pinned to one core:
+
+```text
+$ taskset -c 2 ./spawn 1000 ./tiny_zero
+program          starts    median       p10       p90       min       max  faults
+tiny_zero          1000     56 us     54 us     60 us     53 us   1014 us       5
+$ taskset -c 2 ./spawn 1000 ./hello_c_static
+program          starts    median       p10       p90       min       max  faults
+hello_c_static     1000    143 us    139 us    154 us    136 us    928 us      31
+```
+
+(`tiny_zero` is the same file built with `STATUS=0`, because the launcher expects success.) 56 microseconds and 5 page faults for creating a process, loading a file, exiting and waking the parent. The static hello world needs 143, so the setup of glibc, the constructors, `puts` and the work at exit cost about 90 microseconds more than the empty process in this run. But the machine was busy with other experiments, and the numbers moved: the first part had 111 microseconds for the same file, and [another full run](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/from-source-to-process/results/p10-tiny-time-run2.txt) of the fixture gave 42 and 108, a difference of 66. So I trust only the order: the setup of glibc and the exit cost more than the empty process itself.
+
+## Rust has no constructors, std has one
+
+The Rust language has no "life before main": there is no attribute to run a function before `main`. But the standard library does run code before it. Here is the stack at my `main`:
+
+```text
+Breakpoint 1, 0x0000555555568f80 in hello::main ()
+#0  0x0000555555568f80 in hello::main ()
+#1  0x0000555555568f53 in std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()> ()
+#2  0x0000555555568f69 in std::rt::lang_start::<()>::{closure#0} ()
+#3  0x000055555558e667 in core::ops::function::impls::{impl#2}::call_once<(), (dyn core::ops::function::Fn<(), Output=i32> + core::marker::Sync + core::panic::unwind_safe::RefUnwindSafe)> () at library/core/src/ops/function.rs:287
+...
+#11 std::rt::lang_start_internal () at library/std/src/rt.rs:171
+#12 0x0000555555568fc5 in main ()
+#13 0x00007ffff7d986c1 in ?? () from /usr/lib/libc.so.6
+#14 0x00007ffff7d987f9 in __libc_start_main () from /usr/lib/libc.so.6
+#15 0x0000555555568e75 in _start ()
+```
+
+The bottom is the same as in C: `_start`, `__libc_start_main`, then a C `main`, which rustc generated. This `main` calls `std::rt::lang_start_internal`, the runtime setup that the first part followed with strace. Frames #3 to #11 have no address of their own: gdb found in std's debug information that these functions were inlined into one real frame. `__rust_begin_short_backtrace` is a marker, the std source calls it a "fixed frame used to clean the backtrace", so that a panic message does not show all the frames below it. gdb shows readable names because it demangles the `_R` symbols of Rust's [v0 mangling](/blog/rust-s-v0-symbol-mangling-what-changed-in-rust-1-97).
+
+And the constructor? The Rust binary has two entries in `.init_array`:
+
+```text
+$ readelf -x .init_array hello_rs
+
+Hex dump of section '.init_array':
+  0x00053b78 00000000 00000000 00000000 00000000 ................
+
+$ readelf -rW hello_rs (the two relocations into .init_array)
+0000000000053b78  0000000000000008 R_X86_64_RELATIVE                         3e9c0
+0000000000053b80  0000000000000008 R_X86_64_RELATIVE                         14f40
+$ nm -C hello_rs | grep -E 'ARGV_INIT_ARRAY|frame_dummy'
+0000000000014f40 t frame_dummy
+0000000000053b80 d __frame_dummy_init_array_entry
+0000000000053b78 D std::sys::args::unix::imp::ARGV_INIT_ARRAY
+000000000003e9c0 T std::sys::args::unix::imp::ARGV_INIT_ARRAY::init_wrapper
+```
+
+LLD left zeros in the section and put the values only in the relocations, so I read them there: 0x3e9c0 is `init_wrapper` of std, and 0x14f40 is `frame_dummy`. In the 1.98.0 source of `std::sys::args`, this entry is a static placed in the section `.init_array.00099`, with the comment "glibc passes argc, argv, and envp to functions in .init_array, as a non-standard extension". The priority 99 is inside the range that GCC reserves for "the compiler and its runtime libraries". It runs before `main`, called by libc:
+
+```text
+#0  std::sys::args::unix::imp::ARGV_INIT_ARRAY::init_wrapper () at library/std/src/sys/args/unix.rs:132
+#1  0x00007ffff7d98874 in __libc_start_main () from /usr/lib/libc.so.6
+#2  0x0000555555568e75 in _start ()
+...
+rdi            0x1                 1
+0x7fffffffd4b8:	"hello_rs"
+```
+
+`rdi`, the first argument, is 1 (argc), and the second argument points to "hello_rs", my argv. std saves both, and this is how `std::env::args` works even in a Rust library loaded into a C program. So Rust gives no constructors to the programmer, but its standard library uses exactly the same mechanism as C.
+
+## Convenient and dangerous
+
+Constructors are convenient and dangerous for the same reason: they run before anything else, and nobody calls them explicitly. Their order inside one file follows the priorities, but between files and libraries it follows the link order and the dependencies. A constructor in a library cannot use something that is initialized in the program, because the program is not initialized yet. And at exit, the order is reversed in a way that is easy to forget when a handler registered with `atexit` uses something that a destructor already cleaned. I think Rust is right to not have this in the language. In C, the safe use is probably the smallest one: one constructor per library at most, which does nothing that can fail.
+
+## References
+
+- GCC manual, the `constructor` and `destructor` attributes and their priorities: https://gcc.gnu.org/onlinedocs/gcc/Common-Attributes.html
+- elf(5), `DT_INIT_ARRAY` and `DT_FINI_ARRAY`: https://man7.org/linux/man-pages/man5/elf.5.html
+- atexit(3), the reverse order of the handlers: https://man7.org/linux/man-pages/man3/atexit.3.html
+- Rust 1.98.0, `std::sys::args` with the `.init_array` entry: https://github.com/rust-lang/rust/blob/1.98.0/library/std/src/sys/args/unix.rs
+- The programs and the saved outputs of this part: https://github.com/mehdiakiki/mehdi-cz/tree/main/experiments/from-source-to-process/p10

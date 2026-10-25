@@ -1,0 +1,154 @@
+---
+title: "TIME_WAIT: Why a Closed Connection Stays Around"
+date: "2026-08-03T22:15:00+01:00"
+lastmod: "2026-08-03T22:15:00+01:00"
+tags: ["following a tcp connection", "networking", "linux", "tcp", "reliability"]
+draft: false
+reviewed: true
+reviewedHash: "0ecaabdaf23cf7a84d4dc9c0128d90882ad960deb03db7deea335e51d6afc5a3"
+cluster: "reliable-data-integrations"
+campaign: "editorial"
+summary: "My client and my server closed 500 connections, and the kernel kept 500 sockets for 60 more seconds. I measured which side keeps TIME_WAIT, why tcp_fin_timeout does not change it, how the client side runs out of local ports, and why a restarted server can fail to bind."
+---
+
+My client and my server made 500 short connections and closed every socket. Then I asked `ss` how many sockets were left for these connections. The answer was 500, and it stayed 500 for one minute. Nobody had a file descriptor for them, no program could read or write on them, but the kernel kept them. This is the TIME-WAIT state, the last state of a TCP connection.
+
+In [the previous part about close()](/blog/what-close-really-sends-fin-rst-and-unread-data) I saw it appear on one side after a normal close. Here I wanted to see who gets it, for how long, and what it breaks.
+
+## The side that closes first
+
+The experiment: 500 connections to port 21071 where the client closes first, and 500 connections to port 21072 where the server closes first. Then I counted the TIME-WAIT sockets every 5 seconds, separately for the client side and the server side of each port:
+
+```text
+500 connections to port 21071, the client closes first
+500 connections to port 21072, the server closes first, load average 3.95 4.74 4.15
+0      0      127.0.0.1:41378 127.0.0.1:21071 timer:(timewait,59sec,0)
+0      0      127.0.0.1:21072 127.0.0.1:52368 timer:(timewait,59sec,0)
+  t= 0 s  TIME-WAIT  port 21071: client side  500, server side 0   port 21072: client side 0, server side  500
+  t= 5 s  TIME-WAIT  port 21071: client side  500, server side 0   port 21072: client side 0, server side  500
+...
+  t=55 s  TIME-WAIT  port 21071: client side  500, server side 0   port 21072: client side 0, server side  500
+  t=60 s  TIME-WAIT  port 21071: client side  500, server side 0   port 21072: client side 0, server side  500
+  t=65 s  TIME-WAIT  port 21071: client side    0, server side 0   port 21072: client side 0, server side    0
+```
+
+The rule is very simple: the side that sends the first FIN gets TIME-WAIT. When the client closed first, the 500 TIME-WAIT sockets were on the client side (local port is a random client port, the peer is 21071). When the server closed first, they were on the server side, all of them with the local address 127.0.0.1:21072. The other side has nothing.
+
+The two lines in the middle show one socket of each group with `ss -o`: `timer:(timewait,59sec,0)` is a timer of 60 seconds that just started. And at 65 seconds everything was gone.
+
+## Why 60 seconds, and why at all
+
+The 60 seconds come from a constant. In the headers of my kernel:
+
+```text
+#define TCP_TIMEWAIT_LEN (60*HZ) /* how long to wait to destroy TIME-WAIT
+				  * state, about 60 seconds	*/
+```
+
+It is fixed. There is no setting for it: on this kernel the only files in `/proc/sys/net/ipv4` with "tw" or "fin" in the name are `tcp_fin_timeout`, `tcp_max_tw_buckets` and `tcp_tw_reuse`, and none of them sets this duration. The TCP specification asks for more. RFC 9293 defines the maximum segment lifetime (MSL) as 2 minutes, and a connection "MUST linger in the TIME-WAIT state for a time 2xMSL", so 4 minutes. Linux uses one minute.
+
+Why keep anything after a close? RFC 9293 gives two reasons.
+
+- The last ACK can be lost. The side that closed first receives the FIN of the other side and answers with an ACK. If this ACK is lost, the other side sends its FIN again. TIME-WAIT is still there to acknowledge it once more. Without it, the kernel would find no socket and answer with a RST, and the other side would see an error on a connection that closed normally.
+- Old segments can arrive late. A segment of this connection can stay delayed somewhere in the network. If a new connection with the same addresses and the same ports started at once, it could accept this old segment as its own data. TIME-WAIT blocks this pair of addresses and ports until the old segments are surely dead.
+
+On loopback the second reason can almost not happen, but the kernel keeps TIME-WAIT for every connection anyway.
+
+## tcp_fin_timeout is not the TIME-WAIT timeout
+
+Now the confusion. `net.ipv4.tcp_fin_timeout` is 60 on my laptop, TIME-WAIT is 60 seconds, so it is easy to think that the setting controls TIME-WAIT. Even the kernel header defines one with the other, `#define TCP_FIN_TIMEOUT TCP_TIMEWAIT_LEN`, with the comment "to combine FIN-WAIT-2 timeout with TIME-WAIT timer".
+
+But the kernel documentation describes `tcp_fin_timeout` as "the length of time an orphaned (no longer referenced by any application) connection will remain in the FIN_WAIT_2 state". It is the timeout of the state before TIME-WAIT, for a socket that the program already closed while the other side did not close yet. I saw this case in the previous part: the client in FIN-WAIT-2 with a timer, while the server stayed in CLOSE-WAIT.
+
+I did not want to change the sysctl of my laptop, and I did not need to. tcp(7) has `TCP_LINGER2`, the same timeout for one socket: "The lifetime of orphaned FIN_WAIT2 state sockets". I set it to 5 seconds on the client, and I closed the connection in the two ways:
+
+```text
+tcp_fin_timeout = 60, load average 2.49 3.67 3.84
+-- TCP_LINGER2 5 s, the client closes, the server never closes
+  t=  0.3 s  0      0      127.0.0.1:33068 127.0.0.1:21074 timer:(timewait,4.744sec,0)
+  t=  1.3 s  0      0      127.0.0.1:33068 127.0.0.1:21074 timer:(timewait,3.724sec,0)
+  t=  2.3 s  0      0      127.0.0.1:33068 127.0.0.1:21074 timer:(timewait,2.704sec,0)
+  t=  3.3 s  0      0      127.0.0.1:33068 127.0.0.1:21074 timer:(timewait,1.684sec,0)
+  t=  4.3 s  0      0      127.0.0.1:33068 127.0.0.1:21074 timer:(timewait,657ms,0)
+  t=  5.4 s  no socket
+-- TCP_LINGER2 5 s, the client closes, then the server closes
+  t=  0.3 s  0      0      127.0.0.1:46440 127.0.0.1:21074 timer:(timewait,59sec,0)
+  t=  5.3 s  0      0      127.0.0.1:46440 127.0.0.1:21074 timer:(timewait,54sec,0)
+  t= 10.3 s  0      0      127.0.0.1:46440 127.0.0.1:21074 timer:(timewait,49sec,0)
+```
+
+In the first case the client socket is in FIN-WAIT-2 (I asked `ss` for this state only) and it disappears after 5 seconds, as asked. In the second case the server closed too, so the client socket reached TIME-WAIT, and there the timer starts at 59 seconds, with the same `TCP_LINGER2` of 5. So this timeout shortens FIN-WAIT-2 and does nothing to TIME-WAIT.
+
+The timer name in both cases is `timewait`. So the kernel handles an orphaned FIN-WAIT-2 with the same machinery as TIME-WAIT, only with another timeout, and I think this is what the header comment means by "combine".
+
+## Can the client run out of local ports?
+
+Each connection from my client to one server uses one local port, chosen from `ip_local_port_range`, here 32768 to 60999, so 28232 ports. While a connection is in TIME-WAIT on the client side, its pair of addresses and ports is blocked. So a program that makes many short connections to the same server, and closes first, should run out of ports. Does it?
+
+I did not want to fill all the ports of my laptop for a minute, other programs need them. Linux 6.3 added a socket option for this: `IP_LOCAL_PORT_RANGE` clamps the port range for one socket. So every client socket in this experiment could use only 20 ports, 40000 to 40019. Then I tried three ways to connect, each one with its own 20 ports, as fast as possible, the client closing first:
+
+```text
+== connect, ports 40000 to 40019
+  first error after 20 connections: OSError(99, 'Cannot assign requested address') at t=0.001 s
+  first connection after it at t=0.855 s
+  60 x OSError(99, 'Cannot assign requested address')
+  distinct local ports used: 20, TIME-WAIT now: 20
+  TcpExtTWRecycled +60
+== bind, ports 40100 to 40119
+  first error after 20 connections: OSError(98, 'Address already in use') at t=0.001 s
+  first connection after it at t=60.473 s
+  1295 x OSError(98, 'Address already in use')
+  distinct local ports used: 20, TIME-WAIT now: 20
+  TcpExtTWRecycled +0
+== bind-no-port, ports 40200 to 40219
+  first error after 20 connections: OSError(99, 'Cannot assign requested address') at t=0.001 s
+  first connection after it at t=0.704 s
+  60 x OSError(99, 'Cannot assign requested address')
+  distinct local ports used: 20, TIME-WAIT now: 20
+  TcpExtTWRecycled +60
+```
+
+So yes, the ports run out: after 20 connections, `connect()` failed with `EADDRNOTAVAIL`, "Cannot assign requested address". But only for 0.855 seconds. Then the connections worked again, on the same 20 ports, while their old TIME-WAIT sockets were still there. The counter `TcpExtTWRecycled` grew by 60: the kernel took over 60 TIME-WAIT sockets for new connections.
+
+This is `net.ipv4.tcp_tw_reuse`, which is 2 here: "2 - enable for loopback traffic only". The documentation says that the kernel reuses a TIME-WAIT socket "when it is safe from protocol viewpoint", and timestamps are on (`tcp_timestamps` is 1), which lets the kernel tell an old segment from a new one. What I saw: the reuse came only in the next second. The kernel source agrees: `tcp_twsk_unique()` in `net/ipv4/tcp_ipv4.c` reuses a TIME-WAIT socket only when the clock, counted in seconds, is past the second of its last timestamp. In 3 seconds I got 60 errors and 60 reuses, so with 20 ports the client could make 20 new connections per second, not more. On loopback the limit is not on the number of connections, it is on their rate.
+
+The `bind` case is different, and it is the trap. Here the client calls `bind()` to the address 127.0.0.1 with port 0 before `connect()`, as some libraries do when you choose a source address. `bind()` must choose the port alone, without knowing where the connection goes, and it never takes a port that has a TIME-WAIT socket (the documentation of `ip_autobind_reuse` explains it). Result: `EADDRINUSE` for 60.5 seconds, 1295 failed tries, no reuse at all. The option `IP_BIND_ADDRESS_NO_PORT` exists for this case: its man page says that the kernel does "not reserve an ephemeral port when using bind(2) with a port number of 0", and chooses it later in `connect()`. With it, the third case behaved exactly like a plain `connect()`.
+
+Note also that the error is not the same in the two cases, and the BUGS section of ip(7) mentions it: "The error used to diagnose exhaustion of the ephemeral port range differs across the various system calls". And all this is about loopback. With the default value 2, the reuse does not happen for other traffic, so a program that talks to a real server keeps each port blocked for the full 60 seconds, like in my `bind` case: 28232 ports, so about 28 thousand connections per minute to one server address and port. I could not test this part, everything here is on loopback.
+
+## Restarting a server
+
+The last case is on the server side. A server that closes first gets the TIME-WAIT sockets, and they all use its listening port. What happens if I stop the server and start it again at once? I tried it three times: an old server accepts one connection, closes it first, and closes its listening socket like a server that exits, then a new server calls `bind()` on the same port:
+
+```text
+== port 21076: old server SO_REUSEADDR=0, new server SO_REUSEADDR=0
+  0      0      127.0.0.1:21076 127.0.0.1:35466 timer:(timewait,59sec,0)
+  new server bind(): OSError(98, 'Address already in use')
+== port 21077: old server SO_REUSEADDR=1, new server SO_REUSEADDR=1
+  0      0      127.0.0.1:21077 127.0.0.1:33312 timer:(timewait,59sec,0)
+  new server bind(): ok, listening again
+== port 21078: old server SO_REUSEADDR=0, new server SO_REUSEADDR=1
+  0      0      127.0.0.1:21078 127.0.0.1:55800 timer:(timewait,59sec,0)
+  new server bind(): OSError(98, 'Address already in use')
+```
+
+Without `SO_REUSEADDR`, one TIME-WAIT socket from one old connection is enough: the new server cannot start for one minute. With the option on both servers, it starts at once. The third line surprised me. I expected that the new server alone decides, but the option must also be on the old socket. socket(7) does not say this, but the kernel source does: `inet_bind_conflict()` in `net/ipv4/inet_connection_sock.c` lets the bind pass only when both sockets have `SO_REUSEADDR`, and the TIME-WAIT socket keeps the flag of the old server. In practice it is the same program before and after the restart, so it must always set the option, not only "when bind fails".
+
+Python makes both choices: `socketserver.TCPServer` has `allow_reuse_address = False`, and `http.server.HTTPServer` sets it to `True`.
+
+## So who should close first?
+
+TIME-WAIT is not a leak, and it is not a bug. It is the price of closing first, and one of the two sides must pay it. If the server closes first, it keeps one TIME-WAIT for each connection, all on its listening port. If the client closes first, each client keeps its own, and a busy client meets the port limit that I measured above. Often it is the protocol on top that decides it, and it does not say it.
+
+I do not have a general answer. But after these experiments I would ask the question for every protocol I write: which side closes first, how many connections per second it makes, and if this side can pay one minute for each of them. The last part of this series measures one way to pay less often: do not close at all, and reuse the connection.
+
+The outputs are [p07-sides.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/following-a-tcp-connection/results/p07-sides.txt), [p07-finwait.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/following-a-tcp-connection/results/p07-finwait.txt), [p07-ports.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/following-a-tcp-connection/results/p07-ports.txt), [p07-restart.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/following-a-tcp-connection/results/p07-restart.txt) and [p07-sysctls.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/following-a-tcp-connection/results/p07-sysctls.txt), and the program is `p07_timewait.py` in the [fixture of the series](https://github.com/mehdiakiki/mehdi-cz/tree/main/experiments/following-a-tcp-connection), which starts with [what happens when a program calls connect()](/blog/what-happens-when-your-program-calls-connect).
+
+## References
+
+- [RFC 9293, Transmission Control Protocol (TCP)](https://www.rfc-editor.org/rfc/rfc9293.html#section-3.3.2), sections 3.3.2, 3.4.2 and 3.6.1
+- [IP Sysctl, Linux kernel documentation for 6.6](https://www.kernel.org/doc/html/v6.6/networking/ip-sysctl.html), for `tcp_fin_timeout`, `tcp_tw_reuse`, `ip_local_port_range` and `ip_autobind_reuse`
+- [tcp(7)](https://man7.org/linux/man-pages/man7/tcp.7.html), [ip(7)](https://man7.org/linux/man-pages/man7/ip.7.html) and [socket(7)](https://man7.org/linux/man-pages/man7/socket.7.html), Linux manual pages
+- [IP_LOCAL_PORT_RANGE(2const)](https://man7.org/linux/man-pages/man2/IP_LOCAL_PORT_RANGE.2const.html) and [IP_BIND_ADDRESS_NO_PORT(2const)](https://man7.org/linux/man-pages/man2/IP_BIND_ADDRESS_NO_PORT.2const.html), Linux manual pages
+- [Lib/http/server.py in CPython 3.14.3](https://github.com/python/cpython/blob/v3.14.3/Lib/http/server.py)
+- [net/ipv4/inet_connection_sock.c](https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/net/ipv4/inet_connection_sock.c?h=v6.6.126) and [net/ipv4/tcp_ipv4.c](https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/net/ipv4/tcp_ipv4.c?h=v6.6.126), Linux 6.6.126

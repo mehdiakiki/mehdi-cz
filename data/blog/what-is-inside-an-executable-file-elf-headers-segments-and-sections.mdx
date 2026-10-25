@@ -1,0 +1,283 @@
+---
+title: "What Is Inside an Executable File: ELF Headers, Segments and Sections"
+date: "2026-08-31T08:25:00+01:00"
+lastmod: "2026-08-31T08:25:00+01:00"
+tags: ["from source to process", "linux", "linker", "c", "rust"]
+draft: false
+reviewed: true
+reviewedHash: "4fc437302a2b761b787a12f4598922d9708f9e8a5db4e3f76b6ad417ac0b7ea7"
+cluster: "rust-under-the-hood"
+campaign: "editorial"
+summary: "I opened my three hello worlds with readelf. A program still runs after I delete all its section headers, one changed byte in a segment stops it, and 90% of the Rust file is debug information of the standard library."
+---
+
+When I prepared this experiment, I deleted all the section headers of my C hello world with objcopy. I expected some error. The program printed "hello from C" like before. Then I changed one byte somewhere else in the file, the last character of a path, and the program did not start anymore.
+
+These two small tests say most of what is in this article. An ELF file has two descriptions of itself, sections and segments, and only one of them matters when the program runs.
+
+I use the three programs from [the first part of this series](/blog/what-happens-when-you-run-a-program-from-execve-to-main): `hello_c_dyn` (gcc 15.2.1, dynamic, PIE by default on this system), `hello_c_static` (`gcc -static`) and `hello_rs` (rustc 1.98.0 with `-O`). There I followed what the kernel and the loader do with these files. Now I open the files themselves.
+
+## The first 64 bytes
+
+Every ELF file starts with a fixed header. `readelf -h` prints it:
+
+```text
+$ readelf -h hello_c_dyn
+ELF Header:
+  Magic:   7f 45 4c 46 02 01 01 00 00 00 00 00 00 00 00 00 
+  Class:                             ELF64
+  Data:                              2's complement, little endian
+  Version:                           1 (current)
+  OS/ABI:                            UNIX - System V
+  ABI Version:                       0
+  Type:                              DYN (Position-Independent Executable file)
+  Machine:                           Advanced Micro Devices X86-64
+  Version:                           0x1
+  Entry point address:               0x1060
+  Start of program headers:          64 (bytes into file)
+  Start of section headers:          13976 (bytes into file)
+  Flags:                             0x0
+  Size of this header:               64 (bytes)
+  Size of program headers:           56 (bytes)
+  Number of program headers:         14
+  Size of section headers:           64 (bytes)
+  Number of section headers:         30
+  Section header string table index: 29
+```
+
+The magic is `7f` and then the letters E, L, F. The `02` after them means 64-bit, the next `01` means little endian. The type is `DYN`: for the kernel a PIE is the same kind of file as a shared library, and this is why the entry point is only 0x1060, an offset. The real address is decided when the program is loaded. The static binary is different:
+
+```text
+$ readelf -h hello_c_static | grep -E 'Type|Entry|Number of'
+  Type:                              EXEC (Executable file)
+  Entry point address:               0x402de0
+  Number of program headers:         11
+  Number of section headers:         28
+```
+
+`EXEC` with a fixed address, 0x402de0. `gcc -static` on this system makes a classic non-PIE executable.
+
+The last lines of the first header give the plan of the file. The program headers start at byte 64, right after this header: 14 entries of 56 bytes. The section headers start at byte 13976: 30 entries of 64 bytes. 13976 + 30 × 64 = 15896, exactly the size of the file. So the program headers are at the beginning and the section headers are at the very end, like an index at the end of a book.
+
+## Segments: what the loader maps
+
+The program headers describe segments. Here are the ones of `hello_c_dyn`:
+
+```text
+Program Headers:
+  Type           Offset   VirtAddr           PhysAddr           FileSiz  MemSiz   Flg Align
+  PHDR           0x000040 0x0000000000000040 0x0000000000000040 0x000310 0x000310 R   0x8
+  INTERP         0x000374 0x0000000000000374 0x0000000000000374 0x00001c 0x00001c R   0x1
+      [Requesting program interpreter: /lib64/ld-linux-x86-64.so.2]
+  LOAD           0x000000 0x0000000000000000 0x0000000000000000 0x000600 0x000600 R   0x1000
+  LOAD           0x001000 0x0000000000001000 0x0000000000001000 0x000169 0x000169 R E 0x1000
+  LOAD           0x002000 0x0000000000002000 0x0000000000002000 0x000110 0x000110 R   0x1000
+  LOAD           0x002dd0 0x0000000000003dd0 0x0000000000003dd0 0x000248 0x000250 RW  0x1000
+  DYNAMIC        0x002de0 0x0000000000003de0 0x0000000000003de0 0x0001e0 0x0001e0 RW  0x8
+  NOTE           0x000350 0x0000000000000350 0x0000000000000350 0x000024 0x000024 R   0x4
+  NOTE           0x0020b0 0x00000000000020b0 0x00000000000020b0 0x000040 0x000040 R   0x8
+  NOTE           0x0020f0 0x00000000000020f0 0x00000000000020f0 0x000020 0x000020 R   0x4
+  GNU_PROPERTY   0x0020b0 0x00000000000020b0 0x00000000000020b0 0x000040 0x000040 R   0x8
+  GNU_EH_FRAME   0x002014 0x0000000000002014 0x0000000000002014 0x000024 0x000024 R   0x4
+  GNU_STACK      0x000000 0x0000000000000000 0x0000000000000000 0x000000 0x000000 RW  0x10
+  GNU_RELRO      0x002dd0 0x0000000000003dd0 0x0000000000003dd0 0x000230 0x000230 R   0x1
+```
+
+Each line says: take `FileSiz` bytes at `Offset` in the file, put them at `VirtAddr` in memory (plus the load address), with these permissions. The ones that really create memory are the four `LOAD` lines. In the first part, the memory map of the process at its first instruction had four lines for `hello_c_dyn`: `r--p`, `r-xp`, `r--p`, `rw-p`. Here they are, as segments: read-only, read and execute, read-only, read and write.
+
+The others mostly point inside the loaded memory. `PHDR` is this table itself. `INTERP` is the path of the loader, 0x1c bytes (28 characters with the final zero). `DYNAMIC` is the table that the loader reads to know which libraries are needed, where the symbols and the relocations are, etc. `GNU_EH_FRAME` helps unwinders find the stack frames. And two lines are not about content at all:
+
+- `GNU_STACK` has the flags `RW` and no `E`. It asks for a stack that is not executable.
+- `GNU_RELRO` covers 0x230 bytes at 0x3dd0, the start of the writable segment. The loader writes addresses there at startup, then makes it read-only. This was the `mprotect(..., 4096, PROT_READ)` of one page of the program in the first part.
+
+One more detail in the last `LOAD`: `FileSiz` is 0x248 but `MemSiz` is 0x250. The 8 extra bytes exist only in memory and are filled with zeros. This is `.bss`, the next part of the series is about it.
+
+## Why four LOAD segments for 16 KB
+
+A page has one set of permissions. So code and data that need different permissions must be in different pages. The GNU linker goes one step further by default and gives the code its own pages, in memory and in the file. `ld --help` says it:
+
+```text
+$ ld --help | grep separate-code
+  -z separate-code            Create separate code program header (default)
+  -z noseparate-code          Don't create separate code program header
+```
+
+I was curious what this costs, so I linked the same program with `-z noseparate-code`:
+
+```text
+$ readelf -lW hello_c_noseparate | grep -E 'LOAD|RELRO'
+  LOAD           0x000000 0x0000000000000000 0x0000000000000000 0x000810 0x000810 R E 0x1000
+  LOAD           0x000dd0 0x0000000000001dd0 0x0000000000001dd0 0x000248 0x000250 RW  0x1000
+  GNU_RELRO      0x000dd0 0x0000000000001dd0 0x0000000000001dd0 0x000230 0x000230 R   0x1
+$ wc -c hello_c_dyn hello_c_noseparate
+15896 hello_c_dyn
+ 7704 hello_c_noseparate
+23600 total
+$ count zero bytes in hello_c_dyn
+13785 of 15896 bytes are zero
+$ count zero bytes in hello_c_noseparate
+5601 of 7704 bytes are zero
+```
+
+Two segments instead of four, and the file is half the size. Counting zero bytes is only a rough test, but in the default file 13,785 of the 15,896 bytes are zero. The offsets of the four `LOAD` lines show where most of them are: the gaps between the segments are 2,560 + 3,735 + 3,264 = 9,559 bytes. So 60% of my hello world is padding. I did not expect so much.
+
+The smaller version is not free. Its first segment, from byte 0 to 0x810, is `R E`: the headers and the read-only data are now executable too, because they share pages with the code. With separate code, only real instructions are in executable pages. On a laptop 8 KB does not matter, so for me it is clear why the safer layout is the default.
+
+## Sections: what the linker and the tools see
+
+Sections are a finer description of the same bytes. Here is a part of the 30 sections of `hello_c_dyn`:
+
+```text
+  [12] .text             PROGBITS        0000000000001040 001040 000119 00  AX  0   0 16
+  [13] .fini             PROGBITS        000000000000115c 00115c 00000d 00  AX  0   0  4
+  [14] .rodata           PROGBITS        0000000000002000 002000 000011 00   A  0   0  4
+...
+  [24] .data             PROGBITS        0000000000004008 003008 000010 00  WA  0   0  8
+  [25] .bss              NOBITS          0000000000004018 003018 000008 00  WA  0   0  1
+  [26] .comment          PROGBITS        0000000000000000 003018 00001b 01  MS  0   0  1
+  [27] .symtab           SYMTAB          0000000000000000 003038 000360 18     28  18  8
+  [28] .strtab           STRTAB          0000000000000000 003398 0001e6 00      0   0  1
+  [29] .shstrtab         STRTAB          0000000000000000 00357e 000116 00      0   0  1
+```
+
+`.text` is the code, `.rodata` the constants, `.data` the initialized variables. The flag `A` means "allocated": the section is part of a segment and will be in memory. The last four have no `A` and an address of zero. `.comment`, the symbol table `.symtab` and the string tables are in the file only for tools like nm, objdump and gdb. No segment contains them, so they are never mapped. readelf also prints which sections each segment contains:
+
+```text
+   02     .note.gnu.build-id .interp .gnu.hash .dynsym .dynstr .gnu.version .gnu.version_r .rela.dyn .rela.plt 
+   03     .init .plt .text .fini 
+   04     .rodata .eh_frame_hdr .eh_frame .note.gnu.property .note.ABI-tag 
+   05     .init_array .fini_array .dynamic .got .got.plt .data .bss 
+```
+
+The linker works with sections: it takes `.text` from every object file and puts them together, then it decides the segments. After that, nobody who runs the program needs the sections anymore.
+
+## Deleting the sections, then breaking a segment
+
+Here is the test from the beginning. `strip` removes the symbol table, and `objcopy --strip-section-headers` (binutils 2.46 has it) removes the whole section header table:
+
+```text
+$ wc -c hello_c_dyn hello_c_dyn.strip hello_c_dyn.noshdr hello_rs hello_rs.strip hello_rs.noshdr
+  15896 hello_c_dyn
+  14400 hello_c_dyn.strip
+  12312 hello_c_dyn.noshdr
+4507728 hello_rs
+ 349896 hello_rs.strip
+ 347296 hello_rs.noshdr
+5247528 total
+$ readelf -S hello_c_dyn.noshdr
+
+There are no sections in this file.
+...
+$ ./hello_c_dyn.noshdr; ./hello_rs.noshdr
+hello from C
+hello from Rust
+$ nm hello_c_dyn.noshdr
+nm: hello_c_dyn.noshdr: no symbols
+$ objdump -d hello_c_dyn.noshdr
+
+hello_c_dyn.noshdr:     file format elf64-x86-64
+
+```
+
+No sections, and both programs run. Good, this is what I wanted to see. The tools are the ones who suffer: nm finds no symbols, and objdump prints the file format and disassembles nothing, because it disassembles sections and there are none. In fact, the kernel and the loader never asked for the sections.
+
+Now the other direction. I changed one byte, the "2" at the end of the interpreter path, into a "3":
+
+```text
+$ readelf -lW hello_c_dyn.badinterp | grep interpreter
+      [Requesting program interpreter: /lib64/ld-linux-x86-64.so.3]
+$ ls -l hello_c_dyn.badinterp | cut -c1-10
+-rwxr-xr-x
+$ sh -c ./hello_c_dyn.badinterp
+sh: line 1: ./hello_c_dyn.badinterp: cannot execute: required file not found
+exit status 127
+$ strace ./hello_c_dyn.badinterp
+execve("./hello_c_dyn.badinterp", ["./hello_c_dyn.badinterp"], 0x7ffdc3abffa0 /* 115 vars */) = -1 ENOENT (No such file or directory)
+```
+
+The file exists and is executable, and `execve` fails with ENOENT, "No such file or directory". Strange, for a file that is right there. The missing file is the interpreter, not my program. The execve(2) man page lists this case under ENOENT. The shell says "required file not found", but it does not say which file. The same error appears when a binary is copied to a system where the loader is at another path.
+
+So: sections are for the linker and the tools, segments are for the kernel and the loader.
+
+## Why the Rust file is 4.5 MB
+
+The Rust binary is about 284 times bigger than the C one. `size -A` lists the sections by size:
+
+```text
+$ size -A hello_rs | sort -k2 -nr | head -n 12
+Total                4399651
+.debug_str           1908990        0
+.debug_info          1128240        0
+.debug_ranges         515728        0
+.debug_line           461019        0
+.text                 253091    85584
+.debug_aranges         31424        0
+.rodata                22480    20192
+.eh_frame              21208    60280
+.rela.dyn              16152     4016
+.gcc_except_table      13300    42672
+.data.rel.ro            7328   342920
+$ size -A hello_rs | awk '/^[.]debug/ { s += $2 } END { print s }'
+4049336
+```
+
+4,049,336 bytes of `.debug_*` sections, 90% of the file. But I compiled with `-O` and without `-g`. Whose debug information is it? The names of the compile units answer:
+
+```text
+    <12>   DW_AT_name        : (indirect string, offset: 0x15c9e0): /rustc/88d9e12ae178fab0fb5cc050a94da85685d449ea/library/std/src/lib.rs/@/std.5167731717db2e51-cgu.0
+    <cf4ee>   DW_AT_name        : (indirect string, offset: 0x193285): /rustc/88d9e12ae178fab0fb5cc050a94da85685d449ea/library/panic_unwind/src/lib.rs/@/panic_unwind.ba24728e5e2211f0-cgu.0
+    <cfbf8>   DW_AT_name        : (indirect string, offset: 0xbab29): /rust/deps/memchr-2.7.6/src/lib.rs/@/memchr.926a9bd5e647c904-cgu.0
+    <d9ae9>   DW_AT_name        : (indirect string, offset: 0x1934a4): /rustc/88d9e12ae178fab0fb5cc050a94da85685d449ea/library/alloc/src/lib.rs/@/alloc.93e694a8365d93dd-cgu.0
+    <e9d9b>   DW_AT_name        : (indirect string, offset: 0x12e7cc): /rustc/88d9e12ae178fab0fb5cc050a94da85685d449ea/library/core/src/lib.rs/@/core.8c5ac2f034688f9a-cgu.0
+...
+```
+
+std, panic_unwind, memchr, alloc, core and compiler_builtins. The standard library comes precompiled with the toolchain, with its debug information inside, and the linker copies it into every binary built like this. My own `hello.rs` has no compile unit at all.
+
+```text
+$ wc -c hello_rs hello_rs_strip_debuginfo hello_rs_strip_symbols
+4507728 hello_rs
+ 457928 hello_rs_strip_debuginfo
+ 349904 hello_rs_strip_symbols
+5315560 total
+```
+
+rustc can remove it itself, with `-C strip=debuginfo` (458 KB) or `-C strip=symbols` (350 KB, the same as the `strip` command). Cargo does the first one already: since Rust 1.77, a release profile without debug info gets `strip = "debuginfo"` by default, and the announcement gives exactly this reason, the precompiled standard library. After that, the Rust program is still 22 times bigger than the C one. This part is real code: the parts of std that the program uses are linked into the binary, while the C program finds `puts` in the shared libc. `size` shows the code side:
+
+```text
+   text	   data	    bss	    dec	    hex	filename
+   1297	    584	      8	   1889	    761	hello_c_dyn
+ 656784	  22840	  22560	 702184	  ab6e8	hello_c_static
+ 333907	  12640	   3602	 350149	  557c5	hello_rs
+```
+
+The static C program has even more in its text column than Rust: 657 KB, mostly glibc.
+
+I found also one last difference in the segments of the Rust binary. Its first `LOAD` contains the headers and also `.rodata`, its writable data is in two `LOAD` segments, and there is a section called `.relro_padding`. This is not the GNU linker:
+
+```text
+$ readelf -p .comment hello_rs
+
+String dump of section '.comment':
+  [     0]  Linker: LLD 22.1.8 (/checkout/src/llvm-project/llvm 52ed14fcd56afc30f9cccd8ca8ce237c2eef7e04)
+  [    5f]  rustc version 1.98.0 (88d9e12ae 2026-08-18)
+  [    8b]  GCC: (GNU) 15.2.1 20260209
+```
+
+rustc 1.98 on this target links with LLD, the linker it ships, not with the system `ld`. Same format, other habits: LLD puts the read-only-after-relocation data in its own segment and pads it to a full page, while GNU ld puts it at the start of the writable segment. Two linkers, two layouts, and both programs run.
+
+## What to look at in your own binary
+
+- `readelf -h`: the type (EXEC or DYN) and where the two tables are.
+- `readelf -lW`: what will really be in memory, with which permissions, and which loader the file needs.
+- `readelf -SW`: the sections, for questions about the linker, symbols or debug information.
+- `size -A`: where the bytes of a big binary go, before trying to make it smaller.
+- When a binary "does not exist" but `ls` shows it, check the interpreter line first.
+
+## References
+
+- elf(5), the ELF header, program headers and section headers: https://man7.org/linux/man-pages/man5/elf.5.html
+- execve(2), ENOENT when the ELF interpreter does not exist: https://man7.org/linux/man-pages/man2/execve.2.html
+- The ld manual, `-z separate-code`: https://sourceware.org/binutils/docs/ld/Options.html
+- The Rust 1.77.0 announcement, `strip = "debuginfo"` by default in Cargo: https://blog.rust-lang.org/2024/03/21/Rust-1.77.0/
+- The fixture with the programs and the saved outputs: https://github.com/mehdiakiki/mehdi-cz/tree/main/experiments/from-source-to-process

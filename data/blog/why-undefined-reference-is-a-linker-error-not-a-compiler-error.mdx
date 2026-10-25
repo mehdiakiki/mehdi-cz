@@ -1,0 +1,250 @@
+---
+title: "Why \"Undefined Reference\" Is a Linker Error, Not a Compiler Error"
+date: "2026-09-07T13:05:00+01:00"
+lastmod: "2026-09-07T13:05:00+01:00"
+tags: ["from source to process", "c", "rust", "linker", "compiler internals"]
+draft: false
+reviewed: true
+reviewedHash: "3a2692cbe6ec786f5de67004793d2e12d608de5b4907eef9b7dab50cf0d5f470"
+cluster: "rust-under-the-hood"
+campaign: "editorial"
+summary: "Two C files compile without any problem and then fail together with undefined reference. I followed the error to the program that really prints it, then made the same mistake in Rust, where three different programs speak in one error message."
+---
+
+Here is an error that every C programmer has seen:
+
+```text
+$ gcc main.o -o prog
+/usr/bin/ld: main.o: in function `main':
+main.c:(.text.startup+0xc): undefined reference to `greet'
+collect2: error: ld returned 1 exit status
+exit status 1
+```
+
+Look at the first word of the second line and at the last line. The message comes from `/usr/bin/ld`, and `collect2` only reports that `ld` failed. The compiler is not in this message at all. So why does gcc print it, and why did the compiler not see the problem before?
+
+I made a very small experiment to see where each step happens. It uses the same tools as [the first part of this series](/blog/what-happens-when-you-run-a-program-from-execve-to-main), and the same machine: gcc 15.2.1, binutils 2.46, rustc 1.98.0.
+
+## Two files that compile alone
+
+```c
+void greet(const char *name);
+
+int main(void)
+{
+    greet("linker");
+    return 0;
+}
+```
+
+```c
+#include <stdio.h>
+
+void greet(const char *name)
+{
+    printf("hello, %s\n", name);
+}
+```
+
+`main.c` declares `greet` and calls it. `greet.c` defines it. I compiled each file alone with `-c`, which stops before linking:
+
+```text
+$ gcc -O2 -c main.c -o main.o
+$ gcc -O2 -c greet.c -o greet.o
+$ nm main.o greet.o
+
+main.o:
+                 U greet
+0000000000000000 r .LC0
+0000000000000000 T main
+
+greet.o:
+0000000000000000 T greet
+0000000000000000 r .LC0
+                 U printf
+```
+
+Both compiled without a word. In `main.o`, nm marks `greet` with U, undefined: the object needs it but does not have it. `greet.o` has the opposite, `greet` with T (defined, in the code) and `printf` undefined. An object file is a list of what it gives and what it needs, plus the code.
+
+The compiler did check something. Here is the same `main.c` without the declaration line:
+
+```text
+$ gcc -O2 -c nodecl.c -o nodecl.o
+nodecl.c: In function ‘main’:
+nodecl.c:3:5: error: implicit declaration of function ‘greet’ [-Wimplicit-function-declaration]
+    3 |     greet("linker");
+      |     ^~~~~
+exit status 1
+```
+
+This one is a compiler error, with a line and a column. Since GCC 14 it is an error by default, older versions only warned. So the compiler checks that a declaration exists, because it needs it to generate the call. It cannot check that a definition exists somewhere, because it sees one file at a time.
+
+## Where the error points
+
+The location in the linker message was `.text.startup+0xc`. Here is the code of `main.o` with its relocations:
+
+```text
+$ objdump -dr main.o
+0000000000000000 <main>:
+   0:	48 83 ec 08          	sub    $0x8,%rsp
+   4:	48 8d 3d 00 00 00 00 	lea    0x0(%rip),%rdi        # b <main+0xb>
+			7: R_X86_64_PC32	.LC0-0x4
+   b:	e8 00 00 00 00       	call   10 <main+0x10>
+			c: R_X86_64_PLT32	greet-0x4
+  10:	31 c0                	xor    %eax,%eax
+  12:	48 83 c4 08          	add    $0x8,%rsp
+  16:	c3                   	ret
+```
+
+The call at offset 0xb is `e8 00 00 00 00`: the opcode and four zero bytes. The compiler did not know where `greet` is, so it left a hole at 0xc and a note for the linker: put the address of `greet` here. (gcc places `main` in the section `.text.startup` with `-O2`, this is why the name is not `.text`.) "Undefined reference" means exactly this: the linker found the note at 0xc and nothing to put in the hole. These notes are relocations, and the next part is only about them.
+
+## Who is collect2
+
+When gcc gets object files, it does not link them itself. `gcc -v` shows the command it runs:
+
+```text
+$ gcc -v main.o greet.o -o prog 2>&1 | grep -E '^ .*collect2 ' | tr ' ' '\n' | grep -E 'collect2$|dynamic-linker|ld-linux|^-pie$|\.o$|^-lc$'
+/usr/lib/gcc/x86_64-pc-linux-gnu/15.2.1/collect2
+-dynamic-linker
+/lib64/ld-linux-x86-64.so.2
+-pie
+/usr/lib/gcc/x86_64-pc-linux-gnu/15.2.1/../../../../lib/Scrt1.o
+/usr/lib/gcc/x86_64-pc-linux-gnu/15.2.1/../../../../lib/crti.o
+/usr/lib/gcc/x86_64-pc-linux-gnu/15.2.1/crtbeginS.o
+main.o
+greet.o
+-lc
+/usr/lib/gcc/x86_64-pc-linux-gnu/15.2.1/crtendS.o
+/usr/lib/gcc/x86_64-pc-linux-gnu/15.2.1/../../../../lib/crtn.o
+```
+
+I kept only the interesting arguments. collect2 is a small program of GCC that calls the real `ld`. It receives my two objects, but also five files I never wrote: `Scrt1.o`, `crti.o`, `crtbeginS.o` before, `crtendS.o` and `crtn.o` after. They contain the code that runs before `main`, and a later part opens them. It receives also `-lc` for libc, and the path of the loader that will be written into the program header from the second part.
+
+So "the compiler" is really a driver. The GCC manual describes up to four stages, "preprocessing, compilation proper, assembly and linking", and here I gave it object files, so only the last one was left. The undefined reference is reported by this last step, and gcc only passes the message to us.
+
+## The linker only knows names
+
+If the linker checks names, does it check types? I made a second definition with the wrong type, on purpose:
+
+```c
+#include <stdio.h>
+
+void greet(int n)
+{
+    printf("hello, %d\n", n);
+}
+```
+
+```text
+$ gcc main.o greet_int.o -o prog_wrong && ./prog_wrong && ./prog_wrong
+hello, -174845948
+hello, -1993109500
+```
+
+It links, and it runs. `main` passes a pointer to the string "linker", and `greet` reads the same register as an `int`. The number changes at each run because the address of the string changes. Nobody complained: in an object file a C function is only a name, `greet`, without its parameters. The declaration in `main.c` was a promise, and only a shared header file makes sure that both files have the same promise.
+
+## The order of libraries
+
+The second classic version of this error comes with static libraries. I put `greet.o` in an archive, and I gave the library before my object:
+
+```text
+$ ar rcs libgreet.a greet.o
+$ gcc -L. -lgreet main.o -o prog -Wl,-y,greet
+/usr/bin/ld: main.o: reference to greet
+/usr/bin/ld: main.o: in function `main':
+main.c:(.text.startup+0xc): undefined reference to `greet'
+collect2: error: ld returned 1 exit status
+exit status 1
+$ gcc main.o -L. -lgreet -o prog -Wl,-y,greet
+/usr/bin/ld: main.o: reference to greet
+/usr/bin/ld: ./libgreet.a(greet.o): definition of greet
+$ ./prog
+hello, linker
+```
+
+Same files, same library, only the order changed. `-Wl,-y,greet` asks ld to print every file where the symbol appears, and it shows the difference. In the first command, ld finds only the reference, never the definition. In the second, it takes `greet.o` out of the archive. OK, now it works.
+
+The ld manual explains the rule: the linker searches an archive only once, at the place where it is on the command line, and it takes only the members that define something undefined at that moment. When ld reached `libgreet.a` in the first command, nobody needed `greet` yet. Later `main.o` needed it, and ld did not go back.
+
+This rule belongs to GNU ld, not to linking in general. The same wrong command with LLD:
+
+```text
+$ ld.lld --version
+LLD 21.1.8 (compatible with GNU linkers)
+$ gcc -fuse-ld=lld -L. -lgreet main.o -o prog_lld && ./prog_lld
+hello, linker
+```
+
+LLD accepts it. Good to know, because rustc links with LLD, as the Rust part below shows. With GNU ld the fix is to write the libraries after the objects that use them, in the order of who needs whom.
+
+## The same mistake in Rust
+
+```rust
+use std::ffi::c_char;
+
+unsafe extern "C" {
+    fn greet(name: *const c_char);
+}
+
+fn main() {
+    unsafe { greet(c"rust".as_ptr()) };
+}
+```
+
+The `extern` block is the Rust version of the C declaration. rustc compiles the crate without a problem when I ask only for the object file:
+
+```text
+$ rustc --edition 2024 -O --emit obj missing.rs -o missing.o
+$ nm -C missing.o
+                 U greet
+...
+0000000000000000 T main
+0000000000000000 T std::rt::lang_start::<()>
+...
+0000000000000000 T missing::main
+                 U std::rt::lang_start_internal
+```
+
+`greet` is U, like in `main.o`. There is also a C `main`, which calls `std::rt::lang_start`, the start of the Rust runtime that the first part followed with strace. Now the normal build:
+
+```text
+$ rustc --edition 2024 -O missing.rs -o missing
+error: linking with `cc` failed: exit status: 1
+  |
+...
+  = note: some arguments are omitted. use `--verbose` to show all linker arguments
+  = note: rust-lld: error: undefined symbol: greet
+          >>> referenced by missing.4a2dae97afd9f82b-cgu.0
+          >>>               missing.missing.4a2dae97afd9f82b-cgu.0.rcgu.o:(missing::main)
+          collect2: error: ld returned 1 exit status
+          
+
+error: aborting due to 1 previous error
+```
+
+I cut one very long line, the full `cc` command. This message is interesting because three programs speak in it. The first line and the last line are rustc: it says that linking with `cc` failed and it stops. The lines that start with `rust-lld: error` and `>>>` are LLD, the linker that rustc 1.98 uses on this target, with its own format: the symbol, then which object and which function reference it. And `collect2: error` is gcc again, because rustc calls the linker through `cc`, and gcc's collect2 is in the middle. rustc only puts the output of the others in a `note`.
+
+With the library, it links:
+
+```text
+$ rustc --edition 2024 -O missing.rs -L . -l static=greet -o missing && ./missing
+hello, rust
+```
+
+## What to check when this error appears
+
+The error is never about code that is wrong for the compiler. It is about the list of files given to the linker. So the questions are, in this order:
+
+- Is the object or library that defines the symbol on the link command at all?
+- With GNU ld, is the library after the objects that need it?
+- Is it the same name? The linker compares names only, so a different spelling, a C++ function without `extern "C"`, or a Rust function without `#[unsafe(no_mangle)]`, is a different symbol.
+- And when it links, the types are still my problem. The linker will happily connect a function to a declaration with other parameters.
+
+## Sources
+
+- The ld manual, `-l` (an archive is searched once, at its position) and `-y`: https://sourceware.org/binutils/docs/ld/Options.html
+- GCC 14 porting notes, implicit function declarations are errors: https://gcc.gnu.org/gcc-14/porting_to.html
+- GCC manual, the four stages and `-c`: https://gcc.gnu.org/onlinedocs/gcc/Overall-Options.html
+- GCC internals, collect2: https://gcc.gnu.org/onlinedocs/gccint/Collect2.html
+- nm(1): https://man7.org/linux/man-pages/man1/nm.1.html
+- The programs and the saved outputs of this part: https://github.com/mehdiakiki/mehdi-cz/tree/main/experiments/from-source-to-process/p04

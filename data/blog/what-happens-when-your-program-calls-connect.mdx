@@ -1,0 +1,256 @@
+---
+title: "What Happens When Your Program Calls connect()"
+date: "2026-07-01T18:55:00+01:00"
+lastmod: "2026-07-01T18:55:00+01:00"
+tags: ["following a tcp connection", "networking", "linux", "tcp", "python"]
+draft: false
+reviewed: true
+reviewedHash: "a238606fe2b24a3d191e782c5dfc1d1814d68a3157e9921a897da9c38622c0e3"
+cluster: "reliable-data-integrations"
+campaign: "editorial"
+summary: "On my laptop connect() returns in about 8 microseconds, and the same call can also block for 133 seconds. I followed it with strace and ss: the handshake that the kernel does alone, a port where nobody listens, and a server that never answers."
+---
+
+On my laptop, `connect()` to a local server returns in about 8 microseconds. With the same client code and the same address, but a different server, I made the same call wait 133 seconds before it failed. Between these two numbers there is everything that the kernel does to open one TCP connection, and the program sees almost nothing of it. One call, one return value.
+
+I wanted to see this part with my own eyes, so I made a few small experiments. This is the first part of a series where I follow one TCP connection from `connect()` to `close()`, with small programs on one laptop and the tools that Linux already has: `strace` for the system calls, `ss` for the sockets, and the TCP counters of the kernel in `/proc/net`. I cannot capture packets here (tcpdump needs root, and I do not use root). So I never say "I saw the packet", only what the kernel shows: states, counters, timings, return values.
+
+Everything runs over loopback, the interface where the machine talks to itself (127.0.0.1). It is a good lab, but not a real network: no packet loss, almost no latency, and an MTU of 65536 bytes instead of the usual 1500. When a result depends on this, I will say it.
+
+## A listener that does nothing
+
+The server of the first experiment is a small Python program, `listener.py`. It listens on 127.0.0.1, port 21010, with a backlog of 8, and then it does nothing. It never calls `accept()`:
+
+```python
+ls = listen(port, backlog)
+print(f"ready: listening on 127.0.0.1:{port}, backlog {backlog}, mode {mode}", flush=True)
+if mode == "never":
+    signal.pause()
+```
+
+`listen` is a helper of the fixture for the classic three calls: `socket()`, `bind()`, `listen()`. The client is even shorter:
+
+```python
+def connect_once(port):
+    s = socket.socket()
+    try:
+        s.connect((HOST, port))
+        print(ss("-tan", on_port(port)), end="", flush=True)
+    except OSError as e:
+        print(f"connect: {e!r}")
+    s.close()
+```
+
+I ran the client under `strace -T -e trace=%network`, which prints every network system call with the time spent inside it at the end of the line:
+
+```text
+socket(AF_INET, SOCK_STREAM|SOCK_CLOEXEC, IPPROTO_IP) = 3 <0.000020>
+connect(3, {sa_family=AF_INET, sin_port=htons(21010), sin_addr=inet_addr("127.0.0.1")}, 16) = 0 <0.000061>
+```
+
+Two lines. The first one created a TCP socket and returned the file descriptor 3. At this moment the socket is nothing: no address, no peer, nothing was sent. The second line is the connect. It returned 0, so success, after 61 microseconds. strace makes every system call slower, so the real number comes a bit later.
+
+So what happened inside these 61 microseconds?
+
+## Three messages between two kernels
+
+TCP opens a connection with three messages, the "three-way handshake" of RFC 9293:
+
+1. The client kernel chooses a free local port (here 55384) and sends a SYN to 127.0.0.1:21010. In simple words: "I want to open a connection, and my byte counter starts at this number".
+2. The kernel on the server side answers with a SYN-ACK: "OK, I got your number, and my own counter starts at this other number".
+3. The client kernel sends an ACK: "I got yours".
+
+SYN and ACK are flags in the TCP header, and the two numbers are the initial sequence numbers: each side counts the bytes it sends from its own number. After the third message, both sides know where the stream of the other side starts, and the connection exists.
+
+Here is the point that I want to make clear in this first part: these three messages go between two kernels. Who sent the SYN-ACK in my experiment? Not the server program. It was sleeping in `signal.pause()`. The kernel answered alone, because a socket in the LISTEN state existed on this port. And `connect()` returned when the client kernel received the SYN-ACK and sent its ACK, at the end of the handshake. The server program did nothing at all.
+
+The client printed the `ss` output while it was still connected:
+
+```text
+State  Recv-Q Send-Q Local Address:Port  Peer Address:Port
+LISTEN 1      8          127.0.0.1:21010      0.0.0.0:*
+ESTAB  0      0          127.0.0.1:21010    127.0.0.1:55384
+ESTAB  0      0          127.0.0.1:55384    127.0.0.1:21010
+```
+
+There are three sockets, not two.
+
+The LISTEN socket is the one of the server program. For a listening socket, `ss` uses the queue columns in a special way: Recv-Q is the number of connections that finished the handshake and wait for `accept()`, here 1 (mine), and Send-Q is the limit of this queue, the backlog given to `listen()`, here 8.
+
+The two ESTAB lines are the two ends of the same connection, with the addresses in the opposite order. Local port 55384 is my client socket. Local port 21010 is a new socket that the kernel created on the server side for this connection. It is fully connected already, but no program has a file descriptor for it. `accept()` only hands over a socket that already exists. The next part is about this waiting room, and what happens when it is full.
+
+## Two thousand connects
+
+To measure the real time, I changed the server: now it accepts every connection and closes it at once. The client makes 2000 connections one after the other and measures only the `connect()` call with `time.perf_counter()`:
+
+```text
+2000 connects to 127.0.0.1:21011, load average 3.04 2.88 3.10
+connect(): n=2000 min=6.7 p10=6.9 median=7.3 p90=11.2 p99=23.8 max=68.4 us
+  TcpActiveOpens               +2000
+  TcpAttemptFails              +0
+```
+
+The median connect took 7.3 microseconds. p10 and p90 mean that 10% of the calls were faster than 6.9 µs and 10% slower than 11.2 µs. The `TcpActiveOpens` counter grew by exactly 2000. I made five runs:
+
+| run | median | p99 | max |
+| --- | --- | --- | --- |
+| 1 | 7.3 µs | 23.8 µs | 68.4 µs |
+| 2 | 7.8 µs | 23.4 µs | 49.4 µs |
+| 3 | 7.8 µs | 20.6 µs | 85.3 µs |
+| 4 | 8.1 µs | 23.2 µs | 171.5 µs |
+| 5 | 12.8 µs | 40.7 µs | 74.1 µs |
+
+Four runs are close. The fifth is slower, and I have no precise reason: the laptop was busy (load average around 3), it changes the CPU frequency all the time, and I did not pin the processes to a core. What I keep: a connect over loopback costs some microseconds, and sometimes one call takes 10 or 20 times more.
+
+These microseconds are the full handshake for both sides, done by one kernel, without a wire. On a real network, `connect()` cannot return before the SYN went to the server and the SYN-ACK came back, so it costs at least one network round trip, normally much longer than 8 microseconds. This is the first reason why programs keep connections open.
+
+## Nobody on the port
+
+Now the same client, but to port 21012, where nothing listens:
+
+```text
+connect(3, {sa_family=AF_INET, sin_port=htons(21012), sin_addr=inet_addr("127.0.0.1")}, 16) = -1 ECONNREFUSED (Connection refused) <0.000125>
+```
+
+Python turns `ECONNREFUSED` into `ConnectionRefusedError`. Here are 2000 attempts, with the counters:
+
+```text
+2000 connects to 127.0.0.1:21012, load average 3.04 2.88 3.10
+connect(): n=2000 min=5.1 p10=5.4 median=6.3 p90=8.2 p99=12.1 max=72.1 us
+  2000 x ConnectionRefusedError(111, 'Connection refused')
+  TcpActiveOpens               +2000
+  TcpAttemptFails              +2000
+  TcpOutRsts                   +2000
+  TcpEstabResets               +0
+```
+
+The kernel received each SYN, found no socket on this port, and answered at once with a RST (reset): "there is nothing here, stop". `TcpOutRsts` counts the RST segments the kernel sent: +2000, one per attempt. `TcpAttemptFails` counts the failed attempts: +2000 too. These counters are for the whole machine, but here they match my numbers exactly. I liked that.
+
+I measured also how fast this answer comes. In four runs of five the median was between 5.4 and 6.3 µs, a bit faster than a successful connect (probably because there is no new socket to create on the other side), and one run was at 13.8 µs.
+
+So "connection refused" is a good kind of failure: fast and clear. If something between two machines drops the SYN instead of answering with a RST, the client sees the next case.
+
+## A server that never answers
+
+This is the dangerous case. I used a listener with a backlog of 0 that never calls `accept()`, and I filled its queue with one connection. When the accept queue is full, Linux drops the new SYNs silently: no SYN-ACK, no RST. The kernel documentation of the TCP counters says it in one line: the "kernel will drop the SYN and add 1 to TcpExtListenOverflows".
+
+So the client sends a SYN and nothing comes back. It waits, and it sends the SYN again. How long it tries is set by `net.ipv4.tcp_syn_retries` for the whole system (6 here) or by the option `TCP_SYNCNT` for one socket. With `TCP_SYNCNT` at 2, I expected the classic schedule that I had in my head: a retry after 1 second, another one 2 seconds later, then 4 more seconds and a failure. So 7 seconds and 3 SYNs.
+
+`ss -o` shows the retransmission timer of a socket: `timer:(on,987ms,0)` means the timer fires in 987 ms, and there were 0 retransmissions until now. A small thread in my client ran `ss` every 20 ms and printed the timer each time this count changed:
+
+```text
+TCP_SYNCNT of the socket: 2, load average 3.04 2.88 3.10
+  t=   0.029 s  timer:(on,987ms,0)
+  t=   1.072 s  timer:(on,957ms,1)
+  t=   2.069 s  timer:(on,970ms,2)
+  t=   3.056 s  timer:(on,997ms,3)
+  t=   4.090 s  timer:(on,977ms,4)
+  t=   5.113 s  timer:(on,1.967sec,5)
+connect: TimeoutError(110, 'Connection timed out') after 7.119 s
+  TcpExtListenOverflows        +6
+  TcpExtListenDrops            +6
+  TcpExtTCPSynRetrans          +5
+  TcpAttemptFails              +1
+```
+
+The total, 7.1 seconds, is what I expected. The rest is not. The kernel retried every second, five times, and only the last wait was 2 seconds: six SYNs instead of three. The counters agree. On the listener side, `TcpExtListenOverflows` grew by 6, so six SYNs were dropped because the queue was full, and `TcpExtTCPSynRetrans` grew by 5. At the end `connect()` failed with `ETIMEDOUT` (errno 110).
+
+Strange. It was not obvious for me where this comes from. The answer is in the kernel documentation for my kernel version: a setting `tcp_syn_linear_timeouts`, 4 by default (also here), "the number of times for an active TCP connection to retransmit SYNs with a linear backoff timeout before defaulting to an exponential backoff timeout". The documentation gives even the waits to expect: 1, 1, 1, 1, 1, 2, 4, and so on. Exactly what `ss` showed. With 2 retries the total stays at 7 seconds, but inside it the kernel sends six SYNs instead of three, so one lost SYN costs only one second.
+
+Then the same thing without `TCP_SYNCNT`, so with the default of the system:
+
+```text
+TCP_SYNCNT of the socket: 6, load average 3.18 2.91 3.11
+  t=   0.025 s  timer:(on,990ms,0)
+...
+  t=   5.090 s  timer:(on,1.990sec,5)
+  t=   7.201 s  timer:(on,3.987sec,6)
+  t=  11.292 s  timer:(on,7.957sec,7)
+  t=  19.387 s  timer:(on,15sec,8)
+  t=  36.036 s  timer:(on,31sec,9)
+  t=  68.426 s  timer:(on,1min3sec,10)
+connect: TimeoutError(110, 'Connection timed out') after 133.251 s
+  TcpExtListenOverflows        +11
+  TcpExtListenDrops            +11
+  TcpExtTCPSynRetrans          +11
+  TcpAttemptFails              +1
+```
+
+After the five linear retries, the wait doubles each time: 2, 4, 8, 16, 32 and 64 seconds. The blocking `connect()` failed after 133.3 seconds.
+
+The kernel documentation says 131 seconds for these settings, and the tcp(7) man page still says "approximately 127 seconds", the number from before the linear retries. My two extra seconds came mostly from the longest waits, which ended 0.4 to 0.8 seconds late. The kernel keeps the timers that are far in the future with less precision: the table in the comments of `kernel/time/timer.c` says that with `CONFIG_HZ=300`, the setting of this kernel, a timer 13.6 to 109 seconds away can fire up to 1.7 seconds late.
+
+The listener dropped 11 SYNs: the first one and 10 retries. `TcpExtTCPSynRetrans` grew by 11, one more than my 10 retries: the counter is for the whole machine, and something else on the laptop retransmitted a SYN or a SYN-ACK during these two minutes.
+
+So 6 in `tcp_syn_retries` gave 10 retries. The kernel source explains it: `tcp_write_timeout()` in `net/ipv4/tcp_timer.c` allows the setting plus the 4 linear retries, and it stops also when the time of the old doubling schedule is over, 7 seconds for 2 and 127 seconds for 6. With `TCP_SYNCNT` at 2, the time came first.
+
+With the default settings, then, a blocking `connect()` to a server that never answers blocks the thread for more than two minutes. No user waits so long.
+
+## A timeout, the way most clients do it
+
+This is why clients put a timeout on the connection. In Python it is `socket.create_connection((host, port), timeout=2)`. Under strace, with the first listener (the one with space in its queue):
+
+```text
+socket(AF_INET, SOCK_STREAM|SOCK_CLOEXEC, IPPROTO_TCP) = 3 <0.000034>
+ioctl(3, FIONBIO, [1])                  = 0 <0.000015>
+connect(3, {sa_family=AF_INET, sin_port=htons(21010), sin_addr=inet_addr("127.0.0.1")}, 16) = -1 EINPROGRESS (Operation now in progress) <0.000116>
+poll([{fd=3, events=POLLOUT|POLLERR}], 1, 2000) = 1 ([{fd=3, revents=POLLOUT}]) <0.000017>
+getsockopt(3, SOL_SOCKET, SO_ERROR, [0], [4]) = 0 <0.000016>
+```
+
+This is a non-blocking connect, the same thing that you would write in C:
+
+- `ioctl(FIONBIO)` puts the socket in non-blocking mode (the Python documentation says that sockets with a timeout "are internally set in non-blocking mode").
+- `connect()` starts the handshake and returns at once with `EINPROGRESS`: "it started, I do not wait".
+- `poll()` waits until the socket is writable, at most 2000 ms. Writable means that the handshake is finished, with success or with an error.
+- `getsockopt(SO_ERROR)` gives the result, here 0. The connect(2) man page describes exactly this method.
+
+Over loopback the handshake was already finished, so poll returned after 17 microseconds. With the full listener the end is different:
+
+```text
+connect(3, {sa_family=AF_INET, sin_port=htons(21013), sin_addr=inet_addr("127.0.0.1")}, 16) = -1 EINPROGRESS (Operation now in progress) <0.000055>
+poll([{fd=3, events=POLLOUT|POLLERR}], 1, 2000) = 0 (Timeout) <2.002091>
+```
+
+poll returned 0 after 2 seconds: nothing happened. Python raised `TimeoutError`, and `create_connection` closed the socket.
+
+Now a trap, and honestly I did not know it before this experiment. Many programs do not use `create_connection`: they call `settimeout()` and `connect()` on their own socket. I did this with a timeout of 1.5 seconds and looked at the socket after the `TimeoutError`:
+
+```text
+connect: TimeoutError('timed out') after 1.502 s
+-- ss after the timeout, the socket is still open
+Recv-Q Send-Q Local Address:Port  Peer Address:Port
+0      1          127.0.0.1:39992    127.0.0.1:21013 timer:(on,510ms,1)
+-- ss after close()
+Recv-Q Send-Q Local Address:Port Peer Address:Port
+```
+
+The program gave up after 1.5 seconds. The kernel did not, it is still trying: the socket is in SYN-SENT (I asked `ss` for this state only), one retry was already sent, and the next one comes in 510 ms. Send-Q is 1 because the SYN itself uses one sequence number, and nobody acknowledged it. Only `close()` stopped it.
+
+So the timeout lives in the program, the retries live in the kernel, and they do not know about each other. A program that retries in a loop and forgets to close its old sockets keeps all these old attempts alive.
+
+## The rest of the way
+
+So `connect()` returned, and the connection exists. The next parts follow it from here. First the waiting room on the server side, the accept queue, and a server that accepts too slowly. Then the first bytes: why a small write can wait 40 milliseconds, why `recv()` returns less than you asked, and what a full socket buffer does to the sender. Then the end: what `close()` really sends, and TIME_WAIT, the state that stays after the close. And around the connection: how a name like `localhost` becomes an address, what TLS adds, and what a connection pool saves and breaks.
+
+All the parts are under the tag [following a tcp connection](/blog/tags/following-a-tcp-connection/page/1), and the series belongs to the topic [reliable data integrations](/blog/topics/reliable-data-integrations).
+
+## What I would check in client code
+
+- Does every connect have a timeout? Without one, a server that drops SYNs blocks the call for more than two minutes (133 seconds here).
+- After a timeout, is the socket closed? If not, the kernel keeps sending SYNs.
+- Are "refused" and "timed out" two different cases? The first is a clear answer. The second says nothing: the server can be down, overloaded, or only too slow to accept.
+- Does the code think that "connected" means "the server saw me"? In this experiment it did not see me. That is the next part.
+
+The programs, the `run.sh` that runs everything, and all the outputs are in the [fixture of this series](https://github.com/mehdiakiki/mehdi-cz/tree/main/experiments/following-a-tcp-connection). The outputs quoted here are [p01-strace.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/following-a-tcp-connection/results/p01-strace.txt), [p01-connect-time.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/following-a-tcp-connection/results/p01-connect-time.txt) and [p01-synretry.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/following-a-tcp-connection/results/p01-synretry.txt), and the settings of the machine (kernel, sysctls, constants from the kernel headers) are in [p01-machine.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/following-a-tcp-connection/results/p01-machine.txt).
+
+## Sources
+
+- [RFC 9293, Transmission Control Protocol (TCP)](https://www.rfc-editor.org/rfc/rfc9293.html#section-3.5), section 3.5 for the three-way handshake
+- [connect(2), Linux manual page](https://man7.org/linux/man-pages/man2/connect.2.html)
+- [tcp(7), Linux manual page](https://man7.org/linux/man-pages/man7/tcp.7.html)
+- [ss(8), Linux manual page](https://man7.org/linux/man-pages/man8/ss.8.html)
+- [IP Sysctl, Linux kernel documentation for 6.6](https://www.kernel.org/doc/html/v6.6/networking/ip-sysctl.html), for `tcp_syn_retries` and `tcp_syn_linear_timeouts`
+- [SNMP counter, Linux kernel documentation](https://docs.kernel.org/networking/snmp_counter.html)
+- [socket, Python 3.14 documentation](https://docs.python.org/3.14/library/socket.html), notes on socket timeouts
+- [kernel/time/timer.c](https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/kernel/time/timer.c?h=v6.6.126) and [net/ipv4/tcp_timer.c](https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/net/ipv4/tcp_timer.c?h=v6.6.126), Linux 6.6.126

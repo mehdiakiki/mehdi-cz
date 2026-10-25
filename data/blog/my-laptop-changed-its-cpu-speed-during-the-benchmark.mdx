@@ -1,0 +1,142 @@
+---
+title: "My Laptop Changed Its CPU Speed During the Benchmark"
+date: "2026-09-16T07:15:00+01:00"
+lastmod: "2026-09-16T07:15:00+01:00"
+tags: ["when the benchmark lies", "linux", "performance", "benchmarking", "rust"]
+draft: false
+reviewed: true
+reviewedHash: "31d9192920b204eed6e8898fd9ffac5f7ba0276477904c3fc9a6de4483d66f7e"
+campaign: "editorial"
+summary: "I measured the work of one loop and the clock of its core at the same time, for one minute. The clock moved between 3.3 and 4.2 GHz without any change in my program, and the work per cycle stayed the same in every phase. Here is the trace, and what I can do about it on a laptop."
+---
+
+At the end of [the part about JIT warmup](/blog/jit-warmup-why-a-function-gets-faster-after-thousands-of-calls), a compiled Java function still jumped between levels, 3.24, 3.81, 4.01 nanoseconds per call, long after the JIT had finished its work. The compile log was silent, so the JVM was not the reason. My guess was the clock of the CPU.
+
+A guess is not a measurement. So for this part I made a program that measures two things at the same time: how much work a loop does, and at which frequency its core runs.
+
+## Work and clock in the same trace
+
+The program has two threads. The worker is pinned to CPU 2, a performance core, and runs this loop, in chunks of 100,000 turns:
+
+```asm
+.LBB23_18:
+	imulq	%rax, %rbx
+	addq	%rcx, %rbx
+	incq	%rdx
+	cmpq	$100000, %rdx
+	jne	.LBB23_18
+```
+
+One multiplication and one addition per turn, and each turn needs the result of the previous one. So the loop can never run faster than the latency of this chain, and it does not touch memory at all. After each chunk it increments a shared counter.
+
+The sampler is pinned to CPU 10, an efficiency core, so it does not steal time from the worker. Every 100 ms (every 5 ms during the first half second) it reads the counter and `scaling_cur_freq` of CPU 2. The kernel documentation of `intel_pstate` describes this file as the "frequency of the average P-state of the CPU", so it is an average over a short recent time, not one instant. The sampler prints the work done since the last sample and the work per cycle, that is the work divided by the frequency. It prints also the temperature of the core of CPU 2 and of the whole package.
+
+If the speed of the loop depends only on the clock, the work per cycle must stay constant.
+
+## One minute alone
+
+After three seconds of sleep, the worker ran for 60 seconds. These are the medians of each phase:
+
+```text
+phase      load  freq_MHz  core_C  pkg_C  iter_per_us  iter_per_cycle  (medians)
+0-0.5 s    off       3894      62     88        966.6           0.248
+0.5-10 s   off       3844      68     85        959.4           0.247
+10-20 s    off       3400      69     79        849.0           0.249
+20-30 s    off       3400      70     79        845.0           0.248
+30-40 s    off       4102      70     87       1013.9           0.247
+40-50 s    off       4140      69     88       1026.5           0.248
+50-60 s    off       4123      69     88       1027.1           0.247
+```
+
+The full trace shows three different periods. Until about 6 seconds the clock was between 3.8 and 4.0 GHz. From 7 to 29 seconds it was between 3.3 and 3.6 GHz. After 30 seconds it went back to 3.9 to 4.2 GHz. My program did exactly the same thing during the whole minute.
+
+And the last column is the important one. The work per cycle stayed between 0.247 and 0.249 in every phase, while the work per microsecond moved by 20 percent. 0.25 iterations per cycle means four cycles per turn, the latency of the chain. OK, this is clear: the loop always does the same work per cycle, and only the number of cycles per second changes.
+
+So, if I had measured version A of some code in the first 6 seconds and version B between 10 and 30 seconds, B would look 11.5 percent slower (849 against 959 iterations per microsecond), with no difference in the code at all. Honestly, this number scares me a little: it is bigger than most of the differences I would want a benchmark to detect.
+
+## Why not 4.7 GHz?
+
+The maximum frequency of this CPU is 4.7 GHz, and the result file records it next to the settings:
+
+```text
+cpu2: driver intel_pstate, energy_performance_preference power, cpuinfo_max_freq 4700000 kHz, no_turbo 0, AC online 1
+```
+
+Turbo is allowed (`no_turbo 0`) and the laptop is on AC power. But the energy performance preference is `power`. With `intel_pstate`, the hardware chooses the frequency itself, and this preference is a hint that tells it to save energy. The highest median of any phase in the saved run was 4,399 MHz, during the first half second of the second run.
+
+There is a second reason in the kernel documentation: the maximum turbo frequency "generally depends on the number of cores running concurrently". My laptop is never idle. When this run started, the snapshot of busy CPUs shows CPU 3 at 100 percent, another program on the other hardware thread of my own core, and at the end other CPUs were busy too. (The work per cycle stayed at 0.25 anyway: this loop waits for its own chain all the time.) I can not change the preference without root, I can not stop programs that are not mine, and I did not want to: this is the laptop as I use it.
+
+## Other cores slow down mine
+
+To test the second reason directly, the second run starts the same chain on five efficiency cores (CPUs 11 to 15) during every second phase of 10 seconds:
+
+```text
+phase      load  freq_MHz  core_C  pkg_C  iter_per_us  iter_per_cycle  (medians)
+0-0.5 s    off       4399      64     66       1090.8           0.247
+0.5-10 s   off       4147      69     90       1025.8           0.246
+10-20 s    on        4056      68     78        991.0           0.246
+20-30 s    off       4117      70     89       1021.9           0.248
+30-40 s    on        3727      72     84        932.0           0.249
+40-50 s    off       4128      78     92       1026.6           0.248
+50-60 s    on        3800      69     78        957.0           0.248
+```
+
+Every phase with the extra load is slower than the two phases around it: 4,056, 3,727 and 3,800 MHz, against 4,117 to 4,147 MHz without the load. The size changes, from 2 to 10 percent, but the direction is always the same. In the first test of the program, also in the fixture, the direction was the same too, but the difference was only about 1 percent (medians of 3,758 MHz with the load and 3,800 without). The busy efficiency cores do not share anything with my loop, no memory and no code. They only share the chip.
+
+I did not expect this: during the load phases, the package temperature goes down, from about 90 °C to 78 to 84 °C. My own core stays between 64 and 78 °C in all phases, so it is not my core that cools. Something else in the package gets cooler when five more cores are busy. Maybe the other busy performance cores get a lower clock too, but I did not measure them, so I can not say. And the slow period of the first run, between 7 and 29 seconds, has the same signature: lower clock and a cooler package. So my guess is that some other program started to work on other cores during those twenty seconds. I do not know which one.
+
+## The ramp from idle
+
+In [the part about the first run](/blog/why-the-first-run-is-slower) I wanted to see the clock ramp up after idle, and I could not separate it from cold caches. Here the saved run makes five short starts after three seconds of sleep:
+
+```text
+start 1: cpu 2 at 4059 MHz, its core at 92 C, package at 92 C | 5 ms 4372 MHz  10 ms 4376 MHz  20 ms 4357 MHz  40 ms 4108 MHz  60 ms 4375 MHz  80 ms 4358 MHz  100 ms 4364 MHz  
+start 2: cpu 2 at 991 MHz, its core at 62 C, package at 96 C | 5 ms 4422 MHz  10 ms 4055 MHz  20 ms 4473 MHz  40 ms 4424 MHz  60 ms 4428 MHz  80 ms 4119 MHz  100 ms 4528 MHz  
+...
+```
+
+All five were above 4 GHz at 5 ms. The minute with load in the same run did not start like this: the package was at 66 °C, and the clock went from 1.47 GHz at 5 ms to 4.40 GHz only at 73 ms. The very first test of this program, which I kept in the fixture, looked the same:
+
+```text
+worker on cpu 2, sampler on cpu 10, 40 s, extra load on [11, 12, 13, 14, 15] in every second phase of 10 s
+before the start: cpu 2 at 1275 MHz, package at 67 C
+ time_ms  load  freq_MHz  temp_C  iter_per_us  iter_per_cycle
+       5   off      1207      67        271.7           0.225
+      10   off      1300      66        324.7           0.250
+      15   off      1372      68        338.1           0.246
+      22   off      1555      66        374.4           0.241
+      25   off      1555      66        399.5           0.257
+      30   off      1690      67        420.8           0.249
+      35   off      1802      68        439.8           0.244
+      40   off      2022      68        500.8           0.248
+      46   off      2291      68        551.2           0.241
+      50   off      2463      71        611.8           0.248
+      55   off      2661      72        672.9           0.253
+      60   off      3102      75        756.7           0.244
+      65   off      3390      80        887.2           0.262
+      70   off      3838      80        919.0           0.239
+...
+```
+
+Here the core started at 1.2 GHz and needed 70 ms to reach 3.8 GHz. During the first 35 ms it did less than half of the work per microsecond of the later samples, and still the same work per cycle. The difference between the cases: in the first test and before the minute with load the package was at 66 to 67 °C, so the rest of the laptop was quiet, and before the five starts it was at 92 to 96 °C because other programs were busy. I saw the slow start only when the package was cool, that is when the rest of the laptop was quiet. I do not know the mechanism, but the practical point is clear: a benchmark that starts on a quiet machine can spend its first tens of milliseconds at a third of the speed.
+
+When I ran this part a second time, on a quiet laptop with the package at 50 to 51 °C, the slow start was everywhere: all five starts stayed between 1.0 and 1.9 GHz for the first 80 ms, only one reached 2.4 GHz at 100 ms, and the minute alone needed about 150 ms to pass 3 GHz. After that, its phase medians stayed between 4.47 and 4.61 GHz, so the slow period of the first run probably came from other programs, as I guessed. The five busy E-cores lowered my clock again, but only by about 1 percent, and this time the package did not get cooler ([p06-cpu-speed.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/when-the-benchmark-lies/results/second-run/p06-cpu-speed.txt)).
+
+## What a benchmark machine does, and what I can do
+
+On a machine reserved for benchmarks, people remove these effects at the source. The LLVM documentation has a page of benchmarking tips that lists the usual steps: "Disable frequency scaling, Turbo Boost and address space randomization", set the governor to `performance`, disable Turbo Boost with `intel_pstate/no_turbo`, "Disable the SMT pair of the cpus you will use for the benchmark", and reserve cores with `cset shield`. All of these need root, and they make the machine less similar to the one where the program will really run. They are still the right thing for a benchmark machine.
+
+On my laptop I can not do any of this, so I do what I can:
+
+- Pin the benchmark to one known core, so at least the core type and its sibling are known.
+- Warm up for much longer than the ramp. The slow start above took 70 ms, so I prefer about a second.
+- Record the frequency next to every result, as the result files of this series do since [the first part](/blog/the-benchmark-that-measured-nothing).
+- For a loop that only computes, look at the work per cycle. Its phase medians did not move in this experiment. It fell only in the first 40 ms of the minute with load, to 0.011 to 0.149, and right after that minute the snapshot shows CPU 2 itself 59 percent busy, so probably another program shared my CPU at that moment. So if the work per cycle changes between two versions, look first at what else ran on that CPU.
+- Never run version A for one minute and then version B for the next minute. Alternate them in short blocks, so that a slow period of 20 seconds hits both. A later part of the series measures how much this matters.
+
+The programs, the two traces and the first test are in [the fixture](https://github.com/mehdiakiki/mehdi-cz/tree/main/experiments/when-the-benchmark-lies), with the summary in [p06-cpu-speed.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/when-the-benchmark-lies/results/p06-cpu-speed.txt).
+
+## Sources
+
+- [Linux kernel documentation: intel_pstate CPU Performance Scaling Driver](https://www.kernel.org/doc/html/v6.6/admin-guide/pm/intel_pstate.html)
+- [LLVM documentation: Benchmarking tips](https://releases.llvm.org/22.1.0/docs/Benchmarking.html)

@@ -1,0 +1,139 @@
+---
+title: "How SQLite Commits a Transaction, Followed With strace"
+date: "2026-10-06T17:45:00+01:00"
+lastmod: "2026-10-06T17:45:00+01:00"
+tags: ["what survives a crash", "sqlite", "databases", "linux", "reliability"]
+draft: false
+reviewed: true
+reviewedHash: "3617750a6942ac07bff5b37cae51b0038f9c06508340d5e707635752147d5e48"
+cluster: "reliable-data-integrations"
+campaign: "editorial"
+summary: "One INSERT in SQLite's default rollback journal mode makes four sync calls on my laptop. I followed every write with strace, compared FULL, EXTRA, NORMAL and OFF, and found the one directory sync that FULL leaves out, as the SQLite documentation says."
+---
+
+How many times does SQLite wait for the disk when you insert one row?
+
+I made a small experiment to count it, with strace on my laptop and the `sqlite3` command line tool, version 3.51.2. A new database file has these defaults here:
+
+```text
+== 3.51.2 2026-01-09, defaults for a new database file:
+journal_mode=delete synchronous=2 page_size=4096
+```
+
+`journal_mode=delete` is the classic rollback journal, and `synchronous=2` is FULL. In this mode, one INSERT in its own transaction makes four sync calls. Everything in this series so far explains why, so let me go through them one by one.
+
+## One INSERT, line by line
+
+The database has one empty table. The traced command is one INSERT, and the viewer from [part 3](/blog/how-to-save-a-file-without-losing-it-write-fsync-rename) prints the file operations in the test directory:
+
+```text
+== one INSERT in its own transaction, journal_mode=delete, synchronous=FULL
+  open      test.db (O_RDWR|O_CREAT)
+  open      test.db-journal (O_RDWR|O_CREAT)
+  pwrite64  512 bytes at offset 0 to test.db-journal
+  pwrite64  4 bytes at offset 512 to test.db-journal
+  pwrite64  4096 bytes at offset 516 to test.db-journal
+  pwrite64  4 bytes at offset 4612 to test.db-journal
+  pwrite64  4 bytes at offset 4616 to test.db-journal
+  pwrite64  4096 bytes at offset 4620 to test.db-journal
+  pwrite64  4 bytes at offset 8716 to test.db-journal
+  fdatasync test.db-journal
+  fdatasync ./
+  pwrite64  12 bytes at offset 0 to test.db-journal
+  fdatasync test.db-journal
+  pwrite64  4096 bytes at offset 0 to test.db
+  pwrite64  4096 bytes at offset 4096 to test.db
+  fdatasync test.db
+  unlink    test.db-journal
+  fsync, fdatasync or sync_file_range calls: 4
+```
+
+The idea of a rollback journal is the opposite of the write-ahead log of [part 9](/blog/write-ahead-logging-from-scratch). My store wrote the new data to a log first. SQLite writes the old data first: before it changes a page of the database, it copies the original page into the journal. If something goes wrong, it can put the old pages back.
+
+The journal starts with a header, 512 bytes here. The file format documentation says that the header "is padded with zeros out to the size of a single sector", so that the rest of the journal is safe if this sector is damaged. Then come two page records, each one 4 + 4,096 + 4 bytes: the page number, the original content of the page, and a checksum. The INSERT changes two pages, page 1 (which holds the database header) and page 2 (the table).
+
+Then the first `fdatasync` of the journal. The old pages are now durable, before the database file is touched.
+
+Then `fdatasync ./`. This is [part 4](/blog/why-the-directory-needs-fsync-too): the journal is a new file, so its name is a new directory entry, and SQLite syncs the directory too.
+
+Then the strange small write: 12 bytes at offset 0 of the journal, and a second `fdatasync` of the journal. Why write 12 bytes again in a file that is already synced? The "Atomic Commit In SQLite" document explains it. The header contains the number of pages in the journal, and this number is "initially zero". Only after the first flush, when "there is no "garbage" left in the file", is the count "changed from zero to the number of pages in the rollback journal". So if the power goes during the first flush, a recovery reads a page count of zero and changes nothing. The same document says it plainly: "the rollback journal is flushed to disk twice: once to write the page content and a second time to write the page count in the header."
+
+Then the new pages go into the database file, at offsets 0 and 4,096, and the database is synced.
+
+And the last line, `unlink test.db-journal`, is the commit. In the words of the documentation: "This is the instant where the transaction commits." If the journal exists after a crash, the next process that opens the database finds a "hot journal" and plays it back, so the transaction disappears. If the journal is gone, the transaction is there.
+
+## Four syncs and three flushes
+
+I measured 500 single-row transactions per setting, and counted the flush requests that the disk received during the run, like in [part 2](/blog/what-fsync-costs-on-a-laptop-ssd):
+
+```text
+== machine load: load average: 5.22, 4.07, 3.61
+  journal_mode=delete synchronous=FULL      500 transactions:     302 per second,  3.316 ms each, 3.02 disk flushes each, 500 rows
+  journal_mode=delete synchronous=EXTRA     500 transactions:     240 per second,  4.158 ms each, 4.02 disk flushes each, 500 rows
+  journal_mode=delete synchronous=NORMAL    500 transactions:     680 per second,  1.471 ms each, 2.01 disk flushes each, 500 rows
+  journal_mode=delete synchronous=OFF      5000 transactions:   33436 per second,  0.030 ms each, 0.00 disk flushes each, 5000 rows
+```
+
+Four sync calls per commit in FULL, but 3.02 flushes. I liked this one, because I could explain it with an earlier part. In part 4 a directory fsync right after the fsync of a new file took half a microsecond and sent no flush: the file's journal commit in ext4 already contained the new name, and nothing was left to commit. Here it is the same: the first `fdatasync` of the journal commits the creation of `test.db-journal`, and the `fdatasync ./` just after it has nothing to do. Three real flushes remain: the journal, the journal again, and the database.
+
+So FULL gives 302 transactions per second on this laptop, 3.3 milliseconds each. One small INSERT costs three waits for the device.
+
+## The directory sync that FULL leaves out
+
+Look at the trace again: after `unlink test.db-journal` there is no directory sync. The unlink is a change of the directory, and we know from part 4 that it is not durable until the directory is synced. If the machine loses power just after the commit, the journal can come back, and the next open rolls the committed transaction back.
+
+This is not a bug that I found, it is documented. The setting EXTRA exists for it, and its trace is FULL plus one line at the end:
+
+```text
+== one INSERT in its own transaction, journal_mode=delete, synchronous=EXTRA
+...
+  pwrite64  4096 bytes at offset 0 to test.db
+  pwrite64  4096 bytes at offset 4096 to test.db
+  fdatasync test.db
+  unlink    test.db-journal
+  fdatasync ./
+  fsync, fdatasync or sync_file_range calls: 5
+```
+
+The pragma documentation explains: "EXTRA synchronous is like FULL with the addition that the directory containing a rollback journal is synced after that journal is unlinked to commit a transaction in DELETE mode." And about FULL: "FULL is not necessarily durable across a power loss in rollback mode, so if durability is desired, it is best to set the synchronous mode to EXTRA." The database stays consistent in both cases. With FULL, the last transaction before a power loss can go missing.
+
+This sync is a real one. EXTRA has 4.02 flushes per transaction, one more than FULL, and it costs about 0.8 ms more: 240 transactions per second instead of 302.
+
+## NORMAL and OFF
+
+NORMAL removes the double flush of the journal: the 12-byte header update comes before the only journal sync. Three sync calls, two real flushes, 680 transactions per second. The documentation says that there is "a very small (though non-zero) chance that a power failure at just the wrong time could corrupt the database in journal_mode=DELETE on an older filesystem".
+
+OFF removes everything:
+
+```text
+== one INSERT in its own transaction, journal_mode=delete, synchronous=OFF
+  open      test.db (O_RDWR|O_CREAT)
+  open      test.db-journal (O_RDWR|O_CREAT)
+  pwrite64  512 bytes at offset 0 to test.db-journal
+  pwrite64  4 bytes at offset 512 to test.db-journal
+  pwrite64  4096 bytes at offset 516 to test.db-journal
+  pwrite64  4 bytes at offset 4612 to test.db-journal
+  pwrite64  4 bytes at offset 4616 to test.db-journal
+  pwrite64  4096 bytes at offset 4620 to test.db-journal
+  pwrite64  4 bytes at offset 8716 to test.db-journal
+  pwrite64  4096 bytes at offset 0 to test.db
+  pwrite64  4096 bytes at offset 4096 to test.db
+  unlink    test.db-journal
+  fsync, fdatasync or sync_file_range calls: 0
+```
+
+The same writes, in the same order, and no sync at all. 33,436 transactions per second, a hundred times faster than FULL. And the documentation is clear about what this means: "If the application running SQLite crashes, the data will be safe, but the database might become corrupted if the operating system crashes or the computer loses power before that data has been written to non-volatile storage." The first half of that sentence is what we saw in [the first part](/blog/your-data-is-not-on-disk-when-write-returns) of this series: a process crash cannot lose data that write accepted.
+
+## What I would remember
+
+The rollback journal is a careful protocol, and strace shows every step of it: old pages first, two flushes so that a half-written journal is harmless, the database, and an unlink as the commit point. The four settings are not "safe" and "unsafe". They are a choice of how many of these waits you pay for, between zero and four on this laptop, and the documentation says clearly what each choice can lose.
+
+And the protocol has a cost that does not depend on the size of the transaction: one row costs three flushes in FULL. The next part looks at WAL mode, which changes the whole picture.
+
+The traces are in [p13-trace.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/what-survives-a-crash/results/p13-trace.txt) and the timings in [p13-bench.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/what-survives-a-crash/results/p13-bench.txt); the benchmark script is `sqlbench.py` in the [fixture](https://github.com/mehdiakiki/mehdi-cz/tree/main/experiments/what-survives-a-crash).
+
+## Sources
+
+- [Atomic Commit In SQLite](https://www.sqlite.org/atomiccommit.html)
+- [Pragma statements supported by SQLite: synchronous and journal_mode](https://www.sqlite.org/pragma.html#pragma_synchronous)
+- [Database File Format: the rollback journal](https://www.sqlite.org/fileformat2.html)

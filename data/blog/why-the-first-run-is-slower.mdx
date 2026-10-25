@@ -1,0 +1,132 @@
+---
+title: "Why the First Run Is Slower"
+date: "2026-09-06T22:05:00+01:00"
+lastmod: "2026-09-06T22:05:00+01:00"
+tags: ["when the benchmark lies", "rust", "c", "linux", "benchmarking"]
+draft: false
+reviewed: true
+reviewedHash: "ff54c1458b0ffd083716cd1bbd4b3a16ec86c6bda7d01ecf550091834c293aa1"
+campaign: "editorial"
+summary: "The first iteration of my loop took 145 microseconds and the steady state 12. I separated the causes I could show on my laptop: page faults, cold caches, a pause of 300 ms, lazy binding in C, and the start of the process itself."
+---
+
+The harness of [the first part of this series](/blog/the-benchmark-that-measured-nothing) makes some warm-up calls before it starts to measure. Everybody does this, and I did it without thinking. For this part I wanted to see what these warm-up calls hide. So I made a program that times every single iteration of a small loop, in a fresh process, and prints the first ones.
+
+The loop computes `out[i] = 3 * input[i] + 1` over two buffers of 512 KiB. Here is one fresh process, pinned to CPU 2:
+
+```text
+iteration  1:   144958 ns   130 page faults
+iteration  2:    17957 ns     0 page faults
+iteration  3:    14604 ns     0 page faults
+iteration  4:    14270 ns     0 page faults
+iteration  5:    13975 ns     0 page faults
+iteration 10:    13277 ns     0 page faults
+iteration 50:    11335 ns     0 page faults
+natural,detail       iter1  144958 ns  faults 130  iter2   17957 ns  iter10   13277 ns  steady   11773 ns
+```
+
+The first iteration took 145 microseconds. The steady state, that is the median of 2,000 iterations after the first 50, is 11.8 microseconds. Same code, same data, twelve times slower the first time.
+
+And it is not only the first one: the second iteration is still 50 percent slower than the steady state, and it takes about ten iterations to get close. So "the first run is slower" is in fact several different things, and they do not have the same size. I tried to separate the ones I can show on this laptop.
+
+## The method
+
+One fresh process is one sample of a first iteration, and one sample is nothing on a shared machine. So `run.sh` starts every mode in its own fresh process, ten rounds, the modes one after the other in each round, and takes the median over the ten processes:
+
+```text
+natural              iter1  122784 ns  faults 130  iter2   15039 ns  iter10   13488 ns  steady   12374 ns
+prefault,evict       iter1   39208 ns  faults   2  iter2   18005 ns  iter10   12807 ns  steady   12451 ns
+prefault             iter1   19339 ns  faults   2  iter2   14423 ns  iter10   13781 ns  steady   12325 ns
+prefault,sleep       iter1   46183 ns  faults   1  iter2   19760 ns  iter10   12387 ns  steady   11568 ns
+prefault,spin        iter1   41457 ns  faults   0  iter2   20106 ns  iter10   12478 ns  steady   12131 ns
+prefault,spin,touch  iter1   22341 ns  faults   0  iter2   15836 ns  iter10   14472 ns  steady   12006 ns
+```
+
+The medians of the steady state are the same in all modes, between 11.6 and 12.5 microseconds, and only the beginning changes (but look at the `sleep` lines in the file, I come back to them below). I explain each line below.
+
+## Page faults
+
+The first column to read is the number of page faults. In the natural mode, the first iteration makes 130 minor page faults, and the next ones make zero.
+
+The output buffer comes from `vec![0u64; LEN]`. For 512 KiB, the allocator asks the kernel for new memory, and new memory from the kernel is already zero, so nobody writes it at allocation time. The kernel only reserves the addresses. The first write to each 4 KiB page causes a page fault: the CPU stops my loop, the kernel finds a free page, fills it with zeros, maps it, and my loop continues. 512 KiB are 128 pages, so 128 of the 130 faults are this buffer. The two other faults appear also in the `prefault` mode below, so they come from something else, and I did not look for their source.
+
+The `prefault` mode writes the buffer once before the measured iterations. Then the first iteration takes 19.3 microseconds instead of 122.8. So the page faults cost about 103 microseconds here, a bit less than one microsecond per page. In this experiment they are the biggest part of the first run, by far.
+
+## Cold data
+
+Even without page faults, the first iteration (19.3 microseconds) is slower than the steady state (12.3). The buffers are 1 MiB together, so they fit in the 1.25 MiB L2 cache of one performance core. When the first iteration starts, they are in the cache only if something touched them recently.
+
+To see the cost of cold data, the `evict` mode writes and reads 64 MiB of other memory before the first iteration, much more than the 18 MiB L3 cache. Then the first iteration takes 39.2 microseconds: twice the warm first iteration, three times the steady state. The second iteration is still 18 microseconds. Only after a few iterations everything is back to normal.
+
+## A pause is enough
+
+This is the part that surprised me. I wanted to show the frequency ramp from idle, so I added two modes that wait 300 ms before the first iteration: `sleep` really sleeps, and `spin` runs a busy loop that only reads the clock. My idea was simple: during `sleep` the core is idle and its clock goes down, during `spin` the core is busy at a high clock, so `spin` should be the fast one.
+
+It was not. Both are slow: 46.2 microseconds after sleeping and 41.5 after spinning, almost the same as after the eviction of 64 MiB. A pause of 300 ms made the first iteration as slow as cold data, even when my process was running on the core the whole time.
+
+So my next idea was that the data left the caches during the pause. The `touch` mode tests it: after the spin, it reads the two buffers once, and then it measures. The first iteration is back to 22.3 microseconds, close to the warm case. So it is the data that got cold, not the core: the spin kept the core busy, and reading the data again was enough to repair it.
+
+I can not say what evicted the data. Interrupts can run on this core, other programs can run on the other hardware thread of the same core, and without `perf` I can not count cache misses. But the effect is clear, and it is not small. For a server it means that the first request after a quiet moment is again a first run.
+
+And the frequency ramp? The medians do not show it: sleeping and spinning gave almost the same numbers. But the single processes do. In three of the ten `sleep` processes the steady state stayed at 25.1, 28.4 and 39.9 microseconds, two or three times slower, and no process of the other modes was above 15.8. When I ran this part a second time, on a quieter laptop, it happened in all ten `sleep` processes: the first iteration took 91.6 microseconds, against 59.9 after spinning, and the steady state stayed at 33.2 microseconds instead of about 10.5 ([p04-first-run.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/when-the-benchmark-lies/results/second-run/p04-first-run.txt)). So after the pause the clock was probably slow too, for longer than the whole measurement. A later part of the series measures this slow start of the clock directly.
+
+## Lazy binding, in C only
+
+There is one more first-time cost, and it lives in the dynamic loader. In a C program built with gcc on this machine, the first call to a function of a shared library goes through the loader, which finds the function and patches the address for the next calls. This is lazy binding. I made a tiny C program that times the first three calls of `random()`:
+
+```text
+random(): first call 488 ns, second call 49 ns, third call 17 ns (sink 4332913046)
+random(): first call 405 ns, second call 32 ns, third call 17 ns (sink 4332913046)
+random(): first call 1822 ns, second call 33 ns, third call 20 ns (sink 4332913046)
+random(): first call 557 ns, second call 49 ns, third call 23 ns (sink 4332913046)
+random(): first call 498 ns, second call 38 ns, third call 21 ns (sink 4332913046)
+```
+
+Five fresh processes. The first call takes 400 to 560 nanoseconds (and once 1.8 microseconds), the third about 20. With `LD_BIND_NOW=1` the loader resolves all symbols at startup, as the `ld.so` manual page says, "instead of deferring function call resolution to the point when they are first referenced":
+
+```text
+random(): first call 146 ns, second call 17 ns, third call 17 ns (sink 4332913046)
+random(): first call 176 ns, second call 32 ns, third call 19 ns (sink 4332913046)
+random(): first call 154 ns, second call 40 ns, third call 27 ns (sink 4332913046)
+random(): first call 183 ns, second call 47 ns, third call 25 ns (sink 4332913046)
+random(): first call 159 ns, second call 21 ns, third call 17 ns (sink 4332913046)
+```
+
+So lazy binding was about 300 nanoseconds of the first call. The rest of it, 150 nanoseconds against 20, is something else that is cold in `random()` itself.
+
+My Rust programs do not pay this cost at the first call: they pay it before `main`. `readelf -d` shows the difference:
+
+```text
+ 0x000000000000001e (FLAGS)              BIND_NOW
+ 0x000000006ffffffb (FLAGS_1)            Flags: NOW PIE
+ 0x000000006ffffffb (FLAGS_1)            Flags: PIE
+```
+
+The first two lines are the Rust binary: it is linked with `BIND_NOW`, so all symbols are resolved before `main`. The last line is the C binary, without it. Next to the 103 microseconds of page faults, 300 nanoseconds is small. But it is the kind of cost that a microbenchmark of a single call would show as a big outlier.
+
+## And the first run of all: the process itself
+
+All of this happens inside a process that already runs. If the program is a command line tool, the user also waits for the start of the process. So I made a small launcher that starts the program 20 times in a mode that does the work only once, and measures each whole process from the outside:
+
+```text
+20 fresh processes of out/p04_first once: first 781 us, min 651 us, median 688 us, max 781 us
+```
+
+688 microseconds, against 12 microseconds for one warm iteration: more than 50 times more. Most of it is not my loop at all. It is creating the process, loading the program, the start of the Rust runtime, the page faults of a new process and the exit. Another series on this site follows these steps one by one, and it measures the start of a Rust hello world at about 400 microseconds on this same laptop: [What Happens When You Run a Program](/blog/what-happens-when-you-run-a-program-from-execve-to-main).
+
+## Discard the warm-up or not?
+
+It depends on the question, and I think the important thing is to decide it before looking at the numbers.
+
+If the question is the speed of a loop that runs for hours in a server, then the warm-up is noise, and the steady state is the answer. Discard the first iterations and say that you did it.
+
+If the program is a command line tool, a function that runs once per request after a pause, or the start of a service, then the first run is the program. The steady state of the harness is a number that no user will ever see. Then measure fresh processes, many of them, and remember that each one is only one sample.
+
+And if you do not know which question you have, report both. 145 against 12 microseconds is not a detail.
+
+The programs, the ten rounds and the full output are in [the fixture](https://github.com/mehdiakiki/mehdi-cz/tree/main/experiments/when-the-benchmark-lies), in [p04-first-run.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/when-the-benchmark-lies/results/p04-first-run.txt).
+
+## Sources
+
+- [ld.so(8), Linux manual page (LD_BIND_NOW)](https://man7.org/linux/man-pages/man8/ld.so.8.html)
+- [getrusage(2), Linux manual page (ru_minflt)](https://man7.org/linux/man-pages/man2/getrusage.2.html)

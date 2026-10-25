@@ -1,0 +1,150 @@
+---
+title: "The Benchmark Measured the Allocator"
+date: "2026-10-18T22:00:00+01:00"
+lastmod: "2026-10-18T22:00:00+01:00"
+tags: ["when the benchmark lies", "rust", "memory management", "linux", "concurrency"]
+draft: false
+reviewed: true
+reviewedHash: "d912c1b01a64559e8eb2ec106334ad3e230ba235099bb6b088595d4d7fb42f25"
+campaign: "editorial"
+summary: "A small formatting function took 52 ns per call with a new String and 38 ns with a reused buffer. A 256 KiB buffer cost nothing extra after the first call. And the contention that I saw with four threads came from my own allocation counter, not from malloc."
+---
+
+When I prepared this experiment, I put a counting allocator in the program, only to check how many allocations each version makes. In the end, this counter gave the most interesting result of this part, and it was a mistake in my own measurement.
+
+But first the simple question. My benchmark of a small formatting function said 51.6 nanoseconds per call. Then I gave the function a buffer to reuse, and it said 37.9. The difference was not in my function. It was in `malloc` and `free`.
+
+## Two versions of the same work
+
+The function writes one line of text, the kind of thing that a logger or a serializer does many times:
+
+```rust
+fn record_new(id: u64) -> usize {
+    let s = format!("id={id} name=user{} score={}", id % 1000, id * 7 % 101);
+    s.len()
+}
+
+fn record_reuse(buf: &mut String, id: u64) -> usize {
+    buf.clear();
+    write!(buf, "id={id} name=user{} score={}", id % 1000, id * 7 % 101).unwrap();
+    buf.len()
+}
+```
+
+The formatting is the same in both. The first version creates a new `String` at every call and drops it at the end, so it allocates and frees memory every time. The second one clears a buffer that the caller keeps, so after the first call the memory is already there.
+
+To check this, the program replaces the global allocator of Rust with a small wrapper around `System`. Here `System` is glibc's `malloc`, the same allocator that a normal Rust program uses on Linux. The wrapper counts the calls to `alloc` in one of three ways:
+
+```rust
+unsafe impl GlobalAlloc for Counting {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        match COUNTER.load(Ordering::Relaxed) {
+            SHARED => {
+                ALLOCS.fetch_add(1, Ordering::Relaxed);
+            }
+            PER_THREAD => THREAD_ALLOCS.with(|n| n.set(n.get() + 1)),
+            _ => {}
+        }
+        unsafe { System.alloc(layout) }
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        unsafe { System.dealloc(ptr, layout) }
+    }
+}
+```
+
+`ALLOCS` is one atomic counter for the whole process, `THREAD_ALLOCS` is a `thread_local!` counter, one in each thread, and the last case counts nothing. The tests with one thread use the shared counter. Why I need three ways, you will see at the end. The program also counts the page faults of the measured calls.
+
+## Small strings
+
+The first of three runs, each one a fresh process pinned to CPU 2:
+
+```text
+first call of 256 KiB, new Vec, in a fresh process: 324076 ns, 68 page faults
+version                 ns per call  allocs per call page faults per call
+small, new String              51.6             1.00               0.00
+small, reused buffer           37.9             0.00               0.00
+256 KiB, new Vec            67322.9             1.00               0.00
+256 KiB, reused Vec         66591.8             0.00               0.00
+```
+
+The counter confirms the design: exactly one allocation per call for the new `String`, zero for the reused buffer. The difference is 13.7 ns per call in this run, and 8.3 and 8.9 ns in the two other runs. So one `malloc` and one `free` of a small block cost about 8 to 14 ns here, about a sixth to a quarter of the whole call.
+
+A benchmark of `record_new` measures the formatting and also this `malloc` and `free`. If the real program creates a new string for each line, this is part of its cost, and the benchmark is honest. If the real program writes into a buffer that it reuses, the benchmark is too slow by 21 to 36 percent.
+
+In fact, even the honest case is optimistic. A loop that allocates and frees the same size again and again is the easiest case for an allocator, because the block that was just freed has exactly the right size for the next request. A real program that keeps thousands of strings of different sizes alive does not get this easy case, and my benchmark can not say how much more it pays.
+
+## A big buffer, almost free
+
+256 KiB is more than 128 KiB, the default `mmap` threshold in mallopt(3). So I expected a new mapping, page faults and an `munmap` at every call, and a big difference between the two versions. The table says something else: 67.3 against 66.6 microseconds in this run, and in run 2 the reused `Vec` is even the slower one, 65.9 against 65.7. And no page faults in the measured calls. Strange. `strace -c` for 1,000 calls of the new version explained it:
+
+```text
+% time     seconds  usecs/call     calls    errors syscall
+------ ----------- ----------- --------- --------- ----------------
+  0.00    0.000000           0        14           mmap
+  0.00    0.000000           0         3           munmap
+  0.00    0.000000           0         4           brk
+------ ----------- ----------- --------- --------- ----------------
+100.00    0.000000           0        21           total
+```
+
+21 calls for the whole process, and the start of any program needs some of them. The version with a reused `Vec` has the same numbers with one `brk` less. So 1,000 allocations of 256 KiB made almost no system call.
+
+The reason is in the manual page of `mallopt`: the threshold is dynamic, and when a big block is freed, "the threshold is adjusted upward to the size of the freed block". After the first free, my 256 KiB blocks come from the heap, and the one extra `brk` is probably the moment when the heap grew to make room for them. And because the calls make no page fault, each new `Vec` gets memory that the process already touched before, most likely the block that the previous call freed. Another series on this site shows the same mechanism with a freed block of 1 MiB: [When malloc Asks the Kernel for Memory](/blog/when-malloc-asks-the-kernel-for-memory-brk-and-mmap).
+
+So for this size, after the first call, the allocation disappears in the 66 microseconds of real work.
+
+## The first call is another number
+
+But look again at the first line of the output. The very first call in a fresh process took 324 microseconds and made 68 page faults. 256 KiB is 64 pages of 4 KiB, so most of these faults are probably the first touch of the new buffer. In runs 2 and 3, the first call took 100 and 114 microseconds, with the same 68 faults. All the following calls take about 66 microseconds.
+
+I do not know why run 1 is about three times slower than the two others. Run 1 starts after a pause of one second in the script, and the two others start right after a busy process on the same CPU. Maybe the core was slow after the pause, but I did not measure it.
+
+The warm-up calls of [my harness](/blog/the-benchmark-that-measured-nothing) hide exactly this first call: it is never measured. A command line tool that fills one big buffer and exits pays exactly this first call, and a warm benchmark hides it, as in [the part about the first run](/blog/why-the-first-run-is-slower).
+
+## Threads, and a counter that lied
+
+Now the third case: several threads that allocate small strings at the same time. Each thread is pinned to its own CPU, all the threads wait at a barrier and then measure together, and the program prints the medians of the threads. CPUs 0, 2, 4 and 6 are four different cores. CPUs 0 to 7 are the same four cores with their two hardware threads each, as the top of the results file shows. This is the first of three rounds:
+
+```text
+1 thread on CPU 2, shared counter: new String 87.9 ns, reused buffer 37.9 ns per call, 4508 MHz at the end
+4 threads on CPUs 0,2,4,6, shared counter: new String 135.7 ns, reused buffer 46.8 ns per call, 3914 MHz at the end
+8 threads on CPUs 0,1,2,3,4,5,6,7, shared counter: new String 161.8 ns, reused buffer 82.5 ns per call, 3800 MHz at the end
+1 thread on CPU 2, counter per thread: new String 49.0 ns, reused buffer 39.2 ns per call, 1.00 and 0.00 allocs per call, 4624 MHz at the end
+4 threads on CPUs 0,2,4,6, counter per thread: new String 57.9 ns, reused buffer 47.1 ns per call, 1.00 and 0.00 allocs per call, 3821 MHz at the end
+8 threads on CPUs 0,1,2,3,4,5,6,7, counter per thread: new String 106.4 ns, reused buffer 82.5 ns per call, 1.00 and 0.00 allocs per call, 3800 MHz at the end
+1 thread on CPU 2, no counter: new String 46.4 ns, reused buffer 37.9 ns per call, 4637 MHz at the end
+4 threads on CPUs 0,2,4,6, no counter: new String 57.4 ns, reused buffer 47.3 ns per call, 3800 MHz at the end
+8 threads on CPUs 0,1,2,3,4,5,6,7, no counter: new String 105.6 ns, reused buffer 82.5 ns per call, 3778 MHz at the end
+```
+
+The first line already has a strange number: 87.9 ns for one thread with the shared counter. In rounds 2 and 3 the same line gives 47.0 and 48.6 ns, like the other counters. So I think this one run was disturbed. But when I ran this part a second time, the same first line was again higher (60.3 ns against about 47 for the other counters), so it is probably not another program but something at the start of this test, and I do not know what ([p18-allocator.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/when-the-benchmark-lies/results/second-run/p18-allocator.txt)). With one thread, the shared counter costs nothing visible.
+
+The second line is the interesting one. With four threads and the shared counter, the new `String` costs 88.9 ns more than the reused buffer, against about 9 ns with one thread. This looks like contention in the allocator, the thing that this test was made to find.
+
+But the next lines say something else. With a counter per thread, or with no counter, the difference with four threads is 10.8 and 10.1 ns. The other rounds give the same picture: 86.8 to 100.0 ns with the shared counter, 10.0 to 10.8 ns without it. So the contention was in my measurement tool, not in the allocator, and this tool was there to make the measurement more honest.
+
+`ALLOCS` is one atomic variable, and every allocation of every thread changes it. The usual explanation is the cache line: to change a variable, a core needs its cache line for itself, so with four cores the line must travel from core to core all the time. There is no perf on this machine, so I did not see this traffic. What I could test is the counter itself: the same increment, in a variable that only one thread uses, costs nothing that I can see.
+
+And the allocator itself? The counter per thread still finds 1.00 and 0.00 allocations per call, so it counts correctly. With four threads, one `malloc` and `free` cost 10 to 11 ns, a little more than the 8 to 10 ns of one thread. But everything is slower with four threads, also the reused buffer that does not allocate at all: 47 ns against 38. The kernel reports about 4.6 GHz with one busy core and about 3.8 GHz with four. The ratio of the clocks, about 1.22, is close to the ratio of the times, about 1.24. So the four threads do not wait for each other. They all run on a slower clock. The other series that I linked above also shows that glibc gives [each thread its own heap](/blog/why-freeing-memory-does-not-shrink-your-process), and my numbers fit this.
+
+With eight threads, two on each core, the clock is the same 3.8 GHz, but everything is about 1.8 times slower, also the reused buffer, and one allocation costs 23 ns. This looks like the busy sibling of [the part about efficiency cores](/blog/the-benchmark-ran-on-an-efficiency-core), where two hardware threads on one core made a loop much slower. I did not look deeper into this. And I tested only the easy case, where each thread frees its own blocks. A program where one thread allocates and another one frees can behave differently.
+
+## Three numbers to keep apart
+
+This part gave three different numbers for "the cost of the allocator", and each one answers a different question.
+
+The first is the cost of one small allocation in a tight loop, 8 to 14 ns here. It is the best case. If a benchmark allocates where the real program does not, or the opposite, the benchmark measures another program. So I count the allocations of both, with a counting allocator like this one, in one thread.
+
+The second is the first call. For the big buffer, the steady state had no visible allocation cost at all, but the first call took 1.5 to 5 times as long as the next ones. A warm benchmark never shows this number.
+
+The third is the one that I made myself. With four threads, my shared counter made one allocation look 8 to 10 times more expensive than it is. A counter per thread, or no counter, gave the real number. So now, when a benchmark with threads shows contention, I check my own instruments first.
+
+The program, the three runs, the traces and the thread rounds are in [the fixture](https://github.com/mehdiakiki/mehdi-cz/tree/main/experiments/when-the-benchmark-lies), in [p18-allocator.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/when-the-benchmark-lies/results/p18-allocator.txt).
+
+## References
+
+- [mallopt(3), Linux manual page (M_MMAP_THRESHOLD)](https://man7.org/linux/man-pages/man3/mallopt.3.html)
+- [sched_setaffinity(2), Linux manual page](https://man7.org/linux/man-pages/man2/sched_setaffinity.2.html)
+- [Rust 1.98.0 standard library: std::alloc::GlobalAlloc](https://doc.rust-lang.org/1.98.0/std/alloc/trait.GlobalAlloc.html)
+- [Rust 1.98.0 standard library: std::alloc::System](https://doc.rust-lang.org/1.98.0/std/alloc/struct.System.html)

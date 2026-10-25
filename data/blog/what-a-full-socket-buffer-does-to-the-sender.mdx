@@ -1,0 +1,148 @@
+---
+title: "What a Full Socket Buffer Does to the Sender"
+date: "2026-07-15T12:05:00+01:00"
+lastmod: "2026-07-15T12:05:00+01:00"
+tags: ["following a tcp connection", "networking", "linux", "tcp", "reliability"]
+draft: false
+reviewed: true
+reviewedHash: "de78fe3a027839355cc3fb83ce6d8737c8f7c0251aa4c45f2b7ef398556e85bc"
+cluster: "reliable-data-integrations"
+campaign: "editorial"
+summary: "My sender wrote 2.6 MB to a peer that never read anything, and every send() said success. I looked where these bytes waited, what setsockopt really does to the buffer sizes, how a blocking sender is slowed down for free, and how an unbounded queue breaks this."
+---
+
+My sender wrote 2,612,608 bytes into a connection, and every `send()` call returned success. The program on the other side did not read even one byte. So where were these 2.6 MB, and what happens to the sender when there is no more space?
+
+In this part the connection of [this series](/blog/what-happens-when-your-program-calls-connect) has data to carry, and the data moves faster than the reader.
+
+## Where the bytes wait
+
+The experiment: a connection over loopback, a receiver that never calls `recv()`, and a sender in non-blocking mode that writes 64 KiB with `send()` until the kernel refuses. Then `ss -tmo` shows the two sockets:
+
+```text
+sender before connect: SO_SNDBUF 16384
+sender after connect: SO_SNDBUF 2626560, receiver: SO_RCVBUF 131072
+after 40 send() calls and 2612608 bytes: BlockingIOError(11, 'Resource temporarily unavailable')
+-- ss -tmo 0.5 s later, the receiver
+State Recv-Q Send-Q Local Address:Port  Peer Address:Port
+ESTAB 127168 0          127.0.0.1:21051    127.0.0.1:41446
+	 skmem:(r131008,rb131072,t0,tb2626560,f4160,w0,o0,bl0,d2)
+-- the sender
+ESTAB 0      2485440 127.0.0.1:41446 127.0.0.1:21051 timer:(persist,347ms,0)
+	 skmem:(r0,rb131072,t0,tb2626560,f3200,w2536320,o0,bl0,d0)
+```
+
+The error is `EAGAIN` (errno 11), the answer of a non-blocking socket when the operation would block. The send(2) man page says it: when the message does not fit into the send buffer, `send()` "normally blocks", and "in nonblocking mode it would fail with the error EAGAIN".
+
+Now the two sockets. On the receiver, Recv-Q is 127168: bytes that arrived and that the program did not read. In `skmem`, `rb131072` is the size of its receive buffer and `r131008` is the memory used now, so it is full. On the sender, Send-Q is 2485440: bytes that the program wrote and that the receiver did not accept yet. `tb2626560` is the size of its send buffer and `w2536320` is the memory queued in it.
+
+127168 + 2485440 = 2612608. Exactly the bytes written. So nothing was lost and nothing went anywhere else: a small part waits in the receiver kernel, the big part waits in the sender kernel, and both kernels are on my laptop.
+
+The `timer:(persist,347ms,0)` on the sender is also interesting. ss(8) calls `persist` the "zero window probe timer". The receiver told the sender that its window is zero, so the sender stopped sending data and from time to time it asks again if there is space. This is TCP flow control: the receiver announces how much it can take, and the sender respects it. (The last field of the receiver, `d2`, counts two packets that its kernel dropped. I did not look into them.)
+
+## A send buffer of 2.5 MB
+
+The first two lines surprised me. Before `connect()`, the send buffer of my socket was 16384 bytes, which is the default of `net.ipv4.tcp_wmem` (4096 16384 4194304 on my laptop). Just after `connect()`, before any data, it was 2626560. The kernel made it 160 times bigger.
+
+tcp(7) says that TCP "dynamically adjusts the size of the send buffer", up to the maximum of `tcp_wmem`. In the kernel source, `tcp_sndbuf_expand()` in `net/ipv4/tcp_input.c` sets the send buffer when the connection is established: 2 × 10 × the memory of one full segment (10 is the initial congestion window). On loopback a segment can be almost 64 KiB. The kernel adds the headers and one of its structures, rounds the sum up to a power of two, 131072, and adds 256 bytes for another structure. So 2 × 10 × 131328 = 2626560, exactly my number. When the program sets `SO_SNDBUF` itself, this function is skipped, and the next section shows it. What I measured: on loopback a sender can write about 2.6 MB to a reader that does nothing, before it notices anything.
+
+The receive buffer did not grow: 131072, the default of `tcp_rmem`, from the start to the end. Linux has receive buffer auto-tuning (`tcp_moderate_rcvbuf` is 1), which tries "to match the size required by the path for full throughput". My receiver read nothing, so there was no throughput to match.
+
+## Asking for a size
+
+A program can set the sizes itself with `SO_SNDBUF` and `SO_RCVBUF`. I asked for three sizes on new sockets and read the value back:
+
+```text
+setsockopt(SO_SNDBUF, 4096) then getsockopt: 8192
+setsockopt(SO_SNDBUF, 65536) then getsockopt: 131072
+setsockopt(SO_SNDBUF, 1048576) then getsockopt: 425984
+setsockopt(SO_RCVBUF, 4096) then getsockopt: 8192
+setsockopt(SO_RCVBUF, 65536) then getsockopt: 131072
+setsockopt(SO_RCVBUF, 1048576) then getsockopt: 425984
+```
+
+Every value is doubled. socket(7) explains it: "The kernel doubles this value (to allow space for bookkeeping overhead)". And 1 MiB became 425984, which is two times 212992, the value of `net.core.rmem_max` and `net.core.wmem_max` here. A program cannot ask more than this limit, even when `tcp_wmem` allows 4 MB to the automatic sizing. Strange, but this is how it works: the automatic sizing can go higher than what you can ask for.
+
+Then the same experiment with `SO_SNDBUF` 32768 on the sender and `SO_RCVBUF` 16384 on the receiver (set on the listening socket, so the accepted socket gets it):
+
+```text
+sender before connect: SO_SNDBUF 65536
+sender after connect: SO_SNDBUF 65536, receiver: SO_RCVBUF 32768
+after 2 send() calls and 73728 bytes: BlockingIOError(11, 'Resource temporarily unavailable')
+```
+
+Two things changed. The sender got `EAGAIN` after 73728 bytes instead of 2.6 MB. And the send buffer stayed at 65536 after connect: when the program sets the size, the kernel does not grow it any more for this socket. The receiver kept only 24576 bytes in its buffer of 32768 (in the full output), so the "bookkeeping overhead" of socket(7) is real: a buffer of 32 KiB does not hold 32 KiB of data.
+
+## A blocking sender simply waits
+
+Most programs do not use non-blocking sockets. So the next experiment is a normal blocking `sendall()` of 8 MiB, and a receiver that starts reading only after 2 seconds. Another thread samples the two queues:
+
+```text
+blocking sendall() of 8 MiB, the receiver reads after 2 s, load average 3.46 3.23 3.41
+  t= 0.04 s  receiver Recv-Q 98223, sender Send-Q 2580934
+  t= 0.57 s  receiver Recv-Q 127151, sender Send-Q 2486524
+  t= 1.09 s  receiver Recv-Q 127151, sender Send-Q 2486524
+  t= 1.65 s  receiver Recv-Q 127151, sender Send-Q 2486524
+  t= 2.00 s  receiver starts to read
+  t= 2.00 s  receiver has all 8388608 bytes
+  t= 2.00 s  sendall() of 8 MiB returned
+```
+
+The two queues were almost full at the first sample, after 0.04 s, and then they stayed full. The other 5.8 MB stayed in the memory of my program, inside `sendall()`, which was blocked. Under strace it is one single system call:
+
+```text
+sendto(4, "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"..., 8388608, 0, NULL, 0 <unfinished ...>
+<... sendto resumed>)           = 8388608 <2.003748>
+```
+
+One `sendto()` of 8 MiB that took 2.004 seconds. The kernel copied what fit, put the thread to sleep, and woke it up each time the receiver made space. When the receiver started reading, everything finished in less than 10 ms.
+
+This is backpressure, and it is free. The slow side slows down the fast side, and nobody wrote any code for it: no "please wait" message in the protocol, no rate limit, no polling. The memory used is bounded by the two buffers. I liked this when I saw it in the numbers.
+
+## Until somebody adds a queue
+
+Now a program that is a bit more "modern". A producer creates a message of 64 KiB every millisecond and puts it into a queue. A sender thread takes messages from the queue and sends them. The receiver reads 64 KiB every 4 ms, so four times slower than the producer. First with `queue.Queue()` without a limit:
+
+```text
+unbounded queue: producer every 1 ms, receiver reads 64 KiB every 4 ms, load average 3.58 3.26 3.42
+  start: RSS 14 MiB
+  t=1 s: produced 877 messages, waiting in the queue 543 (34 MiB), RSS 48 MiB
+  t=2 s: produced 1764 messages, waiting in the queue 1170 (73 MiB), RSS 89 MiB
+  t=3 s: produced 2637 messages, waiting in the queue 1818 (114 MiB), RSS 128 MiB
+```
+
+TCP did its job: the sender thread was blocked exactly like before. But the producer did not know it. It continued to create messages at full speed, and the queue grew by about 40 MiB per second. RSS is the memory of the process, from `/proc/self/status`. After one hour at this rate it would be more than 100 GB, so in reality the process dies much earlier.
+
+The same with `queue.Queue(maxsize=32)`:
+
+```text
+queue of at most 32 messages: producer every 1 ms, receiver reads 64 KiB every 4 ms, load average 3.61 3.28 3.42
+  start: RSS 14 MiB
+  t=1 s: produced 364 messages, waiting in the queue 32 (2 MiB), RSS 16 MiB
+  t=2 s: produced 591 messages, waiting in the queue 7 (0 MiB), RSS 16 MiB
+  t=3 s: produced 842 messages, waiting in the queue 32 (2 MiB), RSS 16 MiB
+```
+
+The queue never holds more than 32 messages, and the memory stays at 16 MiB. The producer made 842 messages in 3 seconds instead of 2637, because `put()` blocks when the queue is full. After the first second it produced between 227 and 251 messages per second, close to the speed of the receiver (250 per second). The backpressure went through the queue, up to the producer.
+
+## The price of each choice
+
+No choice here is free.
+
+- A blocking socket with no queue gives the best memory behavior, but the thread that writes is stuck as long as the reader is slow. In a server that writes to many clients, one slow client can block a thread.
+- A non-blocking socket gives control back with `EAGAIN`, and then the program must decide what to do with the data that did not fit. Most programs put it in a buffer, and this buffer is exactly the queue of the last experiment.
+- A bounded queue keeps the memory safe, but the producer must have a plan for "full": wait, drop the message, or fail. Each one is a product decision, not only a technical one.
+- Big socket buffers hide a slow reader for longer. On loopback the sender could write 2.6 MB before it saw anything, so a test on loopback can miss the problem completely.
+
+My rule after these experiments: every queue between a producer and a socket needs a limit, and the code must say what happens when the limit is reached. An unbounded queue is also a decision. It means "use memory until the process dies, instead of saying slow down".
+
+The outputs are in [p05-fill.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/following-a-tcp-connection/results/p05-fill.txt), [p05-sizes.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/following-a-tcp-connection/results/p05-sizes.txt), [p05-block.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/following-a-tcp-connection/results/p05-block.txt), [p05-strace.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/following-a-tcp-connection/results/p05-strace.txt) and [p05-queue.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/following-a-tcp-connection/results/p05-queue.txt), and the program is `p05_buffers.py` in the [fixture](https://github.com/mehdiakiki/mehdi-cz/tree/main/experiments/following-a-tcp-connection). The buffer sysctls of the machine are in [p01-machine.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/following-a-tcp-connection/results/p01-machine.txt).
+
+## References
+
+- [send(2), Linux manual page](https://man7.org/linux/man-pages/man2/send.2.html)
+- [socket(7), Linux manual page](https://man7.org/linux/man-pages/man7/socket.7.html), for `SO_RCVBUF` and `SO_SNDBUF`
+- [tcp(7), Linux manual page](https://man7.org/linux/man-pages/man7/tcp.7.html), for `tcp_rmem`, `tcp_wmem` and `tcp_moderate_rcvbuf`
+- [ss(8), Linux manual page](https://man7.org/linux/man-pages/man8/ss.8.html), for `skmem` and the timers
+- [net/ipv4/tcp_input.c in Linux 6.6.126](https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/net/ipv4/tcp_input.c?h=v6.6.126), `tcp_sndbuf_expand()`
+- [queue, Python 3.14 documentation](https://docs.python.org/3.14/library/queue.html)

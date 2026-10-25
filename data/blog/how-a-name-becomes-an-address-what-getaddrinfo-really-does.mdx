@@ -1,0 +1,176 @@
+---
+title: "How a Name Becomes an Address: What getaddrinfo Really Does"
+date: "2026-08-08T07:25:00+01:00"
+lastmod: "2026-08-08T07:25:00+01:00"
+tags: ["following a tcp connection", "networking", "linux", "dns", "c"]
+draft: false
+reviewed: true
+reviewedHash: "cebc8263482e61100690b29d3867157e3e6cfc5f5649b28857d70b5b9164a388"
+cluster: "reliable-data-integrations"
+campaign: "editorial"
+summary: "Connecting to localhost took 77 microseconds and connecting to 127.0.0.1 took 12, to the same server. I followed getaddrinfo with strace: four sources tried in order, files read on every call, answers sorted with IPv6 first, and a lookup that blocks the thread."
+---
+
+So far in this series the client connected to an address, 127.0.0.1, a number. Real programs connect to names. I measured the difference with Python's `socket.create_connection`, 200 calls each, to the same server on the same port:
+
+```text
+round 2: create_connection(('localhost', 21082)): median 77.6 us over 200 calls
+round 2: create_connection(('127.0.0.1', 21082)): median 12.0 us over 200 calls
+```
+
+The name costs more than six times the number, and the three rounds that I made gave the same picture (75 to 78 µs against 12.0). The extra time is `getaddrinfo()`, the C library function that turns a name into a list of addresses, plus one decision that it makes. In [the first part](/blog/what-happens-when-your-program-calls-connect) a full TCP connect on loopback took about 8 microseconds, so here the name costs more than the connection.
+
+One rule for this part: no query may leave my laptop. So I only resolved names that the machine answers itself: `localhost`, `ip6-localhost` from `/etc/hosts`, and the hostname of the laptop, which `/etc/hosts` maps to 127.0.1.1. I checked every trace of this part: no line with port 53 (DNS), and no `connect()` to an address that is not 127.0.0.1 or ::1.
+
+## What one lookup does
+
+A small C program calls `getaddrinfo("localhost", "21080", ...)` once. Here is what strace shows, from the first file of the lookup:
+
+```text
+openat(AT_FDCWD, "/etc/nsswitch.conf", O_RDONLY|O_CLOEXEC) = 3
+openat(AT_FDCWD, "/etc/host.conf", O_RDONLY|O_CLOEXEC) = 3
+openat(AT_FDCWD, "/etc/resolv.conf", O_RDONLY|O_CLOEXEC) = 3
+openat(AT_FDCWD, "/etc/ld.so.cache", O_RDONLY|O_CLOEXEC) = 3
+openat(AT_FDCWD, "/usr/lib/libnss_mymachines.so.2", O_RDONLY|O_CLOEXEC) = 3
+openat(AT_FDCWD, "/usr/lib/libgcc_s.so.1", O_RDONLY|O_CLOEXEC) = 3
+openat(AT_FDCWD, "/run/systemd/machines/localhost", O_RDONLY|O_CLOEXEC) = -1 ENOENT (No such file or directory)
+openat(AT_FDCWD, "/etc/ld.so.cache", O_RDONLY|O_CLOEXEC) = 3
+openat(AT_FDCWD, "/usr/lib/libnss_mdns_minimal.so.2", O_RDONLY|O_CLOEXEC) = 3
+openat(AT_FDCWD, "/etc/ld.so.cache", O_RDONLY|O_CLOEXEC) = 3
+openat(AT_FDCWD, "/usr/lib/libnss_resolve.so.2", O_RDONLY|O_CLOEXEC) = 3
+openat(AT_FDCWD, "/usr/lib/libm.so.6", O_RDONLY|O_CLOEXEC) = 3
+socket(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC|SOCK_NONBLOCK, 0) = 3
+connect(3, {sa_family=AF_UNIX, sun_path="/run/systemd/resolve/io.systemd.Resolve"}, 42) = -1 ENOENT (No such file or directory)
+openat(AT_FDCWD, "/etc/hosts", O_RDONLY|O_CLOEXEC) = 3
+openat(AT_FDCWD, "/etc/gai.conf", O_RDONLY|O_CLOEXEC) = 3
+socket(AF_NETLINK, SOCK_RAW|SOCK_CLOEXEC, NETLINK_ROUTE) = 3
+bind(3, {sa_family=AF_NETLINK, nl_pid=0, nl_groups=00000000}, 12) = 0
+sendto(3, [{nlmsg_len=20, nlmsg_type=RTM_GETADDR, nlmsg_flags=NLM_F_REQUEST|NLM_F_DUMP, nlmsg_seq=1792883001, nlmsg_pid=0}, {ifa_family=AF_UNSPEC, ...}], 20, 0, {sa_family=AF_NETLINK, nl_pid=0, nl_groups=00000000}, 12) = 20
+socket(AF_INET, SOCK_DGRAM|SOCK_CLOEXEC, IPPROTO_IP) = 3
+connect(3, {sa_family=AF_INET, sin_port=htons(21080), sin_addr=inet_addr("127.0.0.1")}, 16) = 0
+socket(AF_INET6, SOCK_DGRAM|SOCK_CLOEXEC, IPPROTO_IP) = 3
+connect(3, {sa_family=AF_INET6, sin6_port=htons(21080), sin6_flowinfo=htonl(0), inet_pton(AF_INET6, "::1", &sin6_addr), sin6_scope_id=0}, 28) = 0
+```
+
+Twenty-three calls (and I traced only a few kinds of system calls) to find one name in a small text file. Let me go through them in groups.
+
+The first three lines read the configuration. `/etc/nsswitch.conf` says which sources to ask, and in which order. On my laptop the line for host names is:
+
+```text
+hosts: mymachines mdns_minimal [NOTFOUND=return] resolve [!UNAVAIL=return] files myhostname dns
+```
+
+`/etc/resolv.conf` is the configuration of DNS, and it was read also here, even if at the end the lookup never used DNS.
+
+Then come the sources, one after the other. Each source is a small shared library, an NSS module, loaded with `openat()` like any library (with `/etc/ld.so.cache` to find it, and its own dependencies):
+
+1. `mymachines` answers the names of local containers and virtual machines registered with systemd. It looked for `/run/systemd/machines/localhost`, found nothing, and the lookup continued.
+2. `mdns_minimal` is multicast DNS, only for names that end with `.local`. It did not even open a socket for `localhost`. The `[NOTFOUND=return]` after it means "if this source says not found, stop here", and since the lookup continued, it did not say that.
+3. `resolve` sends the question to systemd-resolved through a local socket. The socket does not exist (`ENOENT`): this service does not run on my laptop. The status is "unavailable", and `[!UNAVAIL=return]` means "return for every status except unavailable", so the lookup continued again. nsswitch.conf(5) explains this small language: `continue` is the default for NOTFOUND and UNAVAIL, `return` stops.
+4. `files` reads `/etc/hosts`, and finds `localhost`. The lookup stops: `myhostname` and `dns` are never asked.
+
+I did not see `libnss_files` in the list. There is a `libnss_files.so.2` on the disk, but this glibc never opened it, so the files source must be inside the C library itself. And in fact `nm -D` lists 73 functions of the files module, like `_nss_files_gethostbyname4_r`, inside `libc.so.6`.
+
+The last group happens after the answers are found, and it is about their order.
+
+## Why ::1 comes first
+
+`/etc/hosts` on my laptop lists `127.0.0.1  localhost` first, and `::1` on the next line. But this is what `getaddrinfo()` returned, in C and in Python:
+
+```text
+localhost: ::1 127.0.0.1
+ip6-localhost: ::1
+the hostname: 127.0.1.1
+```
+
+The C library sorts the answers. The rules are in RFC 6724 (and in RFC 3484 before it): for example "Rule 6: Prefer higher precedence", with a table of precedence values. `/etc/gai.conf` can change the table. Mine contains only comments, so the default is used, and the comments show it:
+
+```text
+#precedence  ::1/128       50
+#precedence  ::/0          40
+#precedence  2002::/16     30
+#precedence ::/96          20
+#precedence ::ffff:0:0/96  10
+```
+
+`::1` has precedence 50, and IPv4 addresses (written as `::ffff:0:0/96` here) have 10, so `::1` wins. RFC 6724 gives 35 to IPv4 instead of 10, but `::1` is first in both tables.
+
+Some of these rules need the source address that the kernel would use for each destination. This is the last group of the trace. glibc asked the kernel for the list of local addresses with a netlink request (`RTM_GETADDR`), then it opened one UDP socket for each answer and called `connect()` on it. A UDP connect sends nothing, it only makes the kernel choose a route and a source address for the socket. With only one answer there is nothing to sort, and the trace of `ip6-localhost` stops right after `/etc/hosts`.
+
+This order has a cost when the server does not listen on both. My server for the first measurement listened on 127.0.0.1 only. Here is `create_connection(("localhost", 21081))` under strace (the first `socket()` is my server):
+
+```text
+socket(AF_INET, SOCK_STREAM|SOCK_CLOEXEC, IPPROTO_IP) = 3
+socket(AF_INET, SOCK_DGRAM|SOCK_CLOEXEC, IPPROTO_IP) = 4
+connect(4, {sa_family=AF_INET, sin_port=htons(21081), sin_addr=inet_addr("127.0.0.1")}, 16) = 0
+socket(AF_INET6, SOCK_DGRAM|SOCK_CLOEXEC, IPPROTO_IP) = 4
+connect(4, {sa_family=AF_INET6, sin6_port=htons(21081), sin6_flowinfo=htonl(0), inet_pton(AF_INET6, "::1", &sin6_addr), sin6_scope_id=0}, 28) = 0
+socket(AF_INET6, SOCK_STREAM|SOCK_CLOEXEC, IPPROTO_TCP) = 4
+connect(4, {sa_family=AF_INET6, sin6_port=htons(21081), sin6_flowinfo=htonl(0), inet_pton(AF_INET6, "::1", &sin6_addr), sin6_scope_id=0}, 28) = -1 ECONNREFUSED (Connection refused)
+socket(AF_INET, SOCK_STREAM|SOCK_CLOEXEC, IPPROTO_TCP) = 4
+connect(4, {sa_family=AF_INET, sin_port=htons(21081), sin_addr=inet_addr("127.0.0.1")}, 16) = 0
+```
+
+The two UDP sockets of the sorting, then a real TCP connect to `::1`, refused, then a second one to 127.0.0.1 that works. So every connection to `localhost` pays one lookup and one refused attempt. On loopback a refusal is fast. On a real network, if the IPv6 path silently drops packets instead of refusing, the first attempt waits for its timeout, which can be seconds ([part 1](/blog/what-happens-when-your-program-calls-connect) measured these SYN retries). This is why "Happy Eyeballs" exists, RFC 8305: start the next address after a short delay, in parallel. In Python it is optional, `loop.create_connection()` of asyncio has a parameter `happy_eyeballs_delay`, and the documentation gives 0.25 seconds, the value that RFC 8305 recommends.
+
+## How long it takes
+
+A lookup on the same names, 1000 times each, after a first call. Here is the first of three runs of the C program:
+
+```text
+127.0.0.1              first call     11.9 us, then 1000 calls: median    0.1 us, p99    0.1 us, max     0.4 us
+localhost              first call    913.9 us, then 1000 calls: median   39.6 us, p99   92.1 us, max  1144.7 us
+ip6-localhost          first call     23.7 us, then 1000 calls: median   27.3 us, p99   37.7 us, max  1838.3 us
+the hostname           first call     28.5 us, then 1000 calls: median   30.5 us, p99   42.7 us, max    52.9 us
+```
+
+- `127.0.0.1` is a number, so there is no lookup at all: 0.1 µs. glibc sees that it is an address and never reads a file.
+- `localhost` took 40 to 48 µs in the three runs, the most expensive one, because it has two answers to sort. The first call took 0.9 to 1.1 ms: this is the loading of the three NSS modules.
+- `ip6-localhost` and the hostname have one answer each, and took 27 to 32 µs.
+
+Python adds little after the first call (`localhost` 49 to 51 µs). But its first call costs about 1 ms even for `127.0.0.1`, because Python imports the `idna` codec (and `stringprep`, `unicodedata`) to encode the host name the first time. The trace of that first call shows these files and no `/etc/hosts`.
+
+So the full chain of four sources costs about 30 µs, even when the answer is in a local file. That is more than the TCP connection that comes after it, on loopback.
+
+## No cache, and a blocking call
+
+Three lookups of `localhost` in the same process:
+
+```text
+openat(AT_FDCWD, "/etc/hosts", O_RDONLY|O_CLOEXEC) = 3
+openat(AT_FDCWD, "/etc/gai.conf", O_RDONLY|O_CLOEXEC) = 3
+openat(AT_FDCWD, "/run/systemd/machines/localhost", O_RDONLY|O_CLOEXEC) = -1 ENOENT (No such file or directory)
+openat(AT_FDCWD, "/etc/hosts", O_RDONLY|O_CLOEXEC) = 3
+openat(AT_FDCWD, "/run/systemd/machines/localhost", O_RDONLY|O_CLOEXEC) = -1 ENOENT (No such file or directory)
+openat(AT_FDCWD, "/etc/hosts", O_RDONLY|O_CLOEXEC) = 3
+```
+
+The modules and the configuration were loaded once, at the first lookup (not shown here). But each lookup asked the sources again and opened `/etc/hosts` again. The C library did not remember even one answer. A cache, when a system has one, is a separate service: nscd(8) "is a daemon that provides a cache for the most common name service requests", and the man page of nss-resolve says that systemd-resolved reads `/etc/hosts` "with caching". Neither runs here.
+
+And `getaddrinfo()` blocks the thread that calls it. Here it is some microseconds. With DNS it is a network round trip, and when the name server does not answer, resolv.conf(5) gives the defaults: a timeout of 5 seconds per attempt, and 2 attempts. This is also why the timeout of `socket.create_connection` does not protect you: the Python documentation says that it sets the timeout "on the socket instance before attempting to connect", and the lookup runs before, without it.
+
+An event loop cannot wait like this, so asyncio sends the lookup to a thread. In its source the method ends with `run_in_executor(None, getaddr_func, ...)`, and strace with `-f` shows the files opened by another thread:
+
+```text
+process id 1294960
+asyncio answers: ::1 127.0.0.1
+1294961 openat(AT_FDCWD, "/etc/nsswitch.conf", O_RDONLY|O_CLOEXEC) = 6
+1294961 openat(AT_FDCWD, "/etc/hosts", O_RDONLY|O_CLOEXEC) = 6
+```
+
+The process (and its main thread) is 1294960, the lookup runs in thread 1294961, a worker of the default thread pool. The C library has also `getaddrinfo_a()`, "asynchronous network address and service translation", but it is a GNU extension.
+
+## What I would do with this
+
+If a server listens on 127.0.0.1 only, the clients that use `localhost` pay a refused attempt on `::1` each time, so I would make the server listen on both, or use the address that it really listens on. I would keep in mind that the lookup is outside the connect timeout, and give it its own limit when the name goes to DNS. And I would not resolve the same name for every request: the C library will not remember it for me.
+
+The outputs are [p08-answers.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/following-a-tcp-connection/results/p08-answers.txt), [p08-strace.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/following-a-tcp-connection/results/p08-strace.txt), [p08-time.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/following-a-tcp-connection/results/p08-time.txt), [p08-connect.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/following-a-tcp-connection/results/p08-connect.txt), [p08-asyncio.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/following-a-tcp-connection/results/p08-asyncio.txt), [p08-modules.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/following-a-tcp-connection/results/p08-modules.txt), [p08-libc.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/following-a-tcp-connection/results/p08-libc.txt) and the DNS check [p08-dnscheck.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/following-a-tcp-connection/results/p08-dnscheck.txt), and the programs are `p08_gai.c` and `p08_gai.py` in the [fixture](https://github.com/mehdiakiki/mehdi-cz/tree/main/experiments/following-a-tcp-connection).
+
+## Sources
+
+- [nsswitch.conf(5)](https://man7.org/linux/man-pages/man5/nsswitch.conf.5.html), [resolv.conf(5)](https://man7.org/linux/man-pages/man5/resolv.conf.5.html) and [gai.conf(5)](https://man7.org/linux/man-pages/man5/gai.conf.5.html), Linux manual pages
+- [getaddrinfo(3)](https://man7.org/linux/man-pages/man3/getaddrinfo.3.html) and [getaddrinfo_a(3)](https://man7.org/linux/man-pages/man3/getaddrinfo_a.3.html)
+- [nss-resolve(8)](https://man7.org/linux/man-pages/man8/nss-resolve.8.html) and [nscd(8)](https://man7.org/linux/man-pages/man8/nscd.8.html)
+- [RFC 6724, Default Address Selection for Internet Protocol Version 6 (IPv6)](https://www.rfc-editor.org/rfc/rfc6724.html)
+- [RFC 8305, Happy Eyeballs Version 2](https://www.rfc-editor.org/rfc/rfc8305.html)
+- [Event loop, Python 3.14 documentation](https://docs.python.org/3.14/library/asyncio-eventloop.html), for `getaddrinfo()` and `happy_eyeballs_delay`

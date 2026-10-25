@@ -1,0 +1,155 @@
+---
+title: "The Benchmark Ran on an Efficiency Core"
+date: "2026-09-18T06:55:00+01:00"
+lastmod: "2026-09-18T06:55:00+01:00"
+tags: ["when the benchmark lies", "linux", "performance", "benchmarking", "concurrency"]
+draft: false
+reviewed: true
+reviewedHash: "a93b330bac12511181a92b9419623fec31a0612ec08d8d46ca7d29f7b4a99ce4"
+campaign: "editorial"
+summary: "On a laptop with two kinds of cores, I measured the same benchmark on a P-core and on an E-core, without taskset, and with two threads on one core. The E-core needed more cycles, not only a lower clock, and a busy sibling thread made a P-core as slow as an E-core."
+---
+
+I ran the same small benchmark 30 times without `taskset`, and I sorted the results in bins of 25 nanoseconds:
+
+```text
+ 125- 150 ns  ####                           PPPP
+ 150- 175 ns  ########################       PPPPPPPPPPPPPPPPPPPPPPPP
+ 175- 200 ns                                 
+ 200- 225 ns                                 
+ 225- 250 ns  #                              P
+ 250- 275 ns  #                              P
+sum: mean 164.6 ns, median 160.3 ns; 26 of 30 runs started on an E-core, 30 ended on a P-core
+```
+
+28 runs in one group, two runs far away from it, and nothing between them. The program, the input and the machine were the same every time. What changes is where the thread ran. And the last line says something I did not expect: 26 of the 30 runs started on an efficiency core, and all 30 ended on a performance core.
+
+The laptop of this series has two kinds of cores. In this part I want to know what this does to a benchmark.
+
+## Two kinds of cores in one laptop
+
+The Intel Core i7-1260P has 4 performance cores and 8 efficiency cores. Linux shows 16 CPUs: CPUs 0 to 7 are the P-cores, two hardware threads per core (0 and 1 are the same core, 2 and 3, 4 and 5, 6 and 7), and CPUs 8 to 15 are the E-cores, one thread each. The P-cores can run up to 4.7 GHz and the E-cores up to 3.4 GHz. A P-core has 48 KiB of L1 data cache and 1.25 MiB of L2. An E-core has 32 KiB of L1 data cache and shares 2 MiB of L2 with three other E-cores.
+
+For a program, all 16 CPUs look the same. `taskset -c 2`, the way I pinned all benchmarks since [the first part of this series](/blog/the-benchmark-that-measured-nothing), chooses one of them explicitly.
+
+## Two small benchmarks
+
+I used two kinds of work, because I expected the answer to depend on it:
+
+- `sum`: the sum of 2,048 `u64` values, 16 KiB, so it fits in the L1 cache of both core types. The compiler makes a vector loop of it, and this loop can do several things at the same time.
+- `chain`: 10,000 turns of `x = x * K + C`, where each turn needs the result of the previous one. This is the chain of [the previous part](/blog/my-laptop-changed-its-cpu-speed-during-the-benchmark), where one turn took about four cycles.
+
+When I prepared this part, the chain gave a number that did not make sense. A P-core needed about 1,130 ns for 10,000 turns, so 0.11 ns per turn, less than half of one cycle. The assembly explained it:
+
+```asm
+	movabsq	$-5359887879000474335, %r13
+	movabsq	$6566661184467396264, %r12
+...
+	movl	$10000, %esi
+	movq	8(%rsp), %rdx
+.LBB35_42:
+	imulq	%r13, %rdx
+	addq	%r12, %rdx
+	addq	$-8, %rsi
+	jne	.LBB35_42
+```
+
+The counter goes down by 8 at each step. LLVM saw that eight turns of `x * K + C` are again one multiplication and one addition, with other constants, so it made 1,250 steps instead of 10,000 turns. I added a small mode to the program that computes these constants with wrapping arithmetic:
+
+```text
+8 turns of x * K + C are x * 13086856194709077281 + 6566661184467396264, that is x * -5359887879000474335 + 6566661184467396264 as signed numbers
+```
+
+These are exactly the two constants of the assembly. The chain is still a chain, because each step needs the previous one, so it is still the right test for latency. Only the unit changed: one step, not one turn. The lesson of the first three parts again, in a place where I did not expect it.
+
+## Pinned: P-core against E-core
+
+`run.sh` pins the benchmark to two P-cores (2 and 6) and two E-cores (10 and 14), in 10 rounds, one CPU after the other in each round. After each run the program reads the frequency of its CPU, and on a P-core it also measures how busy the sibling thread was during the run. I started this run when the load average was below 3.5. The medians:
+
+```text
+cpu 10                 sum    238.0 ns  chain   2179.8 ns   3324 MHz  (median of 10)
+cpu 14                 sum    247.2 ns  chain   2179.1 ns   3364 MHz  (median of 10)
+cpu 2                  sum    223.5 ns  chain   1127.8 ns   4368 MHz  (median of 10)
+cpu 6                  sum    160.3 ns  chain   1196.7 ns   4112 MHz  (median of 10)
+```
+
+The chain is clear: an E-core needs 1.8 to 1.9 times the time of a P-core. The frequency read after each run gives a rough number of cycles: CPU 2 needs 1,128 ns at 4.37 GHz, about 4,900 cycles, and CPU 6 the same 4,900 cycles at 4.11 GHz. That is 3.9 cycles per step. The two E-cores need about 7,300 cycles, 5.8 to 5.9 cycles per step. So the E-core is slower for two reasons at the same time: its clock is lower, and the same dependent multiplication and addition take it about 50 percent more cycles. One frequency reading per run is not exact, but four CPUs that agree in pairs make me trust these numbers.
+
+The sum is less clear. CPU 6 needs 160 ns, the E-cores 238 and 247 ns. But CPU 2 needs 223.5 ns, almost like an E-core. Strange, because CPU 2 and CPU 6 are the same kind of core.
+
+## A P-core with a busy neighbor
+
+The per-run lines show the difference:
+
+```text
+cpu  2           sum    220.9 ns  chain   1198.9 ns  4456 MHz after  sibling cpu 3 busy 100%
+cpu 10           sum    237.5 ns  chain   2179.0 ns  3348 MHz after
+cpu  6           sum    137.5 ns  chain   1031.1 ns  4530 MHz after  sibling cpu 7 busy  33%
+cpu 14           sum    250.9 ns  chain   2179.1 ns  3395 MHz after
+...
+```
+
+During most runs on CPU 2, CPU 3 was busy with a program that was not mine. CPU 3 is the other hardware thread of the same physical core. Split by this, the P-core runs look like this:
+
+```text
+cpu 2 sibling busy     sum    233.9 ns  chain   1115.2 ns   4370 MHz  (median of 7)
+cpu 2 sibling idle     sum    161.7 ns  chain   1153.9 ns   4085 MHz  (median of 3)
+cpu 6 sibling idle     sum    161.5 ns  chain   1211.3 ns   4078 MHz  (median of 8)
+...
+```
+
+With an idle sibling, CPU 2 is like CPU 6 in two of its three runs: 161.7 against 161.5 ns in the median. The third idle run was slow anyway, 223.5 ns with the sibling at 0 percent. With a busy sibling, its sum takes 233.9 ns, the same as an E-core. The chain does not get slower at all.
+
+When I ran this part a second time, on a quieter laptop, this split did not work at all. The sibling was idle in 19 of the 20 pinned P-core runs, and still most of their sums were slow, between 137 and 310 ns: the medians were 254.0 and 236.3 ns on the P-cores and 236.2 on both E-cores, so in that run the P-cores were not faster for the sum ([p07-efficiency-core.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/when-the-benchmark-lies/results/second-run/p07-efficiency-core.txt)). In these rounds each P-core waited idle while the other CPUs had their turn, and the sum is the first thing that the program measures, so I think the clock was still coming up, as in [the previous part](/blog/my-laptop-changed-its-cpu-speed-during-the-benchmark). A busy sibling is one reason for a slow sum, not the only one. The controlled experiment below gave the same answer both times.
+
+I wanted to see this under control, without depending on other programs, so the last experiment runs two threads of my own: one thread alone on CPU 2, then two threads on CPUs 2 and 3 (one core), then two threads on CPUs 2 and 4 (two cores):
+
+```text
+cpu 2                  sum    169.9 ns  chain   1241.3 ns   3900 MHz  (median of 10)
+pair 2+3 cpu 2         sum    274.4 ns  chain   1269.8 ns   3890 MHz  (median of 10)
+pair 2+3 cpu 3         sum    274.4 ns  chain   1270.2 ns   3890 MHz  (median of 10)
+pair 2+4 cpu 2         sum    174.4 ns  chain   1292.3 ns   3774 MHz  (median of 10)
+pair 2+4 cpu 4         sum    174.6 ns  chain   1275.3 ns   3758 MHz  (median of 10)
+```
+
+Two threads on one core: the sum is 61 percent slower in both threads, and the chain 2 percent. Two threads on two cores: both are almost like alone. OK, now it is clear.
+
+Why does the sum suffer and the chain not? The two hardware threads of a core share its execution units. The sum is a loop that can use many of them at the same time, so a second thread on the same core takes resources that the first one was using. The chain spends most of its time waiting for its own previous result, so the core has free resources, and the second thread can use them almost without disturbing it. This is the usual description of simultaneous multithreading, and the numbers fit it, but I did not measure the execution units themselves.
+
+## Without taskset
+
+Now back to the 30 runs of the beginning. The program records the CPU at the start and at the end of each run. A few of them:
+
+```text
+cpu 14 then  2   sum    164.4 ns  chain   1307.4 ns  3461 MHz after
+...
+cpu 15 then  2   sum    157.6 ns  chain   3727.8 ns  1311 MHz after
+...
+cpu 10 then  6   sum    251.8 ns  chain   1242.1 ns  3840 MHz after
+...
+cpu 11 then  4   sum    165.7 ns  chain   3229.5 ns  1558 MHz after
+...
+```
+
+So the scheduler often put the new process on an E-core first and moved it to a P-core a bit later. The result of a run depends on where the thread was during the measured part, and the number alone does not show it. In the third line the sum is slow, maybe because it was still on an E-core, maybe because of a busy sibling: I can not tell.
+
+The second and the fourth lines are interesting in another way. Their chains are three times slower, but they ended on a P-core, and the frequency read after the run was only 1.3 and 1.6 GHz. 3,728 ns at 1.31 GHz is about 4,900 cycles, the P-core number from above. So these two runs were slow because of the clock, the subject of the previous part, and not because of the core type. Without the frequency, I would have blamed the E-cores.
+
+One unpinned run is a random sample of decisions made by the scheduler and by the hardware. In this set, the mean (164.6 ns) and the median (160.3 ns) are close, because only two sums were slow. When I ran this part a second time, 11 of the 30 sums were slow, between 250 and 515 ns, and the mean was 222.1 ns against a median of 137.5: a time that no run had.
+
+## Rules for a hybrid CPU
+
+On a hybrid CPU, "the speed of this code" has at least two answers, and on a P-core it has one more, with and without a busy sibling. So:
+
+- Pin a benchmark to a known core type, and say which one in the result.
+- Record whether the sibling thread was busy. The result files of this series record all CPUs, and this part shows why the sibling matters.
+- Do not use one ratio between E-cores and P-cores for all code. Here it was about 1.5 for one loop and 1.8 to 1.9 for the other.
+- For a benchmark with several threads, say on which CPUs they ran. Two threads on one core and two threads on two cores are two different experiments.
+- Without pinning, run many times and look at the distribution, not only at the mean.
+
+The program and all the runs are in [the fixture](https://github.com/mehdiakiki/mehdi-cz/tree/main/experiments/when-the-benchmark-lies), in [p07-efficiency-core.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/when-the-benchmark-lies/results/p07-efficiency-core.txt).
+
+## Further reading
+
+- [taskset(1), Linux manual page](https://man7.org/linux/man-pages/man1/taskset.1.html)
+- [sched_getcpu(3), Linux manual page](https://man7.org/linux/man-pages/man3/sched_getcpu.3.html)

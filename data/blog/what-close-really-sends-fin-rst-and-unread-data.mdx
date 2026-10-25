@@ -1,0 +1,181 @@
+---
+title: "What close() Really Sends: FIN, RST and Unread Data"
+date: "2026-07-19T15:10:00+01:00"
+lastmod: "2026-07-19T15:10:00+01:00"
+tags: ["following a tcp connection", "networking", "linux", "tcp", "c"]
+draft: false
+reviewed: true
+reviewedHash: "e2a4d8591dbda8b22baa8512da116d514efef6539366d84a21fd28bb305b1a7b"
+cluster: "reliable-data-integrations"
+campaign: "editorial"
+summary: "close() returns 0 and the program learns nothing more. I made five small experiments to see what the other side gets: a clean end of file, a reset, a half-closed connection, a broken pipe that kills a C program, and CLOSE-WAIT sockets that never go away."
+---
+
+`close()` returns 0, and for the program that called it, the connection is finished. But what does the other side get? A normal end of file, or an error? It depends on things that the program does not see: bytes waiting in its receive buffer, one socket option, and who closed first.
+
+I made five small experiments on loopback, plus one about a leak. In each one I looked at what the other program gets from its system calls, at the socket states in `ss`, and at the kernel counters. The counters are for the whole machine, so I repeated every case 20 times and looked at the totals: a +20 is mine, a +1 can be another program.
+
+## The normal case: a FIN
+
+The client calls `close()`, the server reads, then the server closes too:
+
+```text
+client: close()
+server: recv(100) -> b''
+-- ss after the client close
+   CLOSE-WAIT 0      0      127.0.0.1:21061 127.0.0.1:38912
+   FIN-WAIT-2 0      0      127.0.0.1:38912 127.0.0.1:21061 timer:(timewait,59sec,0)
+server: close()
+-- ss after the server close
+   TIME-WAIT 0      0      127.0.0.1:38912 127.0.0.1:21061 timer:(timewait,59sec,0)
+```
+
+`close()` sent a FIN, the flag that means "I have nothing more to send". The server's `recv()` returned an empty result, the end of file: recv(2) says that "when a stream socket peer has performed an orderly shutdown, the return value will be 0".
+
+The two states say who waits for whom. The server is in CLOSE-WAIT: the other side closed, and the kernel waits for my program to close too. The client is in FIN-WAIT-2: my FIN was acknowledged, and I wait for the FIN of the other side. When the server closed, the server socket disappeared, and the client socket went to TIME-WAIT for 59 more seconds. The side that closes first gets TIME-WAIT. That is the topic of the next part.
+
+Look also at the timer on FIN-WAIT-2. I come back to it below.
+
+Over 20 repetitions: `TcpOutRsts` +1, `TcpEstabResets` +0. No reset is involved in a normal close (the one RST is from somebody else on my laptop).
+
+## Close with unread data: a RST
+
+Now the server sends 32 bytes that the client never reads, and the client closes:
+
+```text
+client: close() with 32 unread bytes in its receive buffer
+server: recv(100) -> ConnectionResetError(104, 'Connection reset by peer')
+-- ss after the close
+-- the same case 20 times, counters of the whole machine:
+  TcpOutRsts                   +20
+  TcpEstabResets               +40
+  TcpExtTCPAbortOnClose        +20
+  TcpExtTCPAbortOnData         +0
+```
+
+The same `close()`, but the client kernel sent a RST instead of a FIN, and the server got `ECONNRESET`. No socket is left after it, no FIN-WAIT, no TIME-WAIT. The counters agree: 20 RSTs sent, and 20 times `TcpExtTCPAbortOnClose`, which the kernel documentation describes as "the application has unread data in the TCP layer when the application wants to close". `TcpEstabResets` is +40 because both sockets of each connection went directly from ESTABLISHED to CLOSED, which is exactly the definition of this counter in RFC 1213.
+
+Why a reset? Because data was lost. RFC 1122 asks for this: when a host closes "while received data is still pending in TCP", its TCP "SHOULD send a RST to show that data was lost". The kernel tells the other side "your bytes were not read", instead of pretending that everything was fine.
+
+This has a real consequence for HTTP servers. RFC 9112, section 9.6, warns that if a server closes a connection immediately while the client is still sending, "the reset packet might erase the client's unacknowledged input buffers", so the client can lose the last response that the server already sent. This is why RFC 9112 describes a close in stages: the server closes first only its sending side, then it reads until the client closes too. The first step is `shutdown(SHUT_WR)`, and I try it two sections below.
+
+## SO_LINGER with zero: a RST on purpose
+
+The same reset, but asked for. The client sets `SO_LINGER` with "on" and a timeout of 0, then closes, with nothing unread:
+
+```text
+client: close() with SO_LINGER on, timeout 0
+server: recv(100) -> ConnectionResetError(104, 'Connection reset by peer')
+-- ss after the close
+-- the same case 20 times, counters of the whole machine:
+  TcpOutRsts                   +20
+  TcpEstabResets               +40
+  TcpExtTCPAbortOnClose        +0
+  TcpExtTCPAbortOnData         +20
+```
+
+The other side sees the same error, and the kernel counts it in another counter. The kernel documentation explains this one too: with `SO_LINGER` and a timeout of 0, the "kernel will send a RST immediately and increase the TcpExtTCPAbortOnData counter". The name of the counter is strange for this case, but the documentation is clear.
+
+People use this trick because it leaves no TIME-WAIT. The price: the other side gets an error instead of an end of file, and any data that was still in flight is thrown away.
+
+## shutdown(SHUT_WR): half closed
+
+`shutdown(SHUT_WR)` closes only the sending direction. The client sends its request, then says "I have nothing more to send", and waits for the answer:
+
+```text
+client: sendall(b'request'), then shutdown(SHUT_WR)
+server: recv(100) -> b'request'
+server: recv(100) -> b''
+-- ss after the shutdown
+   CLOSE-WAIT 0      0      127.0.0.1:21064 127.0.0.1:55716
+   FIN-WAIT-2 0      0      127.0.0.1:55716 127.0.0.1:21064
+server: sendall(b'answer') -> None
+client: recv(100) -> b'answer'
+client: recv(100) -> b''
+```
+
+The server got the request, then the end of file, and it could still send its answer. The client could still read it, and at the end it got its own end of file when the server closed. A connection has two directions, and they can end at different times.
+
+Compare the FIN-WAIT-2 line with the one of the normal case. Here it has no timer. In the normal case it had `timer:(timewait,59sec,0)`. The difference: here my program still holds the socket, because it called `shutdown()` and not `close()`. The kernel documentation of `tcp_fin_timeout` explains it: the timeout is for an "orphaned (no longer referenced by any application)" connection in FIN-WAIT-2. A program that still has the socket may wait as long as it wants, this is "a perfectly valid 'receive only' state". The kernel puts a limit only when nobody can close it any more.
+
+## Writing to a connection that the other side closed
+
+Now the server closes first, and then the client writes, two times:
+
+```text
+server: close()
+-- ss after the server close
+   FIN-WAIT-2 0      0      127.0.0.1:21065 127.0.0.1:59922 timer:(timewait,59sec,0)
+   CLOSE-WAIT 1      0      127.0.0.1:59922 127.0.0.1:21065
+client: send(b'first') -> 5
+-- ss after the first send
+client: send(b'second') -> BrokenPipeError(32, 'Broken pipe')
+client: recv(100) -> b''
+```
+
+The first `send()` returned 5: success. The client kernel did not know that the program on the other side was gone, it only knew that the other side would not send anything more. (The 1 in Recv-Q of CLOSE-WAIT is this FIN. It uses one sequence number, like the SYN in [the first part](/blog/what-happens-when-your-program-calls-connect), and my program did not read it yet.) The 5 bytes arrived at a socket that no program owned, so the server kernel answered with a RST (the case "new data is received after CLOSE is called" of RFC 1122), and both sockets disappeared: the second `ss` is empty. Over 20 repetitions, `TcpOutRsts` +20 and `TcpEstabResets` +20. So the second `send()` failed with `EPIPE`, and `recv()` returned the end of file that was still waiting.
+
+In Python this is a normal exception, `BrokenPipeError`. In C it is different. Here is a small C program that does the same two writes:
+
+```text
+== C client, default action for SIGPIPE
+write 1 returned 5
+exit status: 141
+== C client, SIGPIPE ignored
+write 1 returned 5
+write 2 returned -1, errno 32 (Broken pipe)
+```
+
+With the default settings, the program did not print anything for the second write. It died. The exit status 141 is 128 plus 13, and 13 is `SIGPIPE`. strace shows it:
+
+```text
+write(3, "hello", 5)                    = 5
+write(3, "hello", 5)                    = -1 EPIPE (Broken pipe)
+--- SIGPIPE {si_signo=SIGPIPE, si_code=SI_USER, si_pid=1144824, si_uid=1000} ---
++++ killed by SIGPIPE +++
+```
+
+send(2) documents it: on `EPIPE` "the process will also receive a SIGPIPE unless MSG_NOSIGNAL is set". The default action of this signal is to end the process. Python does not die because it ignores `SIGPIPE` at startup, the Python documentation says it, "so write errors on pipes and sockets can be reported as ordinary Python exceptions". A server in C must ignore the signal or use `MSG_NOSIGNAL` on every `send()`, otherwise one client that disappears can kill the whole server.
+
+## What the other side gets
+
+Here are the five cases side by side:
+
+| case on my side | the other side gets | left after it |
+| --- | --- | --- |
+| `close()`, nothing unread | end of file, `recv()` returns 0 | TIME-WAIT on my side |
+| `close()` with unread data | `ECONNRESET` | nothing |
+| `SO_LINGER` 0, then `close()` | `ECONNRESET` | nothing |
+| `shutdown(SHUT_WR)` | end of file, and it can still answer | FIN-WAIT-2 without timer on my side |
+| the other side closed, I write | nothing, its kernel answers my bytes with a RST; I get success, then `EPIPE` and `SIGPIPE` | nothing |
+
+## The leak: CLOSE-WAIT forever
+
+The last experiment is a bug that I wanted to see with my own eyes. Fifty clients connect and close. The server accepts them and never calls `close()`:
+
+```text
+50 clients connected and closed, the server keeps every socket open
+  t= 0.5 s  {'LISTEN': 1, 'FIN-WAIT-2': 50, 'CLOSE-WAIT': 50}, open file descriptors of this process: 55
+    CLOSE-WAIT 1      0      127.0.0.1:21067 127.0.0.1:39002
+    FIN-WAIT-2 0      0      127.0.0.1:39088 127.0.0.1:21067 timer:(timewait,59sec,0)
+  t=10.0 s  {'LISTEN': 1, 'FIN-WAIT-2': 50, 'CLOSE-WAIT': 50}, open file descriptors of this process: 55
+  t=30.0 s  {'LISTEN': 1, 'FIN-WAIT-2': 50, 'CLOSE-WAIT': 50}, open file descriptors of this process: 55
+  t=65.0 s  {'LISTEN': 1, 'CLOSE-WAIT': 50}, open file descriptors of this process: 55
+  after the server closes them: {'LISTEN': 1}
+```
+
+On the client side, the 50 FIN-WAIT-2 sockets were orphans with a 60-second timer (`tcp_fin_timeout` is 60 here), and between 30 and 65 seconds they were gone. On the server side, the 50 CLOSE-WAIT sockets have no timer at all. They stay as long as the process keeps their file descriptors open, and here the 50 descriptors are still counted in `/proc/self/fd`. The kernel will not clean them, because only the program knows if it still wants to send something. When the server finally called `close()`, they disappeared at once.
+
+So many CLOSE-WAIT sockets in `ss` have a simple meaning: a program received the end of file and did not close its socket. When they stay for a long time, it is almost always a bug in that program, often a path where an error or an empty `recv()` leaves the function without `close()`. And it costs one file descriptor each, until the process reaches its limit.
+
+The outputs are [p06-close.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/following-a-tcp-connection/results/p06-close.txt), [p06-sigpipe.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/following-a-tcp-connection/results/p06-sigpipe.txt) and [p06-leak.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/following-a-tcp-connection/results/p06-leak.txt), the programs are `p06_close.py` and `p06_sigpipe.c` in the [fixture](https://github.com/mehdiakiki/mehdi-cz/tree/main/experiments/following-a-tcp-connection).
+
+## References
+
+- [recv(2)](https://man7.org/linux/man-pages/man2/recv.2.html), [send(2)](https://man7.org/linux/man-pages/man2/send.2.html) and [socket(7)](https://man7.org/linux/man-pages/man7/socket.7.html), Linux manual pages
+- [SNMP counter, Linux kernel documentation](https://docs.kernel.org/networking/snmp_counter.html), for `TcpExtTCPAbortOnClose` and `TcpExtTCPAbortOnData`
+- [IP Sysctl, Linux kernel documentation for 6.6](https://www.kernel.org/doc/html/v6.6/networking/ip-sysctl.html), for `tcp_fin_timeout`
+- [RFC 1122](https://www.rfc-editor.org/rfc/rfc1122.html#page-87), section 4.2.2.13, closing a connection
+- [RFC 1213](https://www.rfc-editor.org/rfc/rfc1213.html), the definitions of `tcpEstabResets` and `tcpOutRsts`
+- [RFC 9112](https://www.rfc-editor.org/rfc/rfc9112.html#section-9.6), section 9.6, tear-down
+- [signal, Python 3.14 documentation](https://docs.python.org/3.14/library/signal.html)

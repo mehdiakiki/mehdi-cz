@@ -1,0 +1,186 @@
+---
+title: "How LD_PRELOAD Replaces a Function Without Recompiling"
+date: "2026-09-23T12:10:00+01:00"
+lastmod: "2026-09-23T12:10:00+01:00"
+tags: ["from source to process", "linux", "linker", "c", "rust"]
+draft: false
+reviewed: true
+reviewedHash: "6b44dfae3bbac102e8978452b27a11c74f4329e40158e9768032a76fb136c154"
+cluster: "rust-under-the-hood"
+campaign: "editorial"
+summary: "I wrote a small library that counts malloc calls and preloaded it into C, Rust and ls. The famous dlsym trap did not appear with glibc 2.43, but ls hid my output in a way I did not expect, and the static binary ignored the library completely."
+---
+
+I wanted to count the calls to `malloc` in programs that I did not write, without recompiling them. So I made a small shared library that defines its own `malloc`, `calloc`, `realloc` and `free`, counts the calls, forwards them to the real ones, and prints the totals at exit. Here it is in three programs:
+
+```text
+$ LD_PRELOAD=./libcount.so ./hello_c_dyn
+[libcount] malloc 1, calloc 0, realloc 0, free 0, early allocations 0
+hello from C
+$ LD_PRELOAD=./libcount.so ./hello_rs
+hello from Rust
+[libcount] malloc 6, calloc 1, realloc 3, free 8, early allocations 0
+$ LD_PRELOAD=./libcount.so ls /usr/lib > /dev/null
+[libcount] malloc 5566, calloc 0, realloc 12, free 8, early allocations 0
+```
+
+One malloc for my C hello world (the buffer of stdout, from [the first part of this series](/blog/what-happens-when-you-run-a-program-from-execve-to-main)), six for the Rust one, and 5,566 for `ls` on a directory with 5,512 entries. None of these programs knows my library. How does its `malloc` win against the one in libc?
+
+## The order of the search
+
+The answer is the order in which the loader looks for a name. `LD_DEBUG=scopes` prints it:
+
+```text
+$ LD_DEBUG=scopes LD_PRELOAD=./libcount.so ./hello_c_dyn 2>&1 >/dev/null | head -n 4
+    905290:	
+    905290:	Initial object scopes
+    905290:	object=./hello_c_dyn [0]
+    905290:	 scope 0: ./hello_c_dyn ./libcount.so /usr/lib/libc.so.6 /lib64/ld-linux-x86-64.so.2
+```
+
+And the same program without the library:
+
+```text
+$ LD_DEBUG=scopes ./hello_c_dyn 2>&1 >/dev/null | head -n 4
+    905292:	
+    905292:	Initial object scopes
+    905292:	object=./hello_c_dyn [0]
+    905292:	 scope 0: ./hello_c_dyn /usr/lib/libc.so.6 /lib64/ld-linux-x86-64.so.2
+```
+
+The global scope is a list: the program first, then the libraries in the order they were loaded. When the loader must resolve a symbol, like the GOT slot of `malloc` from [the part about the PLT and the GOT](/blog/how-a-call-to-printf-finds-printf-the-plt-and-the-got), it searches this list from left to right, and the first object that defines the name wins. ld.so(8) describes `LD_PRELOAD` as a list of shared objects "to be loaded before all others", so my library lands just after the program and before libc. In fact, nothing is patched or overwritten. My `malloc` is simply found first. This is called symbol interposition.
+
+`LD_DEBUG=bindings` shows every decision of this kind. Here are the four allocation functions:
+
+```text
+    905288:	binding file /usr/lib/libc.so.6 [0] to ./libcount.so [0]: normal symbol `realloc' [GLIBC_2.2.5]
+    905288:	binding file /usr/lib/libc.so.6 [0] to ./libcount.so [0]: normal symbol `calloc' [GLIBC_2.2.5]
+    905288:	binding file /usr/lib/libc.so.6 [0] to ./libcount.so [0]: normal symbol `free' [GLIBC_2.2.5]
+    905288:	binding file /usr/lib/libc.so.6 [0] to ./libcount.so [0]: normal symbol `malloc' [GLIBC_2.2.5]
+    905288:	binding file ./hello_c_dyn [0] to ./libcount.so [0]: normal symbol `calloc' [GLIBC_2.2.5]
+    905288:	binding file ./hello_c_dyn [0] to ./libcount.so [0]: normal symbol `free' [GLIBC_2.2.5]
+    905288:	binding file ./hello_c_dyn [0] to ./libcount.so [0]: normal symbol `malloc' [GLIBC_2.2.5]
+    905288:	binding file ./hello_c_dyn [0] to ./libcount.so [0]: normal symbol `realloc' [GLIBC_2.2.5]
+    905288:	binding file ./libcount.so [0] to /usr/lib/libc.so.6 [0]: normal symbol `malloc'
+    905288:	binding file ./libcount.so [0] to /usr/lib/libc.so.6 [0]: normal symbol `calloc'
+    905288:	binding file ./libcount.so [0] to /usr/lib/libc.so.6 [0]: normal symbol `realloc'
+    905288:	binding file ./libcount.so [0] to /usr/lib/libc.so.6 [0]: normal symbol `free'
+```
+
+Three groups, and each one says something.
+
+The first group is the strangest one. libc itself is bound to my library. When `puts` inside libc allocates the stdout buffer, it calls `malloc` through libc's own GOT, and this slot points to my version. The glibc manual says that replacing malloc works "through ELF symbol interposition", and this is the mechanism: libc does not call its malloc directly, on purpose. So my counter also sees the allocations that libc makes on behalf of the program, like the stdout buffer of the C hello world, which never calls `malloc` itself.
+
+The second group was not clear for me at first, because my program never calls `malloc`. These four lookups are made by the loader, in the name of the main program, in alphabetical order: calloc, free, malloc, realloc. In the glibc source, the function `__rtld_malloc_init_real` (in `elf/dl-minimal.c`) does exactly these four lookups in the scope of the main program. The loader starts with a tiny allocator of its own, and after libc is loaded it switches to the real `malloc`. With my library in the scope, even the loader's later allocations go through my counter.
+
+The third group is my library asking for the real functions, with `dlsym(RTLD_NEXT, "malloc")`. `RTLD_NEXT` means: search the scope, but start after me. So it finds libc.
+
+## The counter
+
+The core of the library is short:
+
+```c
+static void resolve(void)
+{
+    resolving = 1;
+    real_malloc = dlsym(RTLD_NEXT, "malloc");
+    real_calloc = dlsym(RTLD_NEXT, "calloc");
+    real_realloc = dlsym(RTLD_NEXT, "realloc");
+    real_free = dlsym(RTLD_NEXT, "free");
+    resolving = 0;
+}
+
+void *malloc(size_t size)
+{
+    if (!real_malloc) {
+        if (resolving)
+            return arena_alloc(size);
+        resolve();
+    }
+    atomic_fetch_add_explicit(&malloc_calls, 1, memory_order_relaxed);
+    return real_malloc(size);
+}
+```
+
+The `calloc`, `realloc` and `free` wrappers have the same shape, and a destructor prints the counts at exit. The full file is in the fixture. There are two traps in a library like this. The first one is famous, the second one I found by accident.
+
+## Trap 1: dlsym needs malloc
+
+The classic warning: `dlsym` may allocate memory, so a `malloc` wrapper that calls `dlsym` calls itself, which calls `dlsym` again, until the stack is full. This is why my `malloc` has the `resolving` flag and a static `arena` of 8 KiB: while `dlsym` is running, an allocation gets memory from the arena, and `free` ignores pointers that point into it.
+
+Before I trusted this, I wanted to see the trap with my own eyes. I made a naive wrapper without any protection that only records the depth of nested `malloc` calls:
+
+```text
+$ LD_PRELOAD=./libnaive_malloc.so /bin/true
+naive wrapper: max depth 0
+...
+$ LD_PRELOAD=./libnaive_calloc.so ./usecalloc
+naive calloc wrapper: max depth 1
+0
+```
+
+No recursion. The depth never went over 1, for `malloc` and for `calloc` (with `/bin/true` it is even 0: `true` does not allocate at all). So with glibc 2.43 the famous trap did not reproduce for me. The "early allocations" counter of my real library agrees: it stayed at 0 in all the runs above, so the arena was never used. I keep the protection anyway, because nothing in the documentation promises that `dlsym` never allocates, and the code that depends on it would break only on another system.
+
+## Trap 2: ls closes stderr before the end
+
+The first version of my counter printed nothing for `ls`. No error, no line. The naive wrapper shows what happened, because it reports in the same way, with `write(2, ...)` from a destructor:
+
+```text
+$ LD_PRELOAD=./libnaive_malloc.so ls /usr/lib > /dev/null
+$ LD_PRELOAD=./libnaive_malloc.so strace -e trace=close,write ls /usr/lib > /dev/null (the last lines)
+close(1)                                = 0
+close(2)                                = 0
+write(2, "naive wrapper: max depth 1\n", 27) = -1 EBADF (Bad file descriptor)
++++ exited with 0 +++
+```
+
+`ls` closes its standard output and its standard error itself at exit, and only after that the destructor of my library runs. The `write` to fd 2 fails with EBADF, and nobody sees anything. So my library cannot trust fd 2 at exit. The final version takes a copy of it when it is loaded:
+
+```c
+__attribute__((constructor)) static void start(void)
+{
+    int fd = fcntl(2, F_DUPFD_CLOEXEC, 100);
+    if (fd >= 0)
+        report_fd = fd;
+    if (!real_malloc)
+        resolve();
+}
+```
+
+With this version, the line for `ls` at the top of this article appears. OK, now it works. The copy gets a number of at least 100, so it does not take a small descriptor that the program may expect to be free, and `F_DUPFD_CLOEXEC` makes sure it is not inherited by child programs. But it is still a file descriptor that the program did not ask for. A preloaded library lives inside a program it does not know, and every resource it takes can surprise this program.
+
+## Rust and the static binary
+
+The Rust hello world works like the C one, because the default Rust allocator calls `malloc`, `calloc`, `realloc` and `free` from libc. The binary also imports `posix_memalign`, which my library does not wrap, so I do not expect the numbers of allocations and frees to match:
+
+```text
+$ nm -D hello_rs | grep -E 'alloc|free|memalign'
+                 U calloc@GLIBC_2.2.5
+                 U free@GLIBC_2.2.5
+                 U malloc@GLIBC_2.2.5
+                 U posix_memalign@GLIBC_2.2.5
+                 U realloc@GLIBC_2.2.5
+```
+
+The static C program is the opposite:
+
+```text
+$ LD_PRELOAD=./libcount.so ./hello_c_static
+hello from C
+```
+
+No line from my library. A static program has no loader, so nobody reads `LD_PRELOAD`, and its `malloc` is a normal function inside the file, called directly, without a GOT slot that could point elsewhere. This is one of the tradeoffs of [static linking](/blog/static-or-dynamic-linking-what-changes-in-the-binary-and-at-startup).
+
+There is one more case where the variable is ignored on purpose. ld.so(8) describes a secure-execution mode, for example for set-user-ID programs: there, preload paths with a slash are ignored, and only libraries from the standard directories with the set-user-ID bit are preloaded. Otherwise every user could inject code into a privileged program. I did not test this mode, it needs a privileged binary.
+
+## What LD_PRELOAD cannot see
+
+So LD_PRELOAD replaces a function when three things are true: the program is dynamic, the call goes through the GOT of some object, and the name is resolved by the loader. It sees nothing of a static binary, of a system call made directly with the `syscall` instruction, or of a function called inside its own library without the GOT. And a Rust program with its own global allocator, instead of the default one, would never call libc's `malloc` at all. For counting allocations in programs that I did not write, it was still a fast way: one small file and one environment variable.
+
+## Sources
+
+- ld.so(8), `LD_PRELOAD`, `LD_DEBUG` and secure-execution mode: https://man7.org/linux/man-pages/man8/ld.so.8.html
+- The glibc manual, Replacing malloc: https://sourceware.org/glibc/manual/latest/html_node/Replacing-malloc.html
+- dlsym(3) and `RTLD_NEXT`: https://man7.org/linux/man-pages/man3/dlsym.3.html
+- glibc 2.43, `elf/dl-minimal.c` and `__rtld_malloc_init_real`: https://sourceware.org/git/?p=glibc.git;a=blob;f=elf/dl-minimal.c;hb=refs/tags/glibc-2.43
+- The full counting library: https://github.com/mehdiakiki/mehdi-cz/tree/main/experiments/from-source-to-process

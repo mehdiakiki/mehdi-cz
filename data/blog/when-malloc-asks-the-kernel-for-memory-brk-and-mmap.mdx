@@ -1,0 +1,136 @@
+---
+title: "When malloc Asks the Kernel for Memory: brk and mmap"
+date: "2026-10-09T22:30:00+01:00"
+lastmod: "2026-10-09T22:30:00+01:00"
+tags: ["from source to process", "linux", "memory management", "c", "rust"]
+draft: false
+reviewed: true
+reviewedHash: "7afe0137806c498d4bbc9ef430638f08c35208fc7c202acbcf0500e4a72b9f6c"
+cluster: "rust-under-the-hood"
+campaign: "editorial"
+summary: "The usual rule says malloc uses brk below 128 KiB and mmap above. I traced seven allocations and a growing Rust Vec with strace: a 129 KiB block came from the heap, a freed 1 MiB block moved the limit, and Vec growth became a chain of mremap calls."
+---
+
+The rule that everybody repeats about glibc's malloc is simple: small blocks come from the heap, which grows with `brk`, and blocks of 128 KiB or more get their own `mmap`. I made a program that allocates seven sizes, from 16 bytes to 64 MiB, and writes a line before and after each `malloc`, so that strace shows the system calls between the lines. Here is the trace, from the first allocation:
+
+```text
+$ strace -s 80 -e trace=brk,mmap,munmap,mremap,write ./sizes   (from the first malloc on)
+write(1, "malloc(16 B)\n", 13)          = 13
+brk(NULL)                               = 0x55b1f1351000
+brk(0x55b1f1372000)                     = 0x55b1f1372000
+write(1, "  16 B at 0x55b1f1351010\n", 25) = 25
+write(1, "malloc(1 KiB)\n", 14)         = 14
+write(1, "  1 KiB at 0x55b1f1351030\n", 26) = 26
+write(1, "malloc(64 KiB)\n", 15)        = 15
+write(1, "  64 KiB at 0x55b1f1351440\n", 27) = 27
+write(1, "malloc(127 KiB)\n", 16)       = 16
+brk(0x55b1f13a2000)                     = 0x55b1f13a2000
+write(1, "  127 KiB at 0x55b1f1361450\n", 28) = 28
+write(1, "malloc(129 KiB)\n", 16)       = 16
+write(1, "  129 KiB at 0x55b1f1381060\n", 28) = 28
+write(1, "malloc(1 MiB)\n", 14)         = 14
+mmap(NULL, 1052672, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x7f8279bb4000
+write(1, "  1 MiB at 0x7f8279bb4010\n", 26) = 26
+write(1, "malloc(64 MiB)\n", 15)        = 15
+mmap(NULL, 67112960, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x7f8275bb3000
+write(1, "  64 MiB at 0x7f8275bb3010\n", 27) = 27
+```
+
+Look at the 129 KiB block. It is above the limit, and it came from the heap: its address, 0x55b1f1381060, is next to the others, and there is no `mmap` before it. So the rule is not complete. I wanted to understand exactly when malloc goes to the kernel, and with which call.
+
+## The heap grows in steps
+
+The first `malloc(16)` makes two calls. `brk(NULL)` asks where the heap ends now, and `brk(0x55b1f1372000)` moves this end by 0x21000 bytes, 132 KiB. A heap of 132 KiB for 16 bytes. (This is the same 132 KiB `[heap]` line as in [the part about /proc/self/maps](/blog/reading-proc-self-maps-line-by-line).) The extra space is on purpose: mallopt(3) describes a parameter `M_TOP_PAD`, "the amount of padding to employ when calling sbrk(2)", and its default is 128 KiB. malloc takes more than it needs, so the next allocations do not need a system call.
+
+And indeed, the blocks of 1 KiB and 64 KiB come with no system call at all, inside these 132 KiB. Then 127 KiB does not fit anymore, and the heap grows again, by 0x30000 bytes this time, 192 KiB: the missing part plus the 128 KiB of padding, rounded to pages.
+
+The addresses tell the same story from the other side. The 16-byte block is at 0x...351010, 16 bytes after the start of the heap (malloc keeps its own small header before each block). The 1 KiB block is 0x20 bytes later, at 0x...351030. The blocks are simply placed one after the other.
+
+## Why 129 KiB came from the heap
+
+mallopt(3) describes the threshold more carefully than the usual rule: "For allocations greater than or equal to the limit specified (in bytes) by M_MMAP_THRESHOLD that can't be satisfied from the free list, the memory-allocation functions employ mmap(2) instead of increasing the program break". The important words are "that can't be satisfied from the free list". When the 127 KiB request grew the heap, the padding left more than 129 KiB free at the top of the heap. So malloc served the 129 KiB block from memory it already had, and the threshold was not even consulted. The threshold decides only one thing: when the heap is too small, grow the heap or make a separate mapping.
+
+To see the threshold alone, I made each size the first allocation of a fresh process, with an empty heap:
+
+```text
+$ strace -s 80 -e trace=brk,mmap,munmap,mremap,write ./sizes 127   (from the malloc on)
+write(1, "malloc(127 KiB) as the first allocation\n", 40) = 40
+brk(NULL)                               = 0x55a82229b000
+brk(0x55a8222db000)                     = 0x55a8222db000
+write(1, "  127 KiB at 0x55a82229b010\n", 28) = 28
++++ exited with 0 +++
+$ strace -s 80 -e trace=brk,mmap,munmap,mremap,write ./sizes 129   (from the malloc on)
+write(1, "malloc(129 KiB) as the first allocation\n", 40) = 40
+mmap(NULL, 135168, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x7f6d4fc23000
+write(1, "  129 KiB at 0x7f6d4fc23010\n", 28) = 28
++++ exited with 0 +++
+```
+
+Now the rule works. 127 KiB grows the heap by 256 KiB, 129 KiB gets its own mapping of 135,168 bytes, that is 132 KiB: the block, its header, rounded up to whole pages.
+
+## Big blocks get their own mapping
+
+Back to the first trace. 1 MiB becomes an `mmap` of 1,052,672 bytes, exactly 1 MiB plus one page, and the block starts 16 bytes after the start of the mapping, for the header. 64 MiB becomes an `mmap` of 64 MiB plus one page. Each big block is a separate mapping, an anonymous line of its own in `/proc/self/maps`.
+
+Why not put them in the heap too? Because of `free`. Here is the end of the trace:
+
+```text
+write(1, "free(1 MiB)\n", 12)           = 12
+munmap(0x7f8279bb4000, 1052672)         = 0
+write(1, "malloc(1 MiB) again\n", 20)   = 20
+brk(0x55b1f14c2000)                     = 0x55b1f14c2000
+write(1, "  1 MiB at 0x55b1f13a1470\n", 26) = 26
+write(1, "malloc(129 KiB) again\n", 22) = 22
+write(1, "  129 KiB at 0x55b1f14a1480\n", 28) = 28
++++ exited with 0 +++
+```
+
+`free` of the 1 MiB block is one `munmap`, and the memory goes back to the kernel at once. A block in the heap cannot do this, because the heap is one contiguous area that can only shrink from its top. The next part of the series is about this problem.
+
+## The limit moves
+
+Then the interesting line: the second `malloc(1 MiB)` did not use `mmap`. Strange. The heap grew by 0x120000 bytes (1 MiB plus the 128 KiB of padding), and the block is at 0x55b1f13a1470, in the heap. Nothing changed in my program between the two calls, except the `free`.
+
+mallopt(3) explains it: the threshold is dynamic. "When blocks larger than the current threshold and less than or equal to DEFAULT_MMAP_THRESHOLD_MAX are freed", "the threshold is adjusted upward to the size of the freed block". When I freed the 1 MiB block, the threshold became the size of its mapping, 1,052,672 bytes, and a new request of 1 MiB plus the small header is below it, so it goes to the heap. The idea, as I understand it, is that a program that frees a block of this size will probably allocate one again, and an `mmap` plus `munmap` for every allocation is expensive, with all the page faults of the previous part each time.
+
+So the same `malloc(1 << 20)` used `mmap` the first time and `brk` the second time. If a program needs the old behaviour, mallopt(3) also says that setting `M_MMAP_THRESHOLD`, `M_TRIM_THRESHOLD`, `M_TOP_PAD` or `M_MMAP_MAX` disables this dynamic adjustment.
+
+## A Rust Vec that grows
+
+The Rust standard library uses the same malloc by default. I made a `Vec<u8>` grow to 64 MiB, one `push` at a time, and printed its capacity and address each time the capacity changed, from 128 KiB on:
+
+```text
+$ strace -s 80 -e trace=brk,mmap,munmap,mremap,write ./grow   (from capacity 131072 on)
+write(1, "capacity    131072 at 0x55de67521d50\n", 37) = 37
+mmap(NULL, 266240, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x7fb9b2860000
+write(1, "capacity    262144 at 0x7fb9b2860010\n", 37) = 37
+mremap(0x7fb9b2860000, 266240, 528384, MREMAP_MAYMOVE) = 0x7fb9b27df000
+write(1, "capacity    524288 at 0x7fb9b27df010\n", 37) = 37
+mremap(0x7fb9b27df000, 528384, 1052672, MREMAP_MAYMOVE) = 0x7fb9b26de000
+write(1, "capacity   1048576 at 0x7fb9b26de010\n", 37) = 37
+...
+mremap(0x7fb9ae8d9000, 33558528, 67112960, MREMAP_MAYMOVE) = 0x7fb9aa8d8000
+write(1, "capacity  67108864 at 0x7fb9aa8d8010\n", 37) = 37
+write(1, "len 67108864 sum 8556380160\n", 28) = 28
+munmap(0x7fb9aa8d8000, 67112960)        = 0
+munmap(0x7fb9b2aef000, 12288)           = 0
++++ exited with 0 +++
+```
+
+The Vec doubles its capacity when it is full, and each doubling is a `realloc`. Up to 128 KiB the buffer lives in the heap (the address starts with 0x55de). At 256 KiB it moves to its own `mmap`: glibc allocated the new mapping, copied the data and freed the old heap block, which needs no system call. After that, every doubling is one `mremap` and nothing else.
+
+`mremap` is the interesting call here. The mremap(2) man page says that it "changes the mapping between virtual addresses and memory pages" and that this "can be used to implement a very efficient realloc(3)". With `MREMAP_MAYMOVE`, the kernel may also choose a new address, and here it did it every time: 0x7fb9b2860000, then 0x7fb9b27df000, and so on. When the Vec grows from 32 MiB to 64 MiB, the 32 MiB of data are not copied byte by byte. The kernel moves the page table entries of the existing pages to the new place, and the new half gets its pages later, at the first touch, like any new memory. I did not time each growth, but the trace shows only `mremap` calls, and mremap moves page table entries, so no copy of the data is needed above the threshold: the work is about page tables, not about the bytes inside.
+
+At the end, the `munmap` of 64 MiB plus one page is the drop of the Vec, and the last `munmap` of 12 KiB is std removing its alternate signal stack, from [the first part of this series](/blog/what-happens-when-you-run-a-program-from-execve-to-main).
+
+## The rule, corrected
+
+So the usual rule needs two corrections. malloc goes to the kernel only when its own memory is not enough, and most calls make no system call at all: the heap grows with `brk`, with 128 KiB of padding each time. And "above 128 KiB means `mmap`" is true only when the heap cannot serve the request, and only until the first `free` of a big mapped block moves the threshold. What stays true is that big blocks get their own mappings: their `free` returns the memory at once, and their `realloc` can move pages with `mremap` instead of copying bytes. And the small blocks in the heap? For them the way back to the kernel is much harder, and this is the subject of the next part.
+
+## Further reading
+
+- mallopt(3), `M_MMAP_THRESHOLD`, `M_TOP_PAD`, `M_TRIM_THRESHOLD` and the dynamic threshold: https://man7.org/linux/man-pages/man3/mallopt.3.html
+- mremap(2): https://man7.org/linux/man-pages/man2/mremap.2.html
+- brk(2): https://man7.org/linux/man-pages/man2/brk.2.html
+- The glibc manual, the malloc tunables: https://sourceware.org/glibc/manual/latest/html_node/Memory-Allocation-Tunables.html
+- The programs and the saved outputs of this part: https://github.com/mehdiakiki/mehdi-cz/tree/main/experiments/from-source-to-process/p15

@@ -1,0 +1,210 @@
+---
+title: "The Accept Queue: What Happens When a Server Accepts Too Slowly"
+date: "2026-07-05T11:15:00+01:00"
+lastmod: "2026-07-05T11:15:00+01:00"
+tags: ["following a tcp connection", "networking", "linux", "tcp", "backend"]
+draft: false
+reviewed: true
+reviewedHash: "bceec73c053ac8144d13968fd39b865cc829d6c8ff8cda9281e8abae8c821a3b"
+cluster: "reliable-data-integrations"
+campaign: "editorial"
+summary: "A successful connect() does not mean that the server program saw you. I filled the accept queue of a local server and watched clients connect, send data and wait, while the kernel kept their connections in a queue, half open, or nowhere at all."
+---
+
+When `connect()` returns, most code thinks that the server has the connection now. In [the first part of this series](/blog/what-happens-when-your-program-calls-connect) I saw already that this is not exactly true: the kernel finished the handshake alone, while the server program was sleeping. Here I wanted to know how far this goes. How long can my client stay connected before the server program knows about it? And can it be connected to a server that will never know about it?
+
+On my laptop the answers were: more than 4 seconds, with a server that is only a little slow. And yes.
+
+## Connected, sent, and nobody read it
+
+The first experiment: a socket listens on 127.0.0.1:21020 with a backlog of 3, and nobody ever calls `accept()` on it. Six clients connect one after the other, each one with a timeout of 1 second, and each client that connects sends 5 bytes:
+
+```text
+client 0: connected in 0.07 ms, sent 5 bytes
+client 1: connected in 0.02 ms, sent 5 bytes
+client 2: connected in 0.01 ms, sent 5 bytes
+client 3: connected in 0.01 ms, sent 5 bytes
+client 4: no connection after 1001 ms
+client 5: no connection after 1001 ms
+State  Recv-Q Send-Q Local Address:Port  Peer Address:Port
+LISTEN 4      3          127.0.0.1:21020      0.0.0.0:*
+Recv-Q Send-Q Local Address:Port  Peer Address:Port
+5      0          127.0.0.1:21020    127.0.0.1:47144
+5      0          127.0.0.1:21020    127.0.0.1:47138
+5      0          127.0.0.1:21020    127.0.0.1:47140
+5      0          127.0.0.1:21020    127.0.0.1:47152
+  TcpExtListenOverflows        +2
+  TcpExtListenDrops            +2
+  TcpExtSyncookiesSent         +0
+-- client 0 waits 2 s for an answer
+recv: TimeoutError('timed out')
+```
+
+Four clients connected in less than 0.1 ms, and their `send()` returned. For them everything worked. The LISTEN line says where they are: Recv-Q is 4, so four connections wait in the accept queue, and Send-Q 3 is the backlog.
+
+The second table is the server side of these four connections. Each one has 5 in Recv-Q: the five bytes arrived, and they wait in the receive buffer of a socket that no program has opened yet. The kernel acknowledged them too, so the client sees no difference.
+
+Clients 4 and 5 found the queue full: their SYN was dropped (`TcpExtListenOverflows` +2), and they gave up after 1 second. And client 0 waited 2 seconds for an answer. From its side the server is slow. In reality the server program never saw it.
+
+## Backlog 3 means 4
+
+Why four connections for a backlog of 3? I tried several values:
+
+```text
+listen(fd, 0): Send-Q 0, connections that fit: 1
+listen(fd, 1): Send-Q 1, connections that fit: 2
+listen(fd, 5): Send-Q 5, connections that fit: 6
+listen(fd, 100000): Send-Q 4096, connections that fit: 4097
+Python socket.listen() without argument: Send-Q 128
+socketserver.TCPServer: Send-Q 5, request_queue_size = 5
+```
+
+Always one more than the backlog. On Linux, says the listen(2) man page, the backlog is "the queue length for completely established sockets waiting to be accepted". The extra place comes from the test that the kernel does, in its headers:
+
+```text
+static inline bool sk_acceptq_is_full(const struct sock *sk)
+{
+	return READ_ONCE(sk->sk_ack_backlog) > READ_ONCE(sk->sk_max_ack_backlog);
+}
+```
+
+Full means more than the backlog, not equal to it. The kernel documentation of the TCP counters says the same in plain words: "set queue length to n means the actual queue length is n+1".
+
+A backlog of 100000 became 4096: listen(2) says that a bigger value is "silently capped" to `net.core.somaxconn`, 4096 here. The last two lines are the defaults of Python. `socket.listen()` without an argument uses 128. `socketserver.TCPServer` uses `request_queue_size = 5`, and `http.server.HTTPServer` is a subclass that does not change it (I checked the source of Python 3.14). So the small HTTP server of the standard library has an accept queue of 6 connections.
+
+## A server that is only a little slow
+
+Now a server that works, but slowly. Backlog 1, so two places. A server thread calls `accept()` once every 1.5 seconds, and five clients start a blocking connect, 10 ms apart. I made six runs. Here is run 2:
+
+```text
+5 clients, backlog 1, one accept() every 1.5 s, load average 1.86 1.95 1.86
+  t= 0.001 s  client 0 (port 47824): connect() took 0.000 s
+  t= 0.011 s  client 1 (port 47828): connect() took 0.000 s
+  t= 1.501 s  server: accept() returned port 47824
+  t= 2.048 s  client 3 (port 47844): connect() took 2.016 s
+...
+  t= 3.001 s  server: accept() returned port 47828
+  t= 3.065 s  client 2 (port 47838): connect() took 3.043 s
+  t= 4.502 s  server: accept() returned port 47844
+  t= 5.115 s  client 4 (port 47846): connect() took 5.073 s
+...
+  t= 6.002 s  server: accept() returned port 47838
+  t= 7.502 s  server: accept() returned port 47846
+  TcpExtListenOverflows        +10
+  TcpExtListenDrops            +10
+  TcpExtSyncookiesSent         +0
+```
+
+Clients 0 and 1 take the two places at once, and the three others lose their first SYN. At 1.5 s the server accepts one connection, so one place is free. But the next client connects only at 2.05 s: the place was free since 1.5 s, and nobody knew it until the next SYN retry. In part 1 I saw that Linux retries a SYN every second at the beginning, so the clients wait 1, 2, 3, 4 or 5 seconds, not the time that the server needed. Here the three waiting clients needed 2.0, 3.0 and 5.1 seconds. Each time the place went to the retry that came first (not always the client that started first), and the others waited one more second. The counter agrees: 2 + 3 + 5 dropped SYNs, `TcpExtListenOverflows` +10.
+
+Now compare the two sides:
+
+| client | connect() returned | server accept() | gap |
+| --- | --- | --- | --- |
+| 3 | 2.048 s | 4.502 s | 2.5 s |
+| 2 | 3.065 s | 6.002 s | 2.9 s |
+| 4 | 5.115 s | 7.502 s | 2.4 s |
+
+The server needed 1.5 seconds per connection. The clients paid twice: in `connect()`, rounded up to the SYN retries, and then again, connected and waiting in the queue, 2.4 to 2.9 seconds. With a timeout of 2 seconds on the first answer, each of them would report a slow server, and the server would have no trace of them in its logs.
+
+Run 2 was the only clean run of the six. In the others, two or three retries came at nearly the same moment. Run 3:
+
+```text
+  t= 3.001 s  server: accept() returned port 38606
+  t= 3.069 s  client 2 (port 38618): connect() took 3.048 s
+  t= 3.069 s  client 4 (port 38642): connect() took 3.027 s
+  t= 4.501 s  server: accept() returned port 38632
+  t= 5.500 s  ss on the server side:
+...
+    SYN-RECV 0      0      127.0.0.1:21022 127.0.0.1:38618 timer:(on,574ms,1)
+...
+  t= 7.502 s  server: accept() returned port 38618
+```
+
+One place was free, and two clients connected at 3.069 s. Client 4 took the place, but on the server side client 2 was only half open (SYN-RECV): the kernel answered both SYNs, and the queue was full again when the final ACK of client 2 came. The timer on its line is the server kernel waiting to send its SYN-ACK again: one retransmission done, the next in 574 ms. Client 2 was "connected" at 3.069 s, and the server program accepted it at 7.502 s, 4.4 seconds later. Runs 4 and 5 did the same. In runs 1 and 6, two or three clients even entered the queue together, more than its two places: when connections arrive at the same moment, the limit is not exact. The next experiment pushes this further.
+
+## Sixteen clients at the same moment
+
+Sixteen threads wait on a barrier and call `connect()` at the same moment, with a timeout of 0.5 s, to a listener with backlog 2. Then each connected client sends 5 bytes (its port number as text), and the server starts to accept. Here is run 4 of 8:
+
+```text
+16 connects at the same moment, backlog 2: 5 connected, load average 3.82 3.62 3.66
+State  Recv-Q Send-Q Local Address:Port  Peer Address:Port
+LISTEN 3      2          127.0.0.1:21023      0.0.0.0:*
+  client port 33806: client side ESTAB, server side ESTAB
+  client port 33808: client side ESTAB, server side ESTAB
+  client port 33820: client side ESTAB, server side no socket
+  client port 33832: client side ESTAB, server side no socket
+  client port 33798: client side ESTAB, server side ESTAB
+  ss on the client side, 20 ms after the sends:
+    0      0      127.0.0.1:33806 127.0.0.1:21023
+    0      0      127.0.0.1:33798 127.0.0.1:21023
+    0      5      127.0.0.1:33832 127.0.0.1:21023 timer:(on,160ms,0)
+    0      5      127.0.0.1:33820 127.0.0.1:21023 timer:(on,150ms,0)
+    0      0      127.0.0.1:33808 127.0.0.1:21023
+  t=0.083 s  accept() returned port 33806
+  t=0.083 s  accept() returned port 33808
+  t=0.083 s  accept() returned port 33798
+  t=0.209 s  accept() returned port 33832
+  t=0.209 s  accept() returned port 33820
+  TcpExtListenOverflows        +13
+  TcpExtListenDrops            +13
+  TcpExtSyncookiesSent         +2
+  TcpExtSyncookiesRecv         +2
+  TcpExtTCPReqQFullDoCookies   +2
+```
+
+Five clients are connected, but the queue has three connections. For two clients the server side has no socket at all. Not in the queue, not half open, nothing.
+
+The counters say how: `TcpExtSyncookiesSent` +2. A SYN cookie is a SYN-ACK where the kernel puts what it needs about the connection inside the sequence number, and keeps nothing in memory (RFC 4987: SYN cookies "allocate no state at all"). Linux sends them "when the syn backlog queue of a socket overflows", says the documentation of `tcp_syncookies`. This is the queue of half-open requests, and on my kernel its limit is the backlog too: `inet_csk_reqsk_queue_is_full`, in another header (`inet_connection_sock.h`), compares the number of these requests with `sk_max_ack_backlog`. Sixteen SYNs at once were too many for it.
+
+The client knows nothing of this. It got a SYN-ACK, it answered with an ACK, and `connect()` returned. The server received this ACK and could rebuild the connection from the cookie (`TcpExtSyncookiesRecv` +2, the program reads the counters right after the connects), but the accept queue was full, so it dropped it.
+
+The client-side `ss` shows what came next. For these two clients Send-Q is 5: their bytes are not acknowledged, and a retransmission timer runs. When the server started to accept, the three normal connections came at once, the two others 0.209 s after the sends. The client sent its 5 bytes again after about 200 ms (the minimum retransmission timeout, `TCP_RTO_MIN` is HZ/5 in the kernel headers), this segment carried the ACK again, and this time there was space.
+
+So far it costs only 200 ms. Now the connected clients send nothing, like in a protocol where the server speaks first. Two of eight runs:
+
+```text
+16 connects at the same moment, backlog 2: 4 connected, load average 3.82 3.62 3.66
+...
+  client port 38378: client side ESTAB, server side SYN-RECV timer:(on,447ms,0)
+...
+  t=0.447 s  accept() returned port 38378
+...
+16 connects at the same moment, backlog 2: 4 connected, load average 3.83 3.63 3.67
+...
+  client port 39274: client side ESTAB, server side no socket
+...
+  never accepted in 3 s: port 39274, client side ESTAB
+...
+  TcpExtSyncookiesSent         +1
+  TcpExtSyncookiesRecv         +1
+```
+
+In the first run, client 38378 is half open on the server side, like client 2 of the slow server. The kernel documentation of the counters describes this mechanism (in an example for older kernels, but my `ss` output shows the same thing): the connection stays in the half-open queue, and when the client answers again, the kernel checks again if the accept queue is still full. The SYN-RECV timer fired 447 ms later, the client answered with a new ACK, and at 0.447 s the connection came out of `accept()`. Good, the two numbers match.
+
+In the second run, client 39274 got a cookie. It has nothing to send, so no segment brings its ACK back to the server. It is connected on its side, and the server does not know that it exists, at least while the client sends nothing. It sits in ESTAB and waits for a server that does not wait for it.
+
+These results move from run to run, with how close the sixteen SYNs really arrive. In the 8 runs with sends, 5 runs had clients without any socket on the server side, and all of them arrived about 0.2 s late. In the 8 silent runs, two had a half-open connection that came about 0.45 s late, and one had a connection that the server never accepted.
+
+## Two queues, and only one has cookies
+
+So a listening socket has two queues: the half-open queue, for handshakes that are not finished, and the accept queue, for connections that wait for the program. SYN cookies only help with the first one. When the accept queue is full, the kernel drops the SYN, cookies or not: in the first experiment `TcpExtListenOverflows` grew and `TcpExtSyncookiesSent` stayed at 0. And the documentation of `tcp_syncookies` says that they are a "fallback facility" which "MUST NOT be used to help highly loaded servers to stand against legal connection rate".
+
+One more setting, `tcp_abort_on_overflow`, is off by default. When it is on, the kernel answers with a RST when the last ACK of a handshake finds the accept queue full, so this client gets an error at once. But a SYN that finds the queue full is still dropped without any answer. The documentation explains why it is off: "if overflow occurred due to a burst, connection will recover".
+
+## Connected is not seen
+
+My opinion after these experiments: a successful `connect()` means that the kernel on the other side answered. It says nothing about the program.
+
+So a health check that only opens a TCP connection would mark my sleeping server as healthy. The health check in the [load balancer article on this site](/blog/load-balancer-sticky-sessions-course) sends a real HTTP request with a timeout, and this one would catch it. The timeout that matters most is on the first answer, not on the connect. And a bigger backlog is not more capacity. It is a longer line of clients that wait without knowing it, and when the line is full, they pay in whole seconds of SYN retries.
+
+The outputs of this part are in [p02-fill.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/following-a-tcp-connection/results/p02-fill.txt), [p02-sizes.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/following-a-tcp-connection/results/p02-sizes.txt), [p02-slow.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/following-a-tcp-connection/results/p02-slow.txt) and [p02-burst.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/following-a-tcp-connection/results/p02-burst.txt), and the program is `p02_queue.py` in the [fixture](https://github.com/mehdiakiki/mehdi-cz/tree/main/experiments/following-a-tcp-connection).
+
+## References
+
+- [listen(2), Linux manual page](https://man7.org/linux/man-pages/man2/listen.2.html)
+- [IP Sysctl, Linux kernel documentation for 6.6](https://www.kernel.org/doc/html/v6.6/networking/ip-sysctl.html), for `tcp_syncookies`, `tcp_max_syn_backlog` and `tcp_abort_on_overflow`
+- [SNMP counter, Linux kernel documentation](https://docs.kernel.org/networking/snmp_counter.html)
+- [RFC 4987, TCP SYN Flooding Attacks and Common Mitigations](https://www.rfc-editor.org/rfc/rfc4987.html)
+- [socketserver, Python 3.14 documentation](https://docs.python.org/3.14/library/socketserver.html)

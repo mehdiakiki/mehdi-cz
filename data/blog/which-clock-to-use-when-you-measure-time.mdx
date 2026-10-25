@@ -1,0 +1,135 @@
+---
+title: "Which Clock to Use When You Measure Time"
+date: "2026-09-27T12:45:00+01:00"
+lastmod: "2026-09-27T12:45:00+01:00"
+tags: ["when the benchmark lies", "linux", "rust", "python", "benchmarking"]
+draft: false
+reviewed: true
+reviewedHash: "2ede475f2b448b30f973f27628a90f585e20c483d5dd9328046ec379f08ec6a1"
+campaign: "editorial"
+summary: "I measured eight of the clocks that clock_gettime can read, and on my laptop two of them disagreed by 43,257 ns after 20 seconds. I measured their resolution, their cost, which ones enter the kernel, and which clocks Rust and Python use."
+---
+
+My laptop has two clocks that both count the time since boot, and they do not agree. I read both, waited 20 seconds, and read them again:
+
+```text
+adjtimex: state 0, frequency correction +1.970 ppm, status 0x2001
+after 20 s: MONOTONIC advanced 20000069431 ns, MONOTONIC_RAW 20000026174 ns, REALTIME 20000069359 ns
+MONOTONIC minus MONOTONIC_RAW: 43257 ns, that is +2.163 ppm
+```
+
+`CLOCK_MONOTONIC` counted 43,257 nanoseconds more than `CLOCK_MONOTONIC_RAW`, about 2.2 parts per million. For a benchmark of one second this is 2 microseconds, so it does not matter here. But it shows that even "the time" is a choice. Every benchmark of this series since [the first part](/blog/the-benchmark-that-measured-nothing) used Rust's `Instant`. In this part I look at what `Instant` reads, at the other clocks, and at why some of them are wrong for measuring durations.
+
+## Eight clocks
+
+`clock_gettime` can read several clocks. I made a small C program that calls eight of them a million times each, and measures three things: the resolution that `clock_getres` reports, the cost of one call, and the smallest difference between two consecutive readings. Pinned to CPU 2:
+
+```text
+clock                        resolution  ns per call    smallest step   zero steps
+CLOCK_REALTIME                     1 ns         13.8            11 ns            0
+CLOCK_MONOTONIC                    1 ns         13.5            11 ns            0
+CLOCK_MONOTONIC_RAW                1 ns         13.4            12 ns            0
+CLOCK_BOOTTIME                     1 ns         13.7            11 ns            0
+CLOCK_REALTIME_COARSE        3333333 ns          4.5       3333340 ns       999998
+CLOCK_MONOTONIC_COARSE       3333333 ns          4.2       3333340 ns       999999
+CLOCK_PROCESS_CPUTIME_ID           1 ns        143.4             1 ns           74
+CLOCK_THREAD_CPUTIME_ID            1 ns        155.2             2 ns          204
+```
+
+The first four look the same: a resolution of 1 ns, about 13.5 ns per call, and two consecutive readings never equal. What they count is different, and the `clock_gettime(2)` manual page says it precisely:
+
+- `CLOCK_REALTIME` is the wall clock, with the real date. It is affected by "discontinuous jumps in the system time", for example when the administrator sets the clock or when NTP steps it, and also by "frequency adjustments performed by NTP and similar applications".
+- `CLOCK_MONOTONIC` "is not affected by discontinuous jumps", but it "is affected by frequency adjustments", and it "does not count time that the system is suspended".
+- `CLOCK_MONOTONIC_RAW` is "not subject to frequency adjustments".
+- `CLOCK_BOOTTIME` is like `CLOCK_MONOTONIC`, but it "also includes any time that the system is suspended".
+
+So the 43,257 ns of the beginning are the frequency adjustment: `adjtimex`, which a normal user can call in read-only mode, says that the kernel corrects the speed of the clock by +1.970 ppm, and over 20 seconds I measured +2.163 ppm. Close enough, because NTP can also correct the time itself a little in the same period. The raw clock just counts the hardware, here the time stamp counter of the CPU (`tsc` is the current clocksource), and the monotonic clock is the same counter, corrected so that its seconds stay close to the seconds of the NTP servers.
+
+## What a clock costs, and what it does not tell you
+
+The resolution column says 1 ns, but the smallest step between two readings is 11 or 12 ns. Both are true. The clock can represent one nanosecond, but one reading takes about 13.5 ns, so two readings can not be much closer than that. The useful resolution of a clock is limited by the cost of reading it. This is the subject of the next part of the series, which measures something faster than the clock.
+
+The coarse clocks are the opposite trade. They cost only 4.2 to 4.5 ns, three times less, and the manual page calls them a "faster but less precise version". In my million consecutive readings, 999,998 were equal to the previous one. Strange, at first. The clock only moves every 3,333,333 ns, that is 1/300 of a second. The result file shows that this kernel is built with `CONFIG_HZ=300`, a timer interrupt 300 times per second, and the coarse clocks are updated at this tick. For a timeout of several seconds, this is a fine clock. For a benchmark of a function, it is useless.
+
+The two CPU time clocks are a different thing: they count the CPU time of the process or of the thread, not the time on the wall. A thread that waits for a lock or for the disk does not advance them. They are the expensive ones, 143 to 155 ns per call, and the reason is visible with `strace -c`, which counts the system calls of 1,000 calls of each clock:
+
+```text
+CLOCK_REALTIME             0 system calls
+CLOCK_MONOTONIC            0 system calls
+CLOCK_MONOTONIC_RAW        0 system calls
+CLOCK_BOOTTIME             0 system calls
+CLOCK_REALTIME_COARSE      0 system calls
+CLOCK_MONOTONIC_COARSE     0 system calls
+CLOCK_PROCESS_CPUTIME_ID   1000 system calls
+CLOCK_THREAD_CPUTIME_ID    1000 system calls
+```
+
+Six clocks never enter the kernel. The kernel maps a small piece of its code and data into every process (the vDSO), and `clock_gettime` reads these clocks there, in user space. The CPU time clocks need the kernel, so each call is a real system call. Their smallest step, 1 or 2 ns, is much smaller than the cost of one call. I do not know how the kernel computes these readings, so I leave it open.
+
+## The jump that I can not show
+
+The biggest danger of `CLOCK_REALTIME` is a jump: the clock moves by seconds or minutes at once. I can not make it jump without root, and I would not do it on this laptop anyway. But I can show that the conditions exist. `timedatectl` works without root:
+
+```text
+System clock synchronized: yes
+              NTP service: active
+```
+
+And the last answer of the NTP server says how far my clock was from it:
+
+```text
+Poll interval: 34min 8s (min: 32s; max 34min 8s)
+       Offset: -47.243ms
+        Delay: 60.210ms
+       Jitter: 22.006ms
+```
+
+My clock was 47 ms away from the server. On this laptop the NTP service is systemd-timesyncd, and its source corrects an offset smaller than 0.4 seconds by changing the speed of the clock, not by a jump. `CLOCK_MONOTONIC` is affected by such frequency adjustments too, the manual page says it, so this correction makes both clocks run a little faster or slower for a while, and a short benchmark hardly sees it. The danger of the wall clock is the jump: a bigger offset, a manual change, a laptop that comes back from a long sleep. Then a duration measured with `CLOCK_REALTIME` is wrong by the whole jump, and the monotonic clock is not.
+
+Suspend is the other case. `CLOCK_BOOTTIME` minus `CLOCK_MONOTONIC` is exactly the time spent in suspend since boot:
+
+```text
+CLOCK_MONOTONIC 1346837.0 s since boot, CLOCK_BOOTTIME 1346837.0 s, difference 61 ns
+```
+
+This laptop had not been suspended since it booted. If it had slept for an hour during a long benchmark, `CLOCK_MONOTONIC` would not count that hour and `CLOCK_BOOTTIME` would. Which one is right depends on the question. For "how much work did the program do", the monotonic clock. For "when does this timeout expire", maybe the boot time.
+
+## What Rust and Python read
+
+The documentation of Rust 1.98.0 has a table of the system calls behind each clock. On Unix, `Instant::now()` uses "clock_gettime with CLOCK_MONOTONIC", and `SystemTime::now()` uses the realtime clock. The same documentation warns that instants "are not guaranteed to be steady", and the 2 ppm above is a small example. The cost in Rust is the same as in C:
+
+```text
+Instant::now       min    14.150  median    15.045  p90    17.454  max    18.165  ns/call  (n=21)
+SystemTime::now    min    13.899  median    15.140  p90    16.156  max    16.734  ns/call  (n=21)
+1000000 pairs of Instant::now(): smallest nonzero difference 13 ns, 0 differences of zero
+```
+
+Python tells you directly which clock is behind each function, with `time.get_clock_info`:
+
+```text
+time.time: clock_gettime(CLOCK_REALTIME), monotonic=False, adjustable=True, resolution=1e-09
+time.monotonic: clock_gettime(CLOCK_MONOTONIC), monotonic=True, adjustable=False, resolution=1e-09
+time.perf_counter: clock_gettime(CLOCK_MONOTONIC), monotonic=True, adjustable=False, resolution=1e-09
+time.process_time: clock_gettime(CLOCK_PROCESS_CPUTIME_ID), monotonic=True, adjustable=False, resolution=1e-09
+```
+
+`time.time()` is the wall clock, and `perf_counter()` the monotonic one. One small detail I liked: Python says that the monotonic clock is not adjustable. It can not jump, that is true, but its speed is adjusted, by 2 ppm on this laptop. "Not adjustable" here means "it will not jump", not "it counts raw seconds". In Python each call costs 54 to 70 ns, because the interpreter adds its own work around the 14 ns of the clock.
+
+## Which clock, then
+
+For the duration of something in a benchmark, I use the monotonic clock: `Instant` in Rust, `perf_counter` in Python, `CLOCK_MONOTONIC` in C. Never the wall clock, because it can jump, and a duration that includes a jump is not a duration.
+
+For CPU time instead of wall time, the CPU time clocks are the right tool, but each reading is a system call of more than 140 ns, so I read them before and after a long measurement, never around a small one. The coarse clocks are fine for timeouts and logs, not for benchmarks. And for a duration across a suspend, I would think first about what the question really is.
+
+Last, every clock has a cost, about 14 ns here, and every measurement includes it. When the thing to measure takes a few nanoseconds, the clock is bigger than the thing. That is the next problem.
+
+The programs and the output are in [the fixture](https://github.com/mehdiakiki/mehdi-cz/tree/main/experiments/when-the-benchmark-lies), in [p10-clocks.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/when-the-benchmark-lies/results/p10-clocks.txt).
+
+## Sources
+
+- [clock_gettime(2), Linux manual page](https://man7.org/linux/man-pages/man2/clock_gettime.2.html)
+- [adjtimex(2), Linux manual page](https://man7.org/linux/man-pages/man2/adjtimex.2.html)
+- [vdso(7), Linux manual page](https://man7.org/linux/man-pages/man7/vdso.7.html)
+- [systemd v259 source: timesyncd-manager.c (NTP_MAX_ADJUST)](https://github.com/systemd/systemd/blob/v259/src/timesync/timesyncd-manager.c)
+- [Rust 1.98.0 standard library: std::time::Instant](https://doc.rust-lang.org/1.98.0/std/time/struct.Instant.html)
+- [Python documentation: time.get_clock_info](https://docs.python.org/3.14/library/time.html#time.get_clock_info)

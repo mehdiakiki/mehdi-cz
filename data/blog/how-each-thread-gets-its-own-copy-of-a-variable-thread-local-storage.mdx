@@ -1,0 +1,247 @@
+---
+title: "How Each Thread Gets Its Own Copy of a Variable: Thread-Local Storage"
+date: "2026-10-20T14:40:00+01:00"
+lastmod: "2026-10-20T14:40:00+01:00"
+tags: ["from source to process", "linux", "linker", "c", "rust"]
+draft: false
+reviewed: true
+reviewedHash: "1d5a73531819f1142d1f30b15ab970f55f1ef8cfd1af354343defba1a62a1485"
+cluster: "rust-under-the-hood"
+campaign: "editorial"
+summary: "One _Thread_local variable, four threads, four copies at four addresses, and one instruction to reach each of them. I followed the fs register, the TLS segment, the access models of the ELF TLS document, their cost, and Rust's thread_local! in the disassembly."
+---
+
+I wanted to see with my own eyes what the compiler does with a thread-local variable, so I made a small C program. It has a variable `counter`, declared `_Thread_local` and initialized to 42, and an array `scratch` of 4096 bytes, also thread-local, without initial value. Three threads call a function `bump()` that increments `counter`, one, two and three times. Then each thread prints the value of its `fs` register, the addresses of the two variables, and `counter`:
+
+```text
+$ strace -f -e trace=arch_prctl,clone3 -o strace_threads.txt ./threads
+main     fs 0x7f84d2c80740, &counter 0x7f84d2c7f730 = fs - 4112, &scratch 0x7f84d2c7f740, counter 42
+thread 1 fs 0x7f84d2c7e6c0, &counter 0x7f84d2c7d6b0 = fs - 4112, &scratch 0x7f84d2c7d6c0, counter 43
+thread 2 fs 0x7f84d247d6c0, &counter 0x7f84d247c6b0 = fs - 4112, &scratch 0x7f84d247c6c0, counter 44
+thread 3 fs 0x7f84d1c7c6c0, &counter 0x7f84d1c7b6b0 = fs - 4112, &scratch 0x7f84d1c7b6c0, counter 45
+```
+
+Four threads with main, four copies of `counter` at four addresses. Each copy started at 42: main never called `bump()` and still has 42, the threads have 43, 44 and 45. And look at the distance: in every thread, `counter` is 4112 bytes below `fs`. Good, that is the whole trick in one column. Every thread has its own `fs`, and the variable is always at the same place relative to it.
+
+Where do these `fs` values come from? The program ran under strace:
+
+```text
+$ cat strace_threads.txt
+1290832 arch_prctl(ARCH_SET_FS, 0x7f84d2c80740) = 0
+1290832 clone3({flags=CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD|CLONE_SYSVSEM|CLONE_SETTLS|CLONE_PARENT_SETTID|CLONE_CHILD_CLEARTID, child_tid=0x7f84d2c7ece8, parent_tid=0x7f84d2c7e990, exit_signal=0, stack=0x7f84d247e000, stack_size=0x7fef80, tls=0x7f84d2c7e6c0} => {parent_tid=[1290833]}, 88) = 1290833
+...
+```
+
+The `arch_prctl(ARCH_SET_FS, ...)` is the call from [the first part of this series](/blog/what-happens-when-you-run-a-program-from-execve-to-main), when the loader prepared the main thread, and its value is the `fs` that main printed. A new thread gets its value from `clone3` with the flag `CLONE_SETTLS`: the clone(2) man page says that on x86-64, `tls` "is the new value to be set for the %fs base register". The `tls=` of this first `clone3` is the `fs` of thread 1, and the next two calls give the values of threads 2 and 3. The kernel loads the right `fs` each time it switches to a thread, so the program itself never computes anything.
+
+## One instruction with a constant
+
+Here is `bump()`:
+
+```text
+$ objdump -d --no-show-raw-insn threads   (the function bump)
+00000000000012b0 <bump>:
+    12b0:	mov    %fs:0xffffffffffffeff0,%rax
+    12b9:	add    $0x1,%rax
+    12bd:	mov    %rax,%fs:0xffffffffffffeff0
+    12c6:	ret
+...
+```
+
+`%fs:0xffffffffffffeff0` means the address in `fs` plus 0xffffffffffffeff0, which is -0x1010, so -4112. Load, add one, store: the same instructions as for a normal global variable, with `fs` in front and a constant written by the linker.
+
+The reference for all this is the ELF TLS document of Ulrich Drepper, "ELF Handling For Thread-Local Storage". For x86-64 it describes this layout: "The TLS blocks for the executable itself and all the modules loaded at startup are located just below the address the thread pointer points to." And: "The offset of TLS data for the executable itself is even known at link-time."
+
+## Where the 42 comes from
+
+The executable describes its block with a program header of type TLS:
+
+```text
+$ readelf -lW threads | grep -E 'Type|LOAD|TLS'
+  Type           Offset   VirtAddr           PhysAddr           FileSiz  MemSiz   Flg Align
+...
+  LOAD           0x002dc0 0x0000000000003dc0 0x0000000000003dc0 0x000288 0x000560 RW  0x1000
+  TLS            0x002dc0 0x0000000000003dc0 0x0000000000003dc0 0x000008 0x001010 R   0x10
+$ readelf -SW threads | grep -E 'Nr\]|\.tdata|\.tbss'
+  [Nr] Name              Type            Address          Off    Size   ES Flg Lk Inf Al
+  [19] .tdata            PROGBITS        0000000000003dc0 002dc0 000008 00 WAT  0   0 16
+  [20] .tbss             NOBITS          0000000000003dd0 002dd0 001000 00 WAT  0   0 16
+$ readelf -x .tdata threads
+
+Hex dump of section '.tdata':
+  0x00003dc0 2a000000 00000000                   *.......
+
+$ readelf -sW threads | grep ' TLS '
+    37: 0000000000000000     8 TLS     GLOBAL DEFAULT   19 counter
+    41: 0000000000000010  4096 TLS     GLOBAL DEFAULT   20 scratch
+```
+
+The TLS segment has 8 bytes in the file and 0x1010 bytes in memory: the 4112 of the instruction. The 8 bytes are the section `.tdata`, inside the RW `LOAD` segment, and they contain 0x2a, the 42 of `counter`. `.tbss` has 4096 bytes of type NOBITS: like `.bss` in [the part about where variables live](/blog/where-variables-live-in-a-binary-text-rodata-data-and-bss), it takes no place in the file and starts at zero. The `T` in the flags `WAT` means thread-local. Even the symbols are different: their values, 0 and 0x10, are offsets inside the block, not addresses.
+
+So this block is only a template, the "initialization image" of the document: for each thread, a fresh copy is made, with the 8 bytes of `.tdata` and 4104 bytes of zeros. This is why every thread started with 42.
+
+## In a shared library
+
+Now a thread-local variable in a shared library, compiled with `-fPIC`:
+
+```c
+_Thread_local long lib_counter = 7;
+
+long lib_tls_read(void)
+{
+    return lib_counter;
+}
+```
+
+```text
+$ objdump -d --no-show-raw-insn libtls_gd.so   (default model for -fPIC)
+0000000000001120 <lib_tls_read>:
+    1120:	sub    $0x8,%rsp
+    1124:	data16 lea 0x2e94(%rip),%rdi        # 3fc0 <lib_counter@@Base+0x3fc0>
+    112c:	data16 data16 rex.W call 1030 <__tls_get_addr@plt>
+    1134:	mov    (%rax),%rax
+    1137:	add    $0x8,%rsp
+    113b:	ret
+...
+$ readelf -rW libtls_gd.so | grep -E 'DTP|TPOFF'
+0000000000003fc0  0000000800000010 R_X86_64_DTPMOD64      0000000000000000 lib_counter + 0
+0000000000003fc8  0000000800000011 R_X86_64_DTPOFF64      0000000000000000 lib_counter + 0
+```
+
+No `fs` at all. The function puts the address 0x3fc0 in `rdi`, calls `__tls_get_addr`, and reads the variable at the address that comes back. At 0x3fc0 there are two slots of the GOT, with two relocations for the dynamic loader: `DTPMOD64`, the number of the module, and `DTPOFF64`, the offset of the variable in the block of this module. With this pair, `__tls_get_addr` finds the block of the module for the current thread, and adds the offset.
+
+Why so complicated? When gcc compiles a library, it knows neither where the library will be loaded nor when: at startup, or later with `dlopen`. The document calls this model "general dynamic": "Code compiled with it can be used everywhere and it can access variables defined anywhere else." The GCC manual confirms that it is the default with `-fpic`. And the strange `data16` and `rex.W` prefixes? They change nothing for the processor. The document explains that they make the sequence 16 bytes long, so that the linker can replace it.
+
+## The linker rewrites the code
+
+And it does. I compiled the program with the threads with `-fPIC` too, and linked it as a normal executable:
+
+```text
+$ objdump -dr --no-show-raw-insn threads_pic.o   (bump compiled with -fPIC, before linking)
+0000000000000000 <bump>:
+   0:	sub    $0x8,%rsp
+   4:	data16 lea 0x0(%rip),%rdi        # c <bump+0xc>
+			8: R_X86_64_TLSGD	counter-0x4
+   c:	data16 data16 rex.W call 14 <bump+0x14>
+			10: R_X86_64_PLT32	__tls_get_addr-0x4
+...
+$ objdump -d --no-show-raw-insn threads_pic   (the same object after linking into an executable)
+00000000000012d0 <bump>:
+    12d0:	sub    $0x8,%rsp
+    12d4:	mov    %fs:0x0,%rax
+    12dd:	lea    -0x1010(%rax),%rax
+...
+```
+
+In the object file, the general dynamic sequence with its relocation `R_X86_64_TLSGD`, a hole like in [the part about relocations](/blog/relocations-the-holes-the-compiler-leaves-for-the-linker). In the executable, the same 16 bytes are two other instructions: read the thread pointer, which is stored at `%fs:0` (my program reads its `fs` in the same way, and the values matched strace), and subtract 0x1010. The linker saw that `counter` is in the executable, so it replaced the call with the constant. The document describes this replacement in its chapter on linker optimizations, "General Dynamic To Local Exec". So the linker does not only fill holes, it changes also instructions.
+
+## Initial exec, and the cost
+
+There is a middle way for libraries, the model "initial exec":
+
+```text
+$ objdump -d --no-show-raw-insn libtls_ie.so   (-ftls-model=initial-exec)
+0000000000001100 <lib_tls_read>:
+    1100:	mov    0x2ec1(%rip),%rax        # 3fc8 <lib_counter@@Base+0x3fc8>
+    1107:	mov    %fs:(%rax),%rax
+    110b:	ret
+...
+$ readelf -rW libtls_ie.so | grep -E 'DTP|TPOFF'
+0000000000003fc8  0000000700000012 R_X86_64_TPOFF64       0000000000000000 lib_counter + 0
+$ readelf -d libtls_ie.so | grep FLAGS
+ 0x000000000000001e (FLAGS)              STATIC_TLS
+```
+
+One GOT slot with a `TPOFF64` relocation: at startup, the dynamic loader writes there the distance between `fs` and the variable, and the code uses it with `fs`. This works because, after the loader loaded all the libraries of the program, "each variable in the TLS block of any of those modules has a fixed offset from the TCB", says the document. The model assumes that the library is loaded at program start, and the linker marks it with the flag `STATIC_TLS`.
+
+How much does each model cost? I measured functions that only read a variable, called 100 million times through a function pointer on a performance core, median of 7 rounds:
+
+```text
+$ taskset -c 4 ./cost_gd   (library compiled with the default model)
+  executable, function returning a constant       1.01 ns per call (min  0.99, max  1.80)
+  executable, thread-local variable               1.01 ns per call (min  1.00, max  1.13)
+  executable, normal global variable              1.01 ns per call (min  0.99, max  1.38)
+  shared library, function returning a constant   1.56 ns per call (min  1.49, max  1.69)
+  shared library, thread-local variable           2.57 ns per call (min  2.51, max  3.24)
+  shared library, normal global variable          1.55 ns per call (min  1.51, max  1.76)
+$ taskset -c 4 ./cost_ie   (library compiled with -ftls-model=initial-exec)
+  executable, function returning a constant       1.01 ns per call (min  0.99, max  1.19)
+  executable, thread-local variable               1.05 ns per call (min  1.00, max  1.15)
+  executable, normal global variable              1.02 ns per call (min  1.01, max  1.07)
+  shared library, function returning a constant   1.53 ns per call (min  1.51, max  1.56)
+  shared library, thread-local variable           1.53 ns per call (min  1.50, max  1.58)
+  shared library, normal global variable          1.52 ns per call (min  1.49, max  1.67)
+```
+
+In the executable, reading the thread-local variable costs the same as returning a constant: nothing measurable. In the library, the general dynamic model adds 1 ns per access, the call to `__tls_get_addr`. With initial exec, nothing again. A second run of both programs gave the same numbers. One thing is strange: every call into the library costs half a nanosecond more, even for a function that only returns 7, with the same two instructions as in the executable. I did not find why, so I compare each line only with the constant of its own module.
+
+## Rust: thread_local!
+
+Rust has the macro `thread_local!`. I made three variables: `PLAIN`, a `Cell<u64>` with a `const` initializer; `LAZY`, a `Cell<u64>` initialized by a function `start_value()` that returns 100; and `NOISY`, a `RefCell` of a type with `Drop`. Two threads increment them once and twice:
+
+```text
+$ ./tls_rs
+thread 1: PLAIN = 1 at 0x7f6390671698, LAZY = 101, NOISY = 1
+thread 2: PLAIN = 2 at 0x7f6390470698, LAZY = 102, NOISY = 2
+main:     PLAIN = 0 at 0x7f6390672798
+start_value() ran 2 times, Noisy was dropped 2 times
+```
+
+Each thread has its own copies again. `start_value()` ran once per thread that used `LAZY`, and `Noisy` was dropped once at the end of each thread. The copies of `PLAIN` in the two threads are 0x201000 bytes apart, 2 MiB and one page: glibc keeps the thread-local block at the top of each thread stack, as [the part about stack overflows](/blog/how-a-stack-overflow-is-detected-guard-pages-and-signals) showed.
+
+The std source of Rust 1.98 (`library/std/src/sys/thread_local/native/mod.rs`) chooses between four storage types, depending on the initializer (`const` or lazy) and on `Drop`: "For `const` initialization and `!Drop` types, we simply use `T` directly". This is `PLAIN`:
+
+```text
+$ objdump -d --no-show-raw-insn -C tls_rs   (the function bump_plain)
+0000000000018d50 <tls::bump_plain>:
+   18d50:	incq   %fs:0xffffffffffffffd8
+   18d59:	ret
+...
+```
+
+One instruction, at `fs` - 0x28. readelf gives `PLAIN` the offset 0x68 in a TLS block of 0x90 bytes, and 0x90 - 0x68 = 0x28. Local exec, like the C executable. `LAZY` needs a state:
+
+```text
+$ objdump -d --no-show-raw-insn -C tls_rs   (the function bump_lazy)
+0000000000019200 <tls::bump_lazy>:
+   19200:	cmpb   $0x1,%fs:0xffffffffffffffb8
+   19209:	jne    19221 <tls::bump_lazy+0x21>
+   1920b:	mov    %fs:0xffffffffffffffb0,%rax
+   19214:	inc    %rax
+   19217:	mov    %rax,%fs:0xffffffffffffffb0
+   19220:	ret
+   19221:	lock incq 0x45aef(%rip)        # 5ed18 <tls::START_CALLS>
+   19229:	movb   $0x1,%fs:0xffffffffffffffb8
+   19232:	mov    $0x65,%eax
+   19237:	mov    %rax,%fs:0xffffffffffffffb0
+   19240:	ret
+...
+```
+
+The first instruction compares a byte next to the value with 1, the state "alive" of the source. If alive, increment and return. If not, the code from 19221 on is the initialization, with `start_value()` inlined: count the call, set the state to alive, store 0x65, that is 101. So lazy initialization costs one compare and one jump on every access.
+
+For `NOISY`, with a destructor, the slow path is a real call to `get_or_init_slow`, which registers the destructor with glibc's `__cxa_thread_atexit_impl`, the function that "GCC and clang both use to invoke destructors in C++ thread_local globals", says the std source. With a breakpoint on it, gdb shows the call:
+
+```text
+Thread 2 "tls_rs" hit Breakpoint 1, 0x00007ffff7db158c in __cxa_thread_atexit_impl () from /usr/lib/libc.so.6
+#0  0x00007ffff7db158c in __cxa_thread_atexit_impl () from /usr/lib/libc.so.6
+#1  0x000055555556bad1 in <std::sys::thread_local::native::lazy::Storage<core::cell::RefCell<tls::Noisy>, ()>>::get_or_init_slow::<tls::NOISY::__rust_std_internal_init_fn> ()
+#2  0x000055555556cd2d in tls::bump_noisy ()
+```
+
+Each thread registers it once, at the first access. In the same run, gdb stopped also three times for `SPAWN_HOOKS`, a thread-local variable of std itself: the 0x90 bytes contain also std's own variables, like the handle of the current thread.
+
+## The short version
+
+A thread-local variable is a normal variable at a fixed distance from `fs`, and each thread has its own `fs`, given by `arch_prctl` for the main thread and by `clone3` for the others. The TLS segment is the template that is copied for each thread. In the executable, an access is one instruction with a constant, and a Rust `thread_local!` with a `const` initializer and no `Drop` is the same instruction. In a library compiled with `-fPIC`, each access calls `__tls_get_addr`, about 1 ns here, unless the library uses initial exec.
+
+## Further reading
+
+- Ulrich Drepper, "ELF Handling For Thread-Local Storage", version 0.21: https://akkadia.org/drepper/tls.pdf
+- The GCC manual, `-ftls-model` and its defaults: https://gcc.gnu.org/onlinedocs/gcc/Code-Gen-Options.html
+- clone(2), `CLONE_SETTLS`: https://man7.org/linux/man-pages/man2/clone.2.html
+- arch_prctl(2), `ARCH_SET_FS`: https://man7.org/linux/man-pages/man2/arch_prctl.2.html
+- Rust 1.98.0, the storage types of `thread_local!`: https://github.com/rust-lang/rust/blob/1.98.0/library/std/src/sys/thread_local/native/mod.rs
+- Rust 1.98.0, the registration of thread-local destructors on Linux: https://github.com/rust-lang/rust/blob/1.98.0/library/std/src/sys/thread_local/destructors/linux_like.rs
+- glibc 2.43, `nptl/allocatestack.c`, where the thread descriptor is placed at the end of the stack: https://sourceware.org/git/?p=glibc.git;a=blob;f=nptl/allocatestack.c;hb=refs/tags/glibc-2.43
+- The programs and the saved outputs of this part: https://github.com/mehdiakiki/mehdi-cz/tree/main/experiments/from-source-to-process/p19

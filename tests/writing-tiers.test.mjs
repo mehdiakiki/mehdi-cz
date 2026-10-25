@@ -83,6 +83,11 @@ test("the launch investigations are listed in order with evidence", () => {
       "rust-build-times",
       "async-rust",
       "rust-failure-atlas",
+      "from-source-to-process",
+      "what-survives-a-crash",
+      "when-the-benchmark-lies",
+      "following-a-tcp-connection",
+      "inside-a-database-index",
     ]
   );
 

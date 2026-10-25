@@ -1,0 +1,142 @@
+---
+title: "Why a Small Write Can Wait 40 Milliseconds: Nagle and Delayed ACK"
+date: "2026-07-10T16:30:00+01:00"
+lastmod: "2026-07-10T16:30:00+01:00"
+tags: ["following a tcp connection", "networking", "linux", "tcp", "performance"]
+draft: false
+reviewed: true
+reviewedHash: "4e85a6ae61c5f506aaa75b0076fdb2fa829a8193e50b2dd4bbe3b8930ed9e72e"
+cluster: "reliable-data-integrations"
+campaign: "editorial"
+summary: "My client wrote each request in two small pieces, and almost every request took 43 ms or more on loopback, where a round trip costs microseconds. I followed it with strace, ss and the kernel counters to see how Nagle's algorithm and delayed ACK wait for each other."
+---
+
+Here are 200 small requests over loopback, on my laptop, on one connection:
+
+```text
+first 5 requests: 0.11 42.67 43.46 43.23 43.65 ms
+request: n=200 min=0.1 p10=43.2 median=43.3 p90=46.6 p99=46.8 max=46.9 ms
+requests slower than 30 ms: 199
+```
+
+The first request took 0.11 milliseconds. The 199 others took more than 30 milliseconds each, and the median is 43.3 ms. Nothing in the program sleeps, the server answers at once, and in [the first part of this series](/blog/what-happens-when-your-program-calls-connect) a complete connect on loopback took about 8 microseconds. So where do 43 milliseconds come from?
+
+## The experiment
+
+The client sends a request in two pieces, the way a lot of code does it: first a header of 16 bytes, then a body of 32 bytes, with two `send()` calls. Then it waits for the answer:
+
+```python
+            c.send(HEADER)
+            c.send(BODY)
+        c.recv(2)
+```
+
+The server reads until it has the whole request, 48 bytes, and only then it answers with 2 bytes, `OK`. This is also normal: a server cannot answer a request that it did not receive completely. Both run in one Python process, the server in a thread, on one connection that stays open for all 200 requests.
+
+My first idea was that the server is slow, or Python is slow. But the times are too regular for this: 80% of the requests are between 43.2 ms (p10) and 46.6 ms (p90). Something is waiting for a timer.
+
+## The write did not wait
+
+I ran the same client under `strace -T`, which shows the time spent in each system call. Here are the last three requests:
+
+```text
+sendto(5, "HHHHHHHHHHHHHHHH", 16, 0, NULL, 0) = 16 <0.000015>
+sendto(5, "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB", 32, 0, NULL, 0) = 32 <0.000012>
+recvfrom(5, "OK", 2, 0, NULL, NULL)     = 2 <0.043049>
+sendto(5, "HHHHHHHHHHHHHHHH", 16, 0, NULL, 0) = 16 <0.000081>
+sendto(5, "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB", 32, 0, NULL, 0) = 32 <0.000009>
+recvfrom(5, "OK", 2, 0, NULL, NULL)     = 2 <0.043103>
+sendto(5, "HHHHHHHHHHHHHHHH", 16, 0, NULL, 0) = 16 <0.000066>
+sendto(5, "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB", 32, 0, NULL, 0) = 32 <0.000009>
+recvfrom(5, "OK", 2, 0, NULL, NULL)     = 2 <0.046518>
+```
+
+Both `sendto` calls return at once with all the bytes, in less than a tenth of a millisecond. All the waiting is in `recvfrom`, 43 to 46.5 ms each time. So the program wrote the body, and the kernel said OK. But the server did not answer for 43 ms, which means that in fact the body did not arrive at the server during this time. The kernel of the client kept it.
+
+## Two good rules that wait for each other
+
+Two old rules of TCP meet here. Each one is reasonable alone.
+
+The first one is Nagle's algorithm, from RFC 896 (1984). It was made against programs that send many tiny segments, for example one byte for each key pressed in a terminal. The RFC says it in one sentence: "inhibit the sending of new TCP segments when new outgoing data arrives from the user if any previously transmitted data on the connection remains unacknowledged". In simple words: if you already have small data in flight, wait until it is acknowledged, and meanwhile collect the new small data into one bigger segment. On Linux it is on by default.
+
+The second one is delayed ACK, from RFC 1122. The receiver does not acknowledge every segment at once. It waits a little, hoping to send the ACK together with data in the other direction, for example with the answer. RFC 1122 says that "a TCP SHOULD implement a delayed ACK", and that "the delay MUST be less than 0.5 seconds". In the headers of my kernel the limits are `TCP_DELACK_MIN`, defined as `HZ/25`, and `TCP_DELACK_MAX`, `HZ/5`. HZ is the number of kernel ticks per second, so these are 40 ms and 200 ms.
+
+Now follow one request, step by step:
+
+1. The client sends the header. Nothing is in flight, so Nagle lets it go at once.
+2. The client sends the body. It is small, and the header is not acknowledged yet. Nagle keeps the body in the kernel.
+3. The server kernel receives the header. The server program reads it, and it waits for the body, so it has nothing to send back. The kernel delays the ACK, because maybe an answer comes soon.
+4. Now each side waits for the other. The client waits for an ACK before it sends the body. The server waits for the body before it sends anything, also the ACK.
+5. After about 40 ms the delayed ACK timer fires, and the server kernel sends a pure ACK. Nagle releases the body, the server gets the full request and answers. The answer carries the ACK of the body, so the next request starts clean.
+
+It is a small deadlock, and a timer breaks it, once per request.
+
+## The kernel counts it
+
+The `TcpExtDelayedACKs` counter, "a delayed ACK timer expires" in the kernel documentation, grew during the 200 requests:
+
+```text
+  TcpExtDelayedACKs            +208
+  client: rtt:20.171/22.946 ato:40 mss:32768 data_segs_out:400 data_segs_in:200
+  server: rtt:0.093/0.021 ato:40 mss:32768 data_segs_out:200 data_segs_in:400
+```
+
++208 for 199 slow requests. The counter is for the whole machine, so the few extra ones can come from other programs. The two other lines are fields from `ss -ti` for the two sides of the connection:
+
+- `data_segs_out:400` on the client: 200 requests, two data segments each. The two writes really went as two segments.
+- `ato:40` on both sides: the ACK timeout of delayed ACK mode, in milliseconds (ss(8) describes `ato` as "ack timeout, unit is millisecond, used for delay ack mode").
+- `rtt:20.171` on the client. I liked this detail. The client kernel thinks that the round trip on loopback is 20 milliseconds. Half of its segments (the headers) were acknowledged 43 ms later, the other half (the bodies) almost at once by the answer, and the average of the two is around 20 ms. The server, which never waits for an ACK, measures 0.093 ms.
+
+Why 43.3 ms and sometimes 46.7 ms, and not 40? The kernel counts this kind of time in ticks, and this kernel has `CONFIG_HZ=300`, so one tick is 3.33 ms. 43.3 ms is 13 ticks and 46.7 ms is 14 ticks, so the 40 ms timer (12 ticks) fired one or two ticks after its minimum. For a short timer like this one, the timer wheel adds one tick, so that it never fires early (`calc_index()` in `kernel/time/timer.c`).
+
+And why was the first request fast? At the start of a connection the receiver acknowledged at once. The tcp(7) man page calls this quickack mode, and it says that TCP enters and leaves it "depending on internal protocol processing". After the first request and answer, the server side used delayed ACKs.
+
+## Four fixes, and one that does not work
+
+Then I made the same 200 requests in five other ways:
+
+| mode | median | slower than 30 ms | DelayedACKs | client data segments |
+| --- | --- | --- | --- | --- |
+| two `send()` calls | 43.3 ms | 199 | +208 | 400 |
+| `TCP_NODELAY` on the client | 0.0 ms | 0 | +0 | 400 |
+| one `sendall()` of header + body | 0.0 ms | 0 | +0 | 200 |
+| one `sendmsg()` with two buffers | 0.0 ms | 0 | +0 | 200 |
+| `TCP_QUICKACK` once, on the server | 43.3 ms | 199 | +201 | 400 |
+| `TCP_QUICKACK` after each `recv()` | 0.0 ms | 0 | +0 | 400 |
+
+(0.0 ms means less than 0.05 ms, the program prints one decimal.)
+
+`TCP_NODELAY` turns Nagle off: "segments are always sent as soon as possible" (tcp(7)). The body goes at once, the server answers, and the ACK problem disappears. But look at the last column: still 400 segments.
+
+One write is the cleanest fix. If the program builds the whole request in memory first and writes it once, there is only one segment, nothing small waits behind it, and the program also makes one system call instead of two. `sendmsg()` with a list of buffers does the same without copying the two buffers into one (it is the `writev` idea): 200 segments, fast. Linux has also `TCP_CORK`, which holds partial segments until the program clears the option, or for at most 200 ms (tcp(7)), but I did not measure it here.
+
+`TCP_QUICKACK` on the server is the fix from the other side, and here is the trap. Set once after `accept()`, it changes nothing: 199 slow requests. tcp(7) warns about it: "This flag is not permanent, it only enables a switch to or from quickack mode". It works only if the server sets it again after every `recv()`, and then it is one more system call for each read, on Linux only.
+
+## On a real network
+
+Loopback makes this case look extreme, in two ways.
+
+First, on loopback the ACK alone would come back in microseconds. On a real network, even without delayed ACK, Nagle holds the second small write for one round trip, so it costs one round trip more on every request.
+
+Second, Nagle holds a write only if it is smaller than the maximum segment size. On loopback that size is huge: `ss -ti` showed `mss:32768` for this connection, so every write under 32 KiB counts as small. On a normal Ethernet network the segment size is around 1448 bytes, so a bigger body leaves at once in full segments, and only the last partial segment can wait. The 40 ms appears with small writes, and on loopback almost every write is small.
+
+Python's `http.client` sets `TCP_NODELAY` on every connection it opens (I found it in its `connect()` method). The small HTTP server of the standard library does not, and the last part of this series shows what this costs.
+
+## A few rules
+
+- Build a message in memory and write it with one call, or use `sendmsg()` with all the buffers. It is the fix that does not depend on the other side.
+- For request and response protocols, `TCP_NODELAY` is normal. It does not merge your small writes, it only stops waiting.
+- When a latency is close to 40 ms (43 ms here), or a bit more, think about Nagle and delayed ACK first. `TcpExtDelayedACKs` and the `rtt` of `ss -ti` show it without capturing a packet.
+- `TCP_QUICKACK` is not a setting that stays. It changes the mode once, and the kernel changes it back.
+
+The outputs are [p03-nagle.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/following-a-tcp-connection/results/p03-nagle.txt) and [p03-strace.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/following-a-tcp-connection/results/p03-strace.txt), and the program is `p03_nagle.py` in the [fixture](https://github.com/mehdiakiki/mehdi-cz/tree/main/experiments/following-a-tcp-connection).
+
+## Sources
+
+- [RFC 896, Congestion Control in IP/TCP Internetworks](https://www.rfc-editor.org/rfc/rfc896.html), John Nagle, 1984
+- [RFC 1122, Requirements for Internet Hosts, Communication Layers](https://www.rfc-editor.org/rfc/rfc1122.html#page-96), section 4.2.3.2 for delayed ACK
+- [tcp(7), Linux manual page](https://man7.org/linux/man-pages/man7/tcp.7.html), for `TCP_NODELAY`, `TCP_QUICKACK` and `TCP_CORK`
+- [kernel/time/timer.c in Linux 6.6.126](https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/kernel/time/timer.c?h=v6.6.126), `calc_index()`
+- [ss(8), Linux manual page](https://man7.org/linux/man-pages/man8/ss.8.html)
+- [SNMP counter, Linux kernel documentation](https://docs.kernel.org/networking/snmp_counter.html)
+- [Lib/http/client.py in CPython 3.14.3](https://github.com/python/cpython/blob/v3.14.3/Lib/http/client.py), the `connect()` method

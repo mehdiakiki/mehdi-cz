@@ -1,0 +1,176 @@
+---
+title: "When the Database Ignores Your Index"
+date: "2026-07-18T07:55:00+01:00"
+lastmod: "2026-07-18T07:55:00+01:00"
+tags: ["inside a database index", "databases", "sqlite", "indexing", "query plans"]
+draft: false
+reviewed: true
+reviewedHash: "36d576b5427a3a377e2f8c68c25ee5881e8db2c290500262eb9d451dd6d160ea"
+campaign: "editorial"
+summary: "An index exists, and the plan still says SCAN. I tested six cases on SQLite: a function on the column, LIKE, a leading wildcard, OR, a join between a TEXT and an INTEGER column, and a value that matches 93% of the rows. In the last one, ignoring the index is the right choice."
+---
+
+The table has an index on `email`. Which of these queries can use it?
+
+- `WHERE lower(email) = ?`
+- `WHERE email LIKE 'adam.ali1%'`
+- `WHERE email LIKE '%ali1087@example.net'`
+- `WHERE email = ? OR country = ?`
+
+A quick answer could be "no, yes, no, yes". On SQLite, only two of these four are correct. Let me show each one. In this part I tested each case on the table of one million users from [part 1](/blog/an-index-is-a-second-copy-of-your-data), with indexes on `email`, `created_at` and `status`, and I read the plan like in [part 2](/blog/reading-explain-query-plan-scan-versus-search). For each case: what I expected, what the plan said, and the fix. All times are medians of 9 runs with a warm cache.
+
+## A function on the column
+
+```text
+lower(email) with an index on email
+    SELECT * FROM users WHERE lower(email) = ?  ('adam.ali1087@example.net',)
+    plan: SCAN users
+    1 rows, median 110.89 ms (min 105.36 ms, max 126.58 ms, 9 runs)
+```
+
+The index is sorted by `email`, not by `lower(email)`, and these two orders are different. Remember from part 1: capital letters come before small letters, so `Adam.Ali1087@example.net` is at the very beginning of the index, while its lowercase form would be somewhere in the middle. To find `lower(email) = 'adam...'`, SQLite would have to compute `lower()` for every entry. So it scans.
+
+The fix is to index the expression itself:
+
+```text
+-- CREATE INDEX users_email_lower ON users(lower(email))
+lower(email) with an index on lower(email)
+    SELECT * FROM users WHERE lower(email) = ?  ('adam.ali1087@example.net',)
+    plan: SEARCH users USING INDEX users_email_lower (<expr>=?)
+    1 rows, median 5.6 us (min 5.4 us, max 9.1 us, 9 runs)
+```
+
+From 110.89 ms to 5.6 µs. `<expr>` in the plan is the indexed expression. The query must use the same expression as the index, and a later part of the series looks at how exact "the same" has to be.
+
+## LIKE with a prefix
+
+This one is interesting, because `LIKE 'abc%'` is the classic example of a query that "can use an index":
+
+```text
+LIKE, index on email (BINARY)
+    SELECT * FROM users WHERE email LIKE ?  ('adam.ali1%',)
+    plan: SCAN users
+    33 rows, median 56.86 ms (min 54.99 ms, max 74.99 ms, 9 runs)
+```
+
+The reason is the case of the letters. In SQLite, LIKE ignores the case of ASCII letters by default, so `'adam.ali1%'` also matches `Adam.Ali1...`. But the index uses the BINARY collation, that is it compares bytes, so `Adam.Ali1...` and `adam.ali1...` are in two places far from each other. One range in the index cannot contain both. The SQLite documentation lists the conditions of this "LIKE optimization", and the central one is: if `case_sensitive_like` is off (the default), the column must be indexed with the NOCASE collation, and if it is on, with BINARY. "These are the only two combinations under which LIKE operators will be optimized."
+
+There are three fixes, and they do not give the same answer:
+
+```text
+GLOB, index on email (BINARY)
+    SELECT * FROM users WHERE email GLOB ?  ('adam.ali1*',)
+    plan: SEARCH users USING INDEX users_email (email>? AND email<?)
+    29 rows, median 35.5 us (min 34.9 us, max 58.6 us, 9 runs)
+-- PRAGMA case_sensitive_like = ON
+LIKE with case_sensitive_like = ON
+    SELECT * FROM users WHERE email LIKE ?  ('adam.ali1%',)
+    plan: SEARCH users USING INDEX users_email (email>? AND email<?)
+    29 rows, median 35.4 us (min 34.3 us, max 43.3 us, 9 runs)
+-- PRAGMA case_sensitive_like = OFF
+-- CREATE INDEX users_email_nocase ON users(email COLLATE NOCASE)
+LIKE, index on email COLLATE NOCASE
+    SELECT * FROM users WHERE email LIKE ?  ('adam.ali1%',)
+    plan: SEARCH users USING INDEX users_email_nocase (email>? AND email<?)
+    33 rows, median 56.7 us (min 40.2 us, max 67.0 us, 9 runs)
+```
+
+Look at the row counts. GLOB is always case-sensitive, so it returns 29 rows, not 33: it is fast, but it answers another question. The pragma `case_sensitive_like` also changes LIKE itself, and the documentation says it is deprecated and can even make a database "appear to be corrupt" if LIKE is used in the schema. Only the NOCASE index gives the same 33 rows as the original query, in 56.7 µs. So the honest fix is the NOCASE index, and it costs one more index on every write ([part 3](/blog/what-an-index-costs-on-every-insert)).
+
+One more detail: here the pattern is a bound parameter, and SQLite still used the index. The documentation of `sqlite3_prepare_v2` explains that a statement is compiled again when the value bound to a LIKE pattern could change the plan, so the planner sees the real pattern.
+
+PostgreSQL has a similar trap with LIKE, in its own way. Its documentation says that a B-tree index can serve `col LIKE 'foo%'`, but "if your database does not use the C locale you will need to create the index with a special operator class", and that ILIKE can use such an index "only if the pattern starts with non-alphabetic characters". I did not test this, it is from the documentation.
+
+## A wildcard at the start
+
+```text
+LIKE '%...', index on email COLLATE NOCASE
+    SELECT * FROM users WHERE email LIKE ?  ('%ali1087@example.net',)
+    plan: SCAN users
+    3 rows, median 105.03 ms (min 103.47 ms, max 108.33 ms, 9 runs)
+```
+
+This one is expected, in fact: no index sorted by the beginning of a string can find its end, and no collation helps. If this kind of search is important, SQLite has another tool: an FTS5 full-text table with the trigram tokenizer, which the documentation describes as supporting "substring matching in general", and which can use its own index for LIKE and GLOB when the pattern has at least three characters in a row. It is a separate derived structure, and keeping such a structure in sync is the subject of the last part of this series.
+
+## OR across two columns
+
+```text
+OR, both columns indexed
+    SELECT * FROM users WHERE email = ? OR created_at = ?  ('Adam.Ali1087@example.net', '2025-11-24 03:22:10')
+    plan: MULTI-INDEX OR; INDEX 1; SEARCH users USING INDEX users_email (email=?); INDEX 2; SEARCH users USING INDEX users_created (created_at=?)
+    2 rows, median 6.9 us (min 6.8 us, max 7.0 us, 9 runs)
+OR, country has no index
+    SELECT * FROM users WHERE email = ? OR country = ?  ('Adam.Ali1087@example.net', 'IS')
+    plan: SCAN users
+    1024 rows, median 81.48 ms (min 77.88 ms, max 98.62 ms, 9 runs)
+```
+
+The first one works well. `MULTI-INDEX OR` means two searches, one in each index, and then the union of the rowids. But one term without an index is enough to lose everything: the users from Iceland can be anywhere in the table, so SQLite must read the whole table anyway, and then the email index is useless. The query planning documentation explains that there must be an index "that helps resolve every OR-connected term". The fix is an index for the other column. Two queries joined with UNION would not help here: the query on the country alone has no index either, so it would scan the table too.
+
+## A type that does not match
+
+SQLite is very tolerant with literals. The table `logins` stores the user id as TEXT in `user_ref` (100,000 rows, one for every tenth user), and a query with an integer literal still uses its index:
+
+```text
+integer literal against the text column
+    SELECT * FROM logins WHERE user_ref = 966670  
+    plan: SEARCH logins USING INDEX logins_user (user_ref=?)
+    1 rows, median 5.2 us (min 5.1 us, max 9.1 us, 9 runs)
+```
+
+The literal 966670 has no affinity, so SQLite converts it to text before comparing. But a join between the TEXT column and the INTEGER `users.id` is another story:
+
+```text
+join, TEXT column = INTEGER column
+    SELECT logins.at FROM users JOIN logins ON logins.user_ref = users.id WHERE users.email = ?  ('msingh5713@example.com',)
+    plan: SCAN logins; SEARCH users USING COVERING INDEX users_email (email=? AND rowid=?)
+    1 rows, median 21.16 ms (min 20.94 ms, max 36.88 ms, 9 runs)
+```
+
+I expected "find the user by email, then find the logins by `user_ref`". SQLite did the opposite: it scans all 100,000 logins, and for each one it looks for the pair (email, rowid) in the email index. The rule is in the documentation of datatypes: when one operand has INTEGER affinity and the other TEXT affinity, NUMERIC affinity is applied to the text operand. So this comparison is numeric, and an index sorted as text cannot answer a numeric comparison: as text, `'10'` is before `'9'`. The fix is to make the comparison a text comparison:
+
+```text
+join with a CAST
+    SELECT logins.at FROM users JOIN logins ON logins.user_ref = CAST(users.id AS TEXT) WHERE users.email = ?  ('msingh5713@example.com',)
+    plan: SEARCH users USING COVERING INDEX users_email (email=?); SEARCH logins USING INDEX logins_user (user_ref=?)
+    1 rows, median 5.3 us (min 5.2 us, max 5.4 us, 9 runs)
+```
+
+The better fix is to declare the two columns with the same type from the beginning.
+
+## When ignoring the index is right
+
+The last case is the opposite. `status` has three values, and `'inactive'` is 93% of the rows. Without statistics, SQLite uses the index for it, and it is the wrong choice:
+
+```text
+status = 'inactive', no statistics
+    SELECT count(email) FROM users WHERE status = ?  ('inactive',)
+    plan: SEARCH users USING INDEX users_status (status=?)
+    1 rows, median 92.01 ms (min 86.02 ms, max 113.76 ms, 9 runs)
+status = 'inactive', NOT INDEXED
+    SELECT count(email) FROM users NOT INDEXED WHERE status = ?  ('inactive',)
+    plan: SCAN users
+    1 rows, median 75.69 ms (min 64.59 ms, max 84.32 ms, 9 runs)
+```
+
+Reading 930,260 rows through the index means 930,260 jumps into the table. Reading the table in order is cheaper. For `'active'` (2% of the rows) it is the other way: 18.09 ms with the index, 50.42 ms without. After `ANALYZE`, and in a new connection, SQLite chose correctly for both values: `SCAN users` for `'inactive'` and the index for `'active'`. It ignored my index exactly when it should. I liked that.
+
+The value is a bound parameter, so how can one statement get two plans? This SQLite was built with STAT4: ANALYZE also stores samples of the index, and a statement whose parameter is compared to an indexed column is compiled again when a new value is bound (this is in the documentation of `sqlite3_prepare_v2`).
+
+But without statistics it could not know. Without `ANALYZE`, SQLite guesses, and the documentation gives the guess: "an average of 10 duplicates for every value" of the indexed column. Ten rows, when the truth is 930,260. How these statistics are made, and how they become stale, is the subject of the next part.
+
+## If your index is not used
+
+So the plan says SCAN and there is an index. Before you blame the planner, I would look at the WHERE clause with these questions. Is the column inside a function or an expression? Does the comparison use the same collation as the index (LIKE is case-insensitive)? Does the pattern start with a wildcard? Is there an OR with a column that has no index? Do the two sides of the comparison have the same type? And maybe the most important one: how many rows match? Sometimes the database ignores your index because it is right.
+
+The full output is in [p06-ignored-index.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/inside-a-database-index/results/p06-ignored-index.txt).
+
+## Sources
+
+- SQLite, [The SQLite Query Optimizer Overview](https://sqlite.org/optoverview.html), section "The LIKE optimization" and the OR optimizations.
+- SQLite, [Query Planning](https://sqlite.org/queryplanner.html), section "OR-Connected Terms In The WHERE Clause".
+- SQLite, [Indexes On Expressions](https://sqlite.org/expridx.html).
+- SQLite, [Datatypes In SQLite](https://sqlite.org/datatype3.html), "Type Conversions Prior To Comparison".
+- SQLite, [PRAGMA case_sensitive_like](https://sqlite.org/pragma.html#pragma_case_sensitive_like) and [sqlite3_prepare_v2](https://sqlite.org/c3ref/prepare.html).
+- SQLite, [FTS5](https://sqlite.org/fts5.html), section "The Trigram Tokenizer".
+- PostgreSQL 18, [Index Types](https://www.postgresql.org/docs/18/indexes-types.html).

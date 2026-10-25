@@ -1,0 +1,102 @@
+---
+title: "Checksums: Catching Corruption the Disk Did Not Report"
+date: "2026-10-18T12:35:00+01:00"
+lastmod: "2026-10-18T12:35:00+01:00"
+tags: ["what survives a crash", "databases", "sqlite", "reliability", "file system"]
+draft: false
+reviewed: true
+reviewedHash: "b574b7b6748bdc848badc6755754a0ffa1fbf830a94edd96b9ceb3cc357f0fad"
+cluster: "reliable-data-integrations"
+campaign: "editorial"
+summary: "I flipped one bit in four files. My log's CRC caught it and then threw away nine good records, SQLite returned the changed value and its integrity check said ok, gzip reported a CRC error, and the text file changed silently. Where checksums belong, and what ext4 checks itself."
+---
+
+My SQLite database said that `account 0500` is now called `account 2500`, and `PRAGMA integrity_check` said `ok`.
+
+Nothing was wrong with SQLite. I had changed one bit in the file, and SQLite had no way to know. The disk would not know either: a disk that returns a wrong bit without an error is the case where nobody reports anything. This part is about the files that notice such a change, the files that do not, and where the check must be to catch it.
+
+## How I damaged the files
+
+I made a small Python script that flips one bit in the middle of four files: the log of [part 8](/blog/an-append-only-log-that-survives-a-torn-last-record), a SQLite database, a gzip file and a plain text file. Then it asks the normal reader of each file to read it.
+
+One remark about the method: the script flips the bit with a normal write, so the filesystem sees a normal change of the file. A real corruption happens below the filesystem, in the device, a cable, a controller or the memory, and the filesystem does not see it either. So this experiment tests only one thing: when the bytes are wrong, does the reader of the file notice?
+
+## The log: caught, and then too careful
+
+```text
+== the log of part 8: 20 records, 59090 bytes; bit 0 flipped at offset 32703, inside record 10
+  byte 0x6b became 0x6a
+  records after record 10 whose CRC is still correct: 9
+  applog recover: recovered 10 records, tail BadCrc, truncated from 59090 to 32595 bytes, content ok: true
+```
+
+The CRC did its job: record 10 has a bad CRC, and recovery stopped there. The first ten records are correct, and no damaged data came back.
+
+But look at the other two lines. Nine records after the damaged one still had a correct CRC, and the recovery truncated the file from 59,090 to 32,595 bytes, so it deleted them. In part 8 this rule was right: a bad record at the end is a torn tail, and the bytes after it are garbage. Here the bad record is in the middle, and the same rule destroys good data. I wrote this rule myself in part 8, and here it hurts. A recovery that wants to tell the two cases apart must look after the bad record: if valid records follow, this is not a torn tail, it is damage, and the right reaction is to stop and report, not to truncate. My store does not do this, and now I know how it fails.
+
+## SQLite: returned without a complaint
+
+```text
+== a SQLite database: 1000 rows, 32768 bytes; bit 1 flipped at offset 17534, in the name of row 500
+  byte 0x30 (0) became 0x32 (2)
+  SELECT name, balance WHERE id = 500: account 2500|1000
+  PRAGMA integrity_check: ok
+```
+
+The `0` became a `2`, and the query returned the changed name. So why is `integrity_check` happy? Its documentation says what it checks: it "does a low-level formatting and consistency check of the database", and it looks for entries out of sequence, misformatted records, missing pages, wrong index entries, constraint errors, the freelist, and space used twice or not at all. A different digit inside a text value breaks none of these rules. The structure is perfect, only the data is wrong.
+
+SQLite pages have no checksum by default. There is an extension for it, the checksum VFS: it "adds an 8-byte checksum to the end of every page in an SQLite database. The checksum is added as each page is written and verified as each page is read." With it, a bad page gives `SQLITE_IOERR_DATA`. But it needs 8 reserved bytes in every page, and "newly created database files will omit the checksum by default."
+
+## gzip: caught
+
+```text
+== a gzip file: 12725 bytes; bit 0 flipped at offset 6362
+  byte 0xdf became 0xde
+  gzip -t: gzip: out/p18/notes.txt.gz: invalid compressed data--crc error
+```
+
+gzip noticed. The format (RFC 1952) ends every member with a CRC-32 that "contains a Cyclic Redundancy Check value of the uncompressed data", and the size of the original data. The writer computes it over the original text, and the reader checks it after decompression. One changed bit in the compressed stream changed the decompressed result, and the CRC did not match anymore.
+
+## The text file: nothing
+
+```text
+== the plain text file: 280000 bytes; bit 0 flipped at offset 140005
+  byte 0x30 (0) became 0x31 (1)
+  line 2501 before: line 02500: the quick brown fox jumps over the lazy dog
+  line 2501 after:  line 12500: the quick brown fox jumps over the lazy dog
+  wc -l: 5000 lines, the same as before, and no tool reports anything
+```
+
+`02500` became `12500`. Same size, same number of lines, a perfectly valid text file. Strange how normal it looks. If this line were a number in a configuration file, the program would read the wrong number and continue.
+
+## What the filesystem checks by itself
+
+And the filesystem, does ext4 protect file data? Its documentation has a section about checksums: "Starting in early 2012, metadata checksums were added to all major ext4 and jbd2 data structures. The associated feature flag is metadata_csum." The list contains the superblock, group descriptors, bitmaps, inodes, extents, directory entries, extended attributes. The algorithm is crc32c, and "Some data structures did not have space to fit a full 32-bit checksum, so only the lower 16 bits are stored." My mount options also have `journal_checksum` (in the machine facts of [the first part](/blog/your-data-is-not-on-disk-when-write-returns)).
+
+All of this is metadata. The documentation does not describe a checksum for the content of files, and so on ext4 the content of my log, my database and my text file is protected only by the checks that the applications write themselves.
+
+PostgreSQL decided to add its own. In the PostgreSQL 18 documentation, `initdb` has the option `--data-checksums`: "Use checksums on data pages to help detect corruption by the I/O system that would otherwise be silent. This is enabled by default". "Would otherwise be silent" is what the title of this part means.
+
+## Where checksums belong
+
+The four results make the rules quite clear for me.
+
+The check must be per record or per page. The log could tell which record was bad, and only because of this, ten records survived. gzip has one checksum for the whole file, so it can only say "this file is damaged", not where.
+
+End to end. The useful checksum is computed where the data is created and verified where it is used. gzip does this. A checksum computed by the disk or the filesystem protects only one part of the way.
+
+The record needs also an identity, because a checksum says that a record is intact, not that it is the right record. In part 8 I noted that a reused log can contain old records with correct CRCs, and part 14 showed how SQLite's WAL adds salts for this. A lost write, where the device reports success and keeps the old block, leaves an old page with a perfect checksum.
+
+The kind of checksum matters too. A CRC like CRC-32 or CRC-32C (the one ext4 uses) is fast and is made for accidents, random flipped bits. It is not a protection against somebody who changes the data on purpose: anybody can change a record and compute a new CRC. For that, the check needs a secret key, or a hash that is stored somewhere the attacker cannot write.
+
+Which of your files would notice one changed bit? In this experiment, two of four did: the log, which I designed with a CRC per record, and the gzip file, whose format has one. The database would notice only if somebody enabled page checksums, and the text file never.
+
+The script is `bitflip.py` in the [fixture](https://github.com/mehdiakiki/mehdi-cz/tree/main/experiments/what-survives-a-crash), and the output is [p18-bitflip.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/what-survives-a-crash/results/p18-bitflip.txt).
+
+## Sources
+
+- [SQLite: PRAGMA integrity_check](https://www.sqlite.org/pragma.html#pragma_integrity_check)
+- [SQLite: the checksum VFS shim](https://www.sqlite.org/cksumvfs.html)
+- [RFC 1952: GZIP file format specification](https://www.rfc-editor.org/rfc/rfc1952)
+- [ext4: checksums, Linux kernel documentation](https://docs.kernel.org/filesystems/ext4/checksums.html)
+- [PostgreSQL 18 documentation: initdb --data-checksums](https://www.postgresql.org/docs/18/app-initdb.html)

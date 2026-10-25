@@ -109,12 +109,19 @@ test("the resumed October queue publishes due articles and keeps future articles
     [
       "a-dead-letter-queue-is-evidence-not-a-disposal-bin",
       "approval-boundaries-for-expensive-external-and-irreversible-ai-actions",
+      "can-environment-variables-change-how-fast-your-code-runs",
+      "compare-two-versions-by-interleaving-the-runs",
       "how-rust-analyzer-recomputes-only-what-an-edit-invalidates",
+      "how-sqlite-commits-a-transaction-followed-with-strace",
       "macro-expansion-and-name-resolution-rusts-compiler-feedback-loop",
       "ordering-exists-inside-a-boundary-choosing-an-event-partition-key",
       "retry-topics-change-ordering-decide-whether-that-is-acceptable",
+      "sqlite-wal-mode-fewer-fsyncs-a-different-promise",
+      "what-fork-really-copies-copy-on-write-measured",
+      "when-malloc-asks-the-kernel-for-memory-brk-and-mmap",
       "where-a-transaction-ends-in-a-message-consumer",
       "why-one-lookup-per-byte-can-be-latency-bound",
+      "why-the-first-touch-of-memory-is-slow-demand-paging-measured",
     ]
   );
 

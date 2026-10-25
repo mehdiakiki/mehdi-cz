@@ -1,0 +1,122 @@
+---
+title: "A Covering Index Never Touches the Table"
+date: "2026-07-13T16:20:00+01:00"
+lastmod: "2026-07-13T16:20:00+01:00"
+tags: ["inside a database index", "databases", "sqlite", "indexing", "performance"]
+draft: false
+reviewed: true
+reviewedHash: "ba54afcaf546fb7a421e95586af19cdc6be352b64a2e73245a381632c2c88d3d"
+campaign: "editorial"
+summary: "When an index has every column a query needs, SQLite never opens the table. For one row this saves almost nothing. For 67,245 rows it was 98 ms against 21 ms with a warm cache, and 875 ms against 24 ms with a cold one."
+---
+
+In the first part of this series, I broke one entry of an index on purpose, and the query `SELECT id, email FROM users WHERE email = ...` returned a wrong id. The plan said `USING COVERING INDEX`, and SQLite did not even look at the table: the id and the email were both in the index entry, so the table was not needed. That was an accident. In this part I wanted to use it on purpose and measure what it gives.
+
+The table is the same one million users as in [part 1](/blog/an-index-is-a-second-copy-of-your-data). The query is a lookup that returns two columns, `SELECT email, status FROM users WHERE email = ?`. With an index on `(email)`, SQLite finds the entry in the index and then goes to the table for `status`. With an index on `(email, status)`, the index has both columns.
+
+## What the program does not do
+
+Here is the bytecode of the lookup with `(email, status)`, from `EXPLAIN`:
+
+```text
+addr  opcode         p1    p2    p3    p4             p5  comment      
+----  -------------  ----  ----  ----  -------------  --  -------------
+0     Init           0     10    0                    0   Start at 10
+1     OpenRead       1     24994 0     k(3,,,)        2   root=24994 iDb=0; users_email_status
+2     String8        0     1     0     Adam.Ali1087@example.net 0   r[1]='Adam.Ali1087@example.net'
+3     SeekGE         1     9     1     1              0   key=r[1]
+4       IdxGT          1     9     1     1              0   key=r[1]
+5       Column         1     0     2                    0   r[2]= cursor 1 column 0
+6       Column         1     1     3                    0   r[3]= cursor 1 column 1
+7       ResultRow      2     2     0                    0   output=r[2..3]
+8     Next           1     4     0                    0   
+9     Halt           0     0     0                    0   
+10    Transaction    0     0     3     0              1   usesStmtJournal=0
+11    Goto           0     1     0                    0   
+```
+
+Compare it with the program of [part 2](/blog/reading-explain-query-plan-scan-versus-search). There were two `OpenRead`, one for the table (root page 2) and one for the index, and a `DeferredSeek` that moved the table cursor. Here there is only one `OpenRead`, on the index, with keys of 3 parts (`k(3,,,)`: email, status and the rowid). Both columns come from cursor 1. The table is not opened at all. This is what the title means, literally: the program has no instruction that could read the table.
+
+## The price: a bigger index
+
+```text
+users|16468|60708820
+users_email|8524|31665537
+users_email_status|10744|40675925
+```
+
+Adding `status` to the index makes it 10,744 pages instead of 8,524, 26% more than the index on `(email)` alone. And one more thing: the bigger entries made the tree one level deeper.
+
+```text
+users|3
+users_email|3
+users_email_status|4
+```
+
+## One row: a small win
+
+The lookup of one row, 10,000 different emails per run, 9 runs, warm cache (both indexes are in the same file, so my script chooses each one with `INDEXED BY`):
+
+```text
+one row, users_email: SEARCH users USING INDEX users_email (email=?)
+    median 6.7 us (min 6.6 us, max 7.1 us, 9 runs) per lookup, 10000 lookups per run
+one row, users_email_status: SEARCH users USING COVERING INDEX users_email_status (email=?)
+    median 5.3 us (min 5.2 us, max 5.8 us, 9 runs) per lookup, 10000 lookups per run
+```
+
+1.4 µs less per lookup. The `.stats` counters show why the gain is small: 7 page reads for the normal index (page 1, 3 in the index, 3 in the table) and 5 for the covering one (page 1 and 4 in the deeper index). The covering index saves the table lookup, but pays one more level. I measured also with a cold cache, and it is the same picture: 436.4 µs against 371.3 µs. For a single row, a covering index is a small optimization.
+
+## Many rows: a big win
+
+Now a range: all the emails that start with a small "m", 67,245 rows, 6.7% of the table.
+
+```text
+range 'm' to 'n', 67245 rows, users_email: median 98.52 ms (min 94.26 ms, max 117.28 ms, 9 runs)
+range 'm' to 'n', 67245 rows, users_email_status: median 20.81 ms (min 19.55 ms, max 22.74 ms, 9 runs)
+range 'm' to 'n', NOT INDEXED (full table scan): median 71.91 ms (min 66.29 ms, max 76.43 ms, 9 runs)
+```
+
+The covering index is almost 5 times faster. But look at the third line, it surprised me: the normal index is slower than no index at all. A full scan of one million rows took 71.91 ms, and the index that should help took 98.52 ms.
+
+So why is the normal index slower than no index? The page counters explain it. With `(email)`, the range made 68,974 hits and 66,091 misses in SQLite's cache, because each of the 67,245 entries sends SQLite into the table for its `status`, and the emails are in random order compared with the rowids, so each lookup lands on another page. With `(email, status)`, the same range made 1 hit and 725 misses. It reads the index entries one after another, and that is all.
+
+So a normal index helps a lot when it finds a few rows, and it can be worse than a scan when it finds many. A scan reads every page once, in order. The index reads fewer rows, but each one costs a jump. (A later part looks at this from the side of the planner, which has to guess which one is cheaper.)
+
+With a cold cache, the difference becomes huge:
+
+```text
+cold, range 'm' to 'n', users_email: median 874.89 ms (min 833.69 ms, max 882.98 ms, 5 runs)
+cold, range 'm' to 'n', users_email_status: median 23.61 ms (min 23.12 ms, max 26.32 ms, 5 runs)
+```
+
+37 times. The covering index reads its 725 pages in order, which is what the SSD and the kernel read-ahead like most. The normal index makes 66,091 small reads at random places in the table, and with a cold cache the first visit to each page is a separate trip to the SSD.
+
+## The rowid is always covered
+
+One case is covered without doing anything. Every SQLite index entry ends with the rowid, so a query that needs only the indexed columns and the rowid is covered by a normal index:
+
+```text
+SELECT id, email FROM users INDEXED BY users_email WHERE email = 'Adam.Ali1087@example.net';
+QUERY PLAN
+`--SEARCH users USING COVERING INDEX users_email (email=?)
+966676|Adam.Ali1087@example.net
+```
+
+In fact, that is the query from part 1. If your table has `id INTEGER PRIMARY KEY`, the id is the rowid, and it comes with every index.
+
+## When I would make one
+
+A covering index is a copy of more columns, so everything from [part 3](/blog/what-an-index-costs-on-every-insert) applies: it is bigger, and every write updates it. And it is fragile. If someone adds one more column to the SELECT, the index is not covering anymore, and the plan changes from `USING COVERING INDEX` back to `USING INDEX`, without any error.
+
+So my rule is: I add columns to an index for coverage only for a query that reads many rows, or that runs very often, and I check the plan for `COVERING`. For a lookup of one row, it saves about one microsecond.
+
+PostgreSQL has the same idea under the name index-only scan, with one difference that the documentation explains well. Its indexes do not know if a row version is visible to the current transaction. So an index-only scan checks the visibility map of the table, and "if it's set, the row is known visible and so the data can be returned with no further work". If not, it must visit the table anyway. PostgreSQL also has an `INCLUDE` clause, `CREATE INDEX tab_x_y ON tab(x) INCLUDE (y)`, to store extra columns in the index without making them part of the key. SQLite has no `INCLUDE`: the extra column becomes part of the sort key, as with my `(email, status)`. In MySQL, the EXPLAIN output says `Using index` when the row is not read from the table, and since every InnoDB secondary index contains the primary key, the primary key is covered there too, like the rowid in SQLite.
+
+The full output is in [p05-covering-index.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/inside-a-database-index/results/p05-covering-index.txt).
+
+## References
+
+- SQLite, [Query Planning](https://sqlite.org/queryplanner.html), section "Covering Indexes".
+- SQLite, [The SQLite Bytecode Engine](https://sqlite.org/opcode.html).
+- PostgreSQL 18, [Index-Only Scans and Covering Indexes](https://www.postgresql.org/docs/18/indexes-index-only-scans.html).
+- MySQL 8.4, [EXPLAIN Output Format](https://dev.mysql.com/doc/refman/8.4/en/explain-output.html) and [Clustered and Secondary Indexes](https://dev.mysql.com/doc/refman/8.4/en/innodb-index-types.html).

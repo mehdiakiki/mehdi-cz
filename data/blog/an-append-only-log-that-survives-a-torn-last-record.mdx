@@ -1,0 +1,137 @@
+---
+title: "An Append-Only Log That Survives a Torn Last Record"
+date: "2026-09-20T09:25:00+01:00"
+lastmod: "2026-09-20T09:25:00+01:00"
+tags: ["what survives a crash", "rust", "reliability", "databases", "testing"]
+draft: false
+reviewed: true
+reviewedHash: "6d2cc73d2b89d6f9381e73d5a430b5376ac581a772ea2ce53e6ca6de8cc99633"
+cluster: "reliable-data-integrations"
+campaign: "editorial"
+summary: "A log of length, CRC-32 and payload, and a recovery that stops at the first bad record. I tested it with kill -9, with my crash simulator and with a fuzzer that cuts the file at every byte. One small format detail decided if 17 records came back as 17 or as 529."
+---
+
+My log had 17 complete records and then some zeros at the end, and the recovery found 529 records.
+
+This happened in a fuzzer run, with a variant of the log format that looks completely reasonable. The fix is one small detail of the format, and to understand it we have to look at the most dangerous place of every log: its end. That is the subject of this part.
+
+## The format
+
+An append-only log is the simplest durable structure: you never change old bytes, you only add new records at the end. Each record here has three fields: a length (`u32`, little endian), a CRC-32 (`u32`), and the payload.
+
+The CRC-32 is the usual one (the polynomial `0xEDB88320`, the same as in zip and gzip), with a table that Rust computes at compile time. I wrote it by hand, with std only, so first a test:
+
+```text
+crc32 of "123456789" = cbf43926
+crc32 of nothing = 00000000
+crc32 of four zero bytes = 2144df1c
+zlib.crc32 of "123456789" = cbf43926
+```
+
+The last line comes from Python's `zlib` on the same machine, and it agrees with my implementation. The two lines in the middle are important later.
+
+The CRC covers the length and the payload together:
+
+```rust
+fn checksum(format: Format, length: &[u8], payload: &[u8]) -> u32 {
+    match format {
+        Format::Full => crc32(&[length, payload].concat()),
+        Format::PayloadOnly => crc32(payload),
+    }
+}
+```
+
+`PayloadOnly` is the variant that found 529 records. The writer encodes one record and appends it with one write call, like [part 6](/blog/what-a-crash-in-the-middle-of-a-write-leaves-behind) recommends for logs.
+
+Recovery reads the file from the start and stops at the first record that is not valid. There are four reasons to stop: fewer than 8 bytes left for a header (`ShortHeader`), a length of 0 or more than 1 MiB (`BadLength`), fewer bytes left than the length says (`ShortRecord`), or a CRC that does not match (`BadCrc`). Then it truncates the file at the end of the last valid record, so that new appends start from a clean end.
+
+## What kill -9 leaves at the end
+
+The first test is a real process crash, like in the earlier parts. A writer appends 5,000 records of 16 to 6,015 bytes as fast as it can, without fsync, and my kill driver from [part 3](/blog/how-to-save-a-file-without-losing-it-write-fsync-rename) kills it at a random moment, 300 times. After each kill, it asks the recovery how the log ends:
+
+```text
+== append records of 16 to 6015 bytes without fsync, one write() per record, kill -9 at a random moment
+300 runs, SIGKILL after a random delay between 0 and 60 ms
+  killed  finished  outcome
+     258        36  clean end
+       4         0  torn last record (ShortRecord)
+       2         0  no log file
+```
+
+Most kills left a clean end: the signal arrived between two records. But 4 runs had a torn last record. This is the page boundary from part 6: a record that crosses a page is copied in two steps, and the kernel can stop between them. So even a process crash, without any power loss, can cut the last record. Only the last one, though: everything before it is complete, because the kernel copies the calls in order.
+
+Four torn records in 264 kills: not many, but not zero. A test that kills the process 20 times would probably never see a torn record and would conclude that the recovery code is fine, without running it once on a torn tail.
+
+## What a machine crash could leave
+
+The second test is the simulator from [part 7](/blog/building-a-tiny-crash-simulator-from-strace-output). The writer appends 12 records, and after each one it calls fdatasync and prints `ok N`. The checker writes every crash state into a scratch directory, runs the real Rust recovery on it, and checks two things: the recovered records are correct, and there are at least as many as the program acknowledged.
+
+```text
+== append 12 records, fdatasync and print ok after each (applog append log 12 fsync)
+  events: 38 (12 ack, 12 data, 1 dirsync, 1 meta, 12 sync)
+  crash points: 39
+  process crash: 39 states, 0 bad
+  machine crash: 61 states (23 distinct), 0 bad (0 distinct)
+  end of the log in the distinct machine states: Clean 13, ShortRecord 9, no log file 1
+```
+
+In 9 of the 23 distinct states, the last record was cut at a page boundary by the crash, and the recovery handled all of them. Zero bad states.
+
+I ran also a variant of the writer that creates the log file and never syncs the directory. The simulator does not like it:
+
+```text
+  machine crash: 96 states (23 distinct), 34 bad (1 distinct)
+  first bad machine state: crash after event 4 of 37 (stdout: ok 0)
+    promises printed before the crash: ['ok 0\n']
+    model: 0 of 1 name operations kept
+    on disk: log: missing
+    checker: 1 records were acknowledged, recovery found 0
+```
+
+Every record was synced, and the whole log can still disappear, because its name was never made durable. This is [part 4](/blog/why-the-directory-needs-fsync-too) again, and it is easy to forget for a log, because the log is created only once.
+
+## Cutting the log at every byte
+
+The simulator only cuts at page boundaries, so I wanted a harder test for the recovery. The fuzzer builds a log of 20 records in memory, cuts it at every byte of the last three records (7,699 positions), and after each cut it adds one of four tails: nothing, 8 zero bytes, a page of 4,096 zero bytes, or 64 random bytes. For each of these 30,796 files it knows how many complete records come before the cut, and it compares with what the recovery returns:
+
+```text
+fuzz, format full (CRC over length and payload, length 0 rejected): 20 records, the file cut at every byte of the last 3 records (7699 cuts), 4 kinds of tail
+  tail nothing          7699 states, wrong recoveries: 0
+  tail 8 zero bytes     7699 states, wrong recoveries: 0
+  tail 4096 zero bytes  7699 states, wrong recoveries: 0
+  tail 64 random bytes  7699 states, wrong recoveries: 0
+fuzz, format payload-only (CRC over the payload only): 20 records, the file cut at every byte of the last 3 records (7699 cuts), 4 kinds of tail
+  tail nothing          7699 states, wrong recoveries: 0
+  tail 8 zero bytes     7699 states, wrong recoveries: 4
+    first wrong: cut at byte 51392, 17 complete records, recovered 18, stopped at Clean
+  tail 4096 zero bytes  7699 states, wrong recoveries: 4
+    first wrong: cut at byte 51392, 17 complete records, recovered 529, stopped at Clean
+  tail 64 random bytes  7699 states, wrong recoveries: 0
+```
+
+The full format is correct in every case. The payload-only variant is wrong in 4 places for each zero tail, and the 4 places are the cuts exactly at the end of a record. Here are the 529 records from the beginning of this article.
+
+Now the self-test lines make sense. Eight zero bytes are a header with length 0 and CRC 0. The variant allows a length of 0 (an empty record looks harmless), and the CRC-32 of an empty payload is `00000000`. So eight zero bytes are a perfectly valid empty record, and 4,096 zero bytes are 512 of them. 17 real records plus 512 empty ones: 529. OK, now the strange number is clear. When the cut is in the middle of a record, the zeros become part of that record and the CRC fails, which is why only 4 cuts were wrong.
+
+Where do zeros after the last record come from? Not from my program. But a log can be preallocated with zeros on purpose, like the WAL files of PostgreSQL with `wal_init_zero` in [part 2](/blog/what-fsync-costs-on-a-laptop-ssd), and some filesystem modes can leave other data after a crash. The ext4 documentation says about `data=writeback`: "A crash+recovery can cause incorrect data to appear in files which were written shortly before the crash." The full format has two protections against this: the CRC covers the length, and the CRC-32 of four zero bytes is `2144df1c`, not zero; and a length of 0 is rejected anyway.
+
+## What a CRC cannot see
+
+The CRC tells the recovery where valid data ends. It does not tell it what is missing.
+
+If the machine loses power after a record was written but before it was synced, the record may never reach the disk: it was only in the page cache, like the data of [the first part](/blog/your-data-is-not-on-disk-when-write-returns) of this series. The log is then a valid, shorter log, and nothing inside it says that a record is missing. Only the promise knows. This is why the writer prints `ok N` only after the fdatasync, and why the checker compares the acknowledgements with the recovery, not the log with itself.
+
+There are two more limits that I did not test here:
+
+- A log that reuses old files (PostgreSQL recycles WAL files by renaming them, the `wal_recycle` setting) can contain old records with valid CRCs after the real end. A CRC alone cannot tell an old record from a new one. Each record then needs something the reader expects, for example a sequence number.
+- The recovery truncates at the first bad record. At the end of the log this is correct. But if one bit flips in the middle of the log, the same rule throws away every valid record after it. Telling a torn tail from damage in the middle is a question for the part about checksums.
+
+So my opinion after this part: write the recovery first, and test it on states that you did not create on purpose. kill -9 gave me 4 torn tails in 300 runs, the simulator gave 9 states, and the fuzzer gave 30,796. Only the fuzzer found the 529.
+
+The code is `record.rs` (the format and the scan), `applog.rs` (the writer, the recovery and the fuzzer) and `simlog.py` in the [fixture](https://github.com/mehdiakiki/mehdi-cz/tree/main/experiments/what-survives-a-crash). The outputs are [p08-fuzz.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/what-survives-a-crash/results/p08-fuzz.txt), [p08-kill.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/what-survives-a-crash/results/p08-kill.txt) and [p08-simlog.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/what-survives-a-crash/results/p08-simlog.txt).
+
+## Further reading
+
+- [ext4 General Information, the data= mount options](https://docs.kernel.org/admin-guide/ext4.html)
+- [PostgreSQL 18 documentation: Write Ahead Log settings (wal_init_zero, wal_recycle)](https://www.postgresql.org/docs/18/runtime-config-wal.html)
+- [write(2), Linux manual page](https://man7.org/linux/man-pages/man2/write.2.html)

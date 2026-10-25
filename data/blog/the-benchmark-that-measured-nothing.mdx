@@ -1,0 +1,264 @@
+---
+title: "The Benchmark That Measured Nothing"
+date: "2026-08-27T20:15:00+01:00"
+lastmod: "2026-08-27T20:15:00+01:00"
+tags: ["when the benchmark lies", "rust", "c", "benchmarking", "compiler internals"]
+draft: false
+reviewed: true
+reviewedHash: "bbb7658009fd239ddf8d475ad92542ef5faa74c502489903e9bb09a7295fbe0f"
+campaign: "editorial"
+summary: "My first benchmark said that my laptop adds 4,096 numbers in 0.00005 nanoseconds. The compiler had deleted the loop. I show it in the assembly, fix it with black_box, make the same mistake in C, and explain the method of this series."
+---
+
+My first benchmark for this series says that my laptop adds 4,096 numbers in 0.00005 nanoseconds.
+
+This CPU runs at most at 4.7 GHz, so one cycle takes about 0.2 nanoseconds. So the program says that it made 4,096 additions in around one four-thousandth of one cycle. This is not possible, of course. And nothing is broken: not the clock, not the laptop, not the compiler. The compiler removed the work, and the benchmark measured the time between two readings of the clock.
+
+This is the first part of a series about the ways a performance number can be wrong. Every part is one small experiment on this laptop, with the real output and a slow explanation of what it means. I start with this case because I think it is the most common one, and because it teaches the habit we need in all the other parts: before you believe a number, check that the work really happened.
+
+## The program
+
+The function is a sum, the most simple thing I could find:
+
+```rust
+fn sum(data: &[u64]) -> u64 {
+    data.iter().sum()
+}
+
+// ...
+
+#[no_mangle]
+#[inline(never)]
+fn bench_unused(data: &[u64], iters: u64) -> Duration {
+    let start = Instant::now();
+    for _ in 0..iters {
+        sum(data);
+    }
+    start.elapsed()
+}
+```
+
+The benchmark calls `sum` one million times on a slice of 4,096 `u64` values and measures the time. The two attributes are only there to read the result later: `#[no_mangle]` keeps the name readable in the assembly, and `#[inline(never)]` keeps the benchmark function separate, so I can look at it alone. I built it with `rustc +1.98.0 -O`, that is the optimized build, and I ran it pinned to one CPU with `taskset -c 2`. The output:
+
+```text
+sum of 4096 u64 values, 1000000 calls per line
+unused result     total          50 ns      0.00005 ns per call
+```
+
+One million calls in 50 nanoseconds in total. Later in this article the real sum takes about 320 nanoseconds for one single call. So the whole loop took less time than one call of the work it was supposed to measure.
+
+## What the compiler produced
+
+When a number is impossible, I look first at the machine code. Here is the assembly of `bench_unused`, with the directives removed and the names demangled:
+
+```asm
+bench_unused:
+	subq	$24, %rsp
+	callq	*<std::time::Instant>::now@GOTPCREL(%rip)
+	movq	%rax, 8(%rsp)
+	movl	%edx, 16(%rsp)
+	leaq	8(%rsp), %rdi
+	callq	*<std::time::Instant>::elapsed@GOTPCREL(%rip)
+	addq	$24, %rsp
+	retq
+```
+
+Let me read it line by line. The first line makes room on the stack. Then the function calls `Instant::now`. The result comes back in two registers (the seconds in `rax`, the nanoseconds in `edx`), and the next two lines store it on the stack. Then the function gives the address of this saved `Instant` to `elapsed`, and it returns. That is all.
+
+There is no loop. There is no addition. There is not even one load from `data`. The function reads the clock two times and returns the difference.
+
+Why is the compiler allowed to do this? Because `sum` has no side effect. It reads memory and returns a number, and nobody uses the number. If you remove the call, the program prints the same things, writes the same files and returns the same exit code. The C standard says it in one sentence, in section 5.1.2.3: "An actual implementation need not evaluate part of an expression if it can deduce that its value is not used and that no needed side effects are produced". Rust and LLVM work with the same idea. And the time a program takes is not one of the behaviors the compiler must keep. Making the program faster is the whole job of the optimizer.
+
+So the compiler did its job very well. The benchmark is the thing that was wrong.
+
+## The first patch: use the result
+
+The natural reaction is to use the result: add all the sums and print the total at the end. I made this version too. In my build it worked: the loop stayed, and it gave between 321 and 401 ns per call in three runs.
+
+But this patch depends on a decision that you cannot see in the source. To show it, I made one small change. Some people put `#[inline(never)]` on the measured function, so that the optimizer "cannot touch it". So I did it, on a copy called `sum_outlined`, and I kept everything else the same:
+
+```text
+printed, outlined total         515 ns      0.00052 ns per call
+                  total of the sums 8386560000000
+```
+
+The total is correct. The sum of 0 to 4,095 is 8,386,560, and one million times this is 8,386,560,000,000. And the time is impossible again. Here is the interesting part of the assembly:
+
+```asm
+	callq	sum::sum_outlined
+	movq	%rax, %r15
+	imulq	%r14, %r15
+```
+
+The compiler called `sum_outlined` one time and multiplied the result by `r14`, which holds the number of iterations. It could see that the function only reads the slice and that nothing in the loop changes the slice. A million calls with the same input must give a million times the same answer, so one call is enough.
+
+This one surprised me. I expected `#[inline(never)]` to make the benchmark more safe, not less. For me it is the most important lesson of the whole article: the program printed the right answer, and the benchmark was still wrong. A correct output does not prove that the work ran as many times as you think.
+
+## black_box on the input and on the output
+
+The standard library has a function for exactly this problem, `std::hint::black_box`. The correct use needs it two times:
+
+```rust
+for _ in 0..iters {
+    black_box(sum(black_box(data)));
+}
+```
+
+The inner `black_box` hides the input. The compiler must assume that `data` can be different at every iteration, so it cannot compute the sum once and reuse it. The outer `black_box` hides the output. The compiler must assume that something uses the result, so it cannot delete the call. These are exactly the two ways the compiler cheated above, one for each `black_box`.
+
+In the assembly the loop is back. Good, that is what I wanted to see:
+
+```asm
+.LBB18_11:
+	incq	%rax
+	movq	%r9, 24(%rsp)
+	#APP
+	#NO_APP
+	cmpq	%rbx, %rax
+	je	.LBB18_12
+.LBB18_2:
+	movq	%r15, 8(%rsp)
+	movq	%r14, 16(%rsp)
+	#APP
+	#NO_APP
+	movq	16(%rsp), %rsi
+...
+.LBB18_8:
+	movdqu	(%rdi,%r9,8), %xmm2
+	paddq	%xmm2, %xmm1
+	movdqu	16(%rdi,%r9,8), %xmm2
+	paddq	%xmm2, %xmm0
+	addq	$4, %r9
+	cmpq	%r9, %r8
+	jne	.LBB18_8
+```
+
+`#APP` and `#NO_APP` are the markers of inline assembly, and between them there is nothing. In this build, each `black_box` became an empty assembly block that the compiler cannot look inside. At `.LBB18_2`, the pointer and the length of the slice are written to the stack before the block and read back after it, because the compiler must assume that the block changed them. At `.LBB18_11`, the sum of the previous call is written to the stack before the other block, because the compiler must assume that the block reads it. And the real work is the loop at `.LBB18_8`: it loads 16 bytes two times and makes two vector additions, so it handles four numbers per turn.
+
+The result:
+
+```text
+black_box         total   311505738 ns    311.50574 ns per call
+```
+
+311 ns per call. Is this number possible? 4,096 numbers at four per turn are 1,024 turns of the loop. I do not know the exact clock during the run, but between 3 and 4.7 GHz, 311 ns are between about 930 and 1,460 cycles. So it is around one cycle per turn of a loop of seven instructions. That is believable. This small check, "is the number possible for this machine?", takes one minute, and it catches the first mistake of this article every time.
+
+## The same mistake in C
+
+C has the same trap and the same two jobs to do. I made the same experiment with gcc 15.2.1 and `-O2`:
+
+```text
+sum of 4096 uint64_t values, 1000000 calls per line
+unused result     total          32 ns      0.00003 ns per call
+volatile sink     total   518166000 ns    518.16600 ns per call
+asm barrier       total   507059477 ns    507.05948 ns per call
+```
+
+The first line is the same story. gcc removed the loop, and the assembly of `bench_unused` has two calls to `clock_gettime` with only the arithmetic of the first timestamp between them.
+
+The second line stores every result in a global variable declared `volatile`. The C standard says that accessing a volatile object is a side effect, so the million stores must happen. But it does not say that the sum must be computed again for each store: a compiler could compute it once and store the same value a million times, like rustc did with `sum_outlined`. gcc did not do this here, so for gcc this was enough.
+
+The third line is the C version of the two `black_box` calls:
+
+```c
+__asm__ volatile("" : "+r"(p));
+uint64_t s = sum(p, LEN);
+__asm__ volatile("" : : "r"(s));
+```
+
+These are empty `asm` statements again. The first one tells the compiler "this code may change `p`", so it cannot reuse an old result. The second one tells it "this code reads `s`", so the sum must be computed.
+
+One remark about the numbers. C gives about 510 ns per call and Rust about 320 ns. This is not a comparison of the two languages. gcc made a loop with one vector accumulator and rustc made one with two, so these are two different loops. I come back to this point many times in the series: before you compare two numbers, check that they measure the same thing.
+
+## What black_box promises, and what it does not
+
+I read the documentation of `black_box` for Rust 1.98.0 before I trusted it. It describes an identity function that hints to the compiler "to be maximally pessimistic", and then it says clearly that this works only on a "best-effort" basis. The exact sentence is: "Programs cannot rely on `black_box` for correctness, beyond it behaving as the identity function."
+
+So it is a strong hint, not a guarantee. The documentation shows also a case where it does not help: in `black_box(5 * 10)` the multiplication happens before the call, so the compiler can still compute 50 at compile time. Only the value that goes through `black_box` is hidden, not the expression that produces it.
+
+And it has a cost. The stores and loads around the empty block are real instructions. For a function of 300 ns this is nothing. For a function of one nanosecond it can be a big part of the measurement, and a later part of the series measures something that small.
+
+My rule is simple: `black_box` on the inputs and on the result, and then look at the assembly once anyway. It is the only way to know what the compiler really did.
+
+## The harness, the laptop and the method
+
+For the rest of the series I put this pattern in a small harness, `harness.rs`, that most parts include. The core is one function:
+
+```rust
+pub fn run<I: Copy, O>(&self, input: I, mut f: impl FnMut(I) -> O) -> Vec<f64> {
+    for _ in 0..self.warmup {
+        black_box(f(black_box(input)));
+    }
+    let mut ns_per_call = Vec::with_capacity(self.samples);
+    for _ in 0..self.samples {
+        let start = Instant::now();
+        for _ in 0..self.iters {
+            black_box(f(black_box(input)));
+        }
+        let ns = start.elapsed().as_nanos() as f64;
+        ns_per_call.push(ns / self.iters as f64);
+    }
+    ns_per_call
+}
+```
+
+It makes some warm-up calls, then it takes samples. Each sample times many calls and gives one value in nanoseconds per call. The report prints the minimum, the median, the 90th percentile and the maximum, and it can write all the samples to a file. For the sum, with 31 samples of 10,000 calls:
+
+```text
+harness_sum        min   297.865  median   314.323  p90   324.231  max   347.798  ns/call  (n=31)
+```
+
+The same work, measured in the same second, moves between 298 and 348 ns. The median, 314 ns, agrees with the 311 ns of the hand-written loop above. But the spread around it is information, not dirt, and most parts of this series are about what is inside it.
+
+The machine is my laptop: an Intel Core i7-1260P with 4 performance cores (two hardware threads each, CPUs 0 to 7) and 8 efficiency cores (CPUs 8 to 15), with Linux 6.6 and the `powersave` governor of the `intel_pstate` driver. It is not a quiet benchmark machine. Other programs run on it while I measure, and I do not hide it. Every result file starts with the state of the machine at that moment. Its first line, cut here, has the load average, 3.20 for the last minute:
+
+```text
+...
+cpu2: governor powersave, scaling_cur_freq 3288160 kHz
+busy CPUs over one second:
+cpu0    5%  cpu1    4%  cpu2    4%  cpu3    2%  cpu4   10%  cpu5    2%  cpu6   91%  cpu7    0%
+cpu8    3%  cpu9    3%  cpu10   3%  cpu11   2%  cpu12   2%  cpu13   1%  cpu14   1%  cpu15   1%
+```
+
+Then come the governor and the current frequency of the CPU I use, and how busy each CPU was during one second. Here CPU 6 was busy with another program, while CPU 2 (mine) and CPU 3 (its sibling, that is the other hardware thread of the same core) were almost idle.
+
+This matters a lot. Twelve minutes before this run, I ran the same command while something else used all 16 CPUs, with a load average of 15.5. The `black_box` loop gave between 1,013 and 1,051 ns per call, more than three times slower. The impossible number was still impossible, of course. I did not like that run, but it is a true number of this laptop, so I kept it in the fixture too. It shows better than any explanation why the state of the machine must stay next to the number.
+
+So the method for the whole series is:
+
+- Pin the benchmark to one known CPU with `taskset` (CPU 2, a performance core, except when the part is about cores).
+- Record the load, the governor and the frequency next to every result.
+- Repeat the runs, show the spread, and claim only a difference that is much bigger than the spread.
+- Keep the raw results. All programs, the harness and a `run.sh` that rebuilds and runs everything are in [the fixture of this series](https://github.com/mehdiakiki/mehdi-cz/tree/main/experiments/when-the-benchmark-lies), and the output quoted here is in [p01-measured-nothing.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/when-the-benchmark-lies/results/p01-measured-nothing.txt). Your numbers will be different. The conclusions should not.
+
+These are the same habits I used when I measured the pages of this site, where the runs alternate between variants and the failed runs are kept. The [site performance lab](/work/site-performance-lab) shows that work.
+
+## The map of the series
+
+Twenty parts, in five groups.
+
+First, the compiler: after the deleted loop of this part, a debug build that measures a different program, and a compiler that computes the answer before the benchmark starts.
+
+Then, time and warm-up: why the first run is slower than the next ones, and why a function in a JIT runtime gets faster after thousands of calls.
+
+Then, the machine itself: my laptop changes its clock speed during a benchmark, and the same code is much slower on an efficiency core.
+
+Then, the statistics: an average that hides the slow requests, a load test that hides its worst latency, which clock to use, how to measure something faster than the clock, how many runs are enough, and why the runs of two versions should be interleaved.
+
+Then, the layout and the hardware: whether environment variables and code alignment can move the speed of the same code, the caches, sorted data and branches, the allocator, and a microbenchmark that won while the real program got slower. And at the end, what a result must contain so that somebody else can check it.
+
+All parts are under the tag [when the benchmark lies](/blog/tags/when-the-benchmark-lies/page/1).
+
+## Before I believe a number
+
+Every part of this series starts from a number that looked fine. This one looked fine too: it was small, and small is what we want from a benchmark. So the first questions are not about statistics:
+
+1. Is the number possible? Multiply by the clock frequency and count the cycles.
+2. Is the work in the machine code? Look at the assembly of the measured loop, at least once.
+3. Are the inputs hidden and is the output used? `black_box` for both in Rust, `volatile` or an empty `asm` statement in C.
+4. Does a correct result prove that the work ran every time? No. The total above was right.
+
+## Sources
+
+- [Rust 1.98.0 standard library: std::hint::black_box](https://doc.rust-lang.org/1.98.0/std/hint/fn.black_box.html)
+- [ISO C 2011, committee draft N1570, section 5.1.2.3: Program execution](https://www.open-std.org/jtc1/sc22/wg14/www/docs/n1570.pdf)
