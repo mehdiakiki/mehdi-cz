@@ -19,15 +19,31 @@ const element = React.createElement;
 const records = [];
 
 function document(title, content) {
-  return "<!doctype html>" + renderToStaticMarkup(
-    element("html", { lang: "en" },
-      element("head", null,
-        element("meta", { charSet: "utf-8" }),
-        element("meta", { name: "robots", content: "noindex, nofollow" }),
-        element("title", null, title),
-        element("style", null, "body{max-width:74ch;margin:2rem auto;padding:0 1rem;font:18px/1.65 system-ui}pre{overflow:auto;padding:1rem;background:#eee;font-size:.85em}a{color:#174ea6}table{border-collapse:collapse}td,th{padding:.4rem;border:1px solid #ccc}")
-      ),
-      element("body", null, element("p", null, "Private first draft; not approved for publication."), content)
+  return (
+    "<!doctype html>" +
+    renderToStaticMarkup(
+      element(
+        "html",
+        { lang: "en" },
+        element(
+          "head",
+          null,
+          element("meta", { charSet: "utf-8" }),
+          element("meta", { name: "robots", content: "noindex, nofollow" }),
+          element("title", null, title),
+          element(
+            "style",
+            null,
+            "body{max-width:74ch;margin:2rem auto;padding:0 1rem;font:18px/1.65 system-ui}pre{overflow:auto;padding:1rem;background:#eee;font-size:.85em}a{color:#174ea6}table{border-collapse:collapse}td,th{padding:.4rem;border:1px solid #ccc}"
+          )
+        ),
+        element(
+          "body",
+          null,
+          element("p", null, "Private first draft; not approved for publication."),
+          content
+        )
+      )
     )
   );
 }
@@ -45,27 +61,53 @@ for (const article of manifest.articles) {
   for (const [, target] of body.matchAll(/href="\/blog\/([^"#?]+)"/g)) {
     assert.ok(publicArticleHref(allBlogs, target), `${article.slug}: unavailable parent ${target}`);
   }
-  const content = element(React.Fragment, null,
+  const content = element(
+    React.Fragment,
+    null,
     element("a", { href: "index.html" }, "All fifty drafts"),
     element("h1", null, post.title),
     element("article", { dangerouslySetInnerHTML: { __html: body } })
   );
   await writeFile(`${output}/${article.slug}.html`, document(post.title, content));
-  records.push({ number: article.number, slug: article.slug, title: post.title, group: article.group });
+  records.push({
+    number: article.number,
+    slug: article.slug,
+    title: post.title,
+    group: article.group,
+  });
 }
 
 assert.equal(records.length, 50);
-const index = element(React.Fragment, null,
+const index = element(
+  React.Fragment,
+  null,
   element("h1", null, "Practical engineering choices: fifty first drafts"),
-  ...manifest.groups.map((group) => element("section", { key: group.id },
-    element("h2", null, group.label),
-    element("ol", { start: group.numbers[0] },
-      ...records.filter((record) => record.group === group.id).map((record) =>
-        element("li", { key: record.slug }, element("a", { href: `${record.slug}.html` }, record.title))
+  ...manifest.groups.map((group) =>
+    element(
+      "section",
+      { key: group.id },
+      element("h2", null, group.label),
+      element(
+        "ol",
+        { start: group.numbers[0] },
+        ...records
+          .filter((record) => record.group === group.id)
+          .map((record) =>
+            element(
+              "li",
+              { key: record.slug },
+              element("a", { href: `${record.slug}.html` }, record.title)
+            )
+          )
       )
     )
-  ))
+  )
 );
 await writeFile(`${output}/index.html`, document(manifest.series_name, index));
-await writeFile(`${output}/index.json`, JSON.stringify({ articles: records, publicRoutes: 0 }, null, 2));
-console.log(`Rendered ${records.length} private drafts; none has a production route or public search entry.`);
+await writeFile(
+  `${output}/index.json`,
+  JSON.stringify({ articles: records, publicRoutes: 0 }, null, 2)
+);
+console.log(
+  `Rendered ${records.length} private drafts; none has a production route or public search entry.`
+);

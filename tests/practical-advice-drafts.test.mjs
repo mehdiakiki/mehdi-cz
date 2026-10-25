@@ -53,10 +53,17 @@ test("time alone cannot release any of the fifty unapproved drafts", async () =>
 
 test("the synthetic evaluation example really improves the total while losing write cases", () => {
   const post = posts.find((item) => item.number === 50);
-  const rows = [...post.content.matchAll(/\| (ordinary lookup|sensitive write|total) \| (\d+) \| (\d+) \| (\d+) \|/g)];
+  const rows = [
+    ...post.content.matchAll(
+      /\|\s*(ordinary lookup|sensitive write|total)\s*\|\s*(\d+)\s*\|\s*(\d+)\s*\|\s*(\d+)\s*\|/g
+    ),
+  ];
   assert.equal(rows.length, 3);
   const values = rows.map((row) => row.slice(2).map(Number));
-  assert.deepEqual(values[2], values[0].map((n, index) => n + values[1][index]));
+  assert.deepEqual(
+    values[2],
+    values[0].map((n, index) => n + values[1][index])
+  );
   assert.ok(values[2][2] > values[2][1]);
   assert.ok(values[1][2] < values[1][1]);
   assert.ok(post.content.includes("synthetic dataset"));
