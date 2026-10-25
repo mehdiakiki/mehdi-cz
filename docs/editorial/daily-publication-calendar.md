@@ -2,7 +2,7 @@
 
 Approved October 25, 2026. These thirty articles are scheduled **one per day at 13:00 UTC**, from **October 25 through November 23, 2026**. The series order is CI and coding agents, practical engineering, then agent security. The already published prompting article is outside this batch.
 
-**Release status: approved and scheduled.** Every listed article has `draft: false`, `reviewed: true`, and an exact review hash for the verified title, summary and body. The author approved removing the publication hold on October 25 after the revisions and GitHub CI verification. Only release metadata changed in this scheduling step.
+**Release status: approved and scheduled.** Every listed article has `draft: false`, `reviewed: true`, and an exact review hash for the verified title, summary and body. The author approved removing the publication hold on October 25 after the revisions and GitHub CI verification. The release check also prompted a wording clarification in the Deno Sandbox checklist, where a technical term matched the unfinished-content detector. Its review hash was updated; the examples and scope are unchanged.
 
 The earlier working dates started October 24. Approval arrived October 25, so the entire batch moved forward one day. This avoids making yesterday's first article and today's second article due together. There are no elapsed or overlapping slots within this batch.
 

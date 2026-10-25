@@ -25,7 +25,8 @@ const posts = await Promise.all(
 );
 const day = 24 * 60 * 60 * 1000;
 const start = Date.parse(`${approval.approved_on}T13:00:00Z`);
-const sitemap = (items) => items.map((post) => `<loc>https://www.mehdi.cz${post.path}</loc>`).join("");
+const sitemap = (items) =>
+  items.map((post) => `<loc>https://www.mehdi.cz${post.path}</loc>`).join("");
 
 test("the approved thirty sources have exact review hashes and one UTC slot per day", () => {
   assert.equal(posts.length, 30);
@@ -65,7 +66,10 @@ test("each daily boundary requests only its newly due article from the real chec
       fetchImpl,
     });
     assert.equal(due.shouldDeploy, true, post.slug);
-    assert.deepEqual(due.missing.map((item) => item.slug), [post.slug]);
+    assert.deepEqual(
+      due.missing.map((item) => item.slug),
+      [post.slug]
+    );
   }
   const complete = await checkLivePublications({
     posts,
