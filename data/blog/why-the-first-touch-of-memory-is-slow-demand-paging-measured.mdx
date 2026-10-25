@@ -1,0 +1,212 @@
+---
+title: "Why the First Touch of Memory Is Slow: Demand Paging Measured"
+date: "2026-10-05T10:35:00+01:00"
+lastmod: "2026-10-05T10:35:00+01:00"
+tags: ["from source to process", "linux", "memory management", "c", "rust"]
+draft: false
+reviewed: true
+reviewedHash: "60263f0d0b5ee446ae3a035de8c3495dc64aa8925739f5c89db9e19e07d252d6"
+cluster: "rust-under-the-hood"
+campaign: "editorial"
+summary: "Mapping 1 GiB takes no time, the first write to each page costs about a microsecond, and the second write 16 nanoseconds. I measured faults with and without huge pages, MAP_POPULATE, calloc and Rust vectors, and twice the compiler removed the work I wanted to measure."
+---
+
+I asked the kernel for 1 GiB of memory, then wrote one byte in each 4 KiB page, two times. Here is what my program printed:
+
+```text
+$ taskset -c 2 ./touch nohugepage
+nohugepage:
+  mmap                              0.0 ms        2 minor faults      0 ns per 4 KiB page
+  first pass                      293.4 ms   262144 minor faults   1119 ns per 4 KiB page
+  (whole system, /proc/vmstat) thp_fault_alloc +0, thp_fault_fallback +0
+  second pass                       4.3 ms        0 minor faults     16 ns per 4 KiB page
+  (whole system, /proc/vmstat) thp_fault_alloc +0, thp_fault_fallback +0
+  Rss:             1050400 kB
+  AnonHugePages:         0 kB
+```
+
+The `mmap` of 1 GiB took no measurable time. The first pass over the memory took 293 milliseconds, with 262,144 minor page faults: 1 GiB divided by 4 KiB is exactly 262,144, so one fault per page. The second pass did the same writes in 4.3 milliseconds, with no fault at all. The first touch of a page cost about 1.1 microseconds, the second one 16 nanoseconds, 70 times less. The laptop was busy with other experiments that evening, some of them on the same core, so the milliseconds move between runs.
+
+So `mmap` did not give me memory yet. It only reserved the addresses, and the memory came later, page by page. In [the first part of this series](/blog/what-happens-when-you-run-a-program-from-execve-to-main) the launcher already counted page faults for each start of a program. Here I want to see one fault from close, and the ways to avoid paying it at the wrong moment.
+
+## What happens at the first write
+
+`mmap` with `MAP_ANONYMOUS` only creates an entry in the list of mappings of the process, the one that `/proc/self/maps` shows (the previous part). No physical memory, no page table entries. When the program writes to an address of this mapping for the first time, the processor finds no page table entry, and raises a page fault. The kernel looks in its mappings, sees that the address is valid, takes a free physical page, fills it with zeros, puts it in the page table, and returns to the program, which repeats the write. This is demand paging: memory is given when it is used, not when it is asked.
+
+The fault is "minor" because no disk was needed (a major fault would read data from a file or from swap). And it is expensive because of everything around it: entering the kernel, finding and zeroing a page, updating the page table, coming back. About 1.1 microseconds on this laptop, while the write itself is a few nanoseconds.
+
+The program counts faults with `getrusage`, so the numbers are only about my process. The timing loop is simple:
+
+```c
+static void touch(const char *label, volatile char *p)
+{
+    long alloc0 = vmstat("thp_fault_alloc"), fallback0 = vmstat("thp_fault_fallback");
+    long f0 = minor_faults();
+    double t0 = now();
+    for (size_t i = 0; i < SIZE; i += PAGE)
+        p[i] = 1;
+    report(label, now() - t0, minor_faults() - f0);
+```
+
+## Huge pages: always, but not really
+
+This machine has transparent huge pages set to `always`. If the kernel would use 2 MiB pages, 1 GiB would need only 512 faults instead of 262,144. The run above used `madvise(MADV_NOHUGEPAGE)` to forbid them. Here is the default, without any madvise:
+
+```text
+$ taskset -c 2 ./touch default
+default:
+  mmap                              0.0 ms        2 minor faults      0 ns per 4 KiB page
+  first pass                      325.1 ms   261633 minor faults   1240 ns per 4 KiB page
+  (whole system, /proc/vmstat) thp_fault_alloc +1, thp_fault_fallback +510
+  second pass                       4.3 ms        0 minor faults     16 ns per 4 KiB page
+  (whole system, /proc/vmstat) thp_fault_alloc +0, thp_fault_fallback +0
+  Rss:             1050332 kB
+  AnonHugePages:      2048 kB
+```
+
+261,633 faults, almost the same. `AnonHugePages` says that only 2048 kB, one huge page, was used. The counters of `/proc/vmstat` explain why. The kernel documentation says that `thp_fault_alloc` grows when a huge page is allocated for a fault, and `thp_fault_fallback` when the kernel "fails to allocate or charge a huge page and instead falls back to using small pages". During my first pass, the first one grew by 1 and the second by 510. (These counters are for the whole system, but together they make 511, about one attempt for each 2 MiB region of my 1 GiB, so I think they are mine.) The arithmetic agrees too: 262,144 minus 511 faults that one huge page saved is 261,633.
+
+So the kernel tried a huge page for 511 regions, almost all the 512 of my mapping, and failed 510 times. Why? A huge page needs 512 free physical pages in a row, aligned. The memory of this laptop was busy and fragmented when I measured:
+
+```text
+$ grep -E 'MemFree|MemAvailable|SwapFree' /proc/meminfo
+MemFree:         5423560 kB
+MemAvailable:   13478500 kB
+SwapFree:            224 kB
+$ cat /proc/buddyinfo   (free blocks of 2^0 .. 2^10 pages)
+Node 0, zone      DMA      0      0      0      0      0      0      0      0      1      1      2 
+Node 0, zone    DMA32    591    343    588    924    375    261    115     53     30      2     15 
+Node 0, zone   Normal 145148  43423  24362  25206  13602   7073   2935    757    112      2      0 
+```
+
+`/proc/buddyinfo` counts the free blocks by size: the first column is single pages, the tenth column (2 to the 9, 512 pages) is blocks of 2 MiB. The big `Normal` zone had 145,148 free single pages but only 2 free blocks of 2 MiB. More than 5 GB free, almost none of it in one piece. And the `defrag` setting of this machine is `madvise`: the kernel documentation says that the direct reclaim of `always` is then used only for regions marked with madvise(MADV_HUGEPAGE). So, for my normal mapping, the kernel did not try hard. It looked for a free 2 MiB block, found almost none, and used small pages.
+
+What if I ask with `MADV_HUGEPAGE`?
+
+```text
+$ taskset -c 2 ./touch hugepage
+hugepage:
+  mmap                              0.0 ms        2 minor faults      0 ns per 4 KiB page
+  first pass                     1715.9 ms   236594 minor faults   6546 ns per 4 KiB page
+  (whole system, /proc/vmstat) thp_fault_alloc +50, thp_fault_fallback +476
+  second pass                       3.4 ms        0 minor faults     13 ns per 4 KiB page
+  (whole system, /proc/vmstat) thp_fault_alloc +0, thp_fault_fallback +0
+  Rss:             1050396 kB
+  AnonHugePages:    102400 kB
+```
+
+This one surprised me the most. With madvise the kernel may reclaim and compact memory to build free 2 MiB blocks, says the documentation, and here it got 50 huge pages, 100 MiB. And the first pass took 1.7 seconds, more than five times slower than with small pages. On a fragmented machine, asking for huge pages made the first touch much more expensive. The second pass was a little faster, 3.4 ms against 4.3, but only 100 MiB of the 1 GiB were huge pages, and in my runs this pass moved between 3.2 and 4.3 ms also without any huge page. So this test says nothing about what huge pages give later: fewer misses in the TLB, the small cache of the processor for page table entries.
+
+In [another full run](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/from-source-to-process/results/p13-c-run2.txt) of the fixture later the same evening, the kernel did not find even one huge page, also with MADV_HUGEPAGE, and that first pass still took 1.6 seconds. So the number of huge pages depends on the state of the memory at that moment, and the slow part is the attempt to get them.
+
+## Paying in advance: MAP_POPULATE
+
+If the faults are unavoidable, at least I can choose when to pay them. `MAP_POPULATE` asks `mmap` to prepare all the pages immediately:
+
+```text
+$ taskset -c 2 ./touch populate
+populate:
+  mmap                            180.9 ms   237618 minor faults    690 ns per 4 KiB page
+  first pass                        4.2 ms        0 minor faults     16 ns per 4 KiB page
+  (whole system, /proc/vmstat) thp_fault_alloc +0, thp_fault_fallback +0
+  second pass                       4.4 ms        0 minor faults     17 ns per 4 KiB page
+  (whole system, /proc/vmstat) thp_fault_alloc +0, thp_fault_fallback +0
+  Rss:             1050396 kB
+  AnonHugePages:     98304 kB
+```
+
+Now `mmap` takes 181 ms, and both passes are fast. So the cost moved to the place where I asked for it. The faults are counted inside `mmap`, but they cost 690 ns per page instead of 1.1 microseconds: the kernel fills the pages in one loop, without leaving to user space and coming back for each one. This is good for a program that knows it will use all the memory, and wants the cost at startup instead of in the middle of a request. It is bad for a program that maps a lot and uses little, because it pays for everything.
+
+(This run got 48 huge pages without asking. I think the earlier runs had just freed 2 MiB blocks when they exited, but I did not check it, so take it as a guess.)
+
+## malloc plus memset, and calloc
+
+For memory from malloc, the difference is between writing zeros yourself and asking for zeroed memory:
+
+```text
+$ taskset -c 2 ./touch malloc-memset
+malloc-memset:
+  allocation                      358.8 ms   237108 minor faults   1369 ns per 4 KiB page
+...
+$ taskset -c 2 ./touch calloc
+calloc:
+  allocation                        0.0 ms        3 minor faults      0 ns per 4 KiB page
+  first pass                      300.0 ms   239148 minor faults   1144 ns per 4 KiB page
+```
+
+`malloc` of 1 GiB is an `mmap` inside glibc, and the `memset` then touches every page: 359 ms, all the faults, and the kernel and my program both write zeros to the same pages. `calloc` returns in no time and touches nothing. glibc knows that a fresh mapping is already zero, so it does not clear it again, and the faults come later, at the first real use.
+
+My first version of this test printed 0.0 ms for malloc plus memset too. The reason was the compiler: my program never reads the zeros, so gcc removed the `memset` completely. The proof is that the binary does not even import the function:
+
+```text
+$ the same program with memset(p, 0, SIZE) called directly (touch_direct.c)
+74:    if (strcmp(mode, "malloc-memset") == 0 || strcmp(mode, "calloc") == 0) {
+81:            memset(p, 0, SIZE);
+$ nm -D touch_direct | grep -c memset
+0
+```
+
+Line 81 calls `memset`, and the file has no reference to `memset`. The measured version calls it through a `volatile` function pointer, so the compiler cannot know what it calls. The benchmark series has a part about exactly this kind of problem, [When the Compiler Computes the Answer Before the Benchmark Runs](/blog/when-the-compiler-computes-the-answer-before-the-benchmark-runs), and its part [Why the First Run Is Slower](/blog/why-the-first-run-is-slower) found page faults in the first iteration of a loop.
+
+## The same in Rust
+
+In Rust, `vec![0u8; n]` and `Vec::with_capacity(n)` followed by `resize(n, 0)` look different, so I compared them, and a third version that fills with 1:
+
+```text
+$ taskset -c 2 ./vec_touch vec-macro
+vec-macro:
+  create the vector                 0.0 ms        3 minor faults
+  write one byte per page         272.7 ms   239148 minor faults
+  sum of one byte per page     262144
+$ taskset -c 2 ./vec_touch resize-zero
+resize-zero:
+  create the vector                 0.0 ms        3 minor faults
+  write one byte per page         320.9 ms   238126 minor faults
+  sum of one byte per page     262144
+$ taskset -c 2 ./vec_touch resize-one
+resize-one:
+  create the vector               437.8 ms   238130 minor faults
+  write one byte per page           3.6 ms        0 minor faults
+  sum of one byte per page     262144
+```
+
+The two zero versions cost nothing at creation, and the faults come with the first writes. Only the version with 1 pays everything at creation. The functions that `main` calls through the GOT, named with a small script, show why:
+
+```text
+$ python3 gotcalls.py vec_touch vec_touch::main
+...
+  calls __rustc::__rust_alloc
+  calls memset
+  calls __rustc::__rust_alloc_zeroed
+...
+```
+
+The function calls `__rust_alloc_zeroed`, and `__rust_alloc` followed by `memset`, nothing else that allocates. The timings say which branch uses which: LLVM turned my `with_capacity` plus `resize(n, 0)` into a zeroed allocation, the same one as `vec![0u8; n]`, and only the fill with 1 needs `memset`. The allocation counter from the part about LD_PRELOAD confirms that the zeroed allocation reaches libc's `calloc`:
+
+```text
+$ LD_PRELOAD=./libcount.so ./vec_touch vec-macro | grep libcount
+[libcount] malloc 13, calloc 2, realloc 19, free 16, early allocations 0
+$ LD_PRELOAD=./libcount.so ./vec_touch resize-zero | grep libcount
+[libcount] malloc 13, calloc 2, realloc 19, free 16, early allocations 0
+$ LD_PRELOAD=./libcount.so ./vec_touch resize-one | grep libcount
+[libcount] malloc 14, calloc 1, realloc 19, free 16, early allocations 0
+```
+
+One `calloc` more for the two zero versions, one `malloc` more for the version with 1.
+
+## A few rules for the first touch
+
+- Asking for memory is cheap, using it the first time is not: about a microsecond per 4 KiB page here.
+- If a program will use the memory anyway, `MAP_POPULATE` (or touching it early) moves the cost to a moment you choose, and makes it cheaper per page.
+- For zeroed memory, ask for zeroed memory: `calloc` in C, `vec![0; n]` in Rust. Writing the zeros yourself makes the kernel and the program do the same work twice.
+- "Transparent huge pages: always" is not a promise. On a busy machine I got 1 huge page out of 512 possible, and forcing them made the first touch five times slower.
+- And when a measurement says 0.0 ms, check first that the work is still in the binary.
+
+## References
+
+- The kernel documentation of transparent huge pages, the `defrag` setting and the `thp_` counters: https://docs.kernel.org/admin-guide/mm/transhuge.html
+- mmap(2), `MAP_POPULATE`: https://man7.org/linux/man-pages/man2/mmap.2.html
+- madvise(2), `MADV_HUGEPAGE` and `MADV_NOHUGEPAGE`: https://man7.org/linux/man-pages/man2/madvise.2.html
+- getrusage(2), minor and major faults: https://man7.org/linux/man-pages/man2/getrusage.2.html
+- The kernel documentation of /proc, `buddyinfo` and `AnonHugePages`: https://docs.kernel.org/filesystems/proc.html
+- The programs and the saved outputs of this part: https://github.com/mehdiakiki/mehdi-cz/tree/main/experiments/from-source-to-process/p13

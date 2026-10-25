@@ -1,0 +1,135 @@
+---
+title: "What fork Really Copies: Copy-on-Write Measured"
+date: "2026-10-07T07:40:00+01:00"
+lastmod: "2026-10-07T07:40:00+01:00"
+tags: ["from source to process", "linux", "memory management", "c", "performance"]
+draft: false
+reviewed: true
+reviewedHash: "d7f0e406529332d8fcc040ffcb0659a6fe0f683ca34a750cbbfabccb57ec78a7"
+cluster: "rust-under-the-hood"
+campaign: "editorial"
+summary: "fork of a process with 2 GiB of touched memory took 16 ms here, because it copies page tables and not memory. I measured the copies that come later when the child writes, what reading costs, what happens to huge pages, and why posix_spawn stays under a millisecond."
+---
+
+The usual sentence about fork is: it creates a copy of the process. Right? If fork really copied 2 GiB of memory, it would take a long time: the first touch of 1 GiB took about 300 ms in [the previous part](/blog/why-the-first-touch-of-memory-is-slow-demand-paging-measured). So I measured fork in a parent that has touched 0 MiB, 1 MiB, and up to 2 GiB of memory. Each line is the median of 11 forks, and the child exits at once. The laptop was busy with other experiments, so the times move from run to run:
+
+```text
+$ taskset -c 2 ./forktime 0
+    0 MiB touched: fork() median    0.05 ms (min   0.04, max   0.07)   posix_spawn() median  0.15 ms
+$ taskset -c 2 ./forktime 1
+    1 MiB touched: fork() median    0.06 ms (min   0.05, max   0.10)   posix_spawn() median  0.10 ms
+$ taskset -c 2 ./forktime 16
+   16 MiB touched: fork() median    0.23 ms (min   0.19, max   0.51)   posix_spawn() median  0.58 ms
+$ taskset -c 2 ./forktime 64
+   64 MiB touched: fork() median    0.52 ms (min   0.39, max   1.67)   posix_spawn() median  0.55 ms
+$ taskset -c 2 ./forktime 256
+  256 MiB touched: fork() median    1.83 ms (min   1.58, max   3.35)   posix_spawn() median  0.47 ms
+$ taskset -c 2 ./forktime 1024
+ 1024 MiB touched: fork() median    9.34 ms (min   7.31, max  11.47)   posix_spawn() median  0.56 ms
+$ taskset -c 2 ./forktime 2048
+ 2048 MiB touched: fork() median   16.00 ms (min  15.78, max  21.97)   posix_spawn() median  0.61 ms
+```
+
+16 milliseconds for 2 GiB. For a real copy of 2 GiB this is too fast, but it is also too slow for a fork that copies nothing. And it grows with the memory: about 8 to 9 milliseconds per GiB. So what is fork copying?
+
+## Page tables, not pages
+
+The fork(2) man page says it in its notes: "Under Linux, fork() is implemented using copy-on-write pages, so the only penalty that it incurs is the time and memory required to duplicate the parent's page tables, and to create a unique task structure for the child."
+
+A page table entry describes one 4 KiB page of the process: where it is in physical memory, and its permissions. 1 GiB of touched memory is 262,144 pages, so 262,144 entries of 8 bytes, 2 MiB of page tables. fork copies these entries into the child, and marks the pages read-only in both processes. The physical pages themselves are not copied. Both processes now point to the same memory.
+
+This is why the curve follows the touched memory: an untouched page has no entry, so nothing to copy. In [the first part of this series](/blog/what-happens-when-you-run-a-program-from-execve-to-main), the launcher measured whole program starts with `posix_spawn`, here only fork in a parent that I made bigger and bigger. For a small process, fork is 50 microseconds. For a big one, it is a pause of the parent that grows with every gigabyte. The Redis documentation describes this effect for its snapshots, which fork the server: "fork() can be time consuming if the dataset is big, and may result in Redis stopping serving clients for some milliseconds or even for one second if the dataset is very big and the CPU performance is not great".
+
+## The child reads: nothing happens
+
+The second program forks and lets the child read one byte of every page. Before and after, it prints the memory of both processes from `smaps_rollup`:
+
+```text
+$ taskset -c 2 ./cow 1024 read nohuge
+1024 MiB, child read, MADV_NOHUGEPAGE:
+    parent Rss:             1050396 kB
+    parent Pss:             1048702 kB
+    parent AnonHugePages:         0 kB
+  child read      74.3 ms        3 minor faults (sum 262144)
+  fork() in the parent     10.91 ms
+    parent Rss:             1050524 kB
+    parent Pss:              524374 kB
+    parent AnonHugePages:         0 kB
+    child  Rss:             1050056 kB
+    child  Pss:              524372 kB
+    child  AnonHugePages:         0 kB
+  posix_spawn() returned     0.23 ms
+```
+
+The child read the whole GiB (the sum, 262,144, is one byte of value 1 per page) with only 3 page faults. The page table entries are there and readable, so a read needs no help from the kernel.
+
+Look at the memory after the read. Both processes have an Rss of about 1 GiB: each one sees the whole GiB as its own. But the Pss of each is 524 MB, half. Pss divides every page by the number of processes that share it, and these pages are shared by two. So the two processes together use 1 GiB of RAM, not 2. Here the copy-on-write sharing is visible in the numbers. (The `MADV_NOHUGEPAGE` in the title of the run means that I forbid huge pages in this memory, I come back to them below.)
+
+## The child writes: now the copies come
+
+The same with writes:
+
+```text
+$ taskset -c 2 ./cow 1024 write nohuge
+1024 MiB, child write, MADV_NOHUGEPAGE:
+    parent Rss:             1050268 kB
+    parent Pss:             1048698 kB
+    parent AnonHugePages:         0 kB
+  child write    370.9 ms   262147 minor faults (sum 0)
+  fork() in the parent     12.86 ms
+    parent Rss:             1050396 kB
+    parent Pss:             1048660 kB
+    parent AnonHugePages:         0 kB
+    child  Rss:             1049988 kB
+    child  Pss:             1048658 kB
+    child  AnonHugePages:         0 kB
+  posix_spawn() returned     0.16 ms
+```
+
+262,147 minor faults, one per page. Each write hits a page that fork made read-only. The kernel takes the fault, sees that the page is shared because of fork, allocates a new page, copies the 4 KiB, gives the copy to the child with write permission, and the write continues. 371 ms for the GiB, about 1.4 microseconds per page. In the previous part a fresh page cost about 1.1 microseconds, so the copy of 4 KiB adds roughly 0.3.
+
+After the writes, the Pss of both processes is back to about 1 GiB each: the memory really doubled now. So copy-on-write does not remove the copy. It moves it from fork to the first write, page by page, and only for the pages that are written. The parent's pages are read-only too after the fork, so its writes would fault in the same way while the child is alive. I measured only the child.
+
+With 256 MiB the numbers scale: 65,539 faults and 105 ms for the writes, and 4.16 ms for this fork (the median above was 1.83 ms, single forks move a lot).
+
+## And the huge pages?
+
+This machine has transparent huge pages on. The previous part showed that the kernel often cannot find free 2 MiB blocks here, but with `MADV_HUGEPAGE` the parent got some:
+
+```text
+$ taskset -c 2 ./cow 256 write huge
+256 MiB, child write, MADV_HUGEPAGE:
+    parent Rss:              263896 kB
+    parent Pss:              262269 kB
+    parent AnonHugePages:     51200 kB
+  child write     97.9 ms    65539 minor faults (sum 0)
+  fork() in the parent      2.93 ms
+    parent Rss:              263960 kB
+    parent Pss:              262229 kB
+    parent AnonHugePages:     51200 kB
+    child  Rss:              263436 kB
+    child  Pss:              262227 kB
+    child  AnonHugePages:         0 kB
+  posix_spawn() returned     0.17 ms
+```
+
+The parent had 51,200 kB in huge pages, 25 of them. If a write to a shared huge page copied all 2 MiB, the child would need far fewer faults (25 faults instead of 12,800 for that part) and would own huge pages afterwards. The numbers say the opposite, and this one surprised me: the child had exactly the same 65,539 faults as without huge pages, and 0 kB of huge pages at the end, while the parent kept its 25. So on this kernel, a write in the child to a shared huge page ended as a copy of one 4 KiB page, like everywhere else, and the child's part of that memory became small pages. This is on purpose: since the kernel commit "thp: change CoW semantics for anon-THP" (2020), the kernel splits the mapping of the huge page at such a write, like for huge pages of files, and the commit message names Redis as one reason.
+
+## posix_spawn does not care
+
+The last line of every run is `posix_spawn`, which starts `/bin/true` from the same big parent. It stays under one millisecond for every size, 0.61 ms with 2 GiB, against 16 ms for fork. The posix_spawn(3) man page explains why: "Since glibc 2.24, the posix_spawn() function commences by calling clone(2) with CLONE_VM and CLONE_VFORK flags." `CLONE_VM` means that the child shares the memory of the parent instead of getting copied page tables, and `CLONE_VFORK` stops the parent until the child calls `execve`, which gives the child its own new memory. Nothing of the 2 GiB is copied or protected.
+
+In `forktime`, posix_spawn took about 0.1 ms for the parents with 0 and 1 MiB, and about 0.5 ms for all the bigger ones, in [two full runs](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/from-source-to-process/results/p14-forktime-run2.txt), while in `cow` it stayed near 0.2 ms. I cannot explain this step from what I measured.
+
+## When to fork
+
+To start another program I would use `posix_spawn`, or `vfork` and `exec`: a big process that calls fork pays the page tables for nothing, because `exec` throws them away right after. As a snapshot, like for Redis, fork is cheap at the start, a few milliseconds per GiB, and the copies come later with the writes. The bad case is a big process that forks and continues to write everywhere: it pays the page tables, then a fault and a copy for every page, and it can need twice the memory.
+
+## References
+
+- fork(2), the note about copy-on-write and page tables: https://man7.org/linux/man-pages/man2/fork.2.html
+- posix_spawn(3), `CLONE_VM` and `CLONE_VFORK` in glibc: https://man7.org/linux/man-pages/man3/posix_spawn.3.html
+- The kernel documentation of /proc, Pss and `AnonHugePages`: https://docs.kernel.org/filesystems/proc.html
+- Redis persistence, how RDB snapshots use fork and copy-on-write: https://redis.io/docs/latest/operate/oss_and_stack/management/persistence/
+- The Linux commit "thp: change CoW semantics for anon-THP": https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=3917c80280c93a7123f1a3a6dcdb10a3ea19737d
+- The programs and the saved outputs of this part: https://github.com/mehdiakiki/mehdi-cz/tree/main/experiments/from-source-to-process/p14

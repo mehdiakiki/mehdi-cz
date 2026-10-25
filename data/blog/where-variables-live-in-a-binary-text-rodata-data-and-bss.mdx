@@ -1,0 +1,249 @@
+---
+title: "Where Your Variables Live in a Binary: .text, .rodata, .data and .bss"
+date: "2026-09-03T19:45:00+01:00"
+lastmod: "2026-09-03T19:45:00+01:00"
+tags: ["from source to process", "c", "rust", "memory layout", "linker"]
+draft: false
+reviewed: true
+reviewedHash: "b577e399b3189c5d95582793d055f8514129ae7349e8527929eaa118ebfa2b4a"
+cluster: "rust-under-the-hood"
+campaign: "editorial"
+summary: "I printed the address of every kind of variable in a C program and a Rust program and matched them with nm and readelf. A 16 MiB array of zeros costs nothing in the file, the same array with one byte set to 1 costs 16 MiB, and a Rust const has no address at all."
+---
+
+The first version of this experiment printed a strange result. I declared a 16 MiB array, `static char buffer[16 * 1024 * 1024]`, once full of zeros and once with the first byte set to 1. I wanted to show that the second file is 16 MiB bigger. Both files had the same size:
+
+```text
+$ the file with 'static char buffer', built with FIRST=0 and with FIRST=1
+$ wc -c buffer_static buffer_static1
+15904 buffer_static
+15904 buffer_static1
+31808 total
+```
+
+So I looked with nm, and the array was not in the file at all:
+
+```text
+$ the same file with 'static char buffer', FIRST=0
+$ nm buffer_static | grep -c buffer
+0
+```
+
+gcc can see that the array is `static`, that nobody writes into it and that the program reads only its first byte. So it replaced that read by the constant and deleted the array. OK, fair. When I removed `static`, the array came back, and the real experiment could start. I keep this first failure here because it says something true: writing a variable in the source does not mean that it exists in the binary. The compiler decides if it exists in the binary, and in which place.
+
+In [the first part of this series](/blog/what-happens-when-you-run-a-program-from-execve-to-main) the kernel and the loader mapped the segments of a program into memory, and [the second part](/blog/what-is-inside-an-executable-file-elf-headers-segments-and-sections) showed the sections inside these segments. Now I want to see where each kind of variable lands.
+
+## Nine variables in C
+
+The program has one variable of each kind, and it prints their addresses:
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+
+extern char __executable_start;
+
+int counter = 42;
+int zeroed;
+const int limit = 100;
+const char *greeting = "hello";
+const char *const motto = "fixed";
+static int hidden = 7;
+
+static void show(const char *name, const void *p)
+{
+    printf("%-22s %14p  offset 0x%lx\n", name, p, (unsigned long)((const char *)p - &__executable_start));
+}
+
+int main(void)
+{
+    static int calls;
+    static int seeded = 5;
+    int local = 1;
+    int *heap = malloc(sizeof *heap);
+
+    calls++;
+    show("main (code)", (const void *)main);
+    show("counter = 42", &counter);
+    show("zeroed", &zeroed);
+    show("limit (const)", &limit);
+    show("greeting (pointer)", &greeting);
+    show("\"hello\" (the bytes)", greeting);
+    show("motto (const pointer)", &motto);
+    show("hidden (static)", &hidden);
+    show("calls (static local)", &calls);
+    show("seeded (static local)", &seeded);
+    printf("%-22s %14p\n", "local", (void *)&local);
+    printf("%-22s %14p\n", "heap (malloc)", (void *)heap);
+    free(heap);
+    return 0;
+}
+```
+
+The program is a PIE, so its addresses change at every run. To compare them with the file, I subtract `__executable_start`, a symbol that the linker puts at the very beginning of the program. The result is the offset inside the program, the same number that nm prints. Here is one run, then nm, then the sections:
+
+```text
+$ ./places
+main (code)            0x55b272167070  offset 0x1070
+counter = 42           0x55b27216a038  offset 0x4038
+zeroed                 0x55b27216a04c  offset 0x404c
+limit (const)          0x55b2721680f0  offset 0x20f0
+greeting (pointer)     0x55b27216a040  offset 0x4040
+"hello" (the bytes)    0x55b2721680ea  offset 0x20ea
+motto (const pointer)  0x55b272169dd8  offset 0x3dd8
+hidden (static)        0x55b27216a034  offset 0x4034
+calls (static local)   0x55b27216a050  offset 0x4050
+seeded (static local)  0x55b27216a030  offset 0x4030
+local                  0x7fff50721184
+heap (malloc)          0x55b276bf1010
+$ nm -n places (the variables of the program)
+0000000000001070 T main
+00000000000020f0 R limit
+0000000000003dd8 D motto
+0000000000004030 d seeded.0
+0000000000004034 d hidden
+0000000000004038 D counter
+0000000000004040 D greeting
+000000000000404c B zeroed
+0000000000004050 b calls.1
+$ readelf -SW places (the sections they are in)
+  [12] .text             PROGBITS        0000000000001070 001070 000309 00  AX  0   0 16
+  [14] .rodata           PROGBITS        0000000000002000 002000 0000f4 00   A  0   0  4
+  [21] .data.rel.ro      PROGBITS        0000000000003dd8 002dd8 000008 00  WA  0   0  8
+  [25] .data             PROGBITS        0000000000004020 003020 000028 00  WA  0   0  8
+  [26] .bss              NOBITS          0000000000004048 003048 000010 00  WA  0   0  4
+```
+
+Every offset that the program printed is exactly the address in nm. So I can read each variable in the three outputs at the same time. The letter in nm is the kind of section: T for text, R for read-only data, D for initialized data, B for bss. Lowercase means a local symbol, that is a name the linker does not export to other files.
+
+- `main` is at 0x1070, the start of `.text`, the code.
+- `counter = 42` is in `.data` (D). Its 4 bytes with the value 42 are stored in the file.
+- `zeroed` is in `.bss` (B), and `.bss` has the type NOBITS. It has a size but no bytes in the file.
+- `limit` is a global `const`, so it goes to `.rodata` (R). Writing to it would crash, because these pages are read-only.
+- `hidden`, `seeded` and `calls` are `static`, so they have lowercase letters. The two static locals got a number in their name, `seeded.0` and `calls.1`, because two functions could have a static local with the same name. Inside the binary they are normal global variables: the only difference with `counter` is who can see the name.
+- `local` is not in the file at all. Its address starts with 0x7fff, that is the stack, which exists only while the function runs.
+- The heap block has an address in the same range as the program, a bit higher, in the area that malloc gets from the kernel. A later part looks at that.
+
+Now the most interesting two. `greeting` is a pointer to a string literal. The pointer is in `.data`, at 0x4040, because my code is allowed to change it. The bytes of "hello" are somewhere else, at 0x20ea in `.rodata`, and they have no name in nm. `motto` is declared `const char *const`, so the pointer itself cannot change. My first guess was `.rodata`, but it is in another section, `.data.rel.ro`, at 0x3dd8.
+
+Why? The value of `motto` is an address, and in a PIE the address of "fixed" is not known before the program is loaded. So the loader must write the pointer at startup, and only then the page can become read-only. This is exactly the `GNU_RELRO` region from the second part. A value that is constant but contains an address needs a hole that the loader fills. The part after next is about these holes.
+
+## Zeros cost nothing, one byte costs 16 MiB
+
+Back to the array, now without `static`. The only difference between the two builds is one character:
+
+```c
+#include <stdio.h>
+
+char buffer[16 * 1024 * 1024] = {FIRST};
+
+int main(void)
+{
+    printf("first byte %d, size %zu\n", buffer[0], sizeof buffer);
+    return 0;
+}
+```
+
+```text
+$ gcc -O2 -DFIRST=0 buffer.c -o buffer0
+$ gcc -O2 -DFIRST=1 buffer.c -o buffer1
+$ ./buffer0; ./buffer1
+first byte 0, size 16777216
+first byte 1, size 16777216
+$ wc -c buffer0 buffer1
+   15928 buffer0
+16793184 buffer1
+16809112 total
+$ size buffer0 buffer1
+   text	   data	    bss	    dec	    hex	filename
+   1327	    584	16777248	16779159	1000797	buffer0
+   1327	16777816	      8	16779151	100078f	buffer1
+```
+
+With `{0}` the array goes to `.bss`, and the file stays at 15,928 bytes. With `{1}` the array goes to `.data`, and the file becomes 16,793,184 bytes: 16,777,216 bytes for the array (one byte 1 and all the other zeros), plus the normal program. The GCC manual says that putting variables initialized to zero in BSS is the default, `-fzero-initialized-in-bss`.
+
+The segments show how the loader handles both cases:
+
+```text
+$ readelf -lW buffer0 | grep LOAD | tail -n 1
+  LOAD           0x002dd0 0x0000000000003dd0 0x0000000000003dd0 0x000248 0x1000270 RW  0x1000
+$ readelf -lW buffer1 | grep LOAD | tail -n 1
+  LOAD           0x002dd0 0x0000000000003dd0 0x0000000000003dd0 0x1000270 0x1000278 RW  0x1000
+```
+
+For `buffer0`, the writable segment has 0x248 bytes in the file (`FileSiz`) and 0x1000270 bytes in memory (`MemSiz`). The difference is the array. The kernel, which maps the program itself as we saw in the first part, maps the 0x248 bytes from the file and gives zeroed memory for the rest. For `buffer1`, everything comes from the file.
+
+So the cost of `.data` is file size and reading from the disk, and the cost of `.bss` is only some numbers in a header. A big table that starts at zero should stay at zero in the source. One non-zero initializer moves the whole table into the file.
+
+## The same questions in Rust
+
+Rust has no `const` variables in the C sense, but it has `static`, `static mut`, atomics and `const`:
+
+```rust
+use std::sync::atomic::{AtomicU32, Ordering};
+
+static COUNTER: AtomicU32 = AtomicU32::new(42);
+static ZEROED: AtomicU32 = AtomicU32::new(0);
+static LIMIT: u32 = 100;
+static GREETING: &str = "hello from a static";
+static mut RAW: u32 = 3;
+const MAX: u32 = 7;
+```
+
+(The full program prints the addresses like the C version, also with `__executable_start`, which LLD defines too.)
+
+```text
+$ ./statics
+COUNTER (AtomicU32 42)   0x558b1d8ef774  offset 0x57774
+ZEROED (AtomicU32 0)     0x558b1d8f013c  offset 0x5813c
+LIMIT (u32 100)          0x558b1d89e7ec  offset 0x67ec
+GREETING (the &str)      0x558b1d8ec028  offset 0x54028
+GREETING (the bytes)     0x558b1d89e7f0  offset 0x67f0
+RAW (static mut)         0x558b1d8ef770  offset 0x57770
+MAX = 7
+$ nm -C -n statics | grep statics::
+00000000000067ec r statics::LIMIT
+00000000000150f0 t statics::main
+0000000000054028 d statics::GREETING
+0000000000057770 d statics::RAW
+0000000000057774 d statics::COUNTER
+000000000005813c b statics::ZEROED
+$ readelf -SW statics (the sections they are in)
+  [11] .rodata           PROGBITS        0000000000004f30 004f30 005878 00 AMS  0   0 16
+  [15] .text             PROGBITS        0000000000014fc0 013fc0 03dfa3 00  AX  0   0 16
+  [23] .data.rel.ro      PROGBITS        0000000000053ff8 051ff8 001cb0 00  WA  0   0  8
+  [29] .data             PROGBITS        0000000000057768 054768 0009d0 00  WA  0   0  8
+  [30] .bss              NOBITS          0000000000058138 055138 0000ca 00  WA  0   0  8
+```
+
+All the symbols are lowercase: a Rust static is private to its crate, so the linker gets it as a local symbol. The rest follows the same rules as C, with one difference that was new for me.
+
+- `LIMIT` is an immutable static of a plain `u32`, so it is in `.rodata`.
+- `COUNTER` is also declared without `mut`, but it is in `.data`. An atomic can change through a shared reference (interior mutability), so its memory must be writable. The Rust Reference says that only statics without interior mutability "may be placed in read-only memory". The compiler uses the type, not the keyword `mut`, to choose the section.
+- `ZEROED` starts at zero, so `.bss`, like in C.
+- `RAW`, the `static mut`, is in `.data`.
+- `GREETING` is a `&str`, a pointer and a length, 16 bytes. It is immutable but contains an address, so it goes to `.data.rel.ro`, the same place as `motto` in C. Its bytes are in `.rodata` at 0x67f0, just after `LIMIT`. The article [Where a Rust String Literal Actually Lives](/blog/rust-string-literal-under-the-hood) explains this pointer and length pair in more detail.
+
+And `MAX`? nm does not know it:
+
+```text
+$ nm -C statics | grep -c MAX
+0
+$ objdump -d statics, inside statics::main, the instruction with 7
+   1539f:	movl   $0x7,0x8(%rsp)
+```
+
+A `const` is not a place in memory. It is a value that the compiler copies wherever it is used. Here the 7 is inside the instruction itself, as an immediate, and the instruction stores it on the stack because my program passes it to `black_box`. A `#define` in C works the same way, the preprocessor replaces it by the value before the compiler even starts.
+
+## What decides the place
+
+After these two programs, my rule is simple. The file contains only what is known before the program runs and is not zero. Code goes to `.text`. Values that never change go to `.rodata`, except when they contain an address, then they go to `.data.rel.ro` and the loader fixes them first. Values that can change go to `.data` if they start with something, and to `.bss` if they start at zero. Locals and heap blocks are not in the file at all.
+
+The keyword in the source is only the starting point. `static` in C changed the visibility of a name, and once it even deleted my array. The absence of `mut` in Rust did not make `COUNTER` read-only. If the place matters, for the size of the file or for a crash on write, nm and `readelf -S` give the answer in a few seconds.
+
+## Sources
+
+- nm(1), the meaning of the symbol letters: https://man7.org/linux/man-pages/man1/nm.1.html
+- GCC manual, `-fzero-initialized-in-bss`: https://gcc.gnu.org/onlinedocs/gcc/Optimize-Options.html
+- The Rust Reference, static items and read-only memory: https://github.com/rust-lang/reference/blob/master/src/items/static-items.md
+- Programs and outputs: https://github.com/mehdiakiki/mehdi-cz/tree/main/experiments/from-source-to-process

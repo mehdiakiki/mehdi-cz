@@ -1,0 +1,257 @@
+---
+title: "How a Stack Overflow Is Detected: Guard Pages and Signals"
+date: "2026-10-17T14:10:00+01:00"
+lastmod: "2026-10-17T14:10:00+01:00"
+tags: ["from source to process", "linux", "memory management", "c", "rust"]
+draft: false
+reviewed: true
+reviewedHash: "86b80aef1e81c73d62834e71344ee36b0aaf144b12effc57c200e62556eabcc9"
+cluster: "rust-under-the-hood"
+campaign: "editorial"
+summary: "A C program that overflows its stack dies without a word, a Rust program prints a message. I overflowed both on purpose, in the main thread and in a new thread, and followed the limit, the guard page, the SIGSEGV, the alternate signal stack and the abort."
+---
+
+To fill a stack on purpose, I made a function that calls itself forever, with a buffer of 1000 bytes in every call. The compilers saw the problem before I ran anything. First gcc:
+
+```text
+$ gcc -O2 -Wall -Wextra overflow.c -o overflow
+overflow.c: In function ‘recurse’:
+overflow.c:26:39: warning: infinite recursion detected [-Winfinite-recursion]
+...
+```
+
+And rustc, for the same function written in Rust:
+
+```text
+$ rustc --edition 2024 -O overflow.rs -o overflow_rs
+warning: function cannot return without recursing
+...
+```
+
+I ran both programs anyway, the C one first, with the default stack limit of this shell, 8192 KiB:
+
+```text
+$ ulimit -s
+8192
+$ ./overflow
+RLIMIT_STACK soft limit: 8388608 bytes
+exit status 139
+```
+
+The program printed its limit, and then nothing. The exit status 139 is 128 + 11, and `kill -l 11` prints SEGV: the kernel killed the process with SIGSEGV, the same signal as for a bad pointer. The Rust version does better:
+
+```text
+$ ./overflow_rs main
+reached depth 1024
+...
+reached depth 7168
+
+thread 'main' (1138780) has overflowed its stack
+fatal runtime error: stack overflow, aborting
+exit status 134
+```
+
+It knows that the stack overflowed, and it says in which thread. How can it know? In [the first part of this series](/blog/what-happens-when-you-run-a-program-from-execve-to-main), the Rust hello world made several system calls before `main` only to prepare this moment: it read `/proc/self/maps`, mapped a small alternate stack and installed handlers for SIGSEGV and SIGBUS. Here I follow them until the crash, in the main thread and in a new thread, because the two cases are different.
+
+## The main thread stops at a limit
+
+[The part about /proc/self/maps](/blog/reading-proc-self-maps-line-by-line) showed a `[stack]` line of 136 KiB, which grows down when the program needs more. But how far? The getrlimit(2) man page answers for `RLIMIT_STACK`: "This is the maximum size of the process stack, in bytes. Upon reaching this limit, a SIGSEGV signal is generated."
+
+To see where exactly the signal comes, my C program has a mode where it installs its own handler for SIGSEGV. The handler prints the depth of the recursion, the size of one frame, the address that faulted, and the distance from this address to the top of `[stack]`:
+
+```text
+$ ./overflow report
+RLIMIT_STACK soft limit: 8388608 bytes
+SIGSEGV at depth 8179, frame 1024 bytes, fault address 0x7fffcfaecd70, 8389264 bytes below the top of the stack
+exit status 139
+$ sh -c 'ulimit -s 16384; ./overflow report'
+RLIMIT_STACK soft limit: 16777216 bytes
+SIGSEGV at depth 16367, frame 1024 bytes, fault address 0x7ffd99d07d90, 16777840 bytes below the top of the stack
+exit status 139
+```
+
+Each call takes 1024 bytes, a little more than the buffer. After 8179 calls, the program touched an address 8,389,264 bytes below the top of the stack: 656 bytes after the 8 MiB of the limit. With 16 MiB, the depth doubles, and the fault is again a few hundred bytes after the limit. The kernel extends the stack when the program touches the memory below it, and refuses when the stack would become bigger than the limit. No page is mapped at the bottom of this stack, the limit itself is the end. The "kernel's own stack guard" of the std comment below is a gap: the kernel parameters documentation says that `stack_guard_gap` defines "how many pages prior to (for stacks growing down) resp. after (for stacks growing up) the main stack are reserved for no other mapping. Default value is 256 pages."
+
+## A handler needs a second stack
+
+My handler runs on an alternate stack of 64 KiB, installed with `sigaltstack`. I made also a mode with the same handler, but without the alternate stack and without the flag `SA_ONSTACK`:
+
+```text
+$ ./overflow report-no-altstack
+RLIMIT_STACK soft limit: 8388608 bytes
+exit status 139
+```
+
+Not one line from the handler. To call a handler, the kernel must first save the state of the program on the stack, and the stack is exactly the thing that is full. The sigaltstack(2) man page describes this case as the most common use of an alternate stack: "a signal handler for SIGSEGV cannot be invoked on the standard stack; if we wish to handle it, we must use an alternate signal stack."
+
+## How Rust recognizes its own overflow
+
+The Rust 1.98 source of this handler is `library/std/src/sys/pal/unix/stack_overflow.rs`. Before `main`, std installs it like my report mode does:
+
+```text
+$ strace -e trace=mmap,mprotect,munmap,sigaltstack,rt_sigaction ./overflow_rs main
+  (the startup lines from the first rt_sigaction of SIGSEGV to the handler of SIGBUS, then everything from the signal on)
+rt_sigaction(SIGSEGV, NULL, {sa_handler=SIG_DFL, sa_mask=[], sa_flags=0}, 8) = 0
+sigaltstack(NULL, {ss_sp=NULL, ss_flags=SS_DISABLE, ss_size=0}) = 0
+mmap(NULL, 12288, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS|MAP_STACK, -1, 0) = 0x7fc774047000
+mprotect(0x7fc774047000, 4096, PROT_NONE) = 0
+sigaltstack({ss_sp=0x7fc774048000, ss_flags=0, ss_size=8192}, NULL) = 0
+rt_sigaction(SIGSEGV, {sa_handler=0x55a1685dd000, sa_mask=[], sa_flags=SA_RESTORER|SA_ONSTACK|SA_SIGINFO, sa_restorer=0x7fc773e3a2d0}, NULL, 8) = 0
+rt_sigaction(SIGBUS, NULL, {sa_handler=SIG_DFL, sa_mask=[], sa_flags=0}, 8) = 0
+rt_sigaction(SIGBUS, {sa_handler=0x55a1685dd000, sa_mask=[], sa_flags=SA_RESTORER|SA_ONSTACK|SA_SIGINFO, sa_restorer=0x7fc773e3a2d0}, NULL, 8) = 0
+  ...
+--- SIGSEGV {si_signo=SIGSEGV, si_code=SEGV_MAPERR, si_addr=0x7ffd02f02cb0} ---
+--- SIGABRT {si_signo=SIGABRT, si_code=SI_TKILL, si_pid=1237376, si_uid=1000} ---
++++ killed by SIGABRT (core dumped) +++
+```
+
+std first checks that SIGSEGV still has its default action, `SIG_DFL`: it does not replace a handler that somebody else installed. No alternate stack exists yet (`SS_DISABLE`), so std maps 12 KiB, protects the lowest page as a guard, and gives the 8 KiB above it to `sigaltstack`. Then one handler for SIGSEGV and SIGBUS, with `SA_ONSTACK` and `SA_SIGINFO`. At the end, the SIGSEGV of the overflow, and the SIGABRT.
+
+std does one more thing at startup: it computes where the stack of the main thread should end. For this, it calls `pthread_getattr_np`, and glibc reads the limit and `/proc/self/maps`: these were the `getrlimit` and `openat` calls before `main` in the first part. A comment in the source explains the idea: "we'll just note where we expect rlimit to start faulting, so our handler can report "stack overflow", and trust that the kernel's own stack guard will work."
+
+So std saves the page just below the lowest address that the main stack can reach, as the guard range of the main thread. When a SIGSEGV arrives, the handler compares the fault address with this range. Inside, it prints the message and aborts. Outside, it restores the default action and returns, so the faulting instruction faults again and the process dies with a normal SIGSEGV. In the C run, the fault was 656 bytes after the limit, exactly in this page.
+
+Why abort, and not let the SIGSEGV happen? The source answers this too: to avoid "a misleading SIGSEGV that might lead users to believe that unsafe code has accessed an invalid pointer". So the exit status changes:
+
+```text
+$ kill -l 11; kill -l 6
+SEGV
+ABRT
+```
+
+134 is 128 + 6, the signal of `abort`. The number in the message, 1138780, is the thread id, for the main thread also the process id. The source also asks the next person who edits the message to keep every function there "async-signal-safe". My C handler calls `snprintf`, which signal-safety(7) does not list: not correct code, even if it worked.
+
+## A new thread has a real guard page
+
+Then the same recursion in a thread made with `std::thread::spawn`. First, the thread finds its own stack in `/proc/self/maps`, and prints this line and the line below it:
+
+```text
+$ ./overflow_rs thread
+the mapping below it:     7f5426c6e000-7f5426c6f000 ---p 00000000 00:00 0 
+the mapping of the stack: 7f5426c6f000-7f5426e72000 rw-p 00000000 00:00 0 
+stack mapping size: 2109440 bytes
+reached depth 1024
+
+thread '<unknown>' (1138787) has overflowed its stack
+fatal runtime error: stack overflow, aborting
+exit status 134
+```
+
+The thread overflowed between 1024 and 2048 calls, so with about 2 MiB of stack, the default that the `std::thread` documentation gives: "Currently, it is 2 MiB on all Tier-1 platforms." My thread has no name, so the handler prints `<unknown>`.
+
+Below the stack, there is one page of 4 KiB with `---p`: no access at all. This is a real guard page, not a limit computed by the kernel. But 2,109,440 bytes is not 2 MiB. strace shows how the stack was made:
+
+```text
+$ strace -f -e trace=mmap,mprotect,munmap,clone3,sigaltstack,rt_sigaction,openat,write ./overflow_rs thread
+...
+1138805 mmap(NULL, 12288, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x7f5bf7783000
+...
+1138805 mmap(NULL, 2101248, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS|MAP_STACK, -1, 0) = 0x7f5bf7582000
+1138805 mprotect(0x7f5bf7582000, 4096, PROT_NONE) = 0
+1138805 clone3({flags=CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD|CLONE_SYSVSEM|CLONE_SETTLS|CLONE_PARENT_SETTID|CLONE_CHILD_CLEARTID, child_tid=0x7f5bf7782ce8, parent_tid=0x7f5bf7782990, exit_signal=0, stack=0x7f5bf7582000, stack_size=0x1fff00, tls=0x7f5bf77826c0} => {parent_tid=[1138808]}, 88) = 1138808
+```
+
+The main thread maps 2,101,248 bytes, 2 MiB plus one page, and `mprotect` makes the lowest page inaccessible. It is the second try of glibc 2.43. A trace with `madvise` shows the first one, `MADV_GUARD_INSTALL` (Linux 6.13 and newer, says madvise(2)), which fails here:
+
+```text
+$ strace -f -e trace=madvise,mprotect ./overflow_rs thread
+...
+1568070 madvise(0x7fbd4d7f1000, 4096, MADV_GUARD_INSTALL) = -1 EINVAL (Invalid argument)
+1568070 mprotect(0x7fbd4d7f1000, 4096, PROT_NONE) = 0
+...
+```
+
+On a newer kernel this guard has no `---p` line. Back in the first trace, `clone3` starts thread 1138808 on this memory. Its `tls=` points 2,368 bytes below the end of the mapping: glibc keeps the data of the thread itself (what the `fs` register points to, as in the first part) at the top of its stack.
+
+And the extra 12 KiB? The new mapping ends at 0x7f5bf7582000 + 2,101,248 = 0x7f5bf7783000, exactly where the first `mmap` of the trace starts: the 12 KiB area that the loader created at startup for the main thread. Two anonymous areas next to each other, both `rw-p`, so this kernel shows them as one line, like in the part about /proc/self/maps.
+
+Who made the guard page, Rust or glibc? With `-k`, strace prints the functions on the stack of every system call. I kept only the calls that make a page inaccessible:
+
+```text
+$ strace -f -k -e trace=mprotect ./overflow_rs thread
+  (only the calls that make a page inaccessible, with the functions on the stack of each call)
+1138827 mprotect(0x7f74435c7000, 4096, PROT_NONE) = 0
+    called from: std::sys::pal::unix::stack_overflow::imp::get_stack < std::sys::pal::unix::stack_overflow::imp::init < main
+1138827 mprotect(0x7f7443178000, 4096, PROT_NONE) = 0
+    called from: pthread_create < <std::sys::thread::unix::Thread>::new < std::thread::lifecycle::spawn_unchecked::<overflow::main::{closure#0}, u64>
+1138828 mprotect(0x7f74435c4000, 4096, PROT_NONE) = 0
+    called from: std::sys::pal::unix::stack_overflow::imp::get_stack < <std::sys::pal::unix::stack_overflow::Handler>::new
+```
+
+The second guard protects the thread stack, and it comes from glibc's `pthread_create`: Rust asks for 2 MiB, and glibc adds the guard. pthread_attr_setguardsize(3) gives its default size: "The default guard size is the same as the system page size." The first and the third come from std, for the alternate stacks of the main thread and of the new thread, 1138828.
+
+## The crash in the new thread
+
+Back to the first trace. Here is what the new thread does after its start:
+
+```text
+1138808 mmap(NULL, 134217728, PROT_NONE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x7f5bef582000
+1138808 munmap(0x7f5bef582000, 11001856) = 0
+1138808 munmap(0x7f5bf4000000, 56107008) = 0
+1138808 mprotect(0x7f5bf0000000, 135168, PROT_READ|PROT_WRITE) = 0
+1138808 sigaltstack(NULL, {ss_sp=NULL, ss_flags=SS_DISABLE, ss_size=0}) = 0
+1138808 mmap(NULL, 12288, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS|MAP_STACK, -1, 0) = 0x7f5bf79ce000
+1138808 mprotect(0x7f5bf79ce000, 4096, PROT_NONE) = 0
+1138808 sigaltstack({ss_sp=0x7f5bf79cf000, ss_flags=0, ss_size=8192}, NULL) = 0
+1138808 openat(AT_FDCWD, "/proc/self/maps", O_RDONLY|O_CLOEXEC) = 3
+...
+```
+
+The first four lines are glibc preparing a malloc arena for the thread: it reserves 128 MiB, gives back the parts that are not aligned, and makes the first 132 KiB of the remaining 64 MiB usable.
+
+Then std asks with `sigaltstack(NULL, ...)` if this thread has an alternate stack, and the answer is `SS_DISABLE`: no. The notes of sigaltstack(2) say why: for a child made by clone(2) with `CLONE_VM` and without `CLONE_VFORK`, the alternate signal stack is disabled, and `CLONE_VM` is in the flags of the `clone3` above. A SIGSEGV goes to the thread that faulted, so every thread needs its own second stack, and std makes the same 12 KiB with a guard page as in the main thread. The `openat` is my own code. And the end:
+
+```text
+1138808 write(2, "\n", 1)               = 1
+1138808 --- SIGSEGV {si_signo=SIGSEGV, si_code=SEGV_ACCERR, si_addr=0x7f5bf7582f50} ---
+1138808 write(2, "\nthread '", 9)       = 9
+1138808 write(2, "<unknown>", 9)        = 9
+1138808 write(2, "' (", 3)              = 3
+1138808 write(2, "1138808", 7)          = 7
+1138808 write(2, ") has overflowed its stack\n", 27) = 27
+1138808 write(2, "fatal runtime error: stack overf"..., 46) = 46
+1138808 --- SIGABRT {si_signo=SIGABRT, si_code=SI_TKILL, si_pid=1138805, si_uid=1000} ---
+1138808 +++ killed by SIGABRT (core dumped) +++
+1138805 +++ killed by SIGABRT (core dumped) +++
+```
+
+The first `write` ends my last "reached depth 1024". Then the signal: `si_addr=0x7f5bf7582f50` is inside the guard page that starts at 0x7f5bf7582000. `si_code=SEGV_ACCERR` is "Invalid permissions for mapped object" in sigaction(2): the page exists, but nobody may touch it. In the main thread the code was `SEGV_MAPERR`, "Address not mapped to object": there, no page exists at all. For a thread, std takes the range from the stack address and the guard size that glibc reports, so this address is in the range.
+
+The handler writes the message in six pieces with `write`, which is in the safe list. Then `abort` sends SIGABRT to the same thread (`SI_TKILL`, from the process 1138805 itself), and the whole process dies. The "core dumped" comes from systemd-coredump on this machine.
+
+## A bigger stack for a thread
+
+The `std::thread` documentation gives two ways to change the size of new stacks: `Builder::stack_size`, and the environment variable `RUST_MIN_STACK`. And it adds that "the stack size of the main thread is not determined by Rust." With 8 MiB:
+
+```text
+$ RUST_MIN_STACK=8388608 ./overflow_rs thread
+the mapping below it:     7f1ab42b3000-7f1ab42b4000 ---p 00000000 00:00 0 
+the mapping of the stack: 7f1ab42b4000-7f1ab4ab7000 rw-p 00000000 00:00 0 
+stack mapping size: 8400896 bytes
+reached depth 1024
+...
+reached depth 7168
+
+thread '<unknown>' (1138796) has overflowed its stack
+fatal runtime error: stack overflow, aborting
+exit status 134
+```
+
+8 MiB plus the same 12 KiB neighbour, the same guard page below, and now the thread goes as deep as the main thread.
+
+## Two kinds of detection
+
+So the main thread has no guard page at all: the kernel grows its stack and stops at `RLIMIT_STACK`, and std only remembers where. A new thread has a fixed stack with a real `PROT_NONE` page below it, made by glibc. In both cases the kernel sends SIGSEGV, and a handler runs only if it has a second stack. This explains also a case that looks strange at first: a recursive Rust function that works in `main` and overflows in a spawned thread. On this machine, it is 8 MiB against 2 MiB.
+
+## Sources
+
+- getrlimit(2), `RLIMIT_STACK`: https://man7.org/linux/man-pages/man2/getrlimit.2.html
+- sigaltstack(2), the alternate signal stack and threads: https://man7.org/linux/man-pages/man2/sigaltstack.2.html
+- sigaction(2), `SA_ONSTACK`, `SEGV_ACCERR` and `SEGV_MAPERR`: https://man7.org/linux/man-pages/man2/sigaction.2.html
+- signal-safety(7), the functions that a signal handler may call: https://man7.org/linux/man-pages/man7/signal-safety.7.html
+- pthread_attr_setguardsize(3), the default guard size: https://man7.org/linux/man-pages/man3/pthread_attr_setguardsize.3.html
+- madvise(2), `MADV_GUARD_INSTALL`: https://man7.org/linux/man-pages/man2/madvise.2.html
+- The kernel parameters, `stack_guard_gap`: https://docs.kernel.org/admin-guide/kernel-parameters.html
+- Rust 1.98.0, the stack overflow handler: https://github.com/rust-lang/rust/blob/1.98.0/library/std/src/sys/pal/unix/stack_overflow.rs
+- Rust 1.98.0, the `std::thread` documentation and its "Stack size" section: https://github.com/rust-lang/rust/blob/1.98.0/library/std/src/thread/mod.rs
+- Programs and outputs of this part: https://github.com/mehdiakiki/mehdi-cz/tree/main/experiments/from-source-to-process/p18

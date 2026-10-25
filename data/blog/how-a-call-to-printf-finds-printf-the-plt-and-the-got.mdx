@@ -1,0 +1,191 @@
+---
+title: "How a Call to printf Finds printf: The PLT and the GOT"
+date: "2026-09-22T18:25:00+01:00"
+lastmod: "2026-09-22T18:25:00+01:00"
+tags: ["from source to process", "linker", "linux", "c", "rust"]
+draft: false
+reviewed: true
+reviewedHash: "4f9e2f1f14e2adda5d74f82dead0d8151159e6ea01949bcdb8187fb3295731bb"
+cluster: "rust-under-the-hood"
+campaign: "editorial"
+summary: "I watched one GOT slot in gdb before and after the first call to puts, measured what lazy binding costs on that first call, and compared it with -z now, LD_BIND_NOW, -fno-plt and a Rust binary that never uses the PLT for libc."
+---
+
+Here are the same 8 bytes of my program, read twice in gdb. The first time just before `main` calls `puts`, the second time just after:
+
+```text
+Breakpoint 1, 0x0000555555555040 in main ()
+0x555555558000 <puts@got.plt>:	0x0000555555555036
+puts@plt + 6 in section .plt of twice
+
+Breakpoint 2, 0x0000555555555050 in main ()
+0x555555558000 <puts@got.plt>:	0x00007ffff7e20e00
+puts in section .text of /usr/lib/libc.so.6
+```
+
+Before the call, the slot contains an address inside my own program. After the call, it contains the address of `puts` in libc. I liked this view: the same 8 bytes, read twice. So the first call to `puts` changed the memory of my program. Who wrote there, and why not at the start?
+
+The title says printf, but I use `puts`. The way is the same, and gcc itself turns a `printf` of a constant string with a newline into `puts`: a one-line `printf("first call\n")` program compiles to `call 1030 <puts@plt>`. My program calls `puts` twice:
+
+```c
+#include <stdio.h>
+
+int main(void)
+{
+    puts("first call");
+    puts("second call");
+    return 0;
+}
+```
+
+In [the first part of this series](/blog/what-happens-when-you-run-a-program-from-execve-to-main) the loader mapped libc and prepared the process. In [the part about relocations](/blog/relocations-the-holes-the-compiler-leaves-for-the-linker) the last holes left for the loader included two of type `JUMP_SLOT`, and I promised them their own part. This is it. Same machine as before: gcc 15.2.1, binutils 2.46, glibc 2.43.
+
+## The call goes to a stub in my program
+
+```text
+$ objdump -d twice (main)
+0000000000001040 <main>:
+    1040:	48 83 ec 08          	sub    $0x8,%rsp
+    1044:	48 8d 3d b9 0f 00 00 	lea    0xfb9(%rip),%rdi        # 2004 <_IO_stdin_used+0x4>
+    104b:	e8 e0 ff ff ff       	call   1030 <puts@plt>
+    1050:	48 8d 3d b8 0f 00 00 	lea    0xfb8(%rip),%rdi        # 200f <_IO_stdin_used+0xf>
+    1057:	e8 d4 ff ff ff       	call   1030 <puts@plt>
+```
+
+The `call` does not go to libc. It goes to 0x1030, `puts@plt`, a small piece of code in my own file. The linker can compute this address at link time, so the call instruction is complete and never changes. The PLT, the procedure linkage table, contains these stubs:
+
+```text
+$ objdump -d -j .plt twice
+0000000000001020 <puts@plt-0x10>:
+    1020:	ff 35 ca 2f 00 00    	push   0x2fca(%rip)        # 3ff0 <_GLOBAL_OFFSET_TABLE_+0x8>
+    1026:	ff 25 cc 2f 00 00    	jmp    *0x2fcc(%rip)        # 3ff8 <_GLOBAL_OFFSET_TABLE_+0x10>
+    102c:	0f 1f 40 00          	nopl   0x0(%rax)
+
+0000000000001030 <puts@plt>:
+    1030:	ff 25 ca 2f 00 00    	jmp    *0x2fca(%rip)        # 4000 <puts@GLIBC_2.2.5>
+    1036:	68 00 00 00 00       	push   $0x0
+    103b:	e9 e0 ff ff ff       	jmp    1020 <_init+0x20>
+```
+
+The stub for `puts` is three instructions. The first one jumps to the address stored at 0x4000. This 8-byte slot is in the GOT, the global offset table, which is writable data. The relocation from the previous part is exactly this slot:
+
+```text
+Relocation section '.rela.plt' at offset 0x5e8 contains 1 entry:
+    Offset             Info             Type               Symbol's Value  Symbol's Name + Addend
+0000000000004000  0000000300000007 R_X86_64_JUMP_SLOT     0000000000000000 puts@GLIBC_2.2.5 + 0
+```
+
+The code never changes, only the slot. This is the whole idea: the code pages stay identical in every process, and each process has its own small writable table with the real addresses.
+
+(Some toolchains add `endbr64` instructions and a second table, `.plt.sec`, for Intel's indirect branch tracking. This build has neither. `readelf -n` shows that the linked file is not marked for this feature, only `x86 feature used: x86`, so the linker made the classic PLT.)
+
+## Lazy binding: the first call fills the slot
+
+Now the gdb output from the beginning makes sense. At the start of `main`, the slot at 0x4000 (0x555555558000 in memory, gdb turns off randomization) contains `puts@plt + 6`. That is the address of the second instruction of the stub, the `push $0x0`. So the first call jumps through the slot right back into the stub. The stub pushes 0, the index of the `puts` relocation, and jumps to the first entry of the PLT. This one pushes the value at `_GLOBAL_OFFSET_TABLE_+0x8` and jumps to the address at `_GLOBAL_OFFSET_TABLE_+0x10`.
+
+These two entries, the second and the third of the GOT (the first one holds the address of `.dynamic`), are filled by the loader at startup. The x86-64 psABI describes the convention: the first one identifies this object for the loader, the second one is the address of the loader's resolver function. The resolver reads the relocation number 0, looks up `puts` in the loaded libraries, writes the address of `puts` into the slot, and jumps to `puts`. The second call takes only the first `jmp` of the stub, directly to libc. This is lazy binding, that is, a function is looked up the first time it is called, not before.
+
+Is it slow? I made a program that calls `labs` twice and reads the time stamp counter around each call (with `-fno-builtin`, so that gcc really calls the library). The first call of a process is the interesting one, so I ran the program 101 times, pinned to one core (the laptop was busy with other experiments; [a second full run](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/from-source-to-process/results/p08-first-call-run2.txt), later that evening, gave almost three times more cycles, in the same order):
+
+```text
+program                            runs           first call, cycles    second call, cycles
+./firstcall_lazy                    101   median    758 (p10   683, p90  4286)   median   40
+./firstcall_now                     101   median     77 (p10    71, p90   116)   median   40
+LD_BIND_NOW=1 ./firstcall_lazy      101   median    112 (p10   105, p90   150)   median   40
+```
+
+The three programs ran in turn, so a slow moment of the machine touches all of them. The counter runs at 2.496 GHz here. With lazy binding, the first call takes 758 cycles, 0.3 microseconds, and in 10% of the runs more than 4,000. The second call takes 40 cycles, and probably most of these 40 are the cost of reading the counter itself. The middle line is the same program linked with `-z now`: its first call is 77 cycles. Both first calls run cold code, so the difference, about 680 cycles, is the work of the resolver. 0.3 microseconds once per function and per process is not much. But a program that calls 2,000 different library functions pays it 2,000 times, spread over its life.
+
+## Binding everything at startup
+
+`-z now` asks the loader to fill all the slots before `main`:
+
+```text
+$ readelf -d twice_now | grep FLAGS
+ 0x000000000000001e (FLAGS)              BIND_NOW
+ 0x000000006ffffffb (FLAGS_1)            Flags: NOW PIE
+...
+$ gdb ./twice_now: the slot at main
+
+Breakpoint 1 at 0x1040
+
+Breakpoint 1, 0x0000555555555040 in main ()
+0x555555557fd0 <puts@got.plt>:	0x00007ffff7e20e00
+puts in section .text of /usr/lib/libc.so.6
+```
+
+At `main` the slot already points to `puts`. The environment variable `LD_BIND_NOW=1` does the same at run time for a program linked without it, which is the third line of the timing table: 112 cycles for the first call.
+
+There is also a second difference, and for me it is the more important one. Look at the sections and at `GNU_RELRO`, the region that becomes read-only after relocation:
+
+```text
+$ readelf -lW twice | grep GNU_RELRO, and the sections in it
+  GNU_RELRO      0x002dd0 0x0000000000003dd0 0x0000000000003dd0 0x000230 0x000230 R   0x1
+   13     .init_array .fini_array .dynamic .got 
+$ readelf -lW twice_now | grep GNU_RELRO, and the sections in it
+  GNU_RELRO      0x002db8 0x0000000000003db8 0x0000000000003db8 0x000248 0x000248 R   0x1
+   13     .init_array .fini_array .dynamic .got 
+```
+
+The list is the same, but the content is not. In the default build, the slot of `puts` lives in a separate section, `.got.plt`, at 0x4000, after the end of the RELRO region (0x3dd0 + 0x230 = 0x4000). It must stay writable, because the resolver writes it during the run. With `-z now` there is no `.got.plt` section: the slot moved into `.got`, at 0x3fd0, inside a RELRO region that grew from 0x230 to 0x248 bytes. After startup, nothing can change it. This is called full RELRO, the default build has partial RELRO.
+
+Why does it matter? A writable table of function addresses is a good target for an attacker who can write somewhere in memory: change the slot of `puts`, and the next call to `puts` goes elsewhere. With full RELRO this table is read-only before the first line of `main`. `LD_BIND_NOW=1` fills the slots early but does not make them read-only, because the program was not linked for it.
+
+## Without a PLT
+
+gcc can also skip the stub completely with `-fno-plt`:
+
+```text
+$ objdump -d twice_noplt (main)
+0000000000001020 <main>:
+    1020:	48 83 ec 08          	sub    $0x8,%rsp
+    1024:	48 8d 3d d9 0f 00 00 	lea    0xfd9(%rip),%rdi        # 2004 <_IO_stdin_used+0x4>
+    102b:	ff 15 97 2f 00 00    	call   *0x2f97(%rip)        # 3fc8 <puts@GLIBC_2.2.5>
+    1031:	48 8d 3d d7 0f 00 00 	lea    0xfd7(%rip),%rdi        # 200f <_IO_stdin_used+0xf>
+    1038:	ff 15 8a 2f 00 00    	call   *0x2f8a(%rip)        # 3fc8 <puts@GLIBC_2.2.5>
+...
+$ readelf -rW twice_noplt | grep puts
+0000000000003fc8  0000000300000006 R_X86_64_GLOB_DAT      0000000000000000 puts@GLIBC_2.2.5 + 0
+```
+
+The call is now `ff 15`, an indirect call through the GOT slot, and the relocation is `GLOB_DAT`, which the loader resolves at startup. Without a stub there is no place for lazy binding, so the slot is filled before `main`, like with `-z now`. One jump less per call, and no `.plt` section at all in this file.
+
+## Rust calls libc through the GOT
+
+The Rust hello world from the first part was linked by rustc with `-z relro -z now`. In the part about undefined references I cut the long `cc` command, but [its saved output](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/from-source-to-process/results/p04-rust.txt) contains `-Wl,-z,relro,-z,now`. And the binary calls libc like `-fno-plt`:
+
+```text
+$ readelf -d hello_rs | grep FLAGS
+ 0x000000000000001e (FLAGS)              BIND_NOW
+ 0x000000006ffffffb (FLAGS_1)            Flags: NOW PIE
+$ readelf -rW hello_rs | grep -E ' write@|JUMP_SLOT'
+0000000000055e18  0000002300000006 R_X86_64_GLOB_DAT      0000000000000000 write@GLIBC_2.2.5 + 0
+00000000000562d0  0000000600000007 R_X86_64_JUMP_SLOT     0000000000000000 _Unwind_Resume@GCC_3.0 + 0
+$ objdump -d hello_rs | grep the calls through the GOT slot of write
+   36741:	ff 15 d1 f6 01 00    	call   *0x1f6d1(%rip)        # 55e18 <write@GLIBC_2.2.5>
+$ addr2line -f -C -e hello_rs 0x36741 | head -n 1
+<std::sys::fd::unix::FileDesc>::write
+```
+
+The `write` of the standard library is a `call *` through the slot at 0x55e18, the same instruction as in my `-fno-plt` build. In the whole binary I counted 1607 indirect calls of this form, and the PLT has one single entry:
+
+```text
+$ objdump -d hello_rs | grep -oE 'call +[0-9a-f]+ <.*@plt>' | awk '{ print $3 }' | sort | uniq -c
+    124 <_Unwind_Resume@plt>
+```
+
+All 124 calls through the PLT go to `_Unwind_Resume` in libgcc_s, the function that continues the unwinding of a panic. So a Rust program on this target has full RELRO and no lazy binding, by default. This also explains the 214 relocations into the GOT that I counted in the part about relocations.
+
+## Lazy or now?
+
+Lazy binding was a good idea when programs imported thousands of functions and used few of them in one run: the start is faster, and the cost comes later, a third of a microsecond at a time. The price is a writable table of code addresses for the whole life of the process.
+
+`-z now` moves all the lookups to the start, and the table becomes read-only. For the programs I measured in this series, the startup cost of this is small: the loader of the C hello world spent about 22 microseconds in total, relocations included, in the part about relocations. So for anything that is not tiny and short-lived, I prefer full RELRO. It is interesting that Rust already chose it, and that gcc on this system still did not, when I used it with its default flags.
+
+## Sources
+
+- The x86-64 psABI, the PLT, the GOT and the lazy binding convention: https://gitlab.com/x86-psABIs/x86-64-ABI
+- ld.so(8), `LD_BIND_NOW`: https://man7.org/linux/man-pages/man8/ld.so.8.html
+- The ld manual, `-z now` and `-z relro`: https://sourceware.org/binutils/docs/ld/Options.html
+- GCC manual, `-fno-plt`: https://gcc.gnu.org/onlinedocs/gcc/Code-Gen-Options.html
+- The programs and the saved outputs of this part: https://github.com/mehdiakiki/mehdi-cz/tree/main/experiments/from-source-to-process/p08
