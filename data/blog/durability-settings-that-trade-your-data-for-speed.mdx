@@ -1,0 +1,114 @@
+---
+title: "Durability Settings That Trade Your Data for Speed"
+date: "2026-10-11T19:45:00+01:00"
+lastmod: "2026-10-11T19:45:00+01:00"
+tags: ["what survives a crash", "databases", "sqlite", "postgresql", "reliability"]
+draft: false
+reviewed: true
+reviewedHash: "3b4d3d9f7af850e90bfac429d0bf5fd73b3a85af219f18b4aa0fbf507f4dc294"
+cluster: "reliable-data-integrations"
+campaign: "editorial"
+summary: "SQLite synchronous, PostgreSQL synchronous_commit, MySQL innodb_flush_log_at_trx_commit, Redis appendfsync: each one decides how much a crash may lose. I put them in one table, with a column for each kind of crash. Only SQLite is measured here; the others are their documentation."
+---
+
+Every database has a setting that decides how much it is allowed to lose. The names are different, `synchronous`, `synchronous_commit`, `innodb_flush_log_at_trx_commit`, `appendfsync`, and the documentation often describes the values with words like "safe" or "fast". But behind each value there is a number: some seconds of data, or some transactions, that a crash can take with it. This part collects these numbers in one place, for four databases.
+
+One warning first. In this series I measure only SQLite: I did it in the last two parts and again here. For PostgreSQL, MySQL and Redis this article quotes their documentation, with links, and nothing more.
+
+## Two columns, not one
+
+Since [the first part](/blog/your-data-is-not-on-disk-when-write-returns) of this series, every result had two sides. A process crash (kill -9, a panic, an out-of-memory kill) keeps the page cache, so everything that reached the kernel survives. A machine crash (power loss, kernel panic, hard reset) loses the page cache, and only what was synced survives. A durability setting must answer both questions, and the answers are usually different. So the table at the end has a column for each.
+
+## SQLite, measured
+
+SQLite promises that "Transactions are durable across application crashes regardless of the synchronous setting or journal mode." I wanted to see it with my own eyes, for the weakest setting. The test runs the `sqlite3` tool with `synchronous=OFF` and 20,000 single-row transactions, and after each commit the tool prints `ok|N`. My kill driver from [part 3](/blog/how-to-save-a-file-without-losing-it-write-fsync-rename) kills it at a random moment, and a checker counts the rows and runs `PRAGMA integrity_check`:
+
+```text
+== sqlite3, journal_mode=delete, synchronous=OFF: 20000 single-row transactions, each one printed ok|N after its commit
+200 runs, SIGKILL after a random delay between 0 and 300 ms
+  killed  finished  outcome
+     200         0  all acknowledged rows present, integrity ok
+== sqlite3, journal_mode=wal, synchronous=OFF: 20000 single-row transactions, each one printed ok|N after its commit
+200 runs, SIGKILL after a random delay between 0 and 300 ms
+  killed  finished  outcome
+     169        31  all acknowledged rows present, integrity ok
+```
+
+369 kills in the middle of the work, zero acknowledged rows lost, zero inconsistent databases, in both journal modes. Good, this is what the documentation promised. With `synchronous=OFF`, SQLite gives the data to the kernel at every commit, so the process crash cannot touch it. In rollback mode, a kill in the middle of a transaction leaves a hot journal, and the next open rolls the half-done transaction back. My checker did not count how often this happened.
+
+For the machine crash I have no measurement, only the traces of [part 13](/blog/how-sqlite-commits-a-transaction-followed-with-strace) and [part 14](/blog/sqlite-wal-mode-fewer-fsyncs-a-different-promise), which show which syncs each setting makes, and the documentation, which says what this means. In WAL mode with NORMAL, "a transaction committed in WAL mode with synchronous=NORMAL might roll back following a power loss or system crash", and the database stays consistent. With OFF, "the database might become corrupted if the operating system crashes or the computer loses power". And the rollback mode with FULL, the default, "is not necessarily durable across a power loss", because of the missing directory sync after the unlink of the journal.
+
+## PostgreSQL
+
+In PostgreSQL the setting is `synchronous_commit`, and its default is `on`: the server waits for the local flush of the write-ahead log before it reports success. With `off`, "there is no waiting, so there can be a delay between when success is reported to the client and when the transaction is later guaranteed to be safe against a server crash. (The maximum delay is three times wal_writer_delay.)" The default of `wal_writer_delay` is 200 milliseconds, so the number behind `off` is about 600 milliseconds of commits.
+
+Two details make this setting interesting, and the first one was not obvious for me. First, the documentation speaks about "an operating system or database crash": here a crash of the database server itself can lose the recent commits, not only a power cut. The reason is where they wait: in the WAL buffers, which the documentation of `wal_buffers` describes as "the amount of shared memory used for WAL data that has not yet been written to disk". That is a difference with SQLite, which gives every commit to the kernel. Second, it promises consistency: "the database state will be just the same as if those transactions had been aborted cleanly."
+
+`fsync=off` is a completely different thing, and the documentation is direct: it "can result in unrecoverable data corruption in the event of a power failure or system crash", and it is "only advisable to turn off fsync if you can easily recreate your entire database from external data." `synchronous_commit=off` loses at most the last 600 milliseconds and keeps the database sane. `fsync=off` can lose the database.
+
+## MySQL InnoDB
+
+For InnoDB, the setting is `innodb_flush_log_at_trx_commit`, with three values in the MySQL 8.4 documentation:
+
+- `1`, the default: "The default setting of 1 is required for full ACID compliance. Logs are written and flushed to disk at each transaction commit."
+- `0`: "logs are written and flushed to disk once per second. Transactions for which logs have not been flushed can be lost in a crash."
+- `2`: "logs are written after each transaction commit and flushed to disk once per second." The same sentence about lost transactions follows.
+
+On paper, the difference between 0 and 2 looks like the two columns of my table. With 0, the log is not even written to the kernel at commit. With 2, it is written to the kernel at each commit, so after part 1 I would expect a process crash to lose nothing. But the same page says, for both values, that "any unexpected mysqld process exit can erase up to N seconds of transactions", where N is `innodb_flush_log_at_timeout`, one second by default. So in the table I keep what the documentation says, not what I expect.
+
+The binary log has its own setting, `sync_binlog`, default 1. With 0, "in the event of a power failure or operating system crash, it is possible that the server has committed transactions that have not been synchronized to the binary log", and replicas or point-in-time recovery could then miss transactions that the server itself has.
+
+## Redis
+
+Now Redis, which is the most interesting case for the first column. By default it saves snapshots of the dataset in `dump.rdb` (RDB), and the persistence documentation says plainly: "Snapshotting is not very durable. If your computer running Redis stops, your power line fails, or you accidentally `kill -9` your instance, the latest data written to Redis will be lost." Snapshots are usually minutes apart, "so in case of Redis stopping working without a correct shutdown for any reason you should be prepared to lose the latest minutes of data."
+
+I did not expect a documentation page to name kill -9 so directly. So in the default configuration, even a process crash loses minutes. The append-only file (AOF) must be enabled for more, and then `appendfsync` decides:
+
+- `always`: "fsync every time new commands are appended to the AOF. Very very slow, very safe."
+- `everysec`, the default when AOF is on: "you may lose 1 second of data if there is a disaster."
+- `no`: "Never fsync, just put your data in the hands of the Operating System. [...] Normally Linux will flush data every 30 seconds with this configuration, but it's up to the kernel's exact tuning."
+
+The 30 seconds of the last line are the `dirty_expire_centisecs` of part 1, and part 1 also showed that the kernel can start earlier. The documentation does not separate the two kinds of crash for `everysec`, so I leave that cell as the documentation says it.
+
+## The table
+
+| setting | after a process crash | after a machine crash | source |
+| --- | --- | --- | --- |
+| SQLite, rollback, `synchronous=EXTRA` | nothing | nothing | documentation, part 13 |
+| SQLite, rollback, `FULL` (default) | nothing | maybe the last transaction | documentation, trace in part 13 |
+| SQLite, WAL, `FULL` | nothing | nothing | documentation, part 14 |
+| SQLite, WAL, `NORMAL` | nothing | recent transactions, database consistent | documentation, part 14 |
+| SQLite, any mode, `OFF` | nothing (measured, 369 kills) | the database may be corrupted | measured here, documentation |
+| PostgreSQL, `synchronous_commit=on` (default) | nothing | nothing | documentation |
+| PostgreSQL, `synchronous_commit=off` | up to about 600 ms of commits | up to about 600 ms of commits | documentation |
+| PostgreSQL, `fsync=off` | | possible corruption of the cluster | documentation |
+| InnoDB, `innodb_flush_log_at_trx_commit=1` (default) | nothing | nothing | documentation |
+| InnoDB, `=2` | up to about 1 second (documented) | up to about 1 second | documentation |
+| InnoDB, `=0` | up to about 1 second | up to about 1 second | documentation |
+| Redis, RDB only (default) | minutes | minutes | documentation |
+| Redis, AOF, `appendfsync always` | nothing | nothing | documentation |
+| Redis, AOF, `everysec` | up to 1 second, as documented | up to 1 second | documentation |
+| Redis, AOF, `no` | | about 30 seconds, "up to the kernel" | documentation |
+
+The empty cells are the places where the documentation does not say it and I did not guess.
+
+## What to ask about any setting
+
+I think the most useful result of this table is not one row. It is the shape of the questions, which work for any database, queue or file format:
+
+- What does a process crash lose? If the answer is not "nothing", then kill -9 tests will show it, and that is cheap to check.
+- What does a machine crash lose, in seconds or in transactions? "Fast" and "safe" are not answers.
+- After the loss, is the data consistent? Losing the last second is a different problem from losing the database, and `synchronous_commit=off` and `fsync=off` show the difference in one product.
+- Who is told "ok" before the loss window closes? If it is a person, or another system that deletes its copy, the window must be zero.
+
+"Durable" alone is not a property. It is a setting, with a number of seconds behind it.
+
+The kill test is in [p15-kill.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/what-survives-a-crash/results/p15-kill.txt), with `sqlcheck.py` in the [fixture](https://github.com/mehdiakiki/mehdi-cz/tree/main/experiments/what-survives-a-crash); the SQLite timings are from parts 13 and 14.
+
+## Sources
+
+- [SQLite: PRAGMA synchronous](https://www.sqlite.org/pragma.html#pragma_synchronous)
+- [PostgreSQL 18: Write Ahead Log settings (synchronous_commit, fsync, wal_writer_delay)](https://www.postgresql.org/docs/18/runtime-config-wal.html)
+- [MySQL 8.4 Reference Manual: InnoDB startup options and system variables (innodb_flush_log_at_trx_commit)](https://dev.mysql.com/doc/refman/8.4/en/innodb-parameters.html)
+- [MySQL 8.4 Reference Manual: binary logging options and variables (sync_binlog)](https://dev.mysql.com/doc/refman/8.4/en/replication-options-binary-log.html)
+- [Redis persistence](https://redis.io/docs/latest/operate/oss_and_stack/management/persistence/)

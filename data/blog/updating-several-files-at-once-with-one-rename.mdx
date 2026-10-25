@@ -1,0 +1,140 @@
+---
+title: "Updating Several Files at Once With One Rename"
+date: "2026-10-19T14:55:00+01:00"
+lastmod: "2026-10-19T14:55:00+01:00"
+tags: ["what survives a crash", "linux", "rust", "file system", "reliability"]
+draft: false
+reviewed: true
+reviewedHash: "cd0cb24786b80b74485f404cffb74a0dcee59a8baf4df5680f2d2c4212bc8ec8"
+cluster: "reliable-data-integrations"
+campaign: "editorial"
+summary: "Two files saved safely one after the other are not saved safely together: a kill left a new config with old data 85 times in 300. A version directory and one symlink rename, or renameat2 with RENAME_EXCHANGE, switched both files at once in every test. LevelDB does the same with CURRENT."
+---
+
+It is tempting to think that the problem is solved. Every file is saved with the safe method of [part 3](/blog/how-to-save-a-file-without-losing-it-write-fsync-rename) and the directory fsync of [part 4](/blog/why-the-directory-needs-fsync-too), so the program is safe. For one file, yes. Here is a program that saves two files this way, a small configuration and the data file that belongs to it, killed at random moments:
+
+```text
+== twofiles separate: version 1 to version 2, kill -9 at a random moment
+300 runs, SIGKILL after a random delay between 0 and 6 ms
+  killed  finished  outcome
+      28        98  both files at version 2
+      89         0  both files at version 1
+      85         0  mixed: config at version 2, data at version 1
+```
+
+85 times out of 300, the configuration was at version 2 and the data at version 1. That is more than I expected. Each file was perfectly correct, complete, synced, either old or new. Together they were wrong. And this is a process crash, with the page cache intact; a power cut is not needed (the two kinds of crash of [the first part](/blog/your-data-is-not-on-disk-when-write-returns)).
+
+## Two safe saves are not one
+
+Why is it like this? The reason is visible in the code. The program replaces the files one after the other:
+
+```rust
+fn separate(dir: &Path, version: u32) {
+    for (name, content) in [("config", config(version)), ("data", data(version))] {
+        let tmp = dir.join(format!("{name}.tmp"));
+        write_synced(&tmp, &content);
+        fs::rename(&tmp, dir.join(name)).expect("rename");
+        sync_dir(dir);
+    }
+}
+```
+
+Between the rename of `config` and the rename of `data` there is almost a whole save: the directory fsync for config, then the new data file, written and synced. That window is long, and that is why so many kills landed in it. The simulator from [part 7](/blog/building-a-tiny-crash-simulator-from-strace-output) finds the same, at every crash point:
+
+```text
+== two files, each one replaced with temp file, fsync, rename and directory fsync (twofiles separate)
+  events: 11 (1 ack, 2 data, 2 dirsync, 4 meta, 2 sync)
+  crash points: 12
+  process crash: 12 states, 5 bad
+  machine crash: 24 states (7 distinct), 11 bad (3 distinct)
+  first bad process state: crash after event 4 of 11 (rename config.tmp -> config): mixed: config at version 2, data at version 1
+```
+
+A rename is atomic for one name. Two renames are two atomic steps, and a crash between them is a state that nobody designed.
+
+## One name for both files
+
+The fix is to make the two files reachable through one name, and to switch that name with one rename. Why not a directory, to write `v2/` and rename it over `current/`? It does not work, and rename(2) says why: when the old path is a directory, "newpath must either not exist, or it must specify an empty directory." A directory full of files cannot be replaced by a rename. A symlink can, because it is one name with one small value. So the program writes the new version into its own directory, and a symlink called `current` points to the version that is valid:
+
+```rust
+fn switch_symlink(dir: &Path, version: u32) {
+    write_version(&dir.join(format!("v{version}")), version);
+    let tmp = dir.join("current.tmp");
+    symlink(format!("v{version}"), &tmp).expect("symlink");
+    fs::rename(&tmp, dir.join("current")).expect("rename symlink");
+    sync_dir(dir);
+    let old = dir.join(format!("v{}", version - 1));
+    if old.exists() {
+        fs::remove_dir_all(&old).expect("remove old version");
+        sync_dir(dir);
+    }
+}
+```
+
+`write_version` creates `v2`, writes both files with fsync, and syncs the `v2` directory. Only when the new version is complete and durable, a new symlink `current.tmp` pointing to `v2` is created and renamed over `current`. A rename replaces a symlink like any other name ("if newpath refers to a symbolic link, the link will be overwritten", says rename(2)). Then the parent directory is synced, and only after that the old version is deleted. After a complete update the directory looks like this:
+
+```text
+-- symlink: ./current ./v2 ./v2/config ./v2/data 
+   current -> v2
+```
+
+The same tests:
+
+```text
+== twofiles symlink: version 1 to version 2, kill -9 at a random moment
+300 runs, SIGKILL after a random delay between 0 and 6 ms
+  killed  finished  outcome
+      60        94  both files at version 2
+     146         0  both files at version 1
+```
+
+and under the simulator:
+
+```text
+== new version directory, then a symlink current.tmp renamed over current (twofiles symlink)
+  events: 16 (1 ack, 2 data, 3 dirsync, 8 meta, 2 sync)
+  crash points: 17
+  process crash: 17 states, 0 bad
+  machine crash: 44 states (11 distinct), 0 bad (0 distinct)
+```
+
+Never mixed. Before the rename, `current` points to a complete `v1`; after it, to a complete `v2`. There is no third possibility, because there is only one name.
+
+One detail for the reader side. A reader that opens `current/config`, then `current/data`, can still mix versions if the switch happens between its two opens. The reader must resolve `current` once, for example by opening the directory and reading both files relative to it. The atomic switch protects the files on the disk, not a reader that follows the name twice.
+
+## Exchanging two directories
+
+Linux has even one more tool: `renameat2` with the flag `RENAME_EXCHANGE`. The man page: "Atomically exchange oldpath and newpath. Both pathnames must exist but may be of different types (e.g., one could be a non-empty directory and the other a symbolic link)." So the program writes the new version into `staging/`, syncs it, and exchanges `staging` and `live` in one call. The standard library of Rust does not have it, so I declared the glibc function with `extern "C"`. After a complete update, the directory looks like this:
+
+```text
+-- exchange: ./live ./live/config ./live/data ./staging ./staging/config ./staging/data 
+   staging/config: version=1
+```
+
+After the exchange, `live` has version 2 and `staging` has the old version 1, which is nice: the old version is kept, ready for a rollback or for deletion. The tests gave the same result as the symlink: 0 mixed states in 300 kills and 0 bad states in the simulator. The price is portability: renameat2 exists since Linux 3.15 and glibc 2.28, and when the filesystem does not support a flag, the call fails with `EINVAL`.
+
+## How LevelDB and RocksDB do it
+
+In fact databases have the same problem on a bigger scale: a LevelDB database is many table files, and a change must switch from one set of files to another. The LevelDB implementation notes describe the solution. "A MANIFEST file lists the set of sorted tables that make up each level", and "CURRENT is a simple text file that contains the name of the latest MANIFEST file." Recovery starts with: "Read CURRENT to find name of the latest committed MANIFEST".
+
+And how is CURRENT replaced? In LevelDB's source, `SetCurrentFile` writes the new content to a temporary file with `WriteStringToFileSync` and then calls `RenameFile` to CURRENT: the save of part 3, applied to one small file that names everything else. RocksDB documents the same design: "CURRENT is a special file that points to the latest manifest log file", "The latest manifest file pointer is updated and the file system is synced", and "Upon successful update to CURRENT file, the redundant manifest logs are purged." Its documentation starts this topic with a sentence that could be the motto of this whole series: "File system operations are not atomic, and are susceptible to inconsistencies in the event of system failure."
+
+## The pattern
+
+So the general method, whatever the number of files:
+
+1. Write the complete new version under new names, and make it durable: files, and their directory.
+2. Switch one name to it with one rename: a symlink, a directory exchange, or a small pointer file like CURRENT.
+3. Sync the directory of that name.
+4. Delete the old version only now.
+
+It costs space for two versions during the update, a cleanup of old versions after a crash in step 4, and readers that resolve the name once. In exchange, the number of states that a crash can leave is two, old and new, no matter how many files change.
+
+The program is `twofiles.rs` and the simulator driver is `simtwo.py`, in the [fixture](https://github.com/mehdiakiki/mehdi-cz/tree/main/experiments/what-survives-a-crash). The outputs are [p19-kill.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/what-survives-a-crash/results/p19-kill.txt), [p19-simtwo.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/what-survives-a-crash/results/p19-simtwo.txt) and [p19-layouts.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/what-survives-a-crash/results/p19-layouts.txt).
+
+## Further reading
+
+- [rename(2) and renameat2, Linux manual page](https://man7.org/linux/man-pages/man2/rename.2.html)
+- [LevelDB implementation notes (doc/impl.md)](https://github.com/google/leveldb/blob/main/doc/impl.md)
+- [LevelDB db/filename.cc, SetCurrentFile](https://github.com/google/leveldb/blob/main/db/filename.cc)
+- [RocksDB wiki: MANIFEST](https://github.com/facebook/rocksdb/wiki/MANIFEST)

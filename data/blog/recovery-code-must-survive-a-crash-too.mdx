@@ -1,0 +1,107 @@
+---
+title: "Recovery Code Must Survive a Crash Too"
+date: "2026-09-28T21:45:00+01:00"
+lastmod: "2026-09-28T21:45:00+01:00"
+tags: ["what survives a crash", "rust", "databases", "idempotency", "testing"]
+draft: false
+reviewed: true
+reviewedHash: "c1c7a1b242a784141b5cf712c7cc4f21505effa490179eb78e3d4027471f7609"
+cluster: "reliable-data-integrations"
+campaign: "editorial"
+summary: "A recovery that writes files can crash too, and then a second recovery must give the same result. I killed my store 500 times during its own recovery: one design always recovered correctly, the other doubled a counter 53 times. The fix is one number in the snapshot."
+---
+
+Recovery code has a special place in a program. It runs after a crash, so it is easy to imagine it running in a calm moment, once, with all the time it needs. But the machine that crashed once can crash again, and a person who sees a store that does not start often restarts it again and again. So recovery must answer a question that normal code never asks: what if I die in the middle of myself?
+
+For a recovery that only reads, the answer is easy: it starts again from the same files, and nothing changed in between. Right? The problem starts when recovery writes. And the store of the last two parts writes a lot during recovery.
+
+## What my recovery writes
+
+The store from [the write-ahead log part](/blog/write-ahead-logging-from-scratch) and [the checkpoint part](/blog/checkpointing-a-log-without-losing-the-tail) replays the log at start, and if it replayed anything, it immediately makes a checkpoint, so that the next start is fast. Here is one recovery under strace, on a data directory with one log segment of 17 operations:
+
+```text
+== the files before recovery: log.000001 
+== kv . dump under strace: the recovery and its checkpoint
+  open      log.000001 (O_WRONLY|O_CREAT|O_APPEND)
+  open      log.000002 (O_WRONLY|O_CREAT|O_APPEND)
+  fsync     ./
+  open      snapshot.tmp (O_WRONLY|O_CREAT|O_TRUNC)
+  write     124 bytes to snapshot.tmp
+  fsync     snapshot.tmp
+  rename    snapshot.tmp -> snapshot
+  fsync     ./
+  unlink    log.000001
+  fsync     ./
+  fsync, fdatasync or sync_file_range calls: 4
+== the files after recovery: log.000002 snapshot 
+```
+
+A new segment, a snapshot written with the safe method, and the deletion of the old segment. Every crash between two of these lines leaves the directory in a state that the next recovery must handle. The property I want has a name, idempotence: recovery after a crash of recovery must give the same map as one recovery without crash.
+
+## A recovery that is not idempotent
+
+In fact the 17 operations are chosen on purpose: `add c 1` up to `add c 10`, five puts, one delete, and `add d 7`. So the correct map has `c=55` and `d=7`. The increments are important, I come back to this.
+
+The store has a bug variant, `double-apply`. The only difference is one line in the code that writes the snapshot:
+
+```rust
+        let marker = if self.bug == Bug::DoubleApply { 0 } else { covered };
+```
+
+The first record of a snapshot says which log segment it covers. The correct snapshot here says `snapshot 1`: everything in `log.000001` is already inside. The bug variant always writes `snapshot 0`, a snapshot that does not know where it ends. Recovery then replays every segment that it finds on top of it.
+
+Most of the time this changes nothing, because the old segment is deleted right after the snapshot. So where is the problem? Look at the trace above: between `rename snapshot.tmp -> snapshot` and `unlink log.000001` there is an fsync of the directory, a few hundred microseconds. If the recovery dies there, the next one finds a complete snapshot and the old segment, and applies all the increments a second time.
+
+## Killing the recovery 500 times
+
+I used the kill driver again. Before each run it copies the prepared data directory, then starts the recovery (`kv data dump`), kills it after a random delay between 0 and 5 ms (one recovery takes a few milliseconds), and starts a second recovery. A small script compares the second map with the map of a recovery without crash:
+
+```text
+== kv dump : recovery of a log with 17 operations, kill -9 during recovery, then a second recovery
+500 runs, SIGKILL after a random delay between 0 and 5 ms
+  killed  finished  outcome
+     404        96  same map as a recovery without crash
+== kv dump --bug double-apply: recovery of a log with 17 operations, kill -9 during recovery, then a second recovery
+500 runs, SIGKILL after a random delay between 0 and 5 ms
+  killed  finished  outcome
+     324       123  same map as a recovery without crash
+      53         0  different map: c=110 instead of 55, d=14 instead of 7
+```
+
+The correct version gave the same map 500 times, 404 of them after a kill in the middle. The bug variant gave `c=110` and `d=14` in 53 runs: every increment applied twice, as predicted.
+
+This time kill -9 finds the bug, and the reason is clear: the bug needs only a process crash. The data that the second recovery reads twice is all in the page cache, and the page cache survives a process crash, as [the first part](/blog/your-data-is-not-on-disk-when-write-returns) showed. Here the cheap test is enough.
+
+## The simulator agrees, and gives the exact window
+
+The same recovery under the simulator from [part 7](/blog/building-a-tiny-crash-simulator-from-strace-output): this time the traced program is the recovery itself, and the checker runs a second recovery on every crash state:
+
+```text
+== recovery with a snapshot that records the segment it covers
+  events: 16 (7 ack, 1 data, 3 dirsync, 4 meta, 1 sync)
+  crash points: 17
+  process crash: 17 states, 0 bad
+  machine crash: 25 states (6 distinct), 0 bad (0 distinct)
+== bug: the snapshot does not record what it covers, recovery replays every segment
+  events: 16 (7 ack, 1 data, 3 dirsync, 4 meta, 1 sync)
+  crash points: 17
+  process crash: 17 states, 2 bad
+  machine crash: 25 states (6 distinct), 3 bad (1 distinct)
+  first bad process state: crash after event 6 of 16 (rename snapshot.tmp -> snapshot): second recovery: c=110 instead of 55, d=14 instead of 7
+```
+
+(The 7 "ack" events are the lines that `dump` prints at the end, the map itself. They are not promises here, and the checker ignores them.) Two bad process states: the crash after the rename, and the crash after the directory fsync that follows it. This is the window from the trace. 53 kills out of 377 hit this window, which tells me that the window was about one seventh of the time a killed recovery was alive.
+
+## Why one number fixes it
+
+With `snapshot 1`, the second recovery reads the snapshot, sees that segment 1 is covered, does not replay it, and deletes it. It can crash at any point and start again, because every step either is not done yet or is recorded in a durable file that the next attempt reads.
+
+The general rule is the one from the checkpoint part, applied to recovery: the record of what was applied must be in the same atomic step as the result. Here the result is the snapshot and the record is its first line, so they become durable together, by one rename. If the coverage were written in another file, there would be a moment when one is on the disk and the other is not.
+
+This is the same problem as in [Why Exactly-Once Delivery Is a Myth](/blog/exactly-once-delivery-myth), only inside one machine. Replaying a log after a crash is at-least-once delivery from the log to the map: a record can be applied, and then the crash forgets that it was applied. The way out is the same too: make the replay idempotent, with something that remembers what was already done, like an [idempotency key](/blog/idempotency-key) remembers a request.
+
+## Test with operations that are not idempotent
+
+One more observation, and for me the most practical one. If my test had used only puts, the bug variant would pass every test in this article. Applying `put k2 2` twice gives `k2=2`. The bug would still be there, waiting for the first counter, the first balance, the first "append to a list". So for the next recovery code I write, I would test it with operations that change the result when they are applied twice, and I would kill the recovery itself, not only the normal program. Then I would compare the result of the second recovery with the result of a recovery without crash. And in the code itself, an input is deleted only after the output that covers it is durable, and the output says what it covers.
+
+The fixture has the store (`kv.rs`), the comparison script (`samemap.py`) and the simulator driver (`simkv.py`), in the [series fixture](https://github.com/mehdiakiki/mehdi-cz/tree/main/experiments/what-survives-a-crash). The outputs are [p11-order.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/what-survives-a-crash/results/p11-order.txt), [p11-kill.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/what-survives-a-crash/results/p11-kill.txt) and [p11-simkv.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/what-survives-a-crash/results/p11-simkv.txt).

@@ -1,0 +1,191 @@
+---
+title: "Your Data Is Not on Disk When write() Returns"
+date: "2026-08-26T10:10:00+01:00"
+lastmod: "2026-08-26T10:10:00+01:00"
+tags: ["what survives a crash", "linux", "reliability", "systems programming", "rust"]
+draft: false
+reviewed: true
+reviewedHash: "880765873c12062bc55d86631dd7759488d7f5316a4666bfb2d0386fb5285b42"
+cluster: "reliable-data-integrations"
+campaign: "editorial"
+summary: "When write returns, the kernel has your data, but the disk does not have it yet. I measured it on my laptop: 256 MiB sat in RAM until fsync, kill -9 lost nothing, and a power cut could lose everything for up to about 35 seconds."
+---
+
+When a program saves something, most of the time it calls write, it checks that there is no error, and it continues. The call returned, so the data is saved. Right?
+
+I was not so sure what this call really promises. So I made a small experiment on my laptop, with counters that the kernel already shows to everybody: the `Dirty` line in `/proc/meminfo`, the state of one file in the page cache, and the counters of the disk itself.
+
+This is the first part of a series about what survives a crash. In this part I want only one thing to be clear: where the data is at the moment write returns. The rest of the series follows the data down from there: what fsync costs, how to replace a file without losing it, why the directory needs its own fsync, what a crash in the middle of a write leaves behind. Then I build a small crash simulator from strace output, and with it an append-only log and a tiny key-value store with a write-ahead log, checkpoints and a recovery that must survive its own crash. After that: failing fsync, how SQLite commits, the durability settings of databases, group commit, mmap, checksums, several files that change together, and how to test all of it. All parts are under the tag [what survives a crash](/blog/tags/what-survives-a-crash/page/1), and the series belongs to the topic [reliable data integrations](/blog/topics/reliable-data-integrations).
+
+## The experiment
+
+The machine is a normal laptop: Linux 6.6, ext4, an NVMe SSD. A short Rust program creates a new file and writes 256 MiB in pieces of 1 MiB, then it calls fsync one time. Before and after each step it reads four things:
+
+- The `Dirty` line of `/proc/meminfo`. The kernel documentation describes it as "memory which is waiting to get written back to the disk". It counts the whole machine, not only my process, so other programs move it a little.
+- The dirty pages of my file only, with the `cachestat` system call (it exists since Linux 6.5). A page is 4 KiB here. This number has no noise from other programs.
+- `/proc/self/io`, the I/O counters of my own process.
+- `/sys/block/nvme0n1/stat`, the counters of the disk: how many 512-byte sectors were written, and how many flush requests the disk executed. This is for the whole disk.
+
+Here is the first of five runs:
+
+```text
+Dirty before write:       8404 kB
+Dirty after write:      270500 kB
+Dirty after fsync:        8828 kB
+file dirty pages after write:  65536, after fsync: 0
+wchar grew by:       268435456 after write, 268435456 after fsync
+write_bytes grew by: 268435456 after write, 268435456 after fsync
+disk during write: 0 sectors written, 0 flushes
+disk during fsync: 525104 sectors written, 1 flushes
+256 write() calls:     71.1 ms
+one fsync():         61.5 ms
+```
+
+All 256 calls returned with success. Let me go through the lines slowly.
+
+Dirty grew from 8,404 kB to 270,500 kB, so by 262,096 kB. 256 MiB is 262,144 kB. So almost exactly my whole file was sitting in RAM, marked as dirty.
+
+The next line says the same without any noise. After the writes, my file had 65,536 dirty pages. 65,536 pages of 4 KiB is 256 MiB, the whole file. After fsync, zero.
+
+And the disk line is the most direct one. During the 71 ms of writes, the disk received 0 sectors. Not from my program, and not from anybody else. I like this line the most. During fsync it received 525,104 sectors of 512 bytes, which is 268,853,248 bytes. My file is 268,435,456 bytes, so the difference is about 408 KiB: the journal and the metadata of ext4, and maybe a little from other programs, because this counter is for the whole disk. There was also one flush. I come back to this flush later.
+
+So when write returned, the disk did not receive my data yet. The kernel copied it in the page cache (that is the memory where the kernel keeps the content of files), it marked these pages as dirty, and it told my program "done". At this moment the disk did not see even one byte.
+
+The other four runs gave the same three facts: 65,536 dirty pages, 0 sectors during the writes, one flush during fsync.
+
+## A counter that does not mean what I thought
+
+I wanted one more proof from `/proc/self/io`. This file has `wchar`, the bytes that my process passed to write, and `write_bytes`, which the proc_pid_io(5) man page describes as "the number of bytes really sent to the storage layer". My plan was to show `wchar` growing at write time and `write_bytes` staying near zero until fsync.
+
+It did not happen. Look at the two lines above: both grew by 268,435,456 bytes during the writes, and fsync did not change them at all.
+
+Honestly, this surprised me. The kernel documentation has the answer: `write_bytes` is an "attempt to count the number of bytes which this process caused to be sent to the storage layer", and "this is done at page-dirtying time". So the kernel counts the bytes when my process makes the pages dirty, not when they go to the disk.
+
+So `write_bytes` is a count of future I/O, not a proof that the I/O happened. For the proof I keep the disk counter.
+
+## If you never call fsync
+
+The data still reaches the disk at some point. The documentation of the `vm` sysctls gives the rules, and on my machine they have the default values (I did not change them):
+
+- `vm.dirty_writeback_centisecs = 500`: the kernel flusher threads wake up every 5 seconds.
+- `vm.dirty_expire_centisecs = 3000`: "Data which has been dirty in-memory for longer than this interval will be written out next time a flusher thread wakes up", so after 30 seconds.
+- `vm.dirty_background_ratio = 10`: the flusher starts earlier when dirty data passes 10% of the available memory.
+
+So I expected around 30 to 35 seconds. To see it, I made a second mode of the same program. It writes the same 256 MiB, it does not call fsync, and then it samples every second for 40 seconds. "pages written" is a counter of the whole machine (`nr_written` in `/proc/vmstat`), the pages that finished writeback during that second. "reclaim scans" counts how much the kernel searched for memory to free (`pgscan_kswapd` plus `pgscan_direct`):
+
+```text
+== 256 MiB written without fsync, then one sample per second, machine load: load average: 3.48, 9.56, 8.50
+Dirty before write: 12536 kB, 256 write() calls of 1 MiB: 76.7 ms, no fsync
+  t   Dirty kB  file dirty pages  pages written  reclaim scans
+  0     274332             65536              0              0
+  1     273088             65536            462              0
+  2     274096             65536            118              0
+...
+ 32     270260             65536            128              0
+ 33     270276             65536             22              0
+ 34       8208                 0          65538              0
+ 35       5112                 0            896              0
+```
+
+For 33 seconds my 65,536 pages stayed dirty. Between second 33 and second 34, 65,538 pages finished writeback on the machine: my 65,536 and two others. This is the documented rule: 30 seconds to become old, plus up to 5 seconds to wait for the next wake-up.
+
+Then I ran it two more times, and the picture changed. Strange. In the second run, the kernel wrote a part of my file at second 25 and the rest at second 30. In the third run it started at second 5:
+
+```text
+== 256 MiB written without fsync, then one sample per second, machine load: load average: 3.20, 8.08, 8.07
+Dirty before write: 12304 kB, 256 write() calls of 1 MiB: 114.1 ms, no fsync
+  t   Dirty kB  file dirty pages  pages written  reclaim scans
+...
+  3     485376             65536           7010              0
+  4     485824             65536            691              0
+  5     420224             51200          17007              0
+...
+  9     416948             51200              5              0
+ 10     212120                 0          51210              0
+```
+
+At second 3 the Dirty counter of the machine was at 485,376 kB, much more than my 256 MiB, so another program was writing a lot at the same time. And the kernel cleaned my file together with the rest, first 14,336 pages, then the other 51,200 pages five seconds later. A small file of 4 MiB, in a fourth run, was written after only one second.
+
+I did not find which rule started these early writebacks. Reclaim was zero every time, so it was not a lack of memory. But one documented rule is still possible: the 10% of `dirty_background_ratio` are counted from the free and reclaimable memory, not from all the memory of the machine, and my program did not record that limit (the kernel shows it as `nr_dirty_background_threshold` in `/proc/vmstat`). For the question of this article it does not matter much. The 30 seconds is the age when the kernel must write old data, at its next wake-up. It is not a promise that the data stays in memory until then. In every run, for some seconds, the only copy of my data was in RAM, and my program had no way to decide how many seconds.
+
+## Killing the process loses nothing
+
+The second program writes 64 MiB, and every 1 MiB piece is filled with its own number, so a checker can see pieces that are missing or in the wrong place. It does not call fsync. It prints one line, it waits, and I kill it from the shell with `kill -9`, which a process cannot catch:
+
+```text
+== 64 MiB in 1 MiB chunks, no fsync, then kill -9
+64 MiB written, no fsync, now waiting to be killed
+exit status after kill -9: 137
+file size: 67108864 bytes, wrong chunks: 0
+```
+
+The exit status 137 is 128 plus 9, the number of SIGKILL, so the process really died from the signal. And the file is complete and correct: 67,108,864 bytes, no wrong chunk.
+
+Why? After write returned, the bytes were in the page cache of the kernel, not in the memory of my process. The process died, the kernel did not, and it wrote the dirty pages later like for any other file.
+
+## Losing the machine loses everything dirty
+
+`kill -9` cannot simulate the other kind of crash: a power loss, a kernel panic, a hard reset, a virtual machine that is stopped. Then the page cache is gone, because it was only RAM. For the program without fsync, that means up to the full 256 MiB, for up to about 35 seconds after every write returned with success. For the program with fsync, it is the time between the first write and the end of fsync.
+
+There is one more cache under the page cache. My SSD has its own write cache, and it is volatile: `/sys/block/nvme0n1/queue/write_cache` says `write back`. Data that the drive received can still be in that cache when the power goes. This is the reason of the flush that fsync sent in every run: it asks the drive to make permanent what it has. The man page of fsync says it directly: the call "includes writing through or flushing a disk cache if present".
+
+I did not cut the power of my laptop for this. The counters show the window clearly enough, and a later part of this series builds a small simulator for this case.
+
+So "the program crashed" and "the machine crashed" are two different failures. A test that kills the process can only find the first kind. In fact it passes for a program that never calls fsync at all.
+
+## Where the time goes
+
+Here are the five runs of the first program:
+
+| run | 256 write() calls | one fsync() |
+| --- | --- | --- |
+| 1 | 71.1 ms | 61.5 ms |
+| 2 | 70.0 ms | 65.0 ms |
+| 3 | 73.8 ms | 64.8 ms |
+| 4 | 76.9 ms | 70.8 ms |
+| 5 | 77.8 ms | 62.8 ms |
+
+The two columns are similar in size, but they are not the same kind of work. `strace -T` prints the time spent inside every system call (strace adds its own overhead, so the times are a bit bigger):
+
+```text
+call             count    min ms  median ms    max ms  total ms
+write(3)           256     0.271      0.288     1.154      84.7
+fsync(3)             1    62.015     62.015    62.015      62.0
+```
+
+One write of 1 MiB took 0.29 ms in the median. That is the time to copy 1 MiB from my buffer into the page cache: memory work. The single fsync took 62 ms, and this is the call that waits for the device.
+
+What does ext4 do during these 62 ms? Here it runs with `delalloc` and `data=ordered`. With delayed allocation, ext4 did not even choose where my data goes on the disk at write time: the documentation says it defers block allocation "until just before ext4 writes out the block(s) in question". So fsync allocates the blocks, writes the data, then commits the journal transaction with the metadata (in `data=ordered`, "all data are forced directly out to the main file system prior to its metadata being committed to the journal"), and it asks the SSD to flush its cache.
+
+This time the five fsync calls were close to each other, between 61.5 and 70.8 ms. But five calls say nothing about how stable fsync is, and one fsync costs more when it has more dirty data to push. The next part measures it properly, with thousands of small calls.
+
+## What to do with this
+
+The naive version is to call write and to trust it. It survives every process crash and no machine crash. The write man page says it clearly: "A successful return from write() does not make any guarantee that data has been committed to disk."
+
+The first patch people try is fsync after every write. It is correct, but every call waits for the device, and this wait is long compared to the write. `O_SYNC` does the same automatically on every write, with the same cost. fdatasync can skip some metadata (the man page gives the modification time as an example) and is sometimes cheaper, but it still waits for the device.
+
+The real answer is a decision, not a flag. Find the places where your program tells someone "it is saved": a user who sees a confirmation, an HTTP client that receives 200 OK, another system that will delete its own copy. Those places must survive a power cut, so this is where fsync goes. Databases are built around this idea: a commit is an fsync, and many commits can share one.
+
+There are two honest limits. fsync on the file is not enough when the file is new, because the directory entry that points to the file is a separate write. And fsync can fail, and what you can do after a failure is less than you think. Both get their own part.
+
+## What I take from this
+
+- When write returns, the kernel has your data. It does not mean the device has it.
+- A process crash cannot lose data that write accepted. A machine crash can, for up to about 35 seconds with the default settings, and the exact time is decided by the kernel, not by you.
+- Counters can mislead: `write_bytes` grows at write time. The disk's own counter is the one to trust.
+- fsync is the only call here that waits for the device, and almost all the cost is there.
+- Put fsync where your program promises someone that the data is saved.
+
+If you run the fixture yourself, run it on a real disk. On many Linux machines `/tmp` is tmpfs, which lives in RAM, so fsync returns at once and the experiment measures nothing. The programs and all the outputs are in the [fixture of this series](https://github.com/mehdiakiki/mehdi-cz/tree/main/experiments/what-survives-a-crash), and the outputs quoted here are [p01-dirty.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/what-survives-a-crash/results/p01-dirty.txt), [p01-series.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/what-survives-a-crash/results/p01-series.txt), [p01-kill.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/what-survives-a-crash/results/p01-kill.txt) and [p01-strace.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/what-survives-a-crash/results/p01-strace.txt). The settings of the machine (kernel, ext4 options, disk cache, vm sysctls) are in [p01-machine.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/what-survives-a-crash/results/p01-machine.txt).
+
+## Sources
+
+- [write(2), Linux manual page](https://man7.org/linux/man-pages/man2/write.2.html)
+- [fsync(2), Linux manual page](https://man7.org/linux/man-pages/man2/fsync.2.html)
+- [cachestat(2), Linux manual page](https://man7.org/linux/man-pages/man2/cachestat.2.html)
+- [proc_pid_io(5), Linux manual page](https://man7.org/linux/man-pages/man5/proc_pid_io.5.html)
+- [The /proc filesystem, Linux kernel documentation (meminfo and /proc/pid/io)](https://docs.kernel.org/filesystems/proc.html)
+- [Documentation for /proc/sys/vm, Linux kernel documentation](https://docs.kernel.org/admin-guide/sysctl/vm.html)
+- [Block layer statistics in /sys/block/dev/stat, Linux kernel documentation](https://docs.kernel.org/block/stat.html)
+- [ext4 General Information, Linux kernel documentation](https://docs.kernel.org/admin-guide/ext4.html)

@@ -1,0 +1,163 @@
+---
+title: "Write-Ahead Logging From Scratch"
+date: "2026-09-24T19:55:00+01:00"
+lastmod: "2026-09-24T19:55:00+01:00"
+tags: ["what survives a crash", "rust", "databases", "reliability", "testing"]
+draft: false
+reviewed: true
+reviewedHash: "38032ac5fc141a48710f58830117f87c113ceb1f2e45176d0a9d1b53fdc7057d"
+cluster: "reliable-data-integrations"
+campaign: "editorial"
+summary: "I built a tiny key-value store in Rust with a write-ahead log: append, fdatasync, apply, and only then say ok. My crash simulator checks every crash point, and it finds the bug that kill -9 never shows: an ok printed one fdatasync too early."
+---
+
+Write-ahead logging is one rule: before you change anything, write down what you are going to change, and make that note durable. If the program crashes in the middle, the note tells the next start what to finish.
+
+I wanted to see how small a correct store with this rule can be. So I made one: a key-value store of about 260 lines of Rust, std only, which uses the record format of [the previous part](/blog/an-append-only-log-that-survives-a-torn-last-record) for its log. The same program has also a checkpoint with a snapshot, but that is the subject of the next part; here only the log matters. It reads commands from standard input, one per line:
+
+```text
+== printf 'put a 1\nput b 2\nadd c 5\ndel a\nput d 4\nadd c 3\n' | kv data
+ok 1
+ok 2
+ok 3
+ok 4
+ok 5
+ok 6
+== kv data dump, a new process that recovers from the files
+snapshot covers 0, replayed 6 records, cut 0 bytes of torn tail
+b=2
+c=8
+d=4
+```
+
+Three kinds of operation: `put` a value, `del` a key, `add` a number to a counter. Each one gets an `ok` when it is done. Then a second process, `kv data dump`, starts from the files only, replays the 6 records and gets the same map: `a` was deleted, `c` is 5 plus 3. (The first line also speaks about a snapshot. There was none yet; the next part explains it.)
+
+## The order of one operation
+
+The whole design is in one function:
+
+```rust
+    fn mutate(&mut self, op: &str) {
+        self.log.write_all(&encode(Format::Full, op.as_bytes())).expect("append to log");
+        if self.bug != Bug::AckBeforeFsync {
+            self.log.sync_data().expect("fdatasync log");
+        }
+        apply(&mut self.map, op);
+        self.acks += 1;
+        println!("ok {}", self.acks);
+        if self.bug == Bug::AckBeforeFsync {
+            self.log.sync_data().expect("fdatasync log");
+        }
+    }
+```
+
+Ignore the `bug` lines for a moment, they come later. The normal order is: append the record to the log, fdatasync the log, apply the change to the map in memory, and only then print `ok`. Here is what two puts look like under strace, with the viewer from [part 3](/blog/how-to-save-a-file-without-losing-it-write-fsync-rename):
+
+```text
+== printf 'put a 1\nput b 2\n' | kv . 
+  open      log.000001 (O_WRONLY|O_CREAT|O_APPEND)
+  fsync     ./
+  write     15 bytes to log.000001
+  fdatasync log.000001
+  write     5 bytes to stdout: ok 1
+  write     15 bytes to log.000001
+  fdatasync log.000001
+  write     5 bytes to stdout: ok 2
+  fsync, fdatasync or sync_file_range calls: 3
+```
+
+The first two lines are the lessons of the earlier parts: the log file is new, so its directory gets an fsync once ([part 4](/blog/why-the-directory-needs-fsync-too)). Then every operation is three system calls: 15 bytes for the record (8 bytes of header and 7 of payload), the fdatasync, and the `ok`. The fdatasync is between the write and the ok, always.
+
+Recovery is the reverse direction. At start, the store reads the log, stops at the first bad record like in part 8, cuts the torn tail if there is one, and applies the valid records to an empty map, in order. The map in memory is only a copy of the log that is fast to read. The log is the truth.
+
+## Every crash point
+
+Now the important question: is this order correct at every moment? I used the simulator from [part 7](/blog/building-a-tiny-crash-simulator-from-strace-output) with six operations. Its checker runs the real recovery (`kv dump`) on every crash state and accepts a state only if it is the result of some prefix of the six operations, and if this prefix contains every operation that already got its `ok`. The program runs under strace like above:
+
+```text
+== correct order: append, fdatasync, apply, ack
+  events: 20 (6 ack, 6 data, 1 dirsync, 1 meta, 6 sync)
+  crash points: 21
+  process crash: 21 states, 0 bad
+  machine crash: 28 states (8 distinct), 0 bad (0 distinct)
+  crash points around operation 3 (add c 5):
+    after write 15 bytes at offset 30 to log.000001       machine states  2, bad 0
+    after fdatasync log.000001                            machine states  1, bad 0
+    after stdout: ok 3                                    machine states  1, bad 0
+```
+
+Zero bad states. The last three lines show the three moments of one operation:
+
+- After the write, before the fdatasync, two states are possible: the record reached the disk, or it did not. Both are fine, because nobody was told anything yet.
+- After the fdatasync, before the `ok`, there is only one state: the record is on the disk. The client does not know it. If it retries, an `add` will be applied two times, and the store cannot see that it is the same request. This is not a problem of the log, it is the problem that an [idempotency key](/blog/idempotency-key) solves one level higher.
+- After the `ok`, one state, with the record. This is the promise, and it holds.
+
+## The bug that kill -9 cannot see
+
+Now the bug lines in `mutate`. The variant `ack-before-fsync` prints `ok` first and calls fdatasync after it. It looks like a small optimization: the client gets its answer a bit earlier, and the data is synced anyway, a few hundred microseconds later. Under strace:
+
+```text
+== printf 'put a 1\nput b 2\n' | kv . --bug ack-before-fsync
+  open      log.000001 (O_WRONLY|O_CREAT|O_APPEND)
+  fsync     ./
+  write     15 bytes to log.000001
+  write     5 bytes to stdout: ok 1
+  fdatasync log.000001
+  write     15 bytes to log.000001
+  write     5 bytes to stdout: ok 2
+  fdatasync log.000001
+  fsync, fdatasync or sync_file_range calls: 3
+```
+
+The same three calls, in another order. And the simulator:
+
+```text
+== bug: ack before fdatasync
+  events: 20 (6 ack, 6 data, 1 dirsync, 1 meta, 6 sync)
+  crash points: 21
+  process crash: 21 states, 0 bad
+  machine crash: 34 states (8 distinct), 6 bad (6 distinct)
+  first bad machine state: crash after event 4 of 20 (stdout: ok 1)
+    promises printed before the crash: ['ok 1\n']
+    model: 1 of 1 name operations kept
+    model: log.000001: new file, no data, 0 of 1 unsynced writes kept
+    on disk: log.000001: 0 bytes
+    checker: 1 operations acknowledged, recovered [] is not the result of any allowed prefix
+  crash points around operation 3 (add c 5):
+    after write 15 bytes at offset 30 to log.000001       machine states  2, bad 0
+    after stdout: ok 3                                    machine states  2, bad 1
+    after fdatasync log.000001                            machine states  1, bad 0
+```
+
+Six bad states, one for each operation: the moment between its `ok` and its fdatasync. The first one is the clearest. The program said `ok 1`, the machine stopped, and the log on the disk has 0 bytes. The client was told that `a` is 1, and after the restart `a` does not exist.
+
+But look at the line "process crash: 21 states, 0 bad". Strange at first: the bug is real, and the process crash test is green. For a process crash, the bug does not exist, because the record was already in the page cache when the `ok` was printed. So a test suite that kills the store with kill -9, any number of times, will pass. This is [the first part](/blog/your-data-is-not-on-disk-when-write-returns) of this series again, now with a real program: the two kinds of crash need two kinds of test.
+
+## What the fdatasync costs
+
+The store has a small benchmark mode: 2,000 puts with an fdatasync after each, and then 200,000 puts with no sync at all, only to see the difference:
+
+```text
+== machine load: load average: 3.04, 2.91, 3.10
+2000 puts, fdatasync after each put: 1962 puts per second, 510 us per put
+200000 puts, no fsync: 661343 puts per second, 2 us per put
+```
+
+510 microseconds per put, close to the append with fdatasync in [part 2](/blog/what-fsync-costs-on-a-laptop-ssd). Without the sync, 2 microseconds. So the durable store is more than 300 times slower, and almost all of its time is the fdatasync. It is also clear why the ack-before-fsync variant is tempting: it does not make the store faster, it only moves the wait after the answer. A later part shows a correct way to pay less, by sharing one fsync between many operations.
+
+## What is still missing
+
+This store is correct at every crash point that my simulator can produce, and it is still not finished:
+
+- The log grows forever, and recovery reads all of it at every start. The next part adds a checkpoint.
+- It has one writer. With several writers, the order between the log and the map needs a lock, and the cost of the fdatasync becomes the main problem.
+- Every `expect` on fdatasync means: if the sync fails, the process stops before the `ok`. Is that the right reaction? A later part looks at what happens when fsync fails, and the answer is less simple than it looks.
+
+In the end the rule needs very little code. The difficult part is not to write the log. It is to never say `ok` one system call too early.
+
+The store is `kv.rs` (it includes `record.rs` from part 8) and the simulator driver is `simkv.py`, in the [fixture](https://github.com/mehdiakiki/mehdi-cz/tree/main/experiments/what-survives-a-crash). The outputs are [p09-example.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/what-survives-a-crash/results/p09-example.txt), [p09-order.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/what-survives-a-crash/results/p09-order.txt), [p09-simkv.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/what-survives-a-crash/results/p09-simkv.txt) and [p09-bench.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/what-survives-a-crash/results/p09-bench.txt).
+
+## References
+
+- [fsync(2) and fdatasync(2), Linux manual page](https://man7.org/linux/man-pages/man2/fsync.2.html)
+- [std::fs::File::sync_data in the Rust 1.98.0 documentation](https://doc.rust-lang.org/1.98.0/std/fs/struct.File.html#method.sync_data)

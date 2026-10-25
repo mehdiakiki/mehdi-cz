@@ -1,0 +1,170 @@
+---
+title: "How to Save a File Without Losing It: Write, fsync, Rename"
+date: "2026-09-02T08:40:00+01:00"
+lastmod: "2026-09-02T08:40:00+01:00"
+tags: ["what survives a crash", "linux", "reliability", "rust", "file system"]
+draft: false
+reviewed: true
+reviewedHash: "f1f7b4ceaf249f867b82ebda7da840c67c00c7c7688e8424aedda53e925f2bbf"
+cluster: "reliable-data-integrations"
+campaign: "editorial"
+summary: "I killed a program 300 times while it saved a file. Writing in place left a cut file 233 times, without any power loss. A temp file, fsync and rename never did. Then I traced how sed, Python, cp, install and git save files."
+---
+
+Here is what happened when I killed a program 300 times while it was saving a file:
+
+```text
+== naive save: open with O_TRUNC, write 64 pieces of 4 KiB with 1 ms of work after each piece
+300 runs, SIGKILL after a random delay between 0 and 90 ms
+  killed  finished  outcome
+     232         0  new version, cut short
+       5        60  new version, complete
+       2         0  old version, complete
+       1         0  empty file
+```
+
+233 times out of 300, the file on the disk was neither the old version nor the new one. There was no power cut and nothing was wrong with the disk. It was only `kill -9`, the same process crash that lost nothing in [the first part of this series](/blog/your-data-is-not-on-disk-when-write-returns).
+
+So how can a process crash lose a file, if the kernel keeps everything that write accepted? It does keep everything. The problem is what the program asked the kernel to keep.
+
+## The naive save
+
+The test document has 64 pieces of 4 KiB. Every piece starts with its version and its number, so a checker can say what is on the disk: the old version complete, the new version complete, the new version cut short, an empty file, or a mix. The naive save is the code most of us write first:
+
+```rust
+fn naive(path: &str, version: u8, pause: Duration) {
+    let mut file = File::create(path).expect("open with O_TRUNC");
+    write_pieces(&mut file, version, pause);
+}
+```
+
+`File::create` "will create a file if it does not exist, and will truncate it if it does", says the Rust documentation. So the old content is gone at the moment of the open, and the new content arrives piece by piece. Between two pieces the program sleeps 1 ms. This is a stand-in for the work that a real program does while it produces the content: serializing, compressing, reading from the network, etc.
+
+A small Python driver runs the experiment. Before each run it writes the old version. Then it starts the save, waits a random time between 0 and 90 ms, sends SIGKILL, and runs the checker. "killed" counts the runs where the signal arrived while the program was still running, and "finished" the runs where the program was faster than the signal.
+
+Now the table is easy to read. 60 runs finished before the signal, and 5 more were killed after the last piece, so 65 files have the new version. 2 runs were killed before the open, so the old version was still there. One run was killed between the open and the first write: an empty file. And 232 runs were killed in the middle: the old content was truncated and the new content was only a prefix.
+
+The kernel did its job. Every piece that write accepted was in the file. But the file had a state that should never exist: the program itself created it, with the truncate, and the crash only froze it.
+
+## Write somewhere else, then rename
+
+The fix is old and well known. Write the new content into a temporary file in the same directory, fsync it, and rename it over the old name:
+
+```rust
+fn replace(path: &str, version: u8, pause: Duration, sync: bool) {
+    let tmp = format!("{path}.tmp");
+    let mut file = File::create(&tmp).expect("create temp");
+    write_pieces(&mut file, version, pause);
+    if sync {
+        file.sync_all().expect("fsync temp");
+    }
+    fs::rename(&tmp, path).expect("rename");
+}
+```
+
+The important property is in the rename(2) man page: "If newpath already exists, it will be atomically replaced, so that there is no point at which another process attempting to access newpath will find it missing." So the name points to the old file, and then, in one step, to the new file. There is no moment with half of each.
+
+The temp file must be in the same directory, or at least on the same filesystem, because rename does not move data. Across filesystems it fails with `EXDEV` ("oldpath and newpath are not on the same mounted filesystem"). On my laptop `/tmp` is tmpfs, so a temp file in `/tmp` could never be renamed over a file in my home directory.
+
+Same experiment, 300 runs, same random delays:
+
+```text
+== safe save: the same pieces into doc.txt.tmp, fsync, rename over doc.txt
+300 runs, SIGKILL after a random delay between 0 and 90 ms
+  killed  finished  outcome
+     248         0  old version, complete, temp file left
+       1        49  new version, complete
+       2         0  old version, complete
+```
+
+Zero cut files. Every run gave the old version or the new version, complete. Good, that is what I wanted to see.
+
+But look at the first line: 248 times a `doc.txt.tmp` stayed on the disk, with a part of the new content. Nobody reads it, so it does no harm, but nobody deletes it either. A real program must clean these files, for example when it starts.
+
+## kill -9 cannot see the fsync
+
+I ran the same loop a third time, with the same code but without the fsync before the rename:
+
+```text
+== the same temp file and rename, without the fsync
+300 runs, SIGKILL after a random delay between 0 and 90 ms
+  killed  finished  outcome
+     243         0  old version, complete, temp file left
+       0        55  new version, complete
+       2         0  old version, complete
+```
+
+The same result: zero cut files. And this is correct for this kind of crash. After a process crash the page cache is still there, so the temp file has all the data that write accepted, and the rename is atomic for every program that looks at the name.
+
+So why the fsync? It is for the other crash, the one where the machine loses power. Then the page cache is lost, and the question becomes which of the two writes reached the disk: the data of the temp file, or the rename. Nothing in POSIX says that the data goes first. If the rename is on the disk and the data is not, the name points to an empty or partial file. This has a name, the zero-length file problem, and it gets its own part. The fsync forces the data to the device before the rename even starts.
+
+What is important for testing: the program without fsync and the program with fsync give the same outcome under kill -9: zero cut files. A test suite that kills processes cannot tell them apart. To see the difference we need to simulate the lost page cache, and a later part builds a small simulator for that.
+
+There is still one hole in my "safe" save. The rename changes the directory, and the directory is a file too, with its own data. My program never syncs it. That is the next part.
+
+## What real tools do
+
+I was curious what the tools on my laptop do when they save a file. I ran each one under strace, with a small viewer that keeps only the operations on files of the test directory. Here is `sed -i`:
+
+```text
+== sed -i 's/old/new/' config.txt, sed (GNU sed) 4.9
+  open      sedtsE4Bj (O_RDWR|O_CREAT|O_EXCL)
+  fchown    sedtsE4Bj (1000, 1000)
+  write     11 bytes to sedtsE4Bj
+  rename    sedtsE4Bj -> config.txt
+  fsync, fdatasync or sync_file_range calls: 0
+```
+
+sed does the temp file and the rename, with a random name created with `O_EXCL` (so two seds cannot use the same temp file), and it even copies the owner of the old file with fchown. But it never calls fsync. Here is `install`:
+
+```text
+== install -m 644 new.txt config.txt, install (GNU coreutils) 9.10
+  unlink    config.txt
+  open      config.txt (O_WRONLY|O_CREAT|O_EXCL)
+  copy      11 bytes from new.txt to config.txt
+  copy      0 bytes from new.txt to config.txt
+  fsync, fdatasync or sync_file_range calls: 0
+```
+
+I did not expect this one. install deletes the old file first and then creates a new one with the same name. Between the unlink and the end of the copy, a crash leaves no file at all, or a cut one.
+
+The full output, with Python and cp and git, is in the results file. In short:
+
+| tool | how it saves | fsync calls |
+| --- | --- | --- |
+| `sed -i` | new temp file, fchown, rename over the old name | 0 |
+| Python `open(path, "w").write(...)` | truncates the old file, then writes | 0 |
+| `cp new.txt config.txt` | truncates the old file, then copy_file_range | 0 |
+| `install` | unlinks the old file, creates a new one | 0 |
+| `git add`, `git commit` (2.53.0) | temp object plus link; `index.lock` and `refs/heads/main.lock` plus rename | 0 |
+| `git -c core.fsync=all commit` | the same | 4 (objects, index, branch), no directory |
+
+Python and cp are my naive save: a crash, a Ctrl-C or an exception in the middle leaves a cut file. sed and git are safe against a process crash, and not safe against a power cut. git writes it in its documentation: the default "is equivalent to `core.fsync=committed,-loose-object`, which has good performance, but risks losing recent work in the event of an unclean system shutdown". It is a decision, and it is written down.
+
+## The price of the safe save
+
+The safe save is not free:
+
+- One fsync per save. In [the previous part](/blog/what-fsync-costs-on-a-laptop-ssd) a small sync cost around half a millisecond on my laptop, and a big file costs more.
+- Space for two copies during the save.
+- Temp files after crashes, which somebody must delete.
+- A new file, not the old one. The new inode does not have the owner, the permissions, the extended attributes or the hard links of the old file, unless the program copies them. sed copies the owner. My program does not. And rename replaces only the name: if the old file has another hard link, that other name still shows the old content.
+
+For a configuration file or a document, this price is small. For a file of 10 GB that changes one byte at a time, it is not, and that is where logs and databases start, later in this series.
+
+## What to check in your own code
+
+- Do you open the real file with truncate and then write? Then you need no power cut to lose it, a kill is enough.
+- Is the temp file in the same directory as the real one?
+- Is there an fsync between the last write and the rename?
+- Who deletes the temp files that a crash leaves behind?
+- Do you need the owner, the permissions or the hard links of the old file?
+
+The code, the driver and the strace viewer are in the [fixture](https://github.com/mehdiakiki/mehdi-cz/tree/main/experiments/what-survives-a-crash) (`save.rs`, `killer.py`, `opsview.py`), and the outputs are [p03-kill.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/what-survives-a-crash/results/p03-kill.txt) and [p03-tools.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/what-survives-a-crash/results/p03-tools.txt).
+
+## References
+
+- [rename(2), Linux manual page](https://man7.org/linux/man-pages/man2/rename.2.html)
+- [fsync(2), Linux manual page](https://man7.org/linux/man-pages/man2/fsync.2.html)
+- [std::fs::File in the Rust 1.98.0 documentation (create, sync_all)](https://doc.rust-lang.org/1.98.0/std/fs/struct.File.html)
+- [git-config documentation, core.fsync](https://git-scm.com/docs/git-config)

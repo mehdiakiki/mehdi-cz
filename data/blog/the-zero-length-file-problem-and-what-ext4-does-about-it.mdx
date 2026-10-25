@@ -1,0 +1,117 @@
+---
+title: "The Zero-Length File Problem and What ext4 Does About It"
+date: "2026-09-11T15:35:00+01:00"
+lastmod: "2026-09-11T15:35:00+01:00"
+tags: ["what survives a crash", "linux", "file system", "reliability", "kernel"]
+draft: false
+reviewed: true
+reviewedHash: "8e085e11122e880d120248e7c73571c51c087bbfa35d8fe46080c90d1cf8d741"
+cluster: "reliable-data-integrations"
+campaign: "editorial"
+summary: "In 2009, ext4 users found empty files after crashes, and ext4 got a heuristic called auto_da_alloc. I watched it work on my laptop: a rename over an existing file starts the writeback at once. It protects against the worst case, but it is not durability."
+---
+
+The ext4 documentation has a mount option whose description starts like this: "Many broken applications don't use fsync() when replacing existing files via patterns such as fd = open("foo.new")/write(fd,..)/close(fd)/ rename("foo.new", "foo")".
+
+This pattern is the save without fsync from [part 3](/blog/how-to-save-a-file-without-losing-it-write-fsync-rename). It survived 300 kills there, with zero cut files, because a process crash keeps the page cache. The documentation calls it broken anyway. Why? Because of what happened in 2009, when many people lost files after a crash. In this part I tell that story, as documented by the people who were in it, and then I look for the fix on my own laptop. It is still there, and I could watch it work.
+
+## What happened in 2009
+
+ext3, the filesystem before ext4, committed its journal every 5 seconds, and in its default `data=ordered` mode it wrote the data of a file before committing the metadata that pointed to it. Jonathan Corbet explains in the LWN article "ext4 and data loss" (March 2009) that this made recent writes survive most crashes, and that applications started to depend on it, even if nobody had promised it.
+
+ext4 brought delayed allocation, that is: it chooses the place of the data on the disk only when it writes the data back, not at write time (we saw the effect in [part 4](/blog/why-the-directory-needs-fsync-too), where a directory fsync left all the data in RAM). The LWN article says it in one sentence: "So ext4 will not (cannot) write out unallocated blocks as part of the next journal commit cycle."
+
+Now take the pattern from the documentation. The program writes `foo.new` without fsync, so its data is not allocated yet. The rename is metadata, so it goes into the journal and is committed within a few seconds. The data waits for writeback, which can take much longer. What does it mean for the file? If the machine would crash between the two, the journal says that `foo` is the new inode, and the new inode has no data. The old content is gone and the new one never arrived: a file of zero bytes. Users reported this. The bug report quoted by LWN says that after a crash, "any file written to by any application (during the previous boot) was 0 bytes".
+
+Theodore Ts'o, the maintainer of ext4, answered on his blog in "Delayed allocation and the zero-length file problem" (March 12, 2009). His point was that applications were relying on the behaviour of ext3, "even though POSIX never really made any such guarantee". In "Don't fear the fsync!" a few days later he described the correct sequence (write, fsync, close, rename) and added that for the new file to survive a crash, "it's necessary to fsync the containing directory". But he also wrote patches, queued for Linux 2.6.30: when a file replaces another file, ext4 now allocates its delayed blocks, so the data goes to the disk together with the rename. He wrote also that they do not solve the problem for newly created files.
+
+So today this behaviour is controlled by the `auto_da_alloc` mount option. It is on by default, and on my laptop it appears in the mount options.
+
+## Looking for it on my laptop
+
+I wanted to see this heuristic with my own eyes. The program writes 16 MiB without fsync, in four ways:
+
+- rename-over: write `target.tmp`, then rename it over an existing `target`. This is the replace-via-rename pattern.
+- rename-new: the same, but there is no `target` before, so the rename replaces nothing.
+- truncate: open the existing `target` with `O_TRUNC`, write, close. The replace-via-truncate pattern.
+- new-file: create a new file, write, close.
+
+Before and after the rename (or the close), it reads three things: the dirty pages and the pages under writeback of the file (with `cachestat`, like in [the first part](/blog/your-data-is-not-on-disk-when-write-returns)), and the counter `/sys/fs/ext4/nvme0n1p2/delayed_allocation_blocks`, which counts the blocks that ext4 reserved but did not allocate yet, for the whole filesystem. It also times the rename and the close. Here is the first round:
+
+```text
+rename-over: 16 MiB written without fsync
+  after the writes           dirty pages  4096, writeback pages     0, ext4 delayed blocks   5262
+  rename took 2271 us
+  right after rename         dirty pages     0, writeback pages  1160, ext4 delayed blocks   1166
+  one second later           dirty pages     0, writeback pages     0, ext4 delayed blocks   1168
+rename-new: 16 MiB written without fsync
+  after the writes           dirty pages  4096, writeback pages     0, ext4 delayed blocks   5264
+  rename took 21 us
+  right after rename         dirty pages  4096, writeback pages     0, ext4 delayed blocks   5264
+  one second later           dirty pages  4096, writeback pages     0, ext4 delayed blocks   5262
+```
+
+OK, now it is visible. After the writes, the file has 4,096 dirty pages (16 MiB) and the filesystem has 5,262 delayed blocks: mine plus about 1,166 from other programs. The rename over the existing file took 2,271 microseconds, and when it returned, the file had no dirty pages anymore: 1,160 pages were under writeback, the others were already written. The delayed counter fell by 4,096, which is my file in blocks. One second later everything was clean.
+
+The rename to a new name took 21 microseconds and changed nothing. 4,096 dirty pages before, 4,096 after, and still 4,096 one second later.
+
+The truncate pattern does the same thing, but at close:
+
+```text
+truncate: 16 MiB written without fsync
+  after the writes           dirty pages  4096, writeback pages     0, ext4 delayed blocks   5262
+  close took 4538 us
+  right after close          dirty pages     0, writeback pages   215, ext4 delayed blocks   1166
+  one second later           dirty pages     0, writeback pages     0, ext4 delayed blocks   1169
+new-file: 16 MiB written without fsync
+  after the writes           dirty pages  4096, writeback pages     0, ext4 delayed blocks   5265
+  close took 2 us
+  right after close          dirty pages  4096, writeback pages     0, ext4 delayed blocks   5265
+  one second later           dirty pages  4096, writeback pages     0, ext4 delayed blocks   5266
+```
+
+A close of 4.5 milliseconds, for a file that was truncated before. A close of 2 microseconds for a new file. The second round in the results file gives the same picture: 3,366 and 14 microseconds for the two renames, 2,937 and 1 microseconds for the two closes. So the heuristic works for its two patterns, the rename over an old file and the truncate of an old file, and a new file gets no help.
+
+## The code behind it
+
+In the source of Linux 6.6, `ext4_rename` in `fs/ext4/namei.c` has this test, where `new.inode` is the file that the rename replaces:
+
+```c
+	if (new.inode && !test_opt(new.dir->i_sb, NO_AUTO_DA_ALLOC))
+		ext4_alloc_da_blocks(old.inode);
+```
+
+No replaced file, no call. That is the difference between rename-over and rename-new. For the truncate, `ext4_truncate` marks the inode when its size becomes zero, and `ext4_release_file`, which runs at close, calls the same function. And `ext4_alloc_da_blocks` in `fs/ext4/inode.c` says plainly what it does: "For now, though, we'll cheat by calling filemap_flush(), which will map the blocks, and start the I/O, but not actually wait for the I/O to complete."
+
+Start the I/O, do not wait. This is the 1,160 pages under writeback right after the rename.
+
+## Why this is not durability
+
+The heuristic changes what a crash can leave, but it does not make anything durable at the moment the program thinks it is done.
+
+First, nothing waits. When the rename returned, 1,160 pages were still in flight, and the rename itself was only in the running journal transaction. With `commit=5` it is committed within about 5 seconds. The documentation describes the promise: the data blocks "are forced to disk before the rename() operation is committed". So if the machine crashes before the commit, the old file comes back. Not an empty file, which is the progress, but the old version, after the program said "saved".
+
+It also works only when a file is replaced. A new file, like in rename-new and new-file, keeps its data in the page cache for the normal writeback time. Ts'o wrote this himself in 2009, and the experiment shows it.
+
+And all this is ext4, with this option, on this kernel. The option can be disabled with `noauto_da_alloc`, and other filesystems have their own rules. Nothing in POSIX describes it.
+
+And it is not even free. The rename that replaces a file took between 2.3 and 3.4 milliseconds in my runs, against 14 to 21 microseconds for the other rename. A program that saves files with this pattern already pays a part of the price of an fsync, and it gets none of the promise.
+
+## Who should fix it?
+
+In 2009 this was a long argument, and LWN covered it in "That massive filesystem thread". One side said that applications must say what they need, with fsync. The other side said that a filesystem that loses files after a crash is a bad filesystem, whatever POSIX allows.
+
+After this experiment, my opinion is that both were right, but for different programs. A program that tells a user "saved" must call fsync, and also fsync the directory, because only that is a promise. The heuristic protects all the programs that will never do it, and there will always be many of them. Strange, but this is how it is: the same filesystem protects the careless program from the worst outcome, and the careless program pays for this protection in the 2.3 to 3.4 milliseconds of its rename. The careful program does not pay it: after its fsync no block is delayed anymore, and `ext4_alloc_da_blocks` returns at once, because its first test is `if (!EXT4_I(inode)->i_reserved_data_blocks) return 0;`.
+
+The program is `zerolen.rs` in the [fixture](https://github.com/mehdiakiki/mehdi-cz/tree/main/experiments/what-survives-a-crash), and both rounds are in [p05-zerolen.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/what-survives-a-crash/results/p05-zerolen.txt).
+
+## Sources
+
+- [ext4 General Information, the auto_da_alloc mount option](https://docs.kernel.org/admin-guide/ext4.html)
+- [Jonathan Corbet, "ext4 and data loss", LWN, March 11, 2009](https://lwn.net/Articles/322823/)
+- [Jonathan Corbet, "That massive filesystem thread", LWN, March 31, 2009](https://lwn.net/Articles/326471/)
+- [Theodore Ts'o, "Delayed allocation and the zero-length file problem", March 12, 2009](https://thunk.org/tytso/blog/2009/03/12/delayed-allocation-and-the-zero-length-file-problem/)
+- [Theodore Ts'o, "Don't fear the fsync!", March 2009](https://thunk.org/tytso/blog/2009/03/15/dont-fear-the-fsync/)
+- [fs/ext4/namei.c in Linux 6.6](https://elixir.bootlin.com/linux/v6.6/source/fs/ext4/namei.c)
+- [fs/ext4/inode.c in Linux 6.6](https://elixir.bootlin.com/linux/v6.6/source/fs/ext4/inode.c)
+- [cachestat(2), Linux manual page](https://man7.org/linux/man-pages/man2/cachestat.2.html)

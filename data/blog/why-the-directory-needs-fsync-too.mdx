@@ -1,0 +1,163 @@
+---
+title: "Why the Directory Needs fsync Too"
+date: "2026-09-06T17:05:00+01:00"
+lastmod: "2026-09-06T17:05:00+01:00"
+tags: ["what survives a crash", "linux", "reliability", "file system", "python"]
+draft: false
+reviewed: true
+reviewedHash: "918dbe412c9155456c62172d35cc429ddd92c30c2b51d1af64d47ab24a7bf78e"
+cluster: "reliable-data-integrations"
+campaign: "editorial"
+summary: "fsync of a new file does not promise that its name is on the disk. I measured directory fsync on ext4: half a microsecond after a file fsync, about 420 microseconds after a rename, and alone it made the name durable while the data stayed in RAM."
+---
+
+When I prepared this experiment, one number looked wrong to me. A directory fsync took half a microsecond. A file fsync on the same laptop takes around 500 microseconds, so this looked like a call that does nothing. In a way it was, and the reason is the interesting part of this article. But first, why would anybody fsync a directory?
+
+## A directory is a file too
+
+In [the previous part](/blog/how-to-save-a-file-without-losing-it-write-fsync-rename) the safe save was: write a temp file, fsync it, rename it over the old name. The fsync makes the data of the temp file durable. But the rename does not change the data of any file. It changes a directory.
+
+A directory is a file whose content is a list, that is: this name points to this inode. Creating a file adds an entry to that list. Renaming changes entries. Deleting removes one. All of this is a write to the directory, and it is a different write from the data of the file. The fsync(2) man page says it explicitly:
+
+> Calling fsync() does not necessarily ensure that the entry in the directory containing the file has also reached disk. For that an explicit fsync() on a file descriptor for the directory is also needed.
+
+So, after a power loss, a filesystem that keeps these two writes independent can give back a new file whose data was fsynced but whose name was never written. The data is somewhere on the disk, and nothing points to it. For the program it is the same as a lost file. I cannot show this on my laptop without cutting the power, so this part is documentation, not measurement. What I can measure is what the directory fsync costs and what it really does here.
+
+## The code
+
+In Rust, a directory can be opened like a file, and `sync_all` on it is an fsync of the directory:
+
+```rust
+fn sync_parent(path: &str) {
+    let parent = Path::new(path).parent().filter(|p| !p.as_os_str().is_empty());
+    let dir = File::open(parent.unwrap_or(Path::new("."))).expect("open dir");
+    dir.sync_all().expect("fsync dir");
+}
+```
+
+In Python it is `os.open` with `O_RDONLY` and `os.fsync`:
+
+```python
+def save(path, data, flush=True):
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(data)
+        if flush:
+            f.flush()
+        os.fsync(f.fileno())
+    os.rename(tmp, path)
+    dirfd = os.open(os.path.dirname(path) or ".", os.O_RDONLY)
+    try:
+        os.fsync(dirfd)
+    finally:
+        os.close(dirfd)
+```
+
+I ran it under strace with the small viewer from the previous part, which prints only the file operations in the test directory:
+
+```text
+== python3 savedir.py config.txt 
+  open      config.txt.tmp (O_WRONLY|O_CREAT|O_TRUNC)
+  write     11 bytes to config.txt.tmp
+  fsync     config.txt.tmp
+  rename    config.txt.tmp -> config.txt
+  fsync     ./
+  fsync, fdatasync or sync_file_range calls: 2
+```
+
+This is the complete order: data, fsync of the data, rename, fsync of the directory (`./` is the test directory).
+
+The `flush` parameter is there because of a mistake that is easy to make in Python. A file object has its own buffer, so `f.write` does not call write(2) yet. Here is the same program without `f.flush()`:
+
+```text
+== python3 savedir.py config.txt --no-flush
+  open      config.txt.tmp (O_WRONLY|O_CREAT|O_TRUNC)
+  fsync     config.txt.tmp
+  write     11 bytes to config.txt.tmp
+  rename    config.txt.tmp -> config.txt
+  fsync     ./
+  fsync, fdatasync or sync_file_range calls: 2
+```
+
+Look at the second and third lines. This one is easy to miss in a review. The fsync comes before the write: it synced an empty file, and the data went to the kernel only when the `with` block closed the file. Two fsync calls, and the data is still not protected. The Python documentation warns about this: "first do `f.flush()`, and then do `os.fsync(f.fileno())`".
+
+## What the directory fsync costs
+
+The measuring program creates 200 new files of 4 KiB in an empty directory, in four modes:
+
+- file-only: create, write, fsync the file.
+- file-then-dir: the same, then fsync the directory.
+- dir-only: create, write, fsync only the directory.
+- rename: create a temp file, write, fsync it, rename it to its final name, fsync the directory.
+
+Around each fsync it reads the disk counters, and after the syncs of each file it asks the kernel (with `cachestat`, like in [the first part](/blog/your-data-is-not-on-disk-when-write-returns)) if that file still has dirty data in the page cache. I ran the four modes three times, interleaved. Here is the first round:
+
+```text
+== round 1: 200 new files of 4 KiB in a new directory, machine load: load average: 6.04, 4.21, 3.84
+file-only: 200 new files of 4 KiB, 1305 files per second
+  fsync(file)     p50    570 us  p99   2356 us  | whole disk, median:  40 KiB written, 1 flushes
+  files with dirty data after the syncs: 0
+file-then-dir: 200 new files of 4 KiB, 1489 files per second
+  fsync(file)     p50    465 us  p99   2406 us  | whole disk, median:  40 KiB written, 1 flushes
+  fsync(dir)      p50    0.5 us  p99    5.5 us  | whole disk, median:   0 KiB written, 0 flushes
+  files with dirty data after the syncs: 0
+dir-only: 200 new files of 4 KiB, 1523 files per second
+  fsync(dir)      p50    461 us  p99   1918 us  | whole disk, median:  28 KiB written, 1 flushes
+  files with dirty data after the syncs: 200
+rename: 200 new files of 4 KiB, 803 files per second
+  fsync(file)     p50    515 us  p99   2933 us  | whole disk, median:  40 KiB written, 1 flushes
+  fsync(dir)      p50    419 us  p99   1549 us  | whole disk, median:  20 KiB written, 1 flushes
+  files with dirty data after the syncs: 0
+```
+
+The file fsync of a new file wrote 40 KiB in the median: 4 KiB of data and 36 KiB more for the journal. That is more than the 24 KiB of journal for an append in [part 2](/blog/what-fsync-costs-on-a-laptop-ssd), because a new file changes more metadata: a new inode, a new entry in the directory, the allocation of a block.
+
+Then the strange number: in file-then-dir, the directory fsync took 0.5 microseconds in the median, wrote 0 KiB and sent 0 flushes. The other two rounds gave 0.6 and 1.4 microseconds, again with 0 KiB and 0 flushes. So it was not one lucky run.
+
+The rename mode is different. There, the directory fsync took 419 microseconds, wrote 20 KiB and sent one flush, almost like a file fsync. And the whole save got slower: 803 files per second, against 1,305 for file-only. In the other rounds it was 761 and 851 against 1,590 and 1,364.
+
+And dir-only shows something important: the directory fsync wrote 28 KiB and sent a flush, but after it, all 200 files still had their data dirty in memory. The names were on the disk, and the data was not.
+
+## What ext4 does with it
+
+To understand the half microsecond, I read `fs/ext4/fsync.c` in the source of Linux 6.6. For a regular file, ext4 waits until the journal transaction that last changed this inode is committed. For anything else, there is this:
+
+```c
+	/*
+	 * Fastcommit does not really support fsync on directories or other
+	 * special files. Force a full commit.
+	 */
+	if (!S_ISREG(inode->i_mode))
+		return ext4_force_commit(inode->i_sb);
+```
+
+So a directory fsync commits the transaction that is running now, whatever it contains. Now the numbers make sense:
+
+- In file-then-dir, the file fsync just committed the transaction that created the file, and the new directory entry was in that transaction (or in an earlier one, already committed). Right after it, nothing new was waiting, so the directory fsync had nothing to commit and returned at once. Half a microsecond.
+- In the rename mode, the rename happened after the file fsync. It is new metadata in a new transaction, so the directory fsync must commit it: 20 KiB and one flush.
+- In dir-only, the commit contains the new inode and the new name, but not the data. With delayed allocation, the data has no place on the disk yet, so it is not part of the transaction. The name becomes durable, and the data stays in the page cache.
+
+There is one more piece of evidence in the same file. When ext4 runs without a journal, its fsync syncs the parent directory of a new file by itself, and the comment explains why: "otherwise it will only be written by writeback, leaving a huge window during which a crash may lose the file". So the ext4 developers treat the name as a separate write too, and on a journaled ext4 the journal commit covers it.
+
+This is ext4 behaviour, on this kernel, with these mount options. It is not what POSIX promises, and another filesystem can do it differently. So I keep the directory fsync in my code, and on ext4 it costs half a microsecond when there is nothing to commit.
+
+## The order matters
+
+The dir-only mode is a warning. A directory fsync before the data is durable gives a durable name for data that is still in RAM. After a power loss at that moment, ext4 would give back the file, but empty. So the order is not a detail:
+
+1. Write the data to a temp file and fsync the file.
+2. Rename the temp file over the real name.
+3. fsync the directory.
+4. Only now tell anybody that the file is saved.
+
+Steps 1 and 3 each cost about one journal commit here, so a durable replace is around two commits. In my runs, one fsync per new file gave between 1,305 and 1,590 files per second, and the full durable replace between 761 and 851.
+
+How do you check that your code does this in the right order, without cutting the power? Reading the code is one way. A later part of this series builds a small simulator that reads the strace output of a program and shows what a machine crash could leave at each moment. Everything shown here is in the fixture: `dirsync.rs`, `savedir.py`, and the outputs [p04-dirsync.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/what-survives-a-crash/results/p04-dirsync.txt) and [p04-python.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/what-survives-a-crash/results/p04-python.txt).
+
+## Further reading
+
+- [fsync(2), Linux manual page](https://man7.org/linux/man-pages/man2/fsync.2.html)
+- [rename(2), Linux manual page](https://man7.org/linux/man-pages/man2/rename.2.html)
+- [fs/ext4/fsync.c in Linux 6.6](https://elixir.bootlin.com/linux/v6.6/source/fs/ext4/fsync.c)
+- [os.fsync in the Python 3.14 documentation](https://docs.python.org/3.14/library/os.html#os.fsync)
+- [ext4 General Information, delalloc and data=ordered](https://docs.kernel.org/admin-guide/ext4.html)

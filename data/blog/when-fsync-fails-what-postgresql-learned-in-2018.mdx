@@ -1,0 +1,118 @@
+---
+title: "When fsync Fails: What PostgreSQL Learned in 2018"
+date: "2026-10-02T16:10:00+01:00"
+lastmod: "2026-10-02T16:10:00+01:00"
+tags: ["what survives a crash", "postgresql", "linux", "databases", "reliability"]
+draft: false
+reviewed: true
+reviewedHash: "ad4b08f00bb2ea82028e8b2eb14b2ede00d2789330e731b30da03b30ca139b8e"
+cluster: "reliable-data-integrations"
+campaign: "editorial"
+summary: "My program got EIO from fdatasync, called it again and got ok. In 2018 PostgreSQL learned why that second ok can be a lie on Linux. I tell the documented story, then inject fsync errors into my store with an LD_PRELOAD shim, and I say what the shim cannot show."
+---
+
+My program called fdatasync, got an error, called it again, and got success:
+
+```text
+== retrysync with the shim: FAULT_CALL=fdatasync FAULT_AT=1 FAULT_ERRNO=EIO
+first fdatasync: Input/output error (os error 5)
+second fdatasync: ok, so the program reports the record as saved
+content of the file afterwards: an important record
+```
+
+So the record is saved. In my test it really is, the file contains it. But this result comes from a test that lies in a very specific way, and on a real Linux kernel with a real disk error, the same two calls can return the same two answers while the record is lost. PostgreSQL did this retry until 2019. In 2018 its developers found out why it is wrong, and the discussion changed PostgreSQL. Here is the story, as the people involved documented it, and then what my own store does when fsync fails.
+
+## What does a failed fsync mean?
+
+On March 28, 2018, Craig Ringer started a thread on the pgsql-hackers mailing list with the subject "PostgreSQL's handling of fsync() errors is unsafe and risks data loss at least on XFS". The core of it is in two sentences: "Retrying fsync() is not OK at least on Linux. When fsync() returns success it means "all writes since the last fsync have hit disk" but we assume it means "all writes since the last SUCCESSFUL fsync have hit disk"."
+
+To see why, remember where the data is before fsync: in dirty pages of the page cache ([part 1](/blog/your-data-is-not-on-disk-when-write-returns)). fsync starts the writeback of these pages and waits. If the device returns an error during the writeback, the kernel must decide what to do with the pages. Jonathan Corbet described the usual answer in the LWN article "PostgreSQL's fsync() surprise" (April 18, 2018): "that behavior usually includes discarding the data in the affected pages and marking them as being clean."
+
+Clean pages are pages that do not need to be written. So what happens at the next fsync? It has nothing to write for this range, and it returns success. The data that failed is not in the page cache anymore as dirty data, and it is not on the disk. The program that retried now believes it is saved.
+
+## Who sees the error
+
+There was a second problem, about who receives the error at all. LWN described the situation of 2017 in "Improved block-layer error handling" (June 2, 2017): "In current kernels, only the first caller after an error occurs has a chance of seeing that error information." A database with several processes, where one process writes and another one calls fsync later, could lose the error completely.
+
+Jeff Layton's errseq_t work changed this. The kernel documentation describes `errseq_t` as "a way of recording errors in one place", which several subscribers can check, and the fsync(2) man page says the result: "Since Linux 4.13, errors from write-back will be reported to all file descriptors that might have written the data which triggered the error." Even with this, the 2018 LWN article explains that a process which opened the file only after the error could still miss it, and PostgreSQL's checkpointer did that: it opened files later to sync them.
+
+## What PostgreSQL changed
+
+The fix in PostgreSQL is not subtle. The release notes of PostgreSQL 11.2 and 10.7 (both released on February 14, 2019) have this item: "By default, panic instead of retrying after fsync() failure, to avoid possible data corruption". A new setting, `data_sync_retry`, can bring back the old behaviour, and its documentation is the clearest short explanation I found:
+
+> On some operating systems, the status of data in the kernel's page cache is unknown after a write-back failure. In some cases it might have been entirely forgotten, making it unsafe to retry; the second attempt may be reported as successful, when in fact the data has been lost.
+
+Its default is off: on a failure to flush data files, PostgreSQL raises a PANIC, the server crashes, and the next start replays the write-ahead log, which may hold the only remaining copy of the data. The release notes do not hide it: "While this is surely ugly and inefficient, there are few alternatives".
+
+And it was not only PostgreSQL. At USENIX ATC 2020, Anthony Rebello, Yuvraj Patel, Ramnatthan Alagappan, Andrea Arpaci-Dusseau and Remzi Arpaci-Dusseau published "Can Applications Recover from fsync Failures?". Its first sentence: "We analyze how file systems and modern data-intensive applications react to fsync failures." They looked at ext4, XFS and Btrfs and at five applications (PostgreSQL, LMDB, LevelDB, SQLite and Redis). The filesystems share some behaviour, like marking pages clean after a failure, and they differ in how they report errors. And none of the applications had a strategy that was enough: fsync failures could lead to data loss or corruption.
+
+## My store under a shim
+
+I wanted to see what my store from [part 9](/blog/write-ahead-logging-from-scratch) does when fsync fails. I cannot make my SSD fail, so I made a small shared library in C that replaces `fsync`, `fdatasync` and `write`. With the variables `FAULT_CALL`, `FAULT_AT` and `FAULT_ERRNO` it makes one call fail with `EIO` or `ENOSPC`, and every other call goes to the real function, found with `dlsym(RTLD_NEXT, ...)`. The technique is explained in another series on this site, in [How LD_PRELOAD Replaces a Function Without Recompiling](/blog/how-ld-preload-replaces-a-function-without-recompiling). The store is a normal Rust binary, linked dynamically to glibc, so the preload works.
+
+Four puts, and the third fdatasync fails:
+
+```text
+== kv with the shim: FAULT_CALL=fdatasync FAULT_AT=3 FAULT_ERRNO=EIO, commands: put a 1, put b 2, put c 3, put d 4
+ok 1
+ok 2
+
+thread 'main' (1021675) panicked at kv.rs:111:34:
+fdatasync log: Os { code: 5, kind: Uncategorized, message: "Input/output error" }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+exit status: 101
+== recovery at the next start, without the shim
+snapshot covers 0, replayed 3 records, cut 0 bytes of torn tail
+a=1
+b=2
+c=3
+```
+
+The store did what PostgreSQL does now: it stopped. The `expect` on `sync_data` turned the error into a panic, before the `ok 3`, so nothing false was promised. Then a new start replayed the log.
+
+And the next start found `c=3`, an operation that was never acknowledged. Is this wrong? No: the rule of part 9 allows an unacknowledged operation to survive or not. But it shows what my shim really did. The record was written, the shim only returned a false error, and the kernel synced nothing and lost nothing. After a real writeback error, this record could be on the disk, or missing, or the pages could be "clean" in memory and wrong on the disk.
+
+The same with `ENOSPC` on the third write:
+
+```text
+== kv with the shim: FAULT_CALL=write FAULT_AT=3 FAULT_ERRNO=ENOSPC, commands: put a 1, put b 2, put c 3, put d 4
+ok 1
+ok 2
+
+thread 'main' (1021679) panicked at kv.rs:109:66:
+append to log: Os { code: 28, kind: StorageFull, message: "No space left on device" }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+exit status: 101
+== recovery at the next start, without the shim
+snapshot covers 0, replayed 2 records, cut 0 bytes of torn tail
+a=1
+b=2
+```
+
+Here the record never reached the kernel, so recovery finds only two. Again no false promise.
+
+## What the shim cannot show
+
+Now back to the first output of this article. The retry looks correct there, and this is the problem of my test, not a proof of the retry. My shim changes only the return value of one call. It does not touch the page cache, so the dirty pages are still dirty, and the second fdatasync writes them for real. A failing device does something different: the writeback fails, the pages are marked clean, and the second call has nothing left to write.
+
+To reproduce this, the error must come from below the page cache. The kernel has a device-mapper target made for this, dm-flakey: "It's been found useful in simulating failing devices for testing purposes." It needs root, and I do not change the devices of this laptop. So in this part the dangerous behaviour is documented, by the kernel developers, by PostgreSQL and by the paper, and my experiment shows only the half that a user-space test can show: what my code does with the error.
+
+## After an fsync error
+
+After an fsync error, the state of the data in the page cache is unknown, and every later "success" for the same data is suspicious. So I would not retry and continue, and I would not acknowledge anything that depended on the failed sync. I would stop, and recover from a copy that I know is durable: for a database, its log.
+
+The panic in my store looks primitive. After this story I think it is the right reaction, and it is also what PostgreSQL chose, after a long public discussion.
+
+The shim is `faultshim.c`, the retry program `retrysync.rs`, and all outputs are in [p12-faults.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/what-survives-a-crash/results/p12-faults.txt), in the [fixture](https://github.com/mehdiakiki/mehdi-cz/tree/main/experiments/what-survives-a-crash).
+
+## Sources
+
+- [Craig Ringer, "PostgreSQL's handling of fsync() errors is unsafe and risks data loss at least on XFS", pgsql-hackers, March 28, 2018](https://www.postgresql.org/message-id/CAMsr%2BYHh%2B5Oq4xziwwoEfhoTZgr07vdGG%2Bhu%3D1adXx59aTeaoQ%40mail.gmail.com)
+- [Jonathan Corbet, "PostgreSQL's fsync() surprise", LWN, April 18, 2018](https://lwn.net/Articles/752063/)
+- [Jonathan Corbet, "Improved block-layer error handling", LWN, June 2, 2017](https://lwn.net/Articles/724307/)
+- [The errseq_t datatype, Linux kernel documentation](https://docs.kernel.org/core-api/errseq.html)
+- [fsync(2), Linux manual page (the EIO error and Linux 4.13)](https://man7.org/linux/man-pages/man2/fsync.2.html)
+- [PostgreSQL 11.2 release notes](https://www.postgresql.org/docs/release/11.2/) and [PostgreSQL 10.7 release notes](https://www.postgresql.org/docs/release/10.7/)
+- [PostgreSQL 18 documentation: data_sync_retry](https://www.postgresql.org/docs/18/runtime-config-error-handling.html)
+- [Rebello, Patel, Alagappan, Arpaci-Dusseau and Arpaci-Dusseau, "Can Applications Recover from fsync Failures?", USENIX ATC 2020](https://www.usenix.org/conference/atc20/presentation/rebello)
+- [dm-flakey, Linux kernel documentation](https://docs.kernel.org/admin-guide/device-mapper/dm-flakey.html)
