@@ -1,0 +1,126 @@
+---
+title: "The Microbenchmark Won and the Program Got Slower"
+date: "2026-10-20T18:55:00+01:00"
+lastmod: "2026-10-20T18:55:00+01:00"
+tags: ["when the benchmark lies", "rust", "cpu cache", "benchmarking", "performance"]
+draft: false
+reviewed: true
+reviewedHash: "6f3049842172808419bd90d369a2eb11ea168c19921f75fe5f2979737986540b"
+campaign: "editorial"
+summary: "Alone, a lookup table was four times faster than a division. In a loop that also used 1 to 8 MiB of its own counters, the same table made the whole loop 4 to 34 percent slower. The microbenchmark had the cache for itself, and the program had to share it."
+---
+
+Alone, reading the result from a table took 0.32 ns per key, and computing it took 1.32 ns. So the table was four times faster, in every round. Then I put the same function into a small program, and with some sizes of the program's own data, the table made the whole program up to 34 percent slower.
+
+Precomputing results in a table is one of the oldest tricks of performance work. In this part it is also a good example of a microbenchmark that answers a different question than the one I had.
+
+## A division and its table
+
+The function is a stand-in for any small function that costs one slow instruction. Here it is a division:
+
+```rust
+/// u32::MAX divided by x, a reciprocal in fixed point (u32::MAX for 0).
+fn reciprocal(x: u16) -> u32 {
+    if x == 0 { u32::MAX } else { u32::MAX / x as u32 }
+}
+```
+
+A division is one of the slower integer instructions, so the classic trick is to compute all 65,536 possible results once and to read them later:
+
+```rust
+    let table: Vec<u32> = (0..=u16::MAX).map(reciprocal).collect();
+```
+
+The table has 65,536 entries of 4 bytes, so 256 KiB. The core that runs the experiment, CPU 2, has 48 KiB of L1 data cache and 1.25 MiB of L2, and it shares 18 MiB of L3 with all the other cores (from `/sys`, at the top of the results file). The table does not fit in L1, but it fits easily in L2.
+
+## Four times faster, alone
+
+The microbenchmark sums the function over 4,096 random keys with the harness of [the first part](/blog/the-benchmark-that-measured-nothing), with a long warm-up. Before it measures, the program checks that both versions give the same sum. The first of three processes, which measures three times:
+
+```text
+microbenchmark: 4096 keys, ns per key (median of 21 samples)
+round 1: computed 1.320 ns, table 0.321 ns
+round 2: computed 1.320 ns, table 0.321 ns
+round 3: computed 1.320 ns, table 0.321 ns
+```
+
+In all three processes, the table takes 0.31 to 0.33 ns per key, and the division 1.32 ns (once 1.67). OK: a clear winner, and a stable one. If I stopped here, I would replace the division with the table everywhere.
+
+## The same function in a program
+
+The program is a loop that a real program could contain. Each record has a key and a bucket, and the loop adds the function of the key to the counter of the bucket, like a sum per category:
+
+```rust
+/// Adds f(key) to the counter of the bucket of each record.
+#[inline(never)]
+fn count<F: Fn(u16) -> u32>(records: &[(u16, u32)], counters: &mut [u32], f: F) {
+    for &(key, bucket) in records {
+        let c = &mut counters[bucket as usize];
+        *c = c.wrapping_add(f(key));
+    }
+}
+```
+
+There are 4,194,304 records with random keys and random buckets, 32 MiB of them, and the only thing that changes is the number of counters. For each size, the program checks that both versions give the same counters, then it times 5 passes of each version, one after the other. The first of three rounds:
+
+```text
+program: 4194304 records, ns per record (median and range of 5 passes)
+ counters                   computed                      table    ratio
+   16 KiB     1.43 ns (1.37 to 1.67)     0.88 ns (0.86 to 0.92)     0.61
+  128 KiB     1.41 ns (1.37 to 1.62)     1.15 ns (1.12 to 1.17)     0.82
+  256 KiB     1.45 ns (1.38 to 1.60)     1.23 ns (1.20 to 1.43)     0.85
+  512 KiB     1.46 ns (1.42 to 1.64)     1.28 ns (1.22 to 1.35)     0.88
+  768 KiB     1.45 ns (1.41 to 1.62)     1.50 ns (1.48 to 1.79)     1.04
+    1 MiB     1.48 ns (1.43 to 1.75)     1.78 ns (1.74 to 1.97)     1.20
+  1.5 MiB     1.79 ns (1.65 to 2.03)     2.23 ns (2.20 to 2.29)     1.25
+    2 MiB     1.78 ns (1.66 to 1.80)     2.04 ns (2.02 to 2.16)     1.15
+    4 MiB     2.19 ns (2.13 to 2.26)     2.57 ns (2.50 to 2.68)     1.17
+    8 MiB     3.60 ns (3.32 to 3.63)     3.93 ns (3.60 to 4.27)     1.09
+   16 MiB     5.01 ns (4.79 to 6.37)     4.20 ns (4.10 to 5.77)     0.84
+   64 MiB    10.33 ns (10.04 to 10.53)     9.23 ns (8.94 to 9.68)     0.89
+```
+
+With 16 KiB of counters, the table version needs 0.61 times the time of the division version, so the table still wins, but already much less than four times. It wins a little less at each size, the two versions meet at 768 KiB, and from 1 MiB to 8 MiB the table loses. In all three rounds, the median of the table version is higher for every size from 1 MiB to 8 MiB, by 4 to 34 percent. The clearest row is 4 MiB: in all three rounds, the slowest pass of the division is faster than the fastest pass of the table. When I ran this part a second time, the table lost from 1.5 to 8 MiB in every round, by 14 to 35 percent, and at 1 MiB in two of the three rounds ([p19-microbenchmark-and-program.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/when-the-benchmark-lies/results/second-run/p19-microbenchmark-and-program.txt)).
+
+So here the microbenchmark gave the wrong advice. For a program with a few MiB of counters, the table makes the whole program slower.
+
+## Two working sets in one cache
+
+The two columns behave very differently. The division version does not care about the counters until 1 MiB: 1.32 to 1.48 ns per record in the three rounds. It becomes slower only from 1.5 or 2 MiB, when the counters alone are bigger than the 1.25 MiB of L2.
+
+The table version becomes slower from the first sizes: 0.71 to 0.88 ns at 16 KiB, 1.12 to 1.28 ns at 512 KiB, 1.42 to 1.78 ns at 1 MiB. Its data is the counters plus the 256 KiB table, and both have to live in the same caches. 768 KiB of counters plus the table is 1 MiB, close to the size of L2, and this is where the two versions meet. That the table starts to lose a little before the sum reaches 1.25 MiB does not surprise me, because the records also pass through the same caches, but I did not measure it.
+
+This explanation fits the numbers, but it is not a measurement of cache misses. There is no perf on this machine, so I can not count them. What I can show is that the steps are where the data stops fitting in a cache, as in [the part about the working set](/blog/when-the-working-set-no-longer-fits-in-cache).
+
+And there is one thing that I can not explain. With 16 and 64 MiB of counters, both versions are slow because of the counters themselves, 4 to 10 ns per record, and the table version is faster again, by 4 to 16 percent in the three rounds, and by 6 to 15 percent when I ran this part a second time. But in five of the six rows the ranges of the passes overlap, so it is a direction, not a clear result. Strange. I do not know why the order changes there, and without perf I could not find out.
+
+## A big buffer between the calls
+
+The usual story about tables is a little different: the program reads a big buffer between two uses of the table, and the buffer pushes the table out of the cache. The program has a mode for this too. It reads a buffer of some size, then sums the function over a burst of 4,096 new keys, and times only the burst. The bursts of each version come in blocks of 50, so between two bursts of the same version there is exactly one read. This is a block design, the one that [part 13](/blog/compare-two-versions-by-interleaving-the-runs) did not trust. Here the blocks alternate, two of each version, and the differences below are much bigger than the few percent that blocks invented there. This is round 2:
+
+```text
+burst of 4096 keys after reading a buffer, ns per key (median of 100 bursts)
+read   0 KiB before each burst: computed 1.32 ns, table 0.27 ns
+read   1 MiB before each burst: computed 1.32 ns, table 0.81 ns
+read   4 MiB before each burst: computed 1.32 ns, table 1.09 ns
+read  16 MiB before each burst: computed 1.33 ns, table 2.23 ns
+read  64 MiB before each burst: computed 1.61 ns, table 2.76 ns
+```
+
+After 1 MiB of reading, less than the L2, the table still wins: 0.77 to 0.81 ns in the three rounds. After 4 MiB, more than L2 but less than L3, the two are about equal, with 1.01 to 1.48 ns for the table. After 16 MiB, close to the 18 MiB of L3, and after 64 MiB, the table loses: 1.62 to 2.86 ns against 1.33 to 1.61 ns. The division is a little slower after 64 MiB too. I did not look for the reason.
+
+So the buffer does push the table out, but only when it is about as big as the caches. And in this program the read of 16 MiB takes far longer than the burst after it, so the whole program would hardly notice the lost nanoseconds. The program with the counters is the worse case for the table, because there the program uses its own data all the time, at the same moment as the table.
+
+## Measure the function where it lives
+
+The microbenchmark was correct. It answered the question "how fast is this function when it has the whole cache for itself?". My question was a different one: "does the table make my program faster?". The first question has one answer. The second one had three answers in this part, depending on how much memory the rest of the program uses.
+
+The cheaper the computation, the sooner a table loses. My division costs 1.3 ns, and a miss to L3 or to memory costs more than that, so the 256 KiB table loses as soon as the program pushes it out of L2. A function that costs much more than a miss would keep its table useful for longer. Where exactly this limit is for a given function, only a measurement in the program can say.
+
+So, before I replace a computation with a table, I measure the change in the real program, or at least next to a working set as big as the program's own data. Another article on this site, about [benchmarking a streaming scanner](/blog/benchmark-streaming-scanner-rust), says it in one sentence: "Cache state is a workload property, not dirt to remove from every experiment." In this part, the cache state was the whole result.
+
+The program and the three rounds are in [the fixture](https://github.com/mehdiakiki/mehdi-cz/tree/main/experiments/when-the-benchmark-lies), in [p19-microbenchmark-and-program.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/when-the-benchmark-lies/results/p19-microbenchmark-and-program.txt).
+
+## Further reading
+
+- [Ulrich Drepper, What Every Programmer Should Know About Memory (2007)](https://www.akkadia.org/drepper/cpumemory.pdf)

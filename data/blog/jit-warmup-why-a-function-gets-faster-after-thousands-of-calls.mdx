@@ -1,0 +1,188 @@
+---
+title: "JIT Warmup: Why a Function Gets Faster After Thousands of Calls"
+date: "2026-09-09T09:25:00+01:00"
+lastmod: "2026-09-09T09:25:00+01:00"
+tags: ["when the benchmark lies", "java", "javascript", "benchmarking", "compiler internals"]
+draft: false
+reviewed: true
+reviewedHash: "f484cf21583f376fdde5268116dcda1134cb6512ee09bc0f8e07a09814ef6470"
+campaign: "editorial"
+summary: "A small Java function took 66 ns per call in the first batch and 3.6 ns after 185 batches. I matched the speed changes with the JIT compile log, compared C1 and C2, and looked at why the steady state was not one number."
+---
+
+When I prepared this experiment, the first lines of output were these:
+
+```text
+    30.070 ms  batch 1: 66.51 ns per call
+    30.131 ms  batch 2: 60.74 ns per call
+```
+
+And 185 batches later, in the same process:
+
+```text
+    34.646 ms  batch 185: 3.63 ns per call
+```
+
+The same Java function, called with the same kind of input, became 18 times faster. Nothing changed in my program between batch 1 and batch 185. The thing that changed is the code that the JVM runs for it.
+
+This is the JIT warm-up. In [the first part of this series](/blog/the-benchmark-that-measured-nothing) the compiler worked before the program started. Here the compiler works while the program runs, and the benchmark can watch it work.
+
+## The function and the batches
+
+The function is a small integer mix, without loops, and a second function calls it in a loop:
+
+```java
+static long mix(long x) {
+    x ^= x >>> 33;
+    x *= 0xff51afd7ed558ccdL;
+    x ^= x >>> 33;
+    x *= 0xc4ceb9fe1a85ec53L;
+    x ^= x >>> 33;
+    return x;
+}
+
+static long batch(int calls, long seed) {
+    long sink = seed;
+    for (int i = 0; i < calls; i++) {
+        sink += mix(sink + i);
+    }
+    return sink;
+}
+```
+
+`main` calls `batch(1000, sink)` 600 times and times each call with `System.nanoTime`, so each line is one batch of 1,000 calls. The result goes into `sink`, which is printed at the end, so nothing can be removed.
+
+I wanted to see the compilations next to the batches. `-XX:+PrintCompilation` prints one line per compilation, and its unified logging form, `-Xlog:jit+compilation=debug`, can add the time since the start of the JVM in nanoseconds. The program saves the end time of each batch on the same clock and prints everything at the end, so a small script can merge the two in time order. It runs on OpenJDK 17.0.18, pinned to CPUs 2 and 4, two performance cores: the JIT compiles in background threads, so it needs a second CPU.
+
+## Four speeds in one run
+
+This is the merged timeline, cut in a few places:
+
+```text
+    30.252 ms  batch 4: 60.19 ns per call
+    30.295 ms  JIT 68 3 Warmup::mix (35 bytes)
+    30.313 ms  batch 5: 61.05 ns per call
+    30.352 ms  batch 6: 39.16 ns per call
+    30.365 ms  JIT 69 4 Warmup::mix (35 bytes)
+    30.379 ms  batch 7: 26.66 ns per call
+...
+    34.396 ms  batch 167: 30.09 ns per call
+    34.403 ms  JIT 70 % 3 Warmup::batch @ 5 (30 bytes)
+    34.421 ms  batch 168: 25.48 ns per call
+...
+    34.565 ms  batch 174: 15.48 ns per call
+    34.572 ms  batch 175: 7.70 ns per call
+    34.579 ms  batch 176: 6.53 ns per call
+    34.582 ms  JIT 72 3 Warmup::batch (30 bytes)
+    34.586 ms  batch 177: 6.73 ns per call
+...
+    34.638 ms  batch 183: 10.42 ns per call
+    34.642 ms  batch 184: 4.61 ns per call
+    34.646 ms  batch 185: 3.63 ns per call
+```
+
+Each JIT line is a compilation: the compile id, then `%` if it is an OSR compilation (I explain it below), then the tier, then the method. The HotSpot source describes the tiers in a comment: level 0 is the interpreter, level 3 is "C1 with full profiling", and level 4 is C2. C1 compiles quickly, and its level 3 code also collects a profile. C2 compiles more slowly but optimizes more, using this profile.
+
+So I can read four speeds.
+
+First, batches 1 to 5 at about 60 ns per call. Everything is interpreted. To check this I ran the same program with `-Xint`, which disables the JIT. In three fresh JVMs the median of the last 100 batches was between 59.6 and 60.2 ns per call, and the first batch was not much slower (60.3 to 62.7). So 60 ns is the interpreter.
+
+Second, from batch 7, about 26 ns. `mix` is compiled now (at tier 3, and 70 microseconds later at tier 4), but the loop in `batch` is still interpreted. Each call goes from the interpreter into compiled code and back. It is faster, but not fast.
+
+Third, after the `%` line, the loop itself is compiled. OSR means on-stack replacement: `batch` was called only once per batch, so the JVM did not wait for the next call. It compiled the loop and switched the running loop to the compiled version in the middle of a call. Batch 174, the one where the switch happened, is half slow and half fast (15.5 ns), and batch 176 takes 6.5 ns.
+
+Fourth, from batch 185, 3.6 ns per call. And between the third and the fourth there is a strange moment: batches 177 to 183 got slower again, from 6.7 to 10.4 ns, while the JVM was changing from the OSR version to a normal compiled version of `batch`. I do not know what the JVM does there.
+
+The C2 versions of `batch` arrived later, at 34.7 and 35.9 ms, and the typical batch did not change at these moments. But right after the second one there was a batch of 43 ns, and then one slow batch every eight batches until the end of this short run, between 8.7 and 27.9 ns. The summary line counts 10 batches over twice the final level. I do not know what they are.
+
+## How the JVM decides
+
+The JVM prints its own thresholds:
+
+```text
+     intx Tier3InvocationThreshold                 = 200                                       {product} {default}
+     intx Tier4InvocationThreshold                 = 5000                                      {product} {default}
+```
+
+These are numbers of calls, but they are not the only rule. Three more of them, which I saved in a separate file, matter for loops:
+
+```text
+     intx Tier3BackEdgeThreshold                   = 60000                                     {product} {default}
+     intx Tier3CompileThreshold                    = 2000                                      {product} {default}
+     intx Tier3MinInvocationThreshold              = 100                                       {product} {default}
+```
+
+In the HotSpot source, a method goes to tier 3 after 200 calls, or after 100 calls when its calls and its loop turns together reach 2,000, and a loop is compiled with OSR after about 60,000 turns. `mix` is called 1,000 times in each batch, so it crosses 200 calls in the first batch, and its compilation started a little later, during batch 5. `batch` is called only once per batch, but its loop makes 1,000 turns per call, so after about 60 batches it is hot. In most of the ten other JVMs below the fast level came around batch 75; in this run only after 167.
+
+So "after thousands of calls" is true, but the number is not fixed. It depends on where the loops are, and on when the background compiler threads do their work.
+
+## C1 was faster than C2 here
+
+The final speed was reached with C1 code, and C2 did not make it faster. I wanted to know if this is real, so I compared three JVMs in 8 interleaved rounds: the default, `-XX:TieredStopAtLevel=1` (C1 only, without profiling) and `-XX:-TieredCompilation` (C2 only). Each runs 3,000 batches and reports the median of the last 100:
+
+```text
+default                    3.72 ns per call
+-XX:TieredStopAtLevel=1    3.48 ns per call
+-XX:-TieredCompilation     3.81 ns per call
+default                    3.91 ns per call
+-XX:TieredStopAtLevel=1    3.66 ns per call
+-XX:-TieredCompilation     3.91 ns per call
+...
+== median over the 8 rounds
+default                    3.67 ns per call
+-XX:-TieredCompilation     3.81 ns per call
+-XX:TieredStopAtLevel=1    3.40 ns per call
+```
+
+In all 8 rounds, the C1-only JVM was the fastest of the three. I had to look twice at these numbers. The speed of the machine moved between rounds (the C1 numbers go from 3.03 to 3.66 ns), so one round alone would prove nothing, but inside each round C1 was always the fastest. This is a nice small example of why interleaving helps, and a later part of the series is about exactly this.
+
+But when I ran this part a second time, on a quieter laptop, this did not come again. In most JVMs of that run the compiled code was two to three times slower, the final levels went from 3.25 to 12.71 ns, and the medians over the 8 rounds were 8.71 ns for the default, 7.27 for C2 only and 7.72 for C1 only. The order changed from round to round. My guess is that the clock was still low during these short JVM runs: there the first batch of the timeline ended only after 84 ms, instead of 30. But the guess does not explain everything: in the same run, the three `-Xint` JVMs were faster than before, 49.6 to 52.8 ns instead of about 60. So I can only say that C1 was faster in the run above, not that it is faster for this function ([p05-jit-warmup.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/when-the-benchmark-lies/results/second-run/p05-jit-warmup.txt)).
+
+Why was C2 slower in the first run? I do not know. To see the machine code of the JIT, the JVM needs a disassembler plugin that this JDK does not have, so I stop here. My guess is that `mix` is a chain of dependent operations, so a better compiler can not do much, but this is only a guess.
+
+## The steady state is not one number
+
+The paper "Virtual Machine Warmup Blows Hot and Cold" by Barrett, Bolz-Tereick, Killick, Mount and Tratt (OOPSLA 2017) measured exactly this kind of curve for many VMs and benchmarks. They found that "small, deterministic, widely studied microbenchmarks often fail to reach a steady state of peak performance", and that at most 43.5 percent of the VM and benchmark pairs consistently reached one.
+
+Did I see something like it? Partly. I started 10 fresh JVMs with 3,000 batches each, and for each one I printed the medians of windows of 100 batches. This is one of them:
+
+```text
+first batch   69.57 ns per call, last 100 batches  3.81 ns per call (median), first reached at batch   74, later batches over 2x slower: 18 (sink -5809376359160390977)
+24.20 3.60 3.67 3.68 3.63 3.80 3.81 3.81 3.81 3.81 3.81 3.81 3.81 3.81 3.81 3.81 3.24 3.24 3.81 3.25 3.24 3.25 3.24 3.24 3.24 3.38 3.81 3.81 3.81 3.81
+last compile event of Warmup at 37.224 ms, during batch 556
+```
+
+The last compilation of my methods happened during batch 556. After that the log is silent. But the speed still jumps between levels: 3.81, then 3.24, then 3.81 again. Strange. The final levels of the ten JVMs were 3.24, 3.31, 3.54, 3.81 (four times), 4.00, 4.23 and 4.62 ns. And two of them started near 6 ns and went down slowly, in small steps, during the whole run, long after their last compilation.
+
+So yes: the steady state was not one number, and it was different in every fresh process. But here the compile log tells me that the JVM did not change the code at these moments. Something else changed, probably the machine. The levels look like the steps of a CPU clock, and the next parts of the series measure the clock of this laptop directly.
+
+## The same in Node.js
+
+V8 in Node.js 22.23.1 has the same mechanism, and `--trace-opt` prints it in the same stream as the program:
+
+```text
+batch 3: 106.40 ns per call
+[marking 0x0d2ec5026241 <JSFunction mix (sfi = 0x392c3f81bf99)> for optimization to TURBOFAN, ConcurrencyMode::kConcurrent, reason: hot and stable]
+...
+batch 9: 71.34 ns per call
+[completed compiling 0x0d2ec5026241 <JSFunction mix (sfi = 0x392c3f81bf99)> (target TURBOFAN) - took 0.005, 0.641, 0.007 ms]
+[completed optimizing 0x0d2ec5026241 <JSFunction mix (sfi = 0x392c3f81bf99)> (target TURBOFAN)]
+batch 10: 36.42 ns per call
+```
+
+The JavaScript `mix` is a 32-bit version, so the numbers are not comparable with Java. But the pattern is the same: `mix` is marked as hot after 3 batches, compiled by TurboFan in the background, and from batch 10 the time is halved. The optimized `batch` was ready only after the 40th and last batch of this short run, so this run never saw it. A longer run of 3,000 batches reached 11.85 ns per call at the end.
+
+## What I take from this
+
+A JIT benchmark has at least three numbers: the interpreter, the warm-up and the steady state. Which one is "the speed" depends on the program. A short command line tool in Java lives mostly in the first two. A server that runs for days lives in the third.
+
+So I measure in batches and I look at the whole curve before I decide what to report. I use the compile log to understand the steps of the curve, because without it I can not tell a JIT event from the machine. I run several fresh processes, because one JVM is one sample of the warm-up. JMH, the benchmark harness of OpenJDK, does this by default: its forking sample says "JMH will fork the tests by default". And when two versions are compared, I interleave them.
+
+The programs, the timeline and the ten JVMs are in [the fixture](https://github.com/mehdiakiki/mehdi-cz/tree/main/experiments/when-the-benchmark-lies), in [p05-jit-warmup.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/when-the-benchmark-lies/results/p05-jit-warmup.txt) and [p05-jit-timeline.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/when-the-benchmark-lies/results/p05-jit-timeline.txt).
+
+## Sources
+
+- [Edd Barrett, Carl Friedrich Bolz-Tereick, Rebecca Killick, Sarah Mount, Laurence Tratt: Virtual Machine Warmup Blows Hot and Cold, OOPSLA 2017 (arXiv version)](https://arxiv.org/abs/1602.00602)
+- [JMH sample 12: forking](https://github.com/openjdk/jmh/blob/master/jmh-samples/src/main/java/org/openjdk/jmh/samples/JMHSample_12_Forking.java)
+- [OpenJDK 17 source: compilationPolicy.hpp, the comment about the five execution levels](https://github.com/openjdk/jdk17u/blob/master/src/hotspot/share/compiler/compilationPolicy.hpp)
+- [OpenJDK 17 source: compilationPolicy.cpp, CallPredicate and LoopPredicate](https://github.com/openjdk/jdk17u/blob/master/src/hotspot/share/compiler/compilationPolicy.cpp)

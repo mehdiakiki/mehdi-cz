@@ -1,0 +1,101 @@
+---
+title: "Coordinated Omission: How a Load Test Hides Its Worst Latency"
+date: "2026-09-23T15:55:00+01:00"
+lastmod: "2026-09-23T15:55:00+01:00"
+tags: ["when the benchmark lies", "rust", "networking", "statistics", "performance"]
+draft: false
+reviewed: true
+reviewedHash: "f15fc18f9919902cf9790b6ccfc10b0772e608d0e872d69d6e032952b644def8"
+campaign: "editorial"
+summary: "My toy server stops for half a second every five seconds. A client that waits for each answer saw 4 slow requests out of 1.36 million, and a p99 of 30 microseconds. A client with a fixed schedule saw 1,608 slow requests and a p99 of 450 milliseconds."
+---
+
+I made a tiny TCP server that answers in a few microseconds, but stops for half a second every five seconds. Then I tested it with three load generators, 20 seconds each. Here is their p99:
+
+```text
+closed: 1363483 requests, 4 over 100 ms
+  mean 15 us  p50 11 us  p90 15 us  p99 30 us  p99.9 74 us  p99.99 3277 us  max 503657 us
+...
+paced: 17628 requests, 4 over 100 ms
+  mean 218 us  p50 67 us  p90 164 us  p99 312 us  p99.9 4703 us  p99.99 500316 us  max 500331 us
+...
+open: 20000 requests, 1608 over 100 ms
+  mean 25305 us  p50 184 us  p90 2858 us  p99 450608 us  p99.9 495491 us  p99.99 500292 us  max 500476 us
+```
+
+30 microseconds, 312 microseconds, and 450 milliseconds. The same server, the same four stops. The difference is only in how the clients decided when to send the next request.
+
+[The previous part](/blog/the-average-hides-the-slow-requests) showed that the mean can hide slow requests. This part shows something worse: a way of measuring that hides the slow requests even from the percentiles, because they are never measured at all.
+
+## The server
+
+The server runs on 127.0.0.1, in the same process as the client. It reads 8-byte requests and sends the same 8 bytes back. Before each answer, it checks the time, and every five seconds (at 2.5, 7.5, 12.5 and 17.5 seconds) the next answer waits 500 ms:
+
+```rust
+while conn.read_exact(&mut buf).is_ok() {
+    if start.elapsed() >= next_stall {
+        thread::sleep(STALL);
+        next_stall += STALL_EVERY;
+    }
+    if conn.write_all(&buf).is_err() {
+        break;
+    }
+}
+```
+
+This is a model of a real problem: a garbage collector pause, a lock held too long, a slow disk write, a stop to compact something. The server is alive and correct, it is just not answering for 500 ms. In 20 seconds it stops 4 times, so it is unavailable during 2 of the 20 seconds, that is 10 percent of the time.
+
+## Three ways to send requests
+
+Every benchmark of this series until now was a closed loop, like the harness of [the first part](/blog/the-benchmark-that-measured-nothing): call, wait for the result, call again. For a function that only computes, this is fine. For a server, it is the first of the three clients:
+
+- `closed` sends a request, waits for the answer, and sends the next one at once. It measures each round trip.
+- `paced` wants 1,000 requests per second: it waits for the answer, then sleeps until the next millisecond. If it is late, it sends at once and continues the schedule from now. It measures from the moment it really sent the request.
+- `open` has a fixed schedule of one request every millisecond, and a separate thread sends them on time, without waiting for answers. Another thread reads the answers. The latency of request number `i` is the time of its answer minus the time when it should have been sent.
+
+All three use one connection and run pinned to CPUs 2, 4 and 6.
+
+## What each client saw
+
+The `closed` client made 1,363,483 requests, and 4 of them took more than 100 ms: one per stop. Its p99.99 is 3.3 ms, which is not even one of the stops. So 99.99 percent of the requests look perfect, and only the maximum says that something happened.
+
+The `paced` client looks more realistic, because a real service has a rate of requests. But it made only 17,628 requests, not 20,000. During each stop it was waiting for one answer, so it did not send the requests that it planned for these 500 ms, and when the server came back, it continued from the current time. So about 2,400 requests were never sent, and about 2,000 of them were planned inside the four stops. Its p99, 312 microseconds, is computed only from requests that were lucky enough to be sent.
+
+The `open` client sent all 20,000 requests on schedule. A request that was planned during a stop has to wait until the stop ends, plus the time to work through the queue behind it. 1,608 requests took more than 100 ms. This is the number I expected: each stop delays about 500 requests, and the ones planned in the first 400 ms of a stop wait more than 100 ms, so 4 stops times 400 is 1,600. I liked that. Its p99 is 450 ms. One user in a hundred waited almost half a second, and the first two clients reported 30 and 312 microseconds.
+
+## Why it is called coordinated omission
+
+The name comes from Gil Tene, and the README of his load generator wrk2 says it clearly: "Since each connection will only begin to send a request after receiving a response, high latency responses result in the load generator coordinating with the server to avoid measurement during high latency periods."
+
+That is what happened here. The `closed` and `paced` clients did not do anything wrong in their code. They measured every request they sent, correctly. The problem is which requests they sent: when the server was slow, the clients slowed down with it, and the samples from the bad moment are missing. They omitted the bad moment, in coordination with the server. Real users do not do this: they keep arriving, also when the server is stopped.
+
+Each stop gives one slow sample to the closed loop and about 500 to the open loop. That is why the percentiles are so different.
+
+## Two ways to fix it
+
+The first fix is to measure like the `open` client. wrk2 does this: it "measures response latency from the time the transmission should have occurred according to the constant throughput configured for the run". The schedule decides when a request starts, not the previous answer.
+
+The second fix is to correct the data afterwards. HdrHistogram, a histogram library by the same author, has a method for this, `recordValueWithExpectedInterval`: when one value is bigger than the expected interval between requests, it also records the values that the missing requests would have had, decreasing in steps of the interval. I applied the same correction to the `paced` data, with an interval of 1 ms:
+
+```text
+paced, corrected: 19813 requests, 1604 over 100 ms
+  mean 25432 us  p50 80 us  p90 7230 us  p99 451316 us  p99.9 495331 us  p99.99 500316 us  max 500331 us
+```
+
+1,604 requests over 100 ms and a p99 of 451 ms, almost the same as the `open` client. So the missing samples were the whole difference.
+
+Both fixes have limits. They need a planned rate, and the correction assumes that the requests would really have come at this rate. An open loop with a rate higher than what the server can do is also a problem: the queue grows without end, and then the latency measures the length of the test, not the server. And the closed loop is not always wrong: for a batch job that sends one request after the other, it is exactly how the real client behaves.
+
+One more detail in the output: the median of `paced` and `open` (67 and 184 microseconds) is higher than the 11 microseconds of `closed`. Between two requests these clients sleep for almost a millisecond, and waking up has its own cost, which ends up in the measurement. So even the fast part of the distribution depends on how the load is generated. That is a smaller effect than the stops, but it is the same lesson.
+
+## What I ask about a latency number now
+
+Before I read a percentile from a load test, I want to know how the requests were scheduled. Did the client wait for answers? How many requests did it plan, and how many did it really send? If it planned 20,000 and sent 17,628, the missing 2,372 are probably the most important requests of the test.
+
+The program and the output are in [the fixture](https://github.com/mehdiakiki/mehdi-cz/tree/main/experiments/when-the-benchmark-lies), in [p09-coordinated-omission.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/when-the-benchmark-lies/results/p09-coordinated-omission.txt).
+
+## Sources
+
+- [Gil Tene: How NOT to Measure Latency (QCon talk, recording on InfoQ)](https://www.infoq.com/presentations/latency-response-time/)
+- [wrk2 README: a constant throughput, correct latency recording variant of wrk](https://github.com/giltene/wrk2)
+- [HdrHistogram README (recordValueWithExpectedInterval)](https://github.com/HdrHistogram/HdrHistogram)

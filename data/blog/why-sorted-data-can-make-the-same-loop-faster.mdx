@@ -1,0 +1,116 @@
+---
+title: "Why Sorted Data Can Make the Same Loop Faster"
+date: "2026-10-16T19:00:00+01:00"
+lastmod: "2026-10-16T19:00:00+01:00"
+tags: ["when the benchmark lies", "rust", "assembly", "compiler internals", "performance"]
+draft: false
+reviewed: true
+reviewedHash: "b036f79393830cf9240328fc2e467322fa285372ffb2d0d4f502f38e5e0eae8a"
+campaign: "editorial"
+summary: "The famous result says that a loop over sorted data is faster because of branch prediction. In my Rust version, sorting changed nothing, because the compiler removed the branch. With a branch that it could not remove, random data was 3 to 10 times slower."
+---
+
+One of the most famous questions on Stack Overflow, asked in 2012 and now titled "Why is conditional processing of a sorted array faster than of an unsorted array?", is about a loop that adds the elements of an array that are at least 128. The same loop is much faster when the array is sorted first. The famous answer is branch prediction.
+
+I made the same experiment in Rust, and in my first version sorting the data changed nothing at all. This part is about why, and about what I had to do to see the famous effect.
+
+## Sorted and random bytes
+
+The data is 32 KiB of random bytes, and a sorted copy of the same bytes. The program sums the bytes of at least 128 with three functions that give the same result (the program checks it). The first one uses iterators, the second one a plain `if`:
+
+```rust
+fn sum_if(data: &[u8]) -> u64 {
+    let mut sum = 0u64;
+    for &x in data {
+        if x >= 128 {
+            sum += x as u64;
+        }
+    }
+    sum
+}
+```
+
+The third one is the same loop, except that the taken branch passes the sum through `black_box`. I explain why below. Each function is measured with the harness of [the first part](/blog/the-benchmark-that-measured-nothing), pinned to CPU 2, on the random and on the sorted bytes. Here is the second of three runs, built with `rustc -C opt-level=3`, the same as `-O`:
+
+```text
+function             random       sorted     ratio
+sum_filter         0.322 ns     0.320 ns      1.00
+sum_if             0.282 ns     0.305 ns      0.93
+sum_if_effect      3.052 ns     1.048 ns      2.91
+```
+
+For the first two functions the ratio is 1.00 and 0.93: sorting does nothing, or even makes it a little slower. In the three runs, these two ratios stay between 0.93 and 1.11. Only the third function shows the famous effect.
+
+## No branch, nothing to predict
+
+The assembly explains the first two lines. This is the inner loop of `sum_if`, the beginning of it:
+
+```asm
+.LBB21_6:
+	movzbl	(%rdi), %edx
+	movzbl	1(%rdi), %r8d
+	movl	%edx, %r9d
+	sarb	$7, %r9b
+```
+
+And a few lines later, `andb %dl, %r9b`, then an addition. The compiler found a nice trick. `sarb $7` shifts the byte right by 7 bits, copying its sign bit: the result is 0xFF if the top bit of the byte was 1, so if the byte is at least 128, and 0 otherwise. The `and` with the byte itself then gives the byte or zero, and the loop adds this to the sum. There is no jump that depends on the data. The `if` of my source code does not exist in the machine code.
+
+The iterator version became a vector loop with the same idea:
+
+```asm
+	pxor	%xmm5, %xmm5
+	pcmpgtb	%xmm3, %xmm5
+	pand	%xmm3, %xmm5
+```
+
+`pcmpgtb` compares bytes as signed numbers, here zero against each byte, so it gives a mask of 0xFF for the bytes with the top bit set. `pand` keeps those bytes and clears the others. Again: no branch, so the order of the data can not matter, and it did not.
+
+So on this compiler, the classic benchmark measures nothing about branch prediction. Some answers to the original question already mention that a compiler can remove the branch, for example with a conditional move. Here it did it with even less.
+
+## A branch that the compiler must keep
+
+To see the branch effect, I need a branch that the compiler can not remove. `black_box` helps here in an unusual way: in `sum_if_effect` the taken branch does `sum = black_box(sum + x as u64)`. The compiler must assume that `black_box` can do anything, so it can not execute it for bytes below 128 and throw the result away. It must jump around it. At `opt-level=1` the loop is short:
+
+```asm
+.LBB22_2:
+	movzbl	(%rdi,%rdx), %r8d
+	testb	%r8b, %r8b
+	jns	.LBB22_3
+	addq	%r8, %rax
+	movq	%rax, -8(%rsp)
+	#APP
+	#NO_APP
+	movq	-8(%rsp), %rax
+	jmp	.LBB22_3
+```
+
+`testb` and `jns` jump over the addition when the sign bit of the byte is 0, so when the byte is below 128. Now there is a branch whose direction depends on the data. These are the three runs of this function, at both levels:
+
+```text
+== run 1, opt-level=1, taskset -c 2: ns per byte, 32 KiB of random or sorted bytes
+function             random       sorted     ratio
+sum_filter         0.274 ns     0.292 ns      0.94
+sum_if             0.307 ns     0.302 ns      1.02
+sum_if_effect      3.119 ns     0.307 ns     10.15
+```
+
+At `opt-level=1`, random bytes are 10 times slower than sorted bytes: 3.1 against 0.31 ns per byte. OK, now it works. The other runs give 10.01 and 10.46. At `opt-level=3`, the ratio is 2.91 to 2.98.
+
+This is the famous effect. The processor does not wait for the comparison before it continues: it guesses the direction of the jump and works ahead. When the guess is wrong, it throws the work away and starts again from the jump. With sorted bytes, the first half of the array goes always one way and the second half always the other way, so the guess is almost always right. With random bytes, the direction is a coin toss, and about half of the guesses must be wrong. The difference, about 2.8 ns per byte, is the cost of these wrong guesses.
+
+## The fast case changed too
+
+Look again at the sorted column of `sum_if_effect`: 0.31 ns per byte at `opt-level=1`, but 1.05 ns at `opt-level=3`. The "better" optimization level made the predictable case more than three times slower. In the `opt-level=3` code, the taken branch adds directly to the sum in memory, `addq %rdx, -8(%rsp)`, so each taken byte probably waits for the previous addition to go through memory. That is why the ratio at `opt-level=3` is "only" 2.9: the sorted case got slower, not the random case faster. I did not measure the internals, so this is my reading of the assembly, not a proof.
+
+## Read the code before explaining the number
+
+For the same question, "how much faster is this loop on sorted data", this part gave four answers: no faster (1.00), a little slower (0.93), 2.9 times faster, and 10 times faster. The data was the same every time. What changed is the code that the compiler generated, which depended on how I wrote the loop and on one compiler flag.
+
+So "sorted data is faster because of branch prediction" is not a property of the algorithm. It is a property of the machine code, and it is true only when the machine code has a branch that depends on the data. Before I explain a number with branch prediction, cache misses or anything else, I look at the assembly of the loop and I check that the mechanism I want to blame is really there. In [the part about debug builds](/blog/a-debug-build-measures-a-different-program), the same check showed bounds checks and function calls that the source did not show. Here it showed the opposite: a branch in the source that the machine code did not have.
+
+The program, the assembly and the runs are in [the fixture](https://github.com/mehdiakiki/mehdi-cz/tree/main/experiments/when-the-benchmark-lies), in [p17-sorted-data.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/when-the-benchmark-lies/results/p17-sorted-data.txt).
+
+## Sources
+
+- [Stack Overflow: Why is conditional processing of a sorted array faster than of an unsorted array? (2012)](https://stackoverflow.com/questions/11227809/why-is-processing-a-sorted-array-faster-than-processing-an-unsorted-array)
+- [Rust 1.98.0 standard library: std::hint::black_box](https://doc.rust-lang.org/1.98.0/std/hint/fn.black_box.html)
