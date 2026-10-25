@@ -1,0 +1,243 @@
+---
+title: "Defining C Variadic Functions in Rust 1.99"
+date: "2026-10-30T16:10:00+01:00"
+lastmod: "2026-10-30T16:10:00+01:00"
+tags: ["rust", "ffi", "c-abi", "unsafe-rust", "api-design"]
+draft: false
+reviewed: true
+reviewedHash: "881ff2c599709e4ba6467b253c6626b1368b96f34202e6dbc1f75ba524493122"
+cluster: "rust-under-the-hood"
+campaign: "editorial"
+summary: "With Rust 1.99 you can define C variadic functions like printf, not only call them. I called a small Rust library from C and from Rust: the compiler checks the C promotion rules, but the number and the types of the arguments stay a promise between the caller and the function."
+---
+
+Two cases of my [Rust Failure Atlas](/rust-failure-atlas) are about C variadic functions, the functions with `...` like `printf`. In the [first one](/rust/failures/c-variadic-calls-require-default-argument-promotions), Rust refuses to pass an `f32` to `printf`. In the [second one](/rust/failures/c-variadic-function-needs-compatible-abi), a `...` declared with the Rust ABI fails with E0045. Both are about a function that C defines and Rust only declares or calls. Before Rust 1.99, stable Rust could not do more.
+
+Rust 1.99.0 came on October 1 and added the other side. Now the variadic function itself can be written in Rust, and C can call it. The [announcement](https://blog.rust-lang.org/2026/10/01/Rust-1.99.0/) shows a small `sum` that reads two `i32`. It looks easy. But a variadic function has no types in its signature, so my first question was: who checks the arguments now?
+
+So I made an experiment. I wrote a small Rust library with variadic functions, built it as a static library, and called it from C with gcc 15.2.1 and clang 21.1.8, and from Rust, all on x86_64 Linux. I used Rust 1.99.1, the point release of October 15, the one that fixed [FFI `bool` return values](/blog/how-rust-1-99-0-returned-16-for-false) on x86_64. The code and every output are in [`experiments/rust-atlas/rust-1-99-c-variadics`](https://github.com/mehdiakiki/mehdi-cz/tree/main/experiments/rust-atlas/rust-1-99-c-variadics), and `run.sh` makes them again.
+
+## A variadic function in Rust
+
+The first one in my library is a sum, in three functions:
+
+```rust
+/// Adds `count` arguments of C type `int`.
+///
+/// # Safety
+///
+/// The caller passes at least `count` more arguments, each of C type `int`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rv_sum(count: c_int, args: ...) -> c_long {
+    unsafe { rv_vsum(count, args) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rv_vsum(count: c_int, mut args: VaList<'_>) -> c_long {
+    let mut values = Vec::new();
+    for _ in 0..count {
+        values.push(unsafe { args.next_arg::<c_int>() });
+    }
+    sum(&values)
+}
+
+pub fn sum(values: &[c_int]) -> c_long {
+    values.iter().map(|&value| c_long::from(value)).sum()
+}
+```
+
+Inside `rv_sum`, `args: ...` has the type [`VaList`](https://doc.rust-lang.org/std/ffi/struct.VaList.html). The documentation says it is ABI-compatible with `va_list` in C, and `next_arg::<T>()` is the equivalent of C `va_arg`. There is no `va_start` to call, the list is ready when the function starts. Dropping it is the `va_end`.
+
+`rv_sum` and `rv_vsum` are the old C pattern of `printf` and `vprintf`. A `VaList` is a normal value, so `rv_sum` gives it to `rv_vsum`. A C function can give its own `va_list` to `rv_vsum` (this is `forward_sum` in the results below), and Rust can give a `VaList` to `vsnprintf` from the C library. The last function, `sum`, is normal safe Rust. The unsafe reads stay in one small loop.
+
+The rules for the definition are strict, the [Reference](https://doc.rust-lang.org/reference/items/functions.html#c-variadic-functions) lists them, and rustc explains each one well. I tried the mistakes I expected to make:
+
+| Definition | Rust 1.99.1 says |
+| --- | --- |
+| no `unsafe` | `functions with a C variable argument list must be unsafe` |
+| no `extern "C"` | `` `...` is not supported for non-extern functions `` |
+| `extern "sysv64"` | `` `...` is not supported for `extern "sysv64"` functions `` |
+| `...` before `count` | `` `...` must be the last argument of a C-variadic function `` |
+
+The `sysv64` one surprised me, because on x86_64 Linux it is the same calling convention as `"C"`. The [stabilization report](https://github.com/rust-lang/rust/pull/155697) gives the reason: the LLVM intrinsics like `va_start` and `va_arg` always expand with the default C ABI of the target, so for now only `"C"` and `"C-unwind"` definitions are accepted, and other ABIs need [naked functions](https://github.com/rust-lang/rust/pull/159746) written in assembly.
+
+The announcement's `sum(mut args: ...)` has no named parameter at all, like C23 allows. I compiled it as it is, with a small `main`: 1.99.0 and 1.99.1 print `foo() = 2`, and 1.98.0 stops with `error[E0658]: C-variadic functions are unstable`.
+
+The idea is old. [RFC 2137](https://github.com/rust-lang/rfcs/pull/2137) was accepted in 2017, and the [first implementation](https://github.com/rust-lang/rust/pull/57760) was merged for nightly in February 2019.
+
+## The results
+
+The C callers and the Rust caller print the same lines. This is the gcc build:
+
+```text
+count:     rv_sum(3, 10, 20, 12) = 42
+promoted:  rv_sum(2, letter, small) = 72
+promoted:  rv_mean(3, half, 1.5f, 4.0f) = 2.000000
+sentinel:  rv_join_path("usr", "local", "bin", NULL) = "usr/local/bin"
+format:    rv_format("%s: %d jobs, %u%% done, grade %c, avg %f", ...) = "queue: 3 jobs, 75% done, grade A, avg 0.500000"
+forwarded: rv_cformat("%-6s|%5.2f|%#x", "load", 9.87654, 255) = "load  | 9.88|0xff"
+va_list:   forward_sum(4, 1, 2, 3, 4) -> rv_vsum = 10
+typed:     rv_sum_array(values, 3) = 42
+```
+
+In the C caller, `letter` is a `char` with `'A'`, `small` is a `short` with 7, and `half` is a `float` with 0.5. The clang output and the Rust output are the same, byte for byte, and nothing changes when the library is built by 1.99.0. No compiler printed a warning, not rustc and not gcc or clang with `-Wall -Wextra`.
+
+OK, it works. But each line uses a different convention, and the conventions are the part that matters.
+
+## How the function knows what it got
+
+It does not know. In the signature there is only `...`, so the function needs another way to learn how many arguments came, and of which type. My library has the three classic ways:
+
+- `rv_sum` and `rv_mean` get a count first. The caller says 3, the function reads 3.
+- `rv_join_path` reads C strings until a null pointer, like `execl`. The null pointer is the sentinel.
+- `rv_format` reads a format string, like `printf`.
+
+In `rv_format` you can see that the format string is the real signature. Each letter decides the type of the next read:
+
+```rust
+match rest.next() {
+    Some(b'd') => out.extend(unsafe { args.next_arg::<c_int>() }.to_string().bytes()),
+    Some(b'f') => {
+        let value = unsafe { args.next_arg::<c_double>() };
+        out.extend(format!("{value:.6}").bytes());
+    }
+    Some(b'c') => out.push(unsafe { args.next_arg::<c_int>() } as u8),
+```
+
+The `T` in `next_arg::<T>()` is not compared with what the caller passed. It is my guess, based on the format string of the caller. This is why every read is `unsafe`, and why rustc wants the whole function to be `unsafe`: the caller must keep the promise.
+
+## The compiler checks the promotions
+
+One thing is checked, and it is the C rule that surprises people. Before C passes a value through `...`, it promotes it: `char` and `short` become `int`, and `float` becomes `double`. My C caller passes a `char` and a `short` to `rv_sum`, and three `float` values to `rv_mean`. The Rust side reads `c_int` and `c_double`, and the results are right, 72 and 2.000000.
+
+A `float` never arrives in the list, right? It became a `double` before the call. So here, reading an `f32` can never be correct, and Rust 1.99.1 refuses it:
+
+```text
+error[E0277]: the trait bound `f32: VaArgSafe` is not satisfied
+ --> errors/read_f32.rs:6:43
+  |
+6 |         total += unsafe { args.next_arg::<f32>() };
+  |                                --------   ^^^ the nightly-only, unstable trait `VaArgSafe` is not implemented for `f32`
+```
+
+A read of `u8` gets the same error. The other direction is checked also. The Rust caller must promote by hand, with `c_int::from(letter)` and `c_double::from(half)`, because passing an `f32` to `...` is [E0617](/rust/failures/c-variadic-calls-require-default-argument-promotions), the same rule as for `printf`.
+
+Did you see "nightly-only, unstable trait" in the message? I did not expect this. [`VaArgSafe`](https://doc.rust-lang.org/std/ffi/trait.VaArgSafe.html) decides which types `next_arg` accepts, but on stable Rust you cannot write its name. A generic helper with `T: VaArgSafe` fails with E0658, `` use of unstable library feature `c_variadic_va_arg_safe` ``, on 1.99.0 too, so every read needs a concrete type.
+
+The stabilization had made the trait stable together with `VaList`, but the Rust project [made it unstable again](https://github.com/rust-lang/rust/pull/162909) about two weeks before the release, because it was still open if references should implement it, and adding that later would be a breaking change.
+
+The documentation promises the trait only for `c_int`, `c_long`, `c_longlong`, their unsigned versions, `c_double` and raw pointers. `i32` works on my machine, but the docs say not to rely on it, so my functions read `c_int`.
+
+## The list is two counters and two pointers
+
+I wanted to see what the function really gets. `VaList` implements `Debug`, so I printed it in a small function that reads a `c_int` and then a `c_double`:
+
+```text
+count = 2
+start:              VaList(VaListInner { gp_offset: 8, fp_offset: 48, overflow_arg_area: 0x7ffd32026380, reg_save_area: 0x7ffd320262a0 })
+after c_int 7:      VaList(VaListInner { gp_offset: 16, fp_offset: 48, overflow_arg_area: 0x7ffd32026380, reg_save_area: 0x7ffd320262a0 })
+after c_double 2.5: VaList(VaListInner { gp_offset: 16, fp_offset: 64, overflow_arg_area: 0x7ffd32026380, reg_save_area: 0x7ffd320262a0 })
+```
+
+On x86_64 Linux this is the `va_list` of the [psABI](https://refspecs.linuxbase.org/elf/x86_64-abi-0.99.pdf), and the [current text](https://gitlab.com/x86-psABIs/x86-64-ABI) has the same layout. At the start of the function, the argument registers are saved in one area: the six integer registers in the first 48 bytes, then the floating-point registers, 16 bytes each.
+
+`gp_offset` is the position of the next integer register in this area, and `fp_offset` the position of the next floating-point one. It starts at 8 because `count` used the first integer register. Reading the `c_int` moved `gp_offset` from 8 to 16. Reading the `c_double` moved `fp_offset` from 48 to 64. The two addresses change on every run.
+
+That is all. There is no count and no type in it. `next_arg::<c_int>()` takes the next integer slot, even when the caller never put an integer there.
+
+## When the caller is wrong
+
+So what happens with a wrong call? I wrote four wrong calls in C:
+
+```c
+rv_format("%d", 2.5);         /* the format says int, the caller passes a double */
+rv_sum(4, 1, 2, 3);           /* the count says 4, there are 3 values */
+rv_join_path("usr", "local"); /* no NULL at the end */
+rv_format("%ld", 5L);         /* valid for printf, but rv_format does not know %ld */
+```
+
+The first three are undefined behavior. The numbers below mean nothing, and most of them change on every run. I show them only because nothing stopped them.
+
+gcc and clang compiled the four calls with `-Wall -Wextra` and printed nothing. Then I ran them, except the one without NULL, because the function would read a pointer that the caller never passed. Three runs of `rv_format("%d", 2.5)` returned `"629547180"`, `"935518380"` and `"-1166720852"`. The short count gave three other numbers. The `%ld` call is not undefined behavior, only a wrong result. I keep it for the next part.
+
+From Rust it is the same. rustc builds the first two wrong calls without a warning, and `rv_format("%d", 2.5)` gave three different numbers again. One result was worse: in the Rust build, `rv_sum(4, 1, 2, 3)` printed 6, three times. It looks correct. The fourth read just found a zero, so the bug was invisible in the output.
+
+## The fixes people try
+
+The first fix is to tell the C compiler the convention. gcc and clang know two of mine. I added two attributes in the header, behind a `VARARGS_CHECKED` macro so I can compile both ways:
+
+```c
+char *rv_join_path(const char *first, ...) __attribute__((sentinel));
+char *rv_format(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+```
+
+Now gcc warns:
+
+```text
+c/misuse.c:15:58: warning: format '%d' expects argument of type 'int', but argument 2 has type 'double' [-Wformat=]
+c/misuse.c:19:9: warning: missing sentinel in function call [-Wformat=]
+```
+
+clang gives the same two warnings, with `-Wformat` and `-Wsentinel`. This helps, and I use it.
+
+But look at what is missing. Nothing knows my count, so `rv_sum(4, 1, 2, 3)` is still silent. And the attribute checks the `printf` language, not mine. `rv_format("%ld", 5L)` is correct `printf`, so there is no warning, and my function returned `"%ld"`.
+
+The [GCC documentation](https://gcc.gnu.org/onlinedocs/gcc-15.2.0/gcc/Common-Function-Attributes.html) lists what the `format` attribute understands: `printf`, `scanf`, `strftime` and `strfmon` styles. A format of your own is not in the list. And all of this works only for C callers.
+
+The second fix is Miri, for the Rust callers. Nightly Miri, from September 16, finds both Rust bugs:
+
+```text
+error: Undefined Behavior: va_arg type mismatch: requested `i32` is incompatible with next argument of type `f64`
+```
+
+```text
+error: Undefined Behavior: more C-variadic arguments read than were passed
+```
+
+Good, this is the check that was missing. But Miri needs nightly, and it interprets only Rust code, only the code that runs under it. A call from C is outside of it, and C callers are the reason to write a variadic function at all.
+
+## What I do now
+
+For a new interface, I do not use `...`. If C must pass many values, it passes an array and a length:
+
+```c
+long rv_sum_array(const int *values, size_t len);
+```
+
+Now the type is in the signature, and the C compiler checks it. With an array of `double`, gcc 15 refuses to compile:
+
+```text
+c/typed-misuse.c:7:60: error: passing argument 1 of 'rv_sum_array' from incompatible pointer type [-Wincompatible-pointer-types]
+```
+
+clang 21 gives a warning for the same line. And Rust code does not need the C function at all. It can call `sum(&values)`, the safe function from the beginning. The length is still a promise in C, of course. But it is passed next to the pointer, and in Rust it is part of the slice.
+
+I use `...` only when the interface already exists and I cannot change it, for example a C library that wants a `printf`-like callback, or a C function that I rewrite in Rust. Then I keep the variadic part thin, like `rv_sum` and `rv_vsum`: the unsafe reads are in one loop, and the work happens in `sum`, a typed function.
+
+If the convention is `printf`, I do not write my own parser. I give the `VaList` to the C library. In `rv_cformat`, `args.clone()` is the `va_copy` for the first `vsnprintf`, which only measures the length:
+
+```rust
+let needed = unsafe { vsnprintf(ptr::null_mut(), 0, fmt, args.clone()) };
+// ...
+unsafe { vsnprintf(buf.as_mut_ptr().cast(), buf.len(), fmt, args) };
+```
+
+Then the `format(printf, 1, 2)` attribute is honest, because the C library reads the format with the real `printf` rules.
+
+I write the convention in the `# Safety` section of the function, and in the header with `format` or `sentinel` when one of them fits.
+
+And I set `rust-version = "1.99"`, so Cargo 1.98.0 stops with `c-variadics@0.1.0 requires rustc 1.99` before it compiles anything.
+
+## The tradeoffs
+
+An array and a length is more work for the C caller. For two or three values it feels heavy, and `...` is shorter to call.
+
+And the two counters I printed are the x86_64 layout outside Windows and UEFI. In the [Rust source](https://github.com/rust-lang/rust/blob/1.99.1/library/core/src/ffi/va_list.rs), Windows, Apple ARM targets and some others use a single pointer for `va_list`. A wrong read is wrong there too, only in another way.
+
+## What this says about API design
+
+Each compiler checked what was in the signature. When I moved the types into `...`, they did not disappear. They moved into a convention: a count, a null pointer at the end, a format string. rustc could still check the promotions, because they are the same for every call. It could not check my count or my format string, because they are mine.
+
+A compiler can check a convention only when it knows it: gcc and clang know `printf` and the null sentinel. Miri does not need the convention, it sees the real arguments, but only in the Rust calls that it runs. For my count in a call from C, nothing checks it.
+
+So when I design an interface, I ask where the types are. If they are in the signature, each compiler checks every call on its side, and only the C header between the two sides stays a promise. If they are in a convention, I choose a convention that an existing tool already knows, and I keep it inside one small function. And when I am free to choose, I put them in the signature.
