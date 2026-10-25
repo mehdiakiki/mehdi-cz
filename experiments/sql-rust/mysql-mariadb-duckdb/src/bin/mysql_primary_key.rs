@@ -4,8 +4,14 @@ use sqlx::Row;
 // article-example:start
 async fn inspect(c: &mut sqlx::MySqlConnection, table: &str) -> Result<()> {
     let (plan_sql, count_sql) = match table {
-        "b_pk_small" => ("EXPLAIN SELECT id FROM b_pk_small FORCE INDEX (by_status) WHERE status = ?", "SELECT COUNT(*) FROM b_pk_small WHERE status = ?"),
-        "b_pk_wide" => ("EXPLAIN SELECT id FROM b_pk_wide FORCE INDEX (by_status) WHERE status = ?", "SELECT COUNT(*) FROM b_pk_wide WHERE status = ?"),
+        "b_pk_small" => (
+            "EXPLAIN SELECT id FROM b_pk_small FORCE INDEX (by_status) WHERE status = ?",
+            "SELECT COUNT(*) FROM b_pk_small WHERE status = ?",
+        ),
+        "b_pk_wide" => (
+            "EXPLAIN SELECT id FROM b_pk_wide FORCE INDEX (by_status) WHERE status = ?",
+            "SELECT COUNT(*) FROM b_pk_wide WHERE status = ?",
+        ),
         _ => return Err("unknown fixture table".into()),
     };
     for row in sqlx::query(plan_sql).bind(1_i32).fetch_all(&mut *c).await? {
@@ -25,10 +31,11 @@ async fn inspect(c: &mut sqlx::MySqlConnection, table: &str) -> Result<()> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let mut c = connect("MYSQL_URL").await?;
-    for statement in ["DROP TABLE IF EXISTS b_pk_small", "DROP TABLE IF EXISTS b_pk_wide"] {
-        sqlx::query(statement)
-            .execute(&mut c)
-            .await?;
+    for statement in [
+        "DROP TABLE IF EXISTS b_pk_small",
+        "DROP TABLE IF EXISTS b_pk_wide",
+    ] {
+        sqlx::query(statement).execute(&mut c).await?;
     }
     sqlx::query("CREATE TABLE b_pk_small(id BIGINT PRIMARY KEY, status INT NOT NULL, KEY by_status(status)) ENGINE=InnoDB").execute(&mut c).await?;
     sqlx::query("CREATE TABLE b_pk_wide(id CHAR(36) CHARACTER SET ascii COLLATE ascii_bin PRIMARY KEY, status INT NOT NULL, KEY by_status(status)) ENGINE=InnoDB").execute(&mut c).await?;

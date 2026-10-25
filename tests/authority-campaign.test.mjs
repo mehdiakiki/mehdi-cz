@@ -16,7 +16,12 @@ import {
 } from "../scripts/audit-authority-campaign.mjs";
 import { articleReviewHash } from "../lib/content-review.mjs";
 
-const sqlRustSeries = JSON.parse(readFileSync(new URL("../docs/editorial/sql-rust-proposed-series-2026-10-25.json", import.meta.url), "utf8"));
+const sqlRustSeries = JSON.parse(
+  readFileSync(
+    new URL("../docs/editorial/sql-rust-proposed-series-2026-10-25.json", import.meta.url),
+    "utf8"
+  )
+);
 
 test("markdown word count ignores fenced code and inline markup", () => {
   assert.equal(markdownWordCount("One **clear** model.\n\n```rust\nlet hidden = true;\n```"), 3);

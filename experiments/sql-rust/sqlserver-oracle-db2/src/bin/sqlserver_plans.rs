@@ -12,7 +12,9 @@ async fn run() -> AnyResult<()> {
         .into_row()
         .await?
         .ok_or_else(|| invalid("no compatibility setting"))?;
-    let level = settings.try_get::<i32, _>(0)?.ok_or_else(|| invalid("null compatibility level"))?;
+    let level = settings
+        .try_get::<i32, _>(0)?
+        .ok_or_else(|| invalid("null compatibility level"))?;
     println!("database compatibility level={level}");
     client.execute("CREATE TABLE #PlanProbe (id int PRIMARY KEY, tenant int NOT NULL, payload varchar(100) NOT NULL); CREATE INDEX IX_tenant ON #PlanProbe(tenant)", &[]).await?;
     client.execute("WITH n AS (SELECT 1 AS i UNION ALL SELECT i+1 FROM n WHERE i<2000) INSERT INTO #PlanProbe SELECT i, CASE WHEN i=1 THEN 1 ELSE 2 END, REPLICATE('x',100) FROM n OPTION(MAXRECURSION 2000)", &[]).await?;
@@ -63,7 +65,9 @@ async fn capture(
                         return Err(invalid("unexpectedly large plan").into());
                     }
                     std::fs::write(
-                        directory.join(format!("attempt-{attempt}-tenant-{tenant}-plan-{plans}.sqlplan")),
+                        directory.join(format!(
+                            "attempt-{attempt}-tenant-{tenant}-plan-{plans}.sqlplan"
+                        )),
                         text,
                     )?;
                     plans += 1;

@@ -46,7 +46,15 @@ async fn shared_contract(c: &mut MySqlConnection, check_error: u16) -> Result<()
 async fn main() -> Result<()> {
     for variable in ["MYSQL_URL", "MARIADB_URL"] {
         let mut c = connect(variable).await?;
-        shared_contract(&mut c, if variable == "MARIADB_URL" { 4025 } else { 3819 }).await?;
+        shared_contract(
+            &mut c,
+            if variable == "MARIADB_URL" {
+                4025
+            } else {
+                3819
+            },
+        )
+        .await?;
         let duplicate = sqlx::query("INSERT INTO b_contract VALUES(1,'duplicate',NULL,0)")
             .execute(&mut c)
             .await

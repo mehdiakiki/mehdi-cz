@@ -16,7 +16,10 @@ const posts = series.articles.map((article) => {
 });
 
 test("the SQL series contains all thirty commissioned articles and real Rust sources", () => {
-  assert.deepEqual(posts.map((post) => post.number), Array.from({ length: 30 }, (_, i) => i + 1));
+  assert.deepEqual(
+    posts.map((post) => post.number),
+    Array.from({ length: 30 }, (_, i) => i + 1)
+  );
   assert.equal(new Set(posts.map((post) => post.slug)).size, 30);
   assert.equal(posts.filter((post) => post.kind === "profile").length, 8);
   for (const post of posts) {

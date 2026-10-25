@@ -53,9 +53,13 @@ fn run() -> Result<()> {
     let restricted = safe
         .execute("DELETE FROM projects WHERE id = 1", [])
         .unwrap_err();
-    assert_eq!(restricted.sqlite_error_code(), Some(ErrorCode::ConstraintViolation));
+    assert_eq!(
+        restricted.sqlite_error_code(),
+        Some(ErrorCode::ConstraintViolation)
+    );
     for table in ["projects", "members", "tasks"] {
-        let count: i64 = safe.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))?;
+        let count: i64 =
+            safe.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))?;
         assert_eq!(count, 1);
     }
     safe.execute("DELETE FROM members WHERE id = 1", [])?;
@@ -69,7 +73,10 @@ fn run() -> Result<()> {
     let orphan = reopened
         .execute("INSERT INTO tasks VALUES (2, 999)", [])
         .unwrap_err();
-    assert_eq!(orphan.sqlite_error_code(), Some(ErrorCode::ConstraintViolation));
+    assert_eq!(
+        orphan.sqlite_error_code(),
+        Some(ErrorCode::ConstraintViolation)
+    );
     unchecked.execute_batch("BEGIN")?;
     unchecked.pragma_update(None, "foreign_keys", true)?;
     assert_eq!(

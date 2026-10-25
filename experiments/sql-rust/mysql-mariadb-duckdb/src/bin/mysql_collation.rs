@@ -35,10 +35,11 @@ async fn names(c: &mut sqlx::MySqlConnection) -> Result<()> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let mut c = connect("MYSQL_URL").await?;
-    for statement in ["DROP TABLE IF EXISTS b_names_folded", "DROP TABLE IF EXISTS b_names_bytes"] {
-        sqlx::query(statement)
-            .execute(&mut c)
-            .await?;
+    for statement in [
+        "DROP TABLE IF EXISTS b_names_folded",
+        "DROP TABLE IF EXISTS b_names_bytes",
+    ] {
+        sqlx::query(statement).execute(&mut c).await?;
     }
     sqlx::query("CREATE TABLE b_names_folded(name VARCHAR(80) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NOT NULL UNIQUE) ENGINE=InnoDB").execute(&mut c).await?;
     sqlx::query("CREATE TABLE b_names_bytes(name VARBINARY(320) PRIMARY KEY) ENGINE=InnoDB")

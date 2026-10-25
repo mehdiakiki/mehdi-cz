@@ -49,7 +49,11 @@ async fn compare(variable: &str) -> Result<()> {
         .execute(&mut c)
         .await
         .unwrap_err();
-    let expected = if variable == "MARIADB_URL" { 4025 } else { 3140 };
+    let expected = if variable == "MARIADB_URL" {
+        4025
+    } else {
+        3140
+    };
     assert_eq!(number(&rejected), Some(expected));
     let absent: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM b_json WHERE id=3")
         .fetch_one(&mut c)
