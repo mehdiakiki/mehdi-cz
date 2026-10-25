@@ -1,0 +1,107 @@
+---
+title: "Build a Small PostgreSQL Service in Rust with SQLx"
+date: '2026-10-25'
+tags: ["sql", "postgresql", "rust", "sqlx"]
+draft: true
+reviewed: false
+cluster: "reliable-data-integrations"
+campaign: "editorial"
+summary: "Use bound SQLx queries, database constraints, one transaction for related writes, and a limited pool before adding more service infrastructure."
+---
+
+A service moves thirty credits from one account to another. The first update succeeds. The second fails. If each statement committed independently, the service has removed credits without completing the transfer.
+
+This is a useful first PostgreSQL example because it gives the database a real job: keep related changes together and reject invalid stored values. Rust helps represent the operation, but the database must enforce its part even when a request fails halfway through.
+
+PostgreSQL fits a service where several application processes need one shared store with transactions, constraints, and controlled access. That comes with a running server to operate or a managed service to choose. The server also needs monitoring, backups, and a clear upgrade path. Include those costs when deciding whether the service needs a shared database.
+
+## Keep the first service small
+
+The checked-in program uses SQLx 0.8.6 with Tokio and PostgreSQL support. Its disposable database contains two accounts and a transfer record table. An account balance cannot be negative. A transfer amount must be positive, and its request key is unique.
+
+The example opens a pool capped at four connections. It also sets an acquisition timeout and short server-side statement and lock limits. These values keep the demonstration bounded; they are not capacity advice for a production service.
+
+A pool limit is per pool. Ten replicas each allowing forty connections can ask for far more database sessions than a developer expected from reading one configuration file. Include background workers, migrations, and administrative connections when choosing a service's total connection budget.
+
+SQLx's [runtime and TLS documentation](https://docs.rs/sqlx/0.8.6/sqlx/) explains the client features used here. The fixture obtains a database URL from CI configuration and never embeds a credential in the article. Configure certificate and server-name verification for the actual deployment rather than weakening transport settings to make an example connect.
+
+## Make the write boundary visible
+
+The transfer function in `experiments/sql-rust/postgres-sqlite/src/bin/pg_service.rs` moves between two fixed demonstration accounts:
+
+```rust
+async fn transfer(
+    pool: &PgPool,
+    request: &str,
+    amount: i32,
+) -> std::result::Result<bool, sqlx::Error> {
+    if amount <= 0 {
+        return Ok(false);
+    }
+    let mut tx = pool.begin().await?;
+    let changed = sqlx::query(
+        "UPDATE accounts SET balance = balance - $1
+        WHERE id = 1 AND balance >= $1",
+    )
+    .bind(amount)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    if changed != 1 {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+    let credited = sqlx::query("UPDATE accounts SET balance = balance + $1 WHERE id = 2")
+        .bind(amount)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    if credited != 1 {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+    sqlx::query("INSERT INTO transfers (request_key, amount) VALUES ($1, $2)")
+        .bind(request)
+        .bind(amount)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(true)
+}
+```
+
+The debit includes the balance condition in the update. It does not trust a balance read earlier by the web handler. The affected-row count tells the function whether that condition found a row it could change.
+
+The credit checks its affected-row count too. A successful SQL command that changed zero rows is not a successful transfer. Both updates and the request record use the same transaction executor, and the commit happens only after all three operations succeed.
+
+This is an application example using integer credits, not a complete payment system. It omits currencies, account authorization, audit requirements, and the handling needed for opposite concurrent transfer orders. Give those requirements their own explicit design before applying the function to real money.
+
+## Bind values and enforce stored rules
+
+The request key in the test includes an apostrophe. It is passed through `.bind`, so its contents remain a value rather than becoming SQL syntax. The table names and statement structure are fixed application code.
+
+Bindings do not authorize an account or decide that an amount is acceptable. The request path still needs to establish who may perform the operation. The function checks positivity for a useful early refusal, while the table also rejects invalid values.
+
+PostgreSQL's [constraint documentation](https://www.postgresql.org/docs/18/ddl-constraints.html) covers checks, uniqueness, and references. Stored rules protect data written through other code paths too. A later import tool should not be able to create a negative balance simply because it bypassed this Rust function.
+
+Name constraints clearly in a real schema so an error can be mapped to a useful application outcome. Avoid returning raw database messages to clients: they may expose internal names or values. Keep enough structured error detail in restricted diagnostics to identify the failed rule.
+
+## A duplicate request must not move the credits twice
+
+The test first performs one thirty-credit transfer, then submits the same request key again. The unique constraint rejects the second transfer record. The surrounding transaction must roll back the debit and credit performed during that second attempt.
+
+The program then checks the actual balances, seventy and thirty, and exactly one transfer record. It also tries an oversized transfer and a negative amount, then attempts a direct invalid database update to exercise the stored check.
+
+That unique key prevents duplicate committed records in this small example. It is not a complete idempotent API response. A production endpoint needs to decide what to return for an existing key and whether a repeated key with a different amount is a conflict. It may also need to recover after the client loses a commit response.
+
+Check those outcomes against the records, not just a handler's success message. A response can look reasonable while the second transaction has accidentally committed changes.
+
+## Leave room for the service to be operated
+
+Keep schema migrations in version control and run them through a controlled deployment path. Test an upgrade from a supported old schema, including any period when old and new application versions both run. Successful creation of an empty test database is only the first migration case.
+
+Monitor pool acquisition time separately from query execution. A request waiting for a connection will not improve because its eventual query gained an index. Also record transaction failures by category, without logging credentials or private parameters.
+
+Backups need a restore check against a separate database. The transfer test protects one behavior; it does not establish recovery after a lost machine or a mistaken migration. Know who owns that operational work before treating the service as durable storage.
+
+Keep the duplicate-request test when adding the HTTP handler. It should still finish with one transfer record and unchanged balances after the repeated attempt. A nicer response or a new service layer should not change those stored outcomes.

@@ -1,0 +1,85 @@
+---
+title: "MySQL From Rust: Keep the Stock Change and Order Together"
+date: "2026-10-25"
+tags: ["rust", "mysql", "transactions"]
+draft: true
+reviewed: false
+cluster: "reliable-data-integrations"
+campaign: "editorial"
+summary: "Reserve stock with a conditional update, keep the order in the same InnoDB transaction, and check the rollback paths."
+---
+
+A shop has three copies of a book left. One request wants two copies. So does another request. Both requests can read the number three before either changes it. A Rust check that says “three is enough” tells us what was true at the time of that read. It does not reserve anything.
+
+There is another problem hiding behind that race. Even if the stock update is correct, the order insert can fail. A duplicate order key is enough. If these statements commit separately, the customer can lose stock without getting an order record. The two operations need one decision about whether their changes stay.
+
+For this example I use MySQL 8.4.13, SQLx 0.9.0 and InnoDB tables. The engine matters. The [InnoDB transaction documentation](https://dev.mysql.com/doc/refman/8.4/en/innodb-autocommit-commit-rollback.html) describes the commit and rollback behavior we need. Naming the product alone is less useful than naming the table engine and the invariant: available stock must never become negative, and every successful reservation must have its order row.
+
+## Let the update make the decision
+
+The important part is the condition on the update. It subtracts the requested quantity only when enough stock remains. The affected row count becomes the answer. There is no separate application read whose result can become stale before the write.
+
+```rust
+async fn reserve(
+    connection: &mut MySqlConnection,
+    order: &str,
+    units: i32,
+) -> std::result::Result<bool, sqlx::Error> {
+    assert!(units > 0);
+    let mut tx = connection.begin().await?;
+    let changed =
+        sqlx::query("UPDATE b_stock SET available = available - ? WHERE id = 1 AND available >= ?")
+            .bind(units)
+            .bind(units)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+    if changed != 1 {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+    if let Err(error) = sqlx::query("INSERT INTO b_orders(order_key, units) VALUES (?, ?)")
+        .bind(order)
+        .bind(units)
+        .execute(&mut *tx)
+        .await
+    {
+        tx.rollback().await?;
+        return Err(error);
+    }
+    tx.commit().await?;
+    Ok(true)
+}
+```
+
+The full runnable source is `experiments/sql-rust/mysql-mariadb-duckdb/src/bin/mysql_service.rs`. Its setup creates a stock row with three units and an order table with a unique order key. The stock table also has a nonnegative check constraint. The constraint is useful protection for other write paths, even though this update already includes the condition.
+
+The function returns false for a shortage. That is an expected business outcome, so treating it as a database outage would make the caller's job harder. An SQL error remains an error. In particular, a duplicate order key rolls back the earlier stock change instead of quietly accepting a second reservation.
+
+The assertion on units is an internal fixture precondition. An HTTP handler should validate a positive quantity and a sensible upper bound before calling the transaction code. A panic is not a useful response to a customer typing zero. The bound also keeps conversion and arithmetic decisions explicit if the API accepts a larger numeric type than the database column.
+
+## Check the state after a rejected write
+
+The fixture first reserves two units for `order-1`. It then tries to reserve two more for `order-2`, which must report a shortage. Finally it tries `order-1` again with one unit. That update could succeed, but the order insert must fail on the existing key.
+
+The final assertions require one available unit and one order. These are expected conditions encoded in the fixture, not a claimed run result. Checking only that an error appeared would miss the important question: did the rejected operation leave stock behind in the wrong state?
+
+This is also why the rollback is visible in the function. SQLx provides a [transaction type with commit and rollback operations](https://docs.rs/sqlx/0.9.0/sqlx/struct.Transaction.html). Keeping the early exit close to the failed insert makes it easier to review the database work that must be undone. The example uses bound runtime queries; it does not claim that these strings were checked against a schema at Rust compilation time.
+
+## A unique key is only part of retry handling
+
+Rejecting a duplicate order is not yet an idempotent checkout API. Suppose the database commits and the connection breaks before the caller receives the answer. A retry may find the order already present. The service needs enough stored information to decide whether that is the same request and return its previous result.
+
+The same key with a different quantity needs an explicit policy too. Silently returning success could hide a conflicting request. Store and compare the fields that define the operation, or reject the conflict. A request identifier becomes useful when it has a clear meaning across retries, rather than merely being a random string attached to an insert.
+
+An email or a payment request does not become atomic because it sits between begin and commit in Rust. Holding the transaction open during a network call also keeps database resources busy while another system responds. A durable event written in the transaction can support later delivery, with its own retry rules. The related article on <ArticleLink slug="compensation-is-a-business-operation-not-a-database-rollback">compensating a completed business action</ArticleLink> looks at the cases where an external action has already happened.
+
+## What the small example leaves to the service
+
+One connection is enough to show the transaction boundary. A service also needs a bounded connection pool, request deadlines and an answer for a request that expires while a commit is in flight. Those decisions should not disappear behind a helper called `save_order`.
+
+The fixture verifies server identity with TLS by default through [SQLx's MySQL SSL mode](https://docs.rs/sqlx/0.9.0/sqlx/mysql/enum.MySqlSslMode.html). Its plaintext switch exists for an isolated disposable CI database. Copying that switch into a deployed service would change the connection's security assumptions.
+
+Table setup is outside the business transaction. MySQL has [statements that cause implicit commits](https://dev.mysql.com/doc/refman/8.4/en/implicit-commit.html), including common schema operations. A test that creates tables between begin and rollback can teach the wrong lesson about what rollback protects.
+
+Before adopting the pattern, add a concurrent last-units test and a test for a response lost around commit. Keep the same stored-state checks. The function is doing its job when each accepted order has its stock change, and each rejected order leaves both tables consistent.

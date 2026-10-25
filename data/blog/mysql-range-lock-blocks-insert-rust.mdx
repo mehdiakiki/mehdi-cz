@@ -1,0 +1,109 @@
+---
+title: "Why a MySQL Range Read Can Block an Insert Into an Empty Gap"
+date: "2026-10-25"
+tags: ["rust", "mysql", "transactions"]
+draft: true
+reviewed: false
+cluster: "reliable-data-integrations"
+campaign: "editorial"
+summary: "Hold an indexed locking read open and compare an insert under REPEATABLE READ and READ COMMITTED."
+---
+
+The insert has a new primary key. Its indexed value does not exist yet. Why would a request that only selected existing rows make it wait?
+
+With InnoDB, a locking read can protect a range as well as the records found inside it. That protection can include a gap where no row exists. It makes sense when we ask the database to preserve a range while a transaction makes a decision. It is surprising when we think the locks correspond only to the rows returned to Rust.
+
+Here is a small reproduction. A table has primary keys one and two, with indexed values ten and twenty. Connection A reads the interval starting at ten and ending before twenty, using a locking read. Connection B tries to insert a new row with value fifteen. The value is new, but it lies inside that interval.
+
+## Keep the read open while trying the insert
+
+The fixture sets the isolation level explicitly on connection A. It fetches the selected row before starting the insert, so we know the locking read has happened. It does not commit the reader until after the writer attempt has returned.
+
+```rust
+async fn range_case(
+    a: &mut MySqlConnection,
+    b: &mut MySqlConnection,
+    committed: bool,
+) -> Result<()> {
+    let isolation = if committed {
+        "READ COMMITTED"
+    } else {
+        "REPEATABLE READ"
+    };
+    let statement: &'static str = if committed {
+        "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED"
+    } else {
+        "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ"
+    };
+    sqlx::query(statement)
+    .execute(&mut *a)
+    .await?;
+    let mut reader = a.begin().await?;
+    let ids: Vec<i32> = sqlx::query_scalar(
+        "SELECT id FROM b_range FORCE INDEX(by_k) WHERE k>=10 AND k<20 FOR UPDATE",
+    )
+    .fetch_all(&mut *reader)
+    .await?;
+    assert_eq!(ids, vec![1]);
+    let mut writer = b.begin().await?;
+    let insert = sqlx::query("INSERT INTO b_range(id,k) VALUES(3,15)")
+        .execute(&mut *writer)
+        .await;
+    if committed {
+        insert?;
+        writer.commit().await?;
+    } else {
+        assert_eq!(number(&insert.unwrap_err()), Some(1205));
+        writer.rollback().await?;
+    }
+    reader.commit().await?;
+    if !committed {
+        sqlx::query("INSERT INTO b_range(id,k) VALUES(3,15)")
+            .execute(&mut *b)
+            .await?;
+    }
+    let present: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM b_range WHERE id=3 AND k=15")
+        .fetch_one(&mut *b)
+        .await?;
+    assert_eq!(present, 1);
+    sqlx::query("DELETE FROM b_range WHERE id=3")
+        .execute(&mut *b)
+        .await?;
+    println!("{isolation}: checked insert result while locking read remained open");
+    Ok(())
+}
+```
+
+The full binary is `experiments/sql-rust/mysql-mariadb-duckdb/src/bin/mysql_range_lock.rs`, using MySQL 8.4.13 and SQLx 0.9.0. Setup creates an InnoDB table and an ordinary index named `by_k`. The index hint fixes the access path for this narrow demonstration. It should not be copied into application queries without checking the actual plan and data.
+
+Under REPEATABLE READ, the fixture expects the insert to reach the short lock-wait limit and report error 1205. It then explicitly rolls back the writer transaction, commits the reader and tries the insert again. That later insert must succeed. Checking the second attempt matters: an unrelated invalid value or broken table should not be mistaken for evidence of a range lock.
+
+The other case uses READ COMMITTED for the reader. The fixture requires the insert to commit while the reader transaction is still open. Both cases clean up the inserted row before the next comparison. The article does not claim a measured waiting time; the server outcome and transaction ordering are the evidence.
+
+## The missing row is part of the protected range
+
+The [InnoDB locking reference](https://dev.mysql.com/doc/refman/8.4/en/innodb-locking.html) distinguishes record, gap and next-key locks. For this example, the useful consequence is simple: an indexed search interval can prevent another transaction from inserting inside the interval. Looking only at the returned row identifiers misses the protected space around them.
+
+This is a locking read because the statement ends with FOR UPDATE. An ordinary consistent select has different behavior. Removing that distinction from an explanation can make readers believe every report query blocks inserts in the same way.
+
+The predicate also matters. An exact search for an existing row through a unique index is a different case from this range over a nonunique index. A query that appears to select one row is not automatically a unique lookup. Its conditions and the chosen index determine how the engine finds and locks records.
+
+The fixture's two connections make this visible without a complete web service. In an application, the same reader might be a request that validates a batch, then performs unrelated work before committing. The insert can wait during all that extra work. First check transaction boundaries before assuming the insert itself is slow.
+
+## Changing isolation changes the promise
+
+MySQL documents [InnoDB isolation levels](https://dev.mysql.com/doc/refman/8.4/en/innodb-transaction-isolation-levels.html), including the differences in search locking. READ COMMITTED reduces gap locking for searches and index scans. It does not mean “no gap locks anywhere”: foreign-key checks and duplicate-key checks remain important exceptions.
+
+More importantly, it changes what concurrent transactions may observe. If an operation depends on preventing new records from appearing in a selected interval, removing that protection can break the business decision. A successful insert is not automatically evidence that the second isolation level is better for the application.
+
+Write down the rule first. Does a reservation require that no new overlapping row can appear? Does a background task merely need to process the records currently selected? Those are different requirements. Use a constraint or a locking protocol that matches the rule, and test it with the competing operation present.
+
+## Read the error as a transaction decision
+
+The writer gets an error while its transaction is open. The fixture rolls it back explicitly instead of assuming every lock-wait error means every earlier statement was undone. If a real writer has already changed another table, its recovery policy must cover that earlier work as well.
+
+The related <ArticleLink slug="mysql-rust-deadlock-order-bounded-retry">deadlock reproduction</ArticleLink> handles a different failure: two transactions form a cycle and the engine rejects a victim. A long wait and a deadlock can look similar in a slow-request graph, but their errors and causes are different. Treating all of them as “retry anything” makes diagnosis harder.
+
+For a real blocked insert, collect the waiting statement, the blocking transaction, its age, the isolation level and the relevant index plan. Avoid investigating only the request that finally timed out. The blocker may have finished its database work much earlier and remained open while doing something else.
+
+The smallest useful fix is often to shorten that transaction or make its search more precise. If the range really needs protection, keep that guarantee and account for contention. If it does not, change the read deliberately and rerun the competing operations. The empty gap is part of the design either way.

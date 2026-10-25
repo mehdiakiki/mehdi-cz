@@ -1,0 +1,100 @@
+---
+title: "SQL Server used a different plan for the same query"
+date: "2026-10-25"
+tags: ["rust", "sql", "sql-server", "query-plans", "performance"]
+draft: true
+reviewed: false
+cluster: "reliable-data-integrations"
+campaign: "editorial"
+summary: "Capture actual SQL Server plans from Rust with bound parameters, then separate parameter-sensitive behavior from a slow query that only looks identical."
+---
+
+Imagine two tenants using the same reporting endpoint. One owns a few records, the other owns most of the table. The Rust code sends the same parameterized statement for both, but their response times are very different.
+
+It is tempting to blame the new driver, especially if the old application seemed faster. Before changing Rust libraries, keep the parameter values and collect the actual execution plans. Identical SQL text does not promise identical work, one plan for all parameter values, or one stable plan forever.
+
+This article builds a small plan collector. It deliberately uses uneven data, but it does **not** promise to force a plan change. A tiny fixture may use the same reasonable plan every time. Its purpose is to preserve the evidence needed to investigate a real case without replacing parameters with string interpolation or repeatedly clearing the server's cache.
+
+## Write down what “the same query” means
+
+Keep the SQL text, bound parameter types and parameter values together. A literal pasted into a database console is not necessarily equivalent to the application's parameterized request. Even two Rust paths can send different SQL types if one binds an integer and another sends a string containing digits.
+
+The engine build matters, as do the database compatibility level, relevant indexes and statistics. The connection helper rejects a build that differs from `SQLSERVER_EXPECT_VERSION`. This fixture also prints the actual compatibility level. Preserve those logs beside the plans. If the application reaches a different database after a deployment, comparing only its Rust source will hide the change.
+
+There may be more than one explanation for different plans. A recompile can use newer statistics. SQL Server's Parameter Sensitive Plan optimization can also maintain variants for eligible parameterized queries. That feature is available in SQL Server 2022 and later, with applicability depending on configuration and query eligibility. See Microsoft's [PSP explanation](https://learn.microsoft.com/en-us/sql/relational-databases/performance/parameter-sensitive-plan-optimization?view=sql-server-ver17). Do not describe every different plan as a broken cache or assume that every installation supports the same optimization.
+
+## Keep the query result and its plan
+
+The full program creates `#PlanProbe` on one connection. It inserts 2,000 constructed rows: tenant `1` owns one row and tenant `2` owns 1,999. A tenant index and a payload column give the optimizer something to consider, but this is not a production-sized performance test.
+
+It enables `SET STATISTICS XML ON`, then runs tenant `1`, tenant `2`, and tenant `1` again through the same bound statement. That setting executes the statements and returns execution information afterwards. It requires permission to execute the query and `SHOWPLAN` permission on all referenced databases. For this temporary-table example, check permissions involving `tempdb` as well. Microsoft's [STATISTICS XML documentation](https://learn.microsoft.com/en-us/sql/t-sql/statements/set-statistics-xml-transact-sql?view=sql-server-ver17) describes those requirements.
+
+The marked collector below is from `experiments/sql-rust/sqlserver-oracle-db2/src/bin/sqlserver_plans.rs`. Its caller handles table setup, settings and a 30-second overall deadline. Set `SQLSERVER_PLAN_DIR` to an artifact directory belonging to this run.
+
+```rust
+async fn capture(
+    client: &mut sql_rust_enterprise_examples::SqlClient,
+    directory: &std::path::Path,
+) -> AnyResult<()> {
+    for (attempt, tenant) in [1i32, 2, 1].into_iter().enumerate() {
+        let results = client.query(
+            "SELECT COUNT_BIG(*) AS matched, SUM(CONVERT(bigint,DATALENGTH(payload))) AS bytes FROM #PlanProbe WHERE tenant=@P1 /* rust-plan-probe */",
+            &[&tenant],
+        ).await?.into_results().await?;
+        let actual = results
+            .first()
+            .and_then(|set| set.first())
+            .ok_or_else(|| invalid("missing count"))?
+            .try_get::<i64, _>("matched")?;
+        assert_eq!(actual, Some(if tenant == 1 { 1 } else { 1999 }));
+        let mut plans = 0;
+        for rows in &results {
+            for row in rows {
+                let text = if let Ok(Some(text)) = row.try_get::<&str, _>(0) {
+                    Some(text)
+                } else {
+                    row.try_get::<&XmlData, _>(0)
+                        .ok()
+                        .flatten()
+                        .map(|xml| xml.as_ref())
+                };
+                if let Some(text) = text {
+                    if text.len() > 2_000_000 {
+                        return Err(invalid("unexpectedly large plan").into());
+                    }
+                    std::fs::write(
+                        directory.join(format!("attempt-{attempt}-tenant-{tenant}-plan-{plans}.sqlplan")),
+                        text,
+                    )?;
+                    plans += 1;
+                }
+            }
+        }
+        if plans == 0 {
+            return Err(invalid("no actual plan returned; check SHOWPLAN permission").into());
+        }
+        println!("attempt={attempt}, tenant={tenant}, rows={actual:?}, plans={plans}");
+    }
+    Ok(())
+}
+```
+
+Notice that the collector consumes all result sets. The ordinary count row and the plan document are separate results. The returned XML document may arrive as text, so the code accepts that representation as well as a typed XML value. It checks the expected count and refuses a missing plan. Different counts alone are not evidence of different execution plans.
+
+Each document is capped at two million bytes before writing, and each attempt gets a separate filename. This is a bound on stored output after decoding, not a streaming memory limit for arbitrary server responses. The fixture's rows and number of requests are fixed. A collector used with unbounded queries would need stronger limits.
+
+No SQL Server integration output is claimed here yet. Remote compilation can check the collector's types; it cannot prove that a server returns these plans, that the account has `SHOWPLAN`, or that any plan changes. A successful database run should produce the checked counts and plan files. Whether their operators differ is a separate inspection.
+
+## Compare the expensive part, not the file bytes
+
+Open the saved plans in a tool that understands SQL Server plans. Start at the data access and joins: which index is used, how many rows were estimated, and how many were actually processed? Look for a large mismatch before deciding that an index seek is automatically better than a scan. Reading most of a table can make a scan a sensible choice.
+
+The first and third requests use the same tenant, so they provide a useful comparison around the larger tenant's request. They still do not establish a benchmark. Compilation, caching and a very small table can dominate such a short run. A byte-level difference between plan documents may also come from runtime counters rather than a changed strategy.
+
+For a real slow request, collect a small approved sample of parameter values representing both small and large tenants. Keep the query's result checks in place. If the plan estimates are wrong, investigate the statistics and data distribution with the database owner. If the application binds the wrong type, correct that mismatch before adding hints. If a plan changes without explaining the delay, check whether the request is actually <ArticleLink slug="a-sql-server-read-waited-behind-an-update">waiting behind a transaction</ArticleLink>.
+
+## Choose a correction you can check afterwards
+
+A targeted recompile can be useful in some parameter-sensitive cases, but adding `RECOMPILE` everywhere spends compilation work and discards potential reuse. Clearing the global plan cache is an especially poor routine probe on a shared server. It changes other workloads and makes the original evidence harder to recover.
+
+Try one justified change at a time: correct a parameter type, update unsuitable statistics under an agreed policy, change an index, or use a narrowly chosen query treatment. Then repeat the same parameter sample, compare returned data, and inspect the resulting plans and resource use. Keep the small and large tenant in that comparison. Making the large report faster while slowing every small lookup would be a tradeoff to discuss, not a result hidden behind one improved timing.

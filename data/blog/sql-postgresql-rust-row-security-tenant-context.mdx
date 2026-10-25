@@ -1,0 +1,81 @@
+---
+title: "Test PostgreSQL Row Security with a Separate Rust Application Role"
+date: '2026-10-25'
+tags: ["sql", "postgresql", "rust", "multi-tenancy", "security"]
+draft: true
+reviewed: false
+cluster: "reliable-data-integrations"
+campaign: "editorial"
+summary: "Omit a tenant filter deliberately, test through a non-owner PostgreSQL login, and keep transaction-local tenant context from leaking through a SQLx pool."
+---
+
+A new list query forgets its tenant condition. The Rust response type is correct, the query succeeds, and another account's document appears in the result. Nothing about binding the search text prevented the missing authorization rule.
+
+PostgreSQL row-level security can provide another check at the table. The application still authenticates the caller and chooses the tenant, but ordinary reads and writes must also satisfy a policy. To test that protection, the query must run as the role the application really uses.
+
+A test run as a database owner or superuser can give a very different answer. That is why this example uses separate owner and application connections rather than putting a policy on a table and querying it with the account that created everything.
+
+## Separate schema setup from application access
+
+The example creates two documents for tenants seven and eight. The setup account owns the table. A different login receives the required schema and table privileges but must have neither superuser nor `BYPASSRLS` privileges.
+
+The Rust program checks those role attributes before making its policy assertions. It also checks that the application and owner names differ. PostgreSQL's [role attribute documentation](https://www.postgresql.org/docs/18/role-attributes.html) explains these privileges; they are part of the security configuration, not incidental test credentials.
+
+Row security is enabled on the table. The policy compares each row's tenant to a transaction setting named `app.tenant_id`. It uses the same tenant condition for visible rows and newly written values. A missing or empty setting becomes null, so it does not match either tenant.
+
+The [row security reference](https://www.postgresql.org/docs/18/ddl-rowsecurity.html) describes `USING`, `WITH CHECK`, default denial, and the roles that bypass policies. Normal table owners usually bypass them; `FORCE ROW LEVEL SECURITY` changes the owner's treatment, but it does not constrain superusers or bypass roles. A test should say exactly which role it exercised.
+
+## Set the tenant inside the transaction
+
+The source is `experiments/sql-rust/postgres-sqlite/src/bin/pg_rls.rs`. The application pool is deliberately limited to one connection so the test can examine what a later checkout sees:
+
+```rust
+let mut tx = app.begin().await?;
+sqlx::query("SELECT set_config('app.tenant_id', $1, true)")
+    .bind("7")
+    .execute(&mut *tx)
+    .await?;
+let visible: Vec<i32> = sqlx::query_scalar("SELECT id FROM documents ORDER BY id")
+    .fetch_all(&mut *tx)
+    .await?;
+assert_eq!(visible, vec![1]);
+tx.commit().await?;
+let after: i64 = sqlx::query_scalar("SELECT count(*) FROM documents")
+    .fetch_one(&app)
+    .await?;
+assert_eq!(after, 0);
+```
+
+The select deliberately has no tenant predicate. Tenant seven's row is the only visible row because the application role is subject to the table policy.
+
+The final argument to `set_config` makes the value local to the transaction. PostgreSQL documents this in its [configuration-setting functions](https://www.postgresql.org/docs/18/functions-admin.html#FUNCTIONS-ADMIN-SET). When that transaction ends, the tenant choice must not become the next request's session state.
+
+The policy handles an empty custom setting as well as an absent one. That matters when a session has previously used the setting. A helper that assumes “missing” always has one representation can make a pool-reuse check fail for the wrong reason.
+
+## Check writes and reuse too
+
+The test first reads without any tenant setting and expects zero rows. It then exercises the tenant-seven read above and verifies another query through the pool again sees zero. That later query catches a context accidentally left behind after commit.
+
+Another transaction sets tenant seven and tries to insert a tenant-eight row. The write must fail with a policy error. The program rolls that failed transaction back, then starts a fresh tenant-eight transaction and checks it can read the correct second document.
+
+The owner connection still sees both initial rows. That last observation makes the distinction visible: the data did not disappear, and the setup account is not the application authorization test.
+
+An application role that can read nothing would pass a badly written denial-only test. The allowed reads for both tenants matter as much as the refused write. The test must protect the feature's useful behavior while checking its boundary.
+
+## The setting is trusted application context
+
+This design protects against a query accidentally omitting its filter after trusted request handling has selected the tenant. It does not protect against arbitrary SQL execution using the same application role. Code with that database access can attempt to set the custom tenant value itself.
+
+Do not hand a model or an untrusted plugin this connection and call the policy a complete tenant sandbox. Keep the database credential and tenant selection in trusted application code. If the threat includes hostile SQL under that role, choose an authority design that does not let the hostile caller pick the context being checked.
+
+The tenant also must come from authenticated membership, not a request field accepted without authorization. Binding a supplied tenant string prevents it from changing SQL syntax; it does not establish that the caller belongs to that tenant.
+
+Policies are another layer around the access path you design. Review functions, views, elevated roles, and administrative operations that may reach the same table with different privileges. A good result for this ordinary select does not prove every other path applies the same rule.
+
+## Make pool mistakes reproducible
+
+Keep the no-context, tenant-seven, no-context-again, and tenant-eight sequence in the service's integration tests. Include rollback as well as commit when the production helper changes. A connection returned after an exception is still a connection another request may acquire.
+
+The fixture runs against an explicitly supplied disposable PostgreSQL database. It does not create a new production login or change permissions on application tables. Every test gets its own schema, and the application role receives access only to that example schema.
+
+When reviewing the result, retain the effective role attributes, policy definition, and returned IDs with the CI run. Avoid recording the database URLs. The question to settle is concrete: did the separate application role see the right rows, refuse the wrong write, and forget the tenant when its transaction ended?

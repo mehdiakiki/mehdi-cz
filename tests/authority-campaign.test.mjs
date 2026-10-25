@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { fileURLToPath } from "node:url";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 
 import {
@@ -14,6 +15,8 @@ import {
   readCampaignPosts,
 } from "../scripts/audit-authority-campaign.mjs";
 import { articleReviewHash } from "../lib/content-review.mjs";
+
+const sqlRustSeries = JSON.parse(readFileSync(new URL("../docs/editorial/sql-rust-proposed-series-2026-10-25.json", import.meta.url), "utf8"));
 
 test("markdown word count ignores fenced code and inline markup", () => {
   assert.equal(markdownWordCount("One **clear** model.\n\n```rust\nlet hidden = true;\n```"), 3);
@@ -213,6 +216,7 @@ test("the repository maps every written campaign source without counting unrelat
   assert.deepEqual(
     report.unrelatedClusteredPosts.map((post) => post.slug).sort(),
     [
+      ...sqlRustSeries.articles.map((article) => article.slug),
       "BufReader-rust",
       "a-filename-became-a-shell-command",
       "a-record-and-replay-harness-for-agent-tests",

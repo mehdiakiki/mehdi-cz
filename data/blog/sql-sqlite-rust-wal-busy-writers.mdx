@@ -1,0 +1,80 @@
+---
+title: "SQLite WAL Still Allows Only One Writer: Handle Busy Results in Rust"
+date: '2026-10-25'
+tags: ["sql", "sqlite", "rust", "concurrency"]
+draft: true
+reviewed: false
+cluster: "reliable-data-integrations"
+campaign: "editorial"
+summary: "Use two rusqlite connections to distinguish writer contention from a stale read snapshot, then choose a bounded wait or restart the transaction."
+---
+
+An app enables WAL mode and still gets a database-busy error when two requests save at once. That can feel like a broken setting. The new mode was supposed to improve concurrency.
+
+It does, but concurrent reading and writing is a different promise from concurrent writers. SQLite still serializes writes to one database. WAL changes how committed data and readers interact; it does not turn every connection into an independent writer.
+
+There are also different reasons for a busy result. A second writer may need the first writer to finish. A transaction holding an old read snapshot may need to give up that snapshot and start again. Waiting longer does not solve both cases.
+
+## Hold one write open on purpose
+
+The Rust example uses two rusqlite connections to one temporary file. It enables WAL and checks the returned journal mode before creating a counter. The input is one row, with no background load or timing race needed to arrange contention.
+
+The first connection begins an immediate transaction and changes the counter. Before it commits, the second connection reads the old committed value. It then tries to write while the first connection still owns the write transaction:
+
+```rust
+let writer = first.transaction_with_behavior(TransactionBehavior::Immediate)?;
+writer.execute("UPDATE counter SET value = value + 1 WHERE id = 1", [])?;
+let visible: i32 =
+    second.query_row("SELECT value FROM counter WHERE id = 1", [], |r| r.get(0))?;
+assert_eq!(visible, 0);
+let error = second
+    .execute("UPDATE counter SET value = value + 1 WHERE id = 1", [])
+    .unwrap_err();
+assert_eq!(error.sqlite_error_code(), Some(ErrorCode::DatabaseBusy));
+writer.commit()?;
+second.execute("UPDATE counter SET value = value + 1 WHERE id = 1", [])?;
+```
+
+The first writer cannot finish during the second connection's attempt: the program deliberately calls its commit afterward. That makes the expected busy outcome stable without hoping that two threads happen to overlap.
+
+The complete source is `experiments/sql-rust/postgres-sqlite/src/bin/sqlite_wal.rs`. It sets a short busy timeout on the second connection. The timeout bounds how long this controlled failure waits; it is not a suggested setting for every application. The test checks the error category rather than claiming that the call took an exact number of milliseconds.
+
+SQLite's [WAL documentation](https://www.sqlite.org/wal.html) describes how readers and a writer can coexist, along with checkpointing and the cases that can still return busy. Those details are worth reading before making WAL a general answer to lock complaints.
+
+## Put the wait inside the request budget
+
+A busy timeout gives a conflicting operation some time to become possible. It does not reserve future access or guarantee that another transaction will finish within the budget. rusqlite exposes it through the [connection API](https://docs.rs/rusqlite/latest/rusqlite/struct.Connection.html#method.busy_timeout).
+
+For a user request, start with the time the product can afford to wait. Include time already spent in the queue and any later work. Repeating a two-second database wait five times can turn a reasonable-looking setting into a long, unexplained stall.
+
+Keep write transactions short. Read the required input, make the related writes, and commit. Waiting for an HTTP API or user confirmation while a transaction remains open makes unrelated saves wait for work that the database cannot accelerate.
+
+Immediate transactions can make a write-intended operation acquire its write position early. That can simplify failure handling: the transaction learns about contention before doing a collection of reads. It still has to handle a failed begin, and it should not acquire the write lock long before it needs it.
+
+## An old read cannot always become a writer
+
+The second half of the example begins a read transaction on the second connection and reads the counter. The first connection then commits another update. The old reader attempts an update using its earlier snapshot.
+
+This time the expected extended result is `SQLITE_BUSY_SNAPSHOT`. The transaction is trying to write from a database view that can no longer become the current write history. SQLite's [isolation explanation](https://www.sqlite.org/isolation.html) walks through this case.
+
+The program rolls the old read transaction back, starts a fresh write, and checks the final counter. The repair is a new transaction with new reads. Retrying only the failed update inside the same old snapshot would preserve the problem.
+
+That distinction matters when an application catches every error under one “database locked” message. Keep the primary and extended error information in diagnostics, without including private SQL parameters. One failure may suggest contention and shorter transactions. Another says the operation must restart its decision using current data.
+
+## Retry the decision, and stop eventually
+
+Suppose the transaction reads an account balance and decides whether to create an item. A restart must reread the balance and repeat that decision. Reusing a boolean computed before the rollback can make the new transaction act on an old balance.
+
+Put external effects outside a retried database body unless they have their own durable deduplication rule. A notification sent during the first attempt will not be unsent by a SQLite rollback. The same warning applies to a filesystem change or a request to another service.
+
+Use a small maximum number of attempts and an overall deadline. Return a useful busy result when the budget is exhausted. Continuous retries can hide a design in which one slow writer keeps the application permanently congested.
+
+The example does not build a retry framework. It separates two concrete outcomes and demonstrates the transaction boundary each needs. That is enough to stop treating all busy errors as one instruction to sleep longer.
+
+## Check the file and the engine you actually ship
+
+WAL involves the database file and associated WAL and shared-memory state. Its documented deployment constraints include keeping cooperating processes on the same host. Moving the file to a network filesystem is a separate design decision, not a harmless way to share the local example.
+
+Keep the bundled engine version and source identity with CI output. The Rust dependency version alone is not what appears in a database error report. This fixture prints SQLite's runtime version and source ID and pins the C-library package in its Cargo manifest.
+
+After a busy incident, keep which transaction was open, which operation failed, the extended result, and what a fresh attempt observed. Those details help you choose a shorter transaction, an earlier write begin, or a bounded retry instead of increasing every timeout.

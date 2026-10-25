@@ -1,0 +1,69 @@
+---
+title: "Reproduce a MySQL Deadlock From Rust, Then Fix the Lock Order"
+date: "2026-10-25"
+tags: ["rust", "mysql", "concurrency"]
+draft: true
+reviewed: false
+cluster: "reliable-data-integrations"
+campaign: "editorial"
+summary: "Coordinate two transactions to create a real lock cycle, then retry whole transactions with a limit and use a consistent row order."
+---
+
+Two requests update the same two rows. Each request is valid on its own. One takes row one and then row two. The other takes row two and then row one. If they each hold their first row, neither can get the second.
+
+A retry loop can make this problem look solved while it keeps happening. The more useful first step is to make the cycle visible, then remove the inconsistent order. We can do that with two Rust futures and two database connections. A sleep is not enough coordination: it only makes the race more or less likely on a particular machine.
+
+The fixture uses MySQL 8.4.13, InnoDB and SQLx 0.9.0. It creates two rows with a counter in each. Both transactions increment one row before meeting at a Tokio barrier. Once both have reached the barrier, they request the other row. The first locks are already held, so the intended cycle does not depend on guessing a scheduler delay.
+
+## Let the engine choose a victim
+
+The binary requires InnoDB deadlock detection to be enabled. MySQL's [deadlock detection documentation](https://dev.mysql.com/doc/refman/8.4/en/innodb-deadlock-detection.html) describes its role in breaking a detected cycle. If that setting is off, a lock timeout is a different experiment. The fixture reports that unsupported setup rather than accepting any error as proof of a deadlock.
+
+It expects exactly one of the coordinated transactions to commit and the other to report error 1213. It does not predict which request loses. Picking a victim is the engine's job; an application must be able to recover whichever operation is rejected.
+
+After that deliberate failure, recovery uses a fresh transaction and the same row order every time:
+
+```rust
+async fn ordered_with_retry(c: &mut MySqlConnection) -> std::result::Result<(), sqlx::Error> {
+    for attempt in 0..3_u32 {
+        match pair(c, 1, 2, None).await {
+            Ok(()) => return Ok(()),
+            Err(error) if number(&error) == Some(1213) && attempt < 2 => {
+                tokio::time::sleep(Duration::from_millis(10 * u64::from(attempt + 1))).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("the final attempt always returns")
+}
+```
+
+The complete source is `experiments/sql-rust/mysql-mariadb-duckdb/src/bin/mysql_deadlock.rs`. The `pair` function begins a transaction, updates both rows, and commits. When its second update fails, it rolls back and returns the original error. The retry calls the whole function again. It does not repeat only the statement that happened to fail.
+
+## Why the boundary matters
+
+Suppose the operation also reads a balance or calculates a new state inside the transaction. Replaying the last update with an old calculation could apply a decision from a transaction that no longer exists. Starting the entire operation again gives those reads and decisions a consistent new attempt.
+
+For this counter example, one successful original request plus the recovered request should leave both counters at two. The fixture checks that stored state. It then runs two ordered requests concurrently and requires both counters to reach four. Those are assertions to be checked by the executable, not published observations from an unrecorded run.
+
+MySQL's [guidance on handling deadlocks](https://dev.mysql.com/doc/refman/8.4/en/innodb-deadlocks-handling.html) includes keeping transactions short, using consistent operation order and being ready to retry. Our helper makes the order one then two. In a request with an arbitrary set of record identifiers, sort and deduplicate them before acquiring locks, and make the other write paths follow the same convention.
+
+That last part is easy to miss. Fixing one endpoint does not help much if a background worker still takes the same locks in reverse. Include maintenance tasks and less frequent operations when reviewing the order.
+
+## Keep retries smaller than the request budget
+
+Three attempts is a fixture limit, not a universal recommendation. The small delay makes separate attempts visible and bounded. A busy service may need jitter and a deadline shared with the request. It also needs a way to stop spending database work after the caller has gone away.
+
+The loop retries only the deadlock error it recognizes. A syntax error, a failed constraint or a lost connection is not automatically safe to replay. A connection failure around commit can leave the outcome uncertain: the server may have committed even if Rust did not receive the answer. That needs a durable request identity and an outcome lookup, rather than treating it as just another deadlock.
+
+External effects need the same care. Sending an email inside a function that can run three times can send three emails. If an event must follow a committed change, record it durably with the database work and deliver it through a separate retryable step. The transaction retry should repeat work whose effects are covered by that transaction.
+
+## Use the reproduction when diagnosing real traffic
+
+This fixture has known rows, a known index and no unrelated writers. A production deadlock report can involve secondary indexes, foreign keys or different query plans. The two-row cycle helps understand the mechanism; it does not identify every possible cause.
+
+Record the statements and database diagnostics for a real failure before changing isolation levels or adding more retries. Compare the lock order across the participating operations. Keep sensitive bound values out of routine logs, but retain enough structure to connect the failure to a request path.
+
+The executable also has a wall-clock bound around its paired futures, and the connections have a short lock-wait limit. These keep a broken experiment from waiting forever. They are separate from the retry policy: a timeout tells us the reproduction failed to complete as intended, while error 1213 tells us the engine detected the cycle.
+
+A good fix leaves a simple story in the code review: these operations acquire the same rows in the same order, each attempt owns a complete transaction, and the caller receives a clear failure when the bounded attempts are exhausted. Then a retry is recovery from occasional contention, instead of the main plan for making inconsistent lock order survive.

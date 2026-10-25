@@ -13,14 +13,17 @@ const output = "/tmp/editorial-evidence/previews";
 const now = new Date();
 const bySlug = new Map(allBlogs.map((post) => [post.slug, post]));
 const records = [];
+const sqlSeries = JSON.parse(await readFile("docs/editorial/sql-rust-proposed-series-2026-10-25.json", "utf8"));
+const reviewSeries = [...editorialSeries, { parts: sqlSeries.articles.map((article) => article.slug) }];
 await mkdir(output, { recursive: true });
 
-for (const series of editorialSeries) {
+for (const series of reviewSeries) {
   for (const slug of series.parts) {
     const post = bySlug.get(slug);
     assert.ok(post, `Missing compiled article: ${slug}`);
     if (post.draft === true || post.reviewed === false) {
       assert.equal(publicArticleHref(allBlogs, slug, now), null);
+      await assert.rejects(readFile(`.next/server/app/blog/${slug}.html`, "utf8"), { code: "ENOENT" });
     }
     const contextualLinks = [];
     function ArticleLink({ slug: target, children }) {
@@ -55,7 +58,8 @@ for (const series of editorialSeries) {
             null,
             React.createElement("meta", { charSet: "utf-8" }),
             React.createElement("title", null, post.title),
-            React.createElement("meta", { name: "robots", content: "noindex, nofollow" })
+            React.createElement("meta", { name: "robots", content: "noindex, nofollow" }),
+            React.createElement("style", null, "body{max-width:74ch;margin:2rem auto;padding:0 1rem;font:18px/1.65 system-ui}pre{overflow:auto;padding:1rem;background:#f3f4f6;font-size:.85em}h1,h2,h3{line-height:1.2}a{color:#174ea6}")
           ),
           React.createElement(
             "body",
@@ -77,10 +81,26 @@ for (const series of editorialSeries) {
     });
   }
 }
-assert.equal(records.length, 30);
+assert.equal(records.length, 30 + sqlSeries.articles.length);
 await writeFile(
   path.join(output, "index.json"),
   JSON.stringify({ generatedAt: now.toISOString(), articles: records }, null, 2) + "\n"
+);
+await writeFile(
+  path.join(output, "sql-rust-index.html"),
+  "<!doctype html>" + renderToStaticMarkup(
+    React.createElement("html", { lang: "en" },
+      React.createElement("head", null,
+        React.createElement("meta", { charSet: "utf-8" }),
+        React.createElement("meta", { name: "robots", content: "noindex, nofollow" }),
+        React.createElement("title", null, "SQL and Rust: thirty drafts for review")),
+      React.createElement("body", null,
+        React.createElement("h1", null, "SQL and Rust: thirty drafts for review"),
+        React.createElement("p", null, "Private review copies. These articles remain drafts pending publication approval."),
+        React.createElement("ol", null, ...sqlSeries.articles.map((article) =>
+          React.createElement("li", { key: article.slug },
+            React.createElement("a", { href: `${article.slug}.html` }, article.title),
+            ` (${article.database})`))))))
 );
 // Exercise the changed metadata on an actual production article, not the
 // standalone MDX copies above. This existing route is also a build regression target.

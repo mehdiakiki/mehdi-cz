@@ -1,0 +1,108 @@
+---
+title: "The Same JSON Column Does Not Mean the Same MySQL and MariaDB Behavior"
+date: "2026-10-25"
+tags: ["rust", "mysql", "mariadb", "json"]
+draft: true
+reviewed: false
+cluster: "reliable-data-integrations"
+campaign: "editorial"
+summary: "Send raw JSON with duplicate keys to both engines and check storage, extraction, missing fields and explicit null."
+---
+
+A Rust service receives JSON, stores it in a JSON column and reads it later. That sounds like a simple round trip. It becomes less simple when another service expects the original bytes, or when a migration changes which duplicate key a query sees.
+
+Here is a document containing the member `a` twice. This is poor input for an application contract, but it is useful test input. MySQL and MariaDB accept JSON columns through the same Rust driver while giving this document different treatment. A successful insert alone would hide the difference.
+
+The fixture sends the original string directly. It does not parse the value into a map first. Many parsers resolve duplicate members while constructing an object, so parsing and serializing in Rust could remove the behavior we want to inspect before the database sees it.
+
+## Compare storage and extraction separately
+
+The example uses SQLx 0.9.0, MySQL 8.4.13 and MariaDB 11.4.13. The connection helper verifies the server identity by its reported version. Both tables declare a JSON column, but that matching declaration does not imply matching representation.
+
+```rust
+async fn compare(variable: &str) -> Result<()> {
+    let mut c = connect(variable).await?;
+    sqlx::query("DROP TABLE IF EXISTS b_json")
+        .execute(&mut c)
+        .await?;
+    sqlx::query("CREATE TABLE b_json(id INT PRIMARY KEY, payload JSON NOT NULL) ENGINE=InnoDB")
+        .execute(&mut c)
+        .await?;
+    let original = r#"{ "a":1, "a":2, "note":"é" }"#;
+    sqlx::query("INSERT INTO b_json VALUES(1,?)")
+        .bind(original)
+        .execute(&mut c)
+        .await?;
+    let stored: String = sqlx::query_scalar("SELECT CAST(payload AS CHAR) FROM b_json WHERE id=1")
+        .fetch_one(&mut c)
+        .await?;
+    let selected: String = sqlx::query_scalar(
+        "SELECT JSON_UNQUOTE(JSON_EXTRACT(payload,'$.a')) FROM b_json WHERE id=1",
+    )
+    .fetch_one(&mut c)
+    .await?;
+    if variable == "MARIADB_URL" {
+        assert_eq!(stored, original);
+        assert_eq!(selected, "1");
+    } else {
+        assert_ne!(stored, original);
+        assert_eq!(selected, "2");
+    }
+    sqlx::query("INSERT INTO b_json VALUES(2,?)")
+        .bind(r#"{"n":null}"#)
+        .execute(&mut c)
+        .await?;
+    let explicit: Option<String> =
+        sqlx::query_scalar("SELECT JSON_TYPE(JSON_EXTRACT(payload,'$.n')) FROM b_json WHERE id=2")
+            .fetch_one(&mut c)
+            .await?;
+    let missing: Option<String> = sqlx::query_scalar(
+        "SELECT JSON_TYPE(JSON_EXTRACT(payload,'$.absent')) FROM b_json WHERE id=2",
+    )
+    .fetch_one(&mut c)
+    .await?;
+    assert_eq!(explicit.as_deref(), Some("NULL"));
+    assert_eq!(missing, None);
+    assert!(sqlx::query("INSERT INTO b_json VALUES(3,?)")
+        .bind("not json")
+        .execute(&mut c)
+        .await
+        .is_err());
+    println!("{variable}: stored={stored}; selected a={selected}; null and missing checked");
+    Ok(())
+}
+```
+
+The complete source is `experiments/sql-rust/mysql-mariadb-duckdb/src/bin/mysql_mariadb_json.rs`. It drops only its fixture table in each disposable schema. For the first row, it reads both the stored document as text and the value selected by a JSON path.
+
+MySQL's [JSON documentation](https://dev.mysql.com/doc/refman/8.4/en/json.html) describes its native representation and normalization, including duplicate-key handling. MariaDB documents [JSON as a LONGTEXT alias with validation](https://mariadb.com/docs/server/reference/data-types/string-data-types/json), retention of the assigned text and access to the first duplicate member through functions such as JSON_EXTRACT. For this input, MySQL extraction should select two and MariaDB extraction should select one. MariaDB should also return the original document text, while MySQL should return a normalized representation. The assertions encode those differences for the pinned versions.
+
+No performance result follows from this comparison. A native representation and a text-backed representation may affect operations differently, but this small fixture measures neither storage efficiency nor query latency. It checks what a stored value means to the application.
+
+## Duplicate members are a boundary problem
+
+[RFC 8259](https://www.rfc-editor.org/rfc/rfc8259#section-4) recommends unique names within an object and explains the interoperability problem when names repeat. A database accepting a document does not mean every consumer will interpret it the same way.
+
+Suppose one system checks the first `role` member while another reads the last. Rejecting duplicates before the document enters that workflow is safer than hoping every parser agrees. The validator must actually observe duplicate members. A generic parse into an ordinary key-value map may already have discarded the information needed to reject them.
+
+If duplicate members are not allowed, make that a documented input rule and test it at the API boundary. This fixture deliberately stores them to expose engine behavior; it is not a recommendation to keep ambiguous documents in application records.
+
+A similar issue appears with signing or hashing. If a signature covers the exact request bytes, a JSON column that changes formatting or representation is not an archive of those bytes. Store the original payload separately when the original is required, with the appropriate access and retention controls. If the protocol defines a canonical representation, implement that protocol explicitly. Do not invent one by relying on whichever text a database happens to return.
+
+## Missing and null ask different questions
+
+The second row contains a field whose value is JSON null. Another field is absent. The fixture calls JSON_TYPE on the extracted values and requires a JSON null type for the present field and an SQL null result for the missing path.
+
+This distinction matters for updates. “No new value supplied” can mean preserve the old value, while an explicit null can mean clear it. Mapping both to one Rust option without a defined API rule can lose the difference before persistence. The exact Rust representation is a design choice; the important part is retaining the distinction until the operation decides what to do.
+
+The invalid-document insert is another separate check. It must fail on both engines. That tells us validation is active for this table declaration. It does not tell us that the document follows the application's schema, that a quantity is positive, or that a nested identifier refers to a real record. JSON syntax validation is a smaller promise.
+
+## Carry the contract into a migration
+
+Build a short collection of actual document shapes before moving engines. Include absent fields, explicit nulls, Unicode text, large numbers and values that queries extract for filtering. If duplicates are forbidden, include them as expected rejections at the application boundary as well as a diagnostic database probe.
+
+Numeric values need special attention when another consumer uses floating-point numbers. An integer can survive database storage and still lose precision in a later client. Add a large value from your accepted range, then check its extracted type and the value received by that client.
+
+Keep the original inputs when comparing results. Normalizing both outputs into the same Rust value can be a useful semantic comparison, but it should be a second check. Otherwise it can make a storage or extraction difference disappear from the report.
+
+The broader <ArticleLink slug="mariadb-mysql-rust-compatibility-contract">Rust compatibility contract</ArticleLink> tests ordinary columns and rollback. This JSON example extends that approach where the shared type name is especially easy to overread. There is no need to claim that one engine is interchangeable with the other, or that a migration is impossible. List the operations the service uses, compare their meaning, and decide how each difference will be handled before changing the connection URL.

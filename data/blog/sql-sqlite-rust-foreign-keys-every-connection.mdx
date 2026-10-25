@@ -1,0 +1,80 @@
+---
+title: "Enable SQLite Foreign Keys on Every Rust Connection"
+date: '2026-10-25'
+tags: ["sql", "sqlite", "rust", "data-integrity"]
+draft: true
+reviewed: false
+cluster: "reliable-data-integrations"
+campaign: "editorial"
+summary: "A valid Rust project ID can still reference a missing row. Check foreign-key enforcement when opening each connection and exercise real deletion rules."
+---
+
+A Rust task has a project ID of the correct type. The insert succeeds. Later, a join cannot find the project, and the task disappears from the screen.
+
+The integer was valid as an integer. Its Rust type did not prove that the project row existed. Even a foreign-key clause in the schema is not enough if the connection performing the write is not enforcing it.
+
+SQLite requires the application to account for foreign-key enforcement when it opens connections. Do not make the program depend on a build's default setting. Enable it deliberately, read the setting back, and make that initialization part of the one path used to open the application database.
+
+## Put the check beside connection creation
+
+The example's checked opener is short:
+
+```rust
+fn open_checked(path: &Path) -> rusqlite::Result<Connection> {
+    let connection = Connection::open(path)?;
+    connection.pragma_update(None, "foreign_keys", true)?;
+    let enabled: i32 = connection.query_row("PRAGMA foreign_keys", [], |row| row.get(0))?;
+    if enabled != 1 {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    Ok(connection)
+}
+```
+
+The returned connection has passed the setting check. A caller cannot forget a separate setup call after opening it. In a larger application, keep the raw connection opener private where practical and return an application store built from this initialized connection.
+
+The check happens before starting an application transaction. SQLite documents that changing foreign-key enforcement while a transaction is active has no effect. A successful call that submits the pragma is therefore not enough evidence. Read the value back at the right time.
+
+The [foreign-key documentation](https://www.sqlite.org/foreignkeys.html#fk_enable) explains connection-level enablement and the transaction restriction. rusqlite's [pragma API](https://docs.rs/rusqlite/latest/rusqlite/struct.Connection.html#method.pragma_update) supplies the Rust call. The wrapper gives the rest of the program a connection whose setting has already been checked.
+
+## Show the orphan before trying to prevent it
+
+The complete source is `experiments/sql-rust/postgres-sqlite/src/bin/sqlite_foreign_keys.rs`. It creates a temporary database with projects, members, and tasks. Both child tables require a project ID and declare references to the project table.
+
+One deliberately unchecked connection explicitly disables enforcement. It inserts a member referencing project 999 even though that project does not exist. This is a constructed failure, not a claim that every SQLite build starts with the same defaults.
+
+A second connection uses the checked opener. It runs `PRAGMA foreign_key_check` and expects one violation. Turning enforcement on did not search for and repair old data. The program must inspect that existing orphan and choose a repair before assuming the database is clean.
+
+In the disposable example, the repair is deleting the invalid row. A real product may need to recover the missing parent, move the child, or quarantine the record for a user decision. Deleting unexplained production data merely to make a check pass would lose the information needed to make that choice.
+
+After removing the constructed orphan, the checked connection attempts the same invalid relationship. The write must fail. The test therefore distinguishes finding old damage from preventing new damage; those are different responsibilities.
+
+## Choose what deleting a project means
+
+A reference also needs a deletion policy. The example gives members `ON DELETE RESTRICT` and tasks `ON DELETE CASCADE` to make the difference visible.
+
+It inserts one project, one member, and one task. Deleting the project first must fail because the member still references it. The project remains, and the task must not be treated as successfully deleted just because the command was attempted.
+
+The program then removes the member and deletes the project. With the restricting relationship gone, that deletion succeeds, and the task disappears through the cascade. A count verifies that the task table is empty.
+
+These are example policies, not recommendations that every product should delete tasks automatically. A billing system may need to retain child records for audit. A personal scratch list may reasonably delete them with the parent. Make the database behavior match the product's meaning, and test both the successful delete and the refusal.
+
+Do not confuse a database cascade with deleting files, cancelling jobs, or removing data from another service. Those effects are outside this reference. If a task has an uploaded attachment, removing its row will not necessarily remove the attachment's bytes.
+
+## A pool creates more than one opportunity to forget
+
+The setting belongs to each connection. Configuring the first connection used for migration does not initialize a second connection opened later for background work. The same mistake can appear when a connection pool replaces an old connection after an error.
+
+Run the opener for every newly created connection, including migration tools and import paths that should enforce the same rules. For a pool, use its connection-initialization hook and verify the setting through a checked-out connection. Avoid changing it casually for one operation and returning that connection to the pool with weaker behavior.
+
+The fixture closes the checked connection, opens another through the wrapper, and tries another orphan insert. That later connection must reject it too. It also attempts to enable enforcement inside a transaction on the deliberately unchecked connection and verifies that the setting stays off until the transaction ends.
+
+Those checks are bounded and use a few temporary rows. They establish the application's initialization and deletion contract. They do not measure cascade performance on a large hierarchy or prove that an external program opening the same file uses the wrapper.
+
+## Keep Rust validation and database validation together
+
+Rust types still help. A distinct project-ID type can prevent mixing project and account identifiers in application code. An enum can limit the states a screen constructs. Neither replaces a database constraint that must hold across imports, old app versions, and concurrent connections.
+
+Likewise, a foreign key does not authorize access to a project. A row may exist and still belong to another user. Check that permission in the trusted request path before choosing the relationship. A successful constraint check only answers the relationship defined by the schema.
+
+When a join unexpectedly loses a row, inspect both sides of that boundary: what the Rust code passed, and what the writing connection enforced. Keeping the opener, the schema, and the negative insert test close together makes the next missing relationship easier to explain.

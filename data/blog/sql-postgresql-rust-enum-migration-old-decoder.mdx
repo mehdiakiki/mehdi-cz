@@ -1,0 +1,78 @@
+---
+title: "Add a PostgreSQL Enum Value Without Surprising Old Rust Readers"
+date: '2026-10-25'
+tags: ["sql", "postgresql", "rust", "schema-evolution"]
+draft: true
+reviewed: false
+cluster: "reliable-data-integrations"
+campaign: "editorial"
+summary: "Keep an old Rust decoder unchanged while adding a PostgreSQL enum value, and separate committing the schema change from allowing writers to use it."
+---
+
+A new order state is ready: `processing`. The database migration accepts it, the new service writes it, and an older worker immediately fails while reading the order. The schema change succeeded. The rollout did not.
+
+Adding an enum label changes what the database can store. It does not change the set of values understood by every Rust binary already running. A worker deployed yesterday may still have a match that knows only `pending` and `paid`.
+
+There is also a database transaction boundary to respect. A newly added PostgreSQL enum value cannot be used in the same transaction before that addition commits. These are two separate readiness checks: when the database can use the value, and when the application fleet can handle it.
+
+## Keep the old reader old
+
+The example in `experiments/sql-rust/postgres-sqlite/src/bin/pg_enum.rs` retains a small decoder for the old application. Its `OldStatus` enum has only the two original variants:
+
+```rust
+fn decode_old(value: &str) -> std::result::Result<OldStatus, String> {
+    match value {
+        "pending" => Ok(OldStatus::Pending),
+        "paid" => Ok(OldStatus::Paid),
+        other => Err(format!("unsupported order status: {other}")),
+    }
+}
+```
+
+The fixture reads the database enum as text and passes that text to the unchanged decoder. That makes the compatibility failure explicit without depending on a particular derive macro's error wording. It is not a test of SQLx's generated enum decoder; the boundary here is the old Rust application's accepted values.
+
+Do not add the new variant to this retained decoder to make the migration test pass. That would test two new components together while the installed old component remains untested. Keep the release artifact or its actual decoding code available for compatibility checks.
+
+PostgreSQL's [enum documentation](https://www.postgresql.org/docs/18/datatype-enum.html) explains the database type's labels and ordering. An application enum is a separate definition that must evolve with the consumers using it.
+
+## Commit the addition before writing the value
+
+The test first creates the database enum with `pending` and `paid`, then stores an ordinary pending order. It begins a migration transaction, adds `processing`, and immediately attempts to insert an order using that new label.
+
+PostgreSQL must reject that early use. The fixture checks SQLSTATE `55P04` and rolls the failed transaction back. Since the transaction aborted, that attempt has not left a committed enum change behind.
+
+The real demonstration migration then adds the value again in a new transaction and commits. Only afterward does another statement insert the processing order. PostgreSQL's [ALTER TYPE reference](https://www.postgresql.org/docs/18/sql-altertype.html) documents the commit requirement for added enum values.
+
+This matters for migration frameworks that wrap several changes in one transaction. A file that adds an enum label and backfills rows to that label may need a deliberate transaction split. Do not disable transaction handling across all migrations merely to solve one specific ordering requirement.
+
+Check what the framework actually commits, and keep the schema addition separate from the first data write in the integration test. A successful command log without that boundary can hide the failing path.
+
+## The committed row still breaks the old decoder
+
+Once the second migration commits, the fixture inserts a processing order and reads both stored status labels. The old decoder must still accept the pending order and return its explicit unsupported-state error for the processing order.
+
+The test also counts the processing row in PostgreSQL. That confirms the compatibility error did not come from a failed insert or an empty query. The row exists; the old reader cannot represent its state.
+
+These checks are intentionally asymmetric. The database accepting the new label is expected. The old decoder rejecting it is also expected. The purpose is to expose a rollout condition the release process must address, not to pretend that a green migration automatically means all readers are compatible.
+
+A decoder that maps every unknown status to `paid` would hide the failure while changing the product's meaning. A processing order has not become paid because that happens to be a convenient old variant. Choose an honest fallback or an explicit refusal that the surrounding application can handle.
+
+## Prepare readers before enabling writers
+
+One workable order is to deploy readers that understand the new state while writers continue producing the old states. Commit the database addition, check the relevant read paths, and then enable the new writer behavior for a controlled population.
+
+The exact deployment order can vary with dependencies. The important point is that a schema accepting the value and a writer choosing the value are independently controlled steps. If the writer starts as soon as the migration completes, the team loses the opportunity to verify the readers first.
+
+Inventory readers outside the main HTTP service too. Reports, exports, scheduled jobs, change-data consumers, and older administrative tools may all decode the same column. A rarely run report can be the first component to meet a label that the interactive application has handled for weeks.
+
+If an old consumer must remain supported, decide how it receives a meaningful representation. That might be an explicit unsupported-state response or a separate compatibility view, depending on the product. Test the consumer's behavior around that response, including retries. Replacing a decode failure with an endless retry loop is not a successful transition.
+
+## Rollback includes the rows already written
+
+Turning off the new writer does not remove processing orders that were committed earlier. Rolling back to a binary with the old decoder can therefore reintroduce the failure even after the feature flag is off.
+
+Keep a reader that can handle the stored values deployed while those rows exist, or perform a separately reviewed data transition whose meaning the product accepts. Do not assume a down migration can simply erase an enum label and leave existing data untouched.
+
+PostgreSQL enum changes have different costs and restrictions from editing a Rust enum declaration. Preserve the database migration history and the application compatibility checks together. The old decoder test is useful precisely because it can remain unchanged across several candidate rollout plans.
+
+Before enabling the writer, the release record should answer three concrete questions: has the enum addition committed, which readers have been checked, and what will handle rows written before a rollback? The small fixture makes the first failure visible. The deployment plan must decide how users are protected from the second.

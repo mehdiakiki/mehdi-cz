@@ -1,0 +1,126 @@
+---
+title: "A SQL Server read waited behind an update"
+date: "2026-10-25"
+tags: ["rust", "sql", "sql-server", "transactions", "debugging"]
+draft: true
+reviewed: false
+cluster: "reliable-data-integrations"
+campaign: "editorial"
+summary: "Reproduce a blocked SQL Server read from Rust, check READ_COMMITTED_SNAPSHOT and distinguish lock timeout 1222 from an application timeout."
+---
+
+An order page reads one row by its primary key. It normally returns quickly, so a request waiting for several seconds looks like a network problem. Meanwhile, another request has updated the same order and is waiting for a remote payment response before it commits.
+
+In this example, the update has finished but its transaction has not. Depending on the database's read-committed configuration, the other request may wait for the writer instead of immediately reading an older committed value.
+
+Adding another async task does not remove a lock held by SQL Server. To understand this delay, use two connections, hold one update open, and make the second connection's expected behavior explicit. The example below does that without relying on a lucky sleep between tasks.
+
+## Check which read committed the database uses
+
+SQL Server can implement `READ COMMITTED` with locking reads or with row versions when `READ_COMMITTED_SNAPSHOT` is enabled. The latter is often shortened to RCSI. A versioned read gets committed data as of the statement's start; it does not get the writer's uncommitted new value. Microsoft describes both modes in the [transaction isolation documentation](https://learn.microsoft.com/en-us/sql/t-sql/statements/set-transaction-isolation-level-transact-sql?view=sql-server-ver17).
+
+The setting is a database property. Do not infer it from the Rust isolation-level name, or from the behavior of another environment. SQL Server and Azure SQL Database can also have different defaults. Query the database you reached and record its actual setting with the engine version.
+
+Our fixture requires `SQLSERVER_EXPECT_RCSI` to be `0` or `1`, matching the intended test database. It never changes that database setting. Have a database owner prepare separate disposable databases for the two modes if you want to compare them. Changing a live database's versioning policy to make an example pass would skip the part of the investigation that matters.
+
+## Hold the update open before starting the read
+
+The checked-in program creates a uniquely named table with one row, quantity `10`. It opens an explicit transaction and updates the quantity to `11`. Only after SQL Server acknowledges that update does the reader begin. The writer still holds the transaction open.
+
+There are two reads. The first uses `READCOMMITTEDLOCK`, which requests locking behavior for this table access. It should wait and fail with SQL Server error `1222` after the one-second lock timeout. The second has no table hint. With RCSI enabled, it should return `10`. With RCSI disabled, it should also time out behind the update. The writer finally rolls back.
+
+The marked function comes from `experiments/sql-rust/sqlserver-oracle-db2/src/bin/sqlserver_blocking.rs`. The surrounding program provides the table setup, cleanup and a 30-second overall deadline. It uses the same certificate-verifying Tiberius connection helper as <ArticleLink slug="adding-rust-to-a-system-that-already-uses-sql-server">the SQL Server connection example</ArticleLink>.
+
+```rust
+async fn exercise(
+    writer: &mut sql_rust_enterprise_examples::SqlClient,
+    table: &str,
+) -> AnyResult<()> {
+    let mut reader = sqlserver().await?;
+    let settings = reader
+        .query(
+            "SELECT is_read_committed_snapshot_on FROM sys.databases WHERE database_id=DB_ID()",
+            &[],
+        )
+        .await?
+        .into_row()
+        .await?
+        .ok_or_else(|| invalid("no database setting"))?;
+    let rcsi: bool = settings
+        .try_get(0)?
+        .ok_or_else(|| invalid("null RCSI setting"))?;
+    assert_eq!(
+        u8::from(rcsi).to_string(),
+        std::env::var("SQLSERVER_EXPECT_RCSI")?
+    );
+    writer.execute("BEGIN TRANSACTION", &[]).await?;
+    writer
+        .execute(format!("UPDATE {table} SET quantity=11 WHERE id=1"), &[])
+        .await?;
+    reader
+        .execute(
+            "SET TRANSACTION ISOLATION LEVEL READ COMMITTED; SET LOCK_TIMEOUT 1000",
+            &[],
+        )
+        .await?;
+    let locked = async {
+        let stream = reader
+            .query(
+                format!("SELECT quantity FROM {table} WITH (READCOMMITTEDLOCK) WHERE id=1"),
+                &[],
+            )
+            .await?;
+        stream.into_row().await
+    }
+    .await;
+    match locked {
+        Err(error) => assert_eq!(error.code(), Some(1222)),
+        Ok(_) => return Err(invalid("expected a lock timeout").into()),
+    }
+    drop(reader);
+    let mut reader = sqlserver().await?;
+    reader
+        .execute(
+            "SET TRANSACTION ISOLATION LEVEL READ COMMITTED; SET LOCK_TIMEOUT 1000",
+            &[],
+        )
+        .await?;
+    let read = async {
+        let stream = reader
+            .query(format!("SELECT quantity FROM {table} WHERE id=1"), &[])
+            .await?;
+        stream.into_row().await
+    }
+    .await;
+    match read {
+        Ok(Some(row)) if rcsi => {
+            assert_eq!(row.try_get::<i32, _>(0)?, Some(10));
+        }
+        Err(error) if !rcsi => assert_eq!(error.code(), Some(1222)),
+        _ => return Err(invalid("READ COMMITTED result disagrees with declared RCSI mode").into()),
+    }
+    writer.execute("ROLLBACK", &[]).await?;
+    println!("RCSI={rcsi}; explicit locking waited; plain read matched the configured mode");
+    Ok(())
+}
+```
+
+These are assertions for a controlled server run, not measured results claimed by this draft. Rust-only unit tests and successful compilation cannot establish locking behavior. A real run needs the declared SQL Server build, verified TLS and the two deliberately configured database modes.
+
+## A query can fail after it has started returning a stream
+
+There is a small detail in the Rust that is easy to miss. The code matches the result of both `query(...).await` and `into_row().await` together. A server error can arrive while the returned stream is being consumed. Matching only the first await may miss the very lock timeout the example was supposed to test. The [Tiberius query API](https://docs.rs/tiberius/latest/tiberius/struct.Client.html) calls out this distinction.
+
+The server's `LOCK_TIMEOUT` and Tokio's overall timeout answer different questions. Error `1222` says the server stopped waiting for a lock according to that session setting. An application deadline can expire while connecting, sending, waiting or reading. Do not turn every timeout into the same retry message. Include the operation and safe server error code in diagnostics so the next person can tell them apart.
+
+This fixture opens a new reader after the expected failed read. Its outer deadline owns the complete operation and drops its clients if it expires. A production pool also needs a policy for discarding connections whose request or response was interrupted. Returning a half-consumed connection to the next request can create a second problem while investigating the first.
+
+## Find why the writer kept the lock
+
+Suppose the reproduction agrees with the failing application: a locking read waits behind an open update. Start by looking at the writer's transaction boundaries. Does it call a payment service, build a report or wait for a user while the transaction remains open? Move work that does not need the transaction outside it, then check that the business operation is still correct.
+
+If a transaction really must update several related rows together, shortening it does not mean splitting it into unrelated commits. Keep the required atomic change, use a consistent update order, and check the predicates and supporting indexes. A statement scanning many rows can cause more contention than the single-row fixture here.
+
+Avoid reaching immediately for `NOLOCK`. Returning data from an uncommitted update changes what the order page is allowed to show. An older committed value under RCSI and a dirty value are different outcomes. Enabling RCSI also requires an operational decision about version-store use and the application's consistency requirements; this fixture is too small to make that decision for a workload.
+
+After changing the application, repeat the two-connection case with the real transaction shape. The useful result is concrete: the payment wait happens after the database transaction ends, the intended rows still commit together, and another order lookup no longer spends its deadline behind that avoidable wait. Preserve a bounded blocked case too, so a future refactor cannot quietly move the remote call back inside the transaction.

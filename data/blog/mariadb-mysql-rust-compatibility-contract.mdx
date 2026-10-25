@@ -1,0 +1,88 @@
+---
+title: "MariaDB From Rust: Test the MySQL Contract You Actually Use"
+date: "2026-10-25"
+tags: ["rust", "mariadb", "mysql"]
+draft: true
+reviewed: false
+cluster: "reliable-data-integrations"
+campaign: "editorial"
+summary: "Use the same Rust checks against MySQL and MariaDB, then keep engine-specific SQL as an explicit capability."
+---
+
+Changing a database URL can be a useful migration experiment. It is a poor compatibility test on its own. A successful connection and a single select tell us that the driver can talk to the server. They say very little about the writes the application depends on.
+
+Imagine a small catalogue service moving between MySQL and MariaDB. It stores a numeric identifier, a label, an optional note and a quantity. Before discussing every difference between the products, we can write down what this service actually needs: Unicode survives a round trip, a missing note remains null, negative quantities are rejected, and a rolled back update leaves the old quantity visible.
+
+That contract is small enough to read. It is also much more informative than a green “database reachable” check.
+
+## Run the same operation against both servers
+
+The fixture uses SQLx 0.9.0 with MySQL 8.4.13 and MariaDB 11.4.13. Its connection helper checks the reported server version, so pointing both environment variables at the same engine cannot accidentally produce a convincing comparison. These are pinned test versions, not a promise about every release in either product family.
+
+```rust
+async fn shared_contract(c: &mut MySqlConnection) -> Result<()> {
+    sqlx::query("DROP TABLE IF EXISTS b_contract")
+        .execute(&mut *c)
+        .await?;
+    sqlx::query("CREATE TABLE b_contract(id BIGINT PRIMARY KEY, label VARCHAR(80) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL, note TEXT NULL, quantity INT NOT NULL CHECK(quantity >= 0)) ENGINE=InnoDB").execute(&mut *c).await?;
+    sqlx::query("INSERT INTO b_contract VALUES(?, ?, ?, ?)")
+        .bind(1_i64)
+        .bind("café 🦆")
+        .bind(Option::<String>::None)
+        .bind(3_i32)
+        .execute(&mut *c)
+        .await?;
+    let row = sqlx::query("SELECT label, note FROM b_contract WHERE id=?")
+        .bind(1_i64)
+        .fetch_one(&mut *c)
+        .await?;
+    assert_eq!(row.try_get::<String, _>("label")?, "café 🦆");
+    assert_eq!(row.try_get::<Option<String>, _>("note")?, None);
+    let mut tx = c.begin().await?;
+    sqlx::query("UPDATE b_contract SET quantity=2 WHERE id=1")
+        .execute(&mut *tx)
+        .await?;
+    tx.rollback().await?;
+    let quantity: i32 = sqlx::query_scalar("SELECT quantity FROM b_contract WHERE id=1")
+        .fetch_one(&mut *c)
+        .await?;
+    assert_eq!(quantity, 3);
+    assert!(sqlx::query("UPDATE b_contract SET quantity=-1 WHERE id=1")
+        .execute(&mut *c)
+        .await
+        .is_err());
+    Ok(())
+}
+```
+
+The full source is `experiments/sql-rust/mysql-mariadb-duckdb/src/bin/mariadb_contract.rs`. The binary calls this function once with `MYSQL_URL` and once with `MARIADB_URL`. Both point at disposable schemas because setup drops the fixture table.
+
+The emoji is deliberate. A label containing only plain ASCII would not catch a connection accidentally configured for a narrower character set. The null is deliberate too: an empty string and the absence of a note are different values in this contract. SQLx documents the [Rust types supported by its MySQL driver](https://docs.rs/sqlx/0.9.0/sqlx/mysql/types/index.html), including optional values. The fixture checks the actual conversion rather than assuming that a type annotation proves the server round trip.
+
+A rejected negative quantity exercises the check constraint. That is useful even if the public API already validates the quantity. Imports, maintenance scripts and future endpoints can become additional writers. Database constraints keep the rule close to the shared data.
+
+## Try one feature that does differ
+
+After the shared checks, the binary probes an insert with a returning clause. [MariaDB supports INSERT RETURNING](https://mariadb.com/docs/server/reference/sql-statements/data-manipulation/inserting-loading-data/insertreturning). The fixture expects MariaDB to return the new identifier and MySQL to reject this syntax. It checks the server error rather than interpreting any failure as the desired outcome.
+
+This does not make all application SQL incompatible. It makes this particular statement a capability that needs a choice. A project can stay within a common SQL subset, or keep separate implementations behind a small interface. Both choices can be reasonable. Quietly using an engine-specific statement in a shared repository function makes the next migration harder to understand.
+
+The distinction also prevents a misleading comparison. If the application never uses insert returning, its absence may have no practical effect. If hundreds of write paths rely on it, a basic connection test hides a large amount of work. The contract should follow the application's real behavior, rather than becoming a contest over which engine supports more syntax.
+
+## Make session choices visible
+
+The connection helper sets a strict SQL mode, a UTF-8 connection character set and a UTC session time zone. These settings reduce hidden differences in this fixture. They do not make the two engines identical, and they do not replace tests for the types your service uses.
+
+For example, preserving the text `café` says nothing about whether a unique index considers it equal to `cafe`. A text round trip and a comparison rule are separate questions. The article on <ArticleLink slug="mysql-rust-collation-unique-names">collations and unique names</ArticleLink> checks that distinction with values that look different in Rust.
+
+Dates, decimal amounts and unsigned integers deserve their own cases when they cross the boundary. Use values near the limits your product accepts. A happy path containing a small integer and an ordinary date can miss the problem that brought a migration down in the first place. Expected rejection is part of compatibility too: does an invalid value fail, produce a warning, or arrive as a changed value?
+
+## Keep differences observable
+
+JSON is an easy place to hide a difference before the test even reaches the server. If the Rust code parses a document and serializes it again, duplicate keys and formatting may already be gone. The database never receives the original input. The separate <ArticleLink slug="mysql-mariadb-json-round-trip-rust">JSON round-trip comparison</ArticleLink> sends the raw text so each engine's behavior remains visible.
+
+Use the same care when comparing errors. The fixture checks the duplicate-key error number for an existing identifier. It does not compare complete human-readable messages, which can change without changing the application's decision. Keep the part the application depends on stable, and retain the original error for diagnosis.
+
+There is plenty this check cannot answer. It does not rehearse backup restoration, account permissions, replication, stored routines or an upgrade of a large existing schema. Those operations need their own rehearsal with representative data. The [MariaDB 11.4.13 release notes](https://mariadb.com/docs/release-notes/community-server/11.4/11.4.13) are also part of choosing the tested version; a maintenance pin should move through review, not remain frozen forever.
+
+A practical next step is to collect a few real operations from the service: create a record, update it, reject a conflicting request and read it through the public query. Keep those expectations in Rust beside the database adapter. When a server or driver changes, the useful question is whether those operations still mean the same thing.
