@@ -6,7 +6,7 @@ fn query_file(c: &Connection, path: &str) -> Result<()> {
     let mut explain =
         c.prepare("EXPLAIN SELECT id FROM read_parquet(?) WHERE id>=8000 AND id<8010")?;
     for row in explain.query_map(params![path], |row| row.get::<_, String>(1))? {
-        println!("actual plan:\n{}", row?);
+        println!("EXPLAIN plan:\n{}", row?);
     }
     let (count, total): (i64, i64) = c.query_row(
         "SELECT COUNT(*), CAST(SUM(id) AS BIGINT) FROM read_parquet(?) WHERE id>=8000 AND id<8010",

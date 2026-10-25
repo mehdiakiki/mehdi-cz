@@ -78,10 +78,13 @@ async fn run() -> Result<()> {
     assert_eq!(first_result.await??, 1);
     assert_eq!(second_result.await??, 1);
     drop(send);
-    database_thread
-        .join()
-        .map_err(|_| "database worker panicked")??;
-    println!("Current-thread Tokio task progressed while SQLite write waited. Two queue slots filled; third rejected. Releasing lock saved one note.");
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        database_thread
+            .join()
+            .map_err(|_| "database worker panicked")?
+    })
+    .await??;
+    println!("Current-thread Tokio task progressed while the submitted SQLite write was pending. Two queue slots filled; third rejected. Releasing the lock allowed one note to be saved.");
     Ok(())
 }
 #[tokio::main(flavor = "current_thread")]

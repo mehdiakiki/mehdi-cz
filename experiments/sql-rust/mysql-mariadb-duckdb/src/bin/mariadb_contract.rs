@@ -2,7 +2,7 @@ use sql_rust_engines_b::{connect, number, Result};
 use sqlx::{Connection, MySqlConnection, Row};
 
 // article-example:start
-async fn shared_contract(c: &mut MySqlConnection) -> Result<()> {
+async fn shared_contract(c: &mut MySqlConnection, check_error: u16) -> Result<()> {
     sqlx::query("DROP TABLE IF EXISTS b_contract")
         .execute(&mut *c)
         .await?;
@@ -29,10 +29,15 @@ async fn shared_contract(c: &mut MySqlConnection) -> Result<()> {
         .fetch_one(&mut *c)
         .await?;
     assert_eq!(quantity, 3);
-    assert!(sqlx::query("UPDATE b_contract SET quantity=-1 WHERE id=1")
+    let rejected = sqlx::query("UPDATE b_contract SET quantity=-1 WHERE id=1")
         .execute(&mut *c)
         .await
-        .is_err());
+        .unwrap_err();
+    assert_eq!(number(&rejected), Some(check_error));
+    let unchanged: i32 = sqlx::query_scalar("SELECT quantity FROM b_contract WHERE id=1")
+        .fetch_one(&mut *c)
+        .await?;
+    assert_eq!(unchanged, 3);
     Ok(())
 }
 // article-example:end
@@ -41,7 +46,7 @@ async fn shared_contract(c: &mut MySqlConnection) -> Result<()> {
 async fn main() -> Result<()> {
     for variable in ["MYSQL_URL", "MARIADB_URL"] {
         let mut c = connect(variable).await?;
-        shared_contract(&mut c).await?;
+        shared_contract(&mut c, if variable == "MARIADB_URL" { 4025 } else { 3819 }).await?;
         let duplicate = sqlx::query("INSERT INTO b_contract VALUES(1,'duplicate',NULL,0)")
             .execute(&mut c)
             .await

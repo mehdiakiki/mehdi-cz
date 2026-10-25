@@ -1,4 +1,4 @@
-use sql_rust_engines_b::{connect, Result};
+use sql_rust_engines_b::{connect, number, Result};
 
 // article-example:start
 async fn compare(variable: &str) -> Result<()> {
@@ -44,11 +44,17 @@ async fn compare(variable: &str) -> Result<()> {
     .await?;
     assert_eq!(explicit.as_deref(), Some("NULL"));
     assert_eq!(missing, None);
-    assert!(sqlx::query("INSERT INTO b_json VALUES(3,?)")
+    let rejected = sqlx::query("INSERT INTO b_json VALUES(3,?)")
         .bind("not json")
         .execute(&mut c)
         .await
-        .is_err());
+        .unwrap_err();
+    let expected = if variable == "MARIADB_URL" { 4025 } else { 3140 };
+    assert_eq!(number(&rejected), Some(expected));
+    let absent: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM b_json WHERE id=3")
+        .fetch_one(&mut c)
+        .await?;
+    assert_eq!(absent, 0);
     println!("{variable}: stored={stored}; selected a={selected}; null and missing checked");
     Ok(())
 }

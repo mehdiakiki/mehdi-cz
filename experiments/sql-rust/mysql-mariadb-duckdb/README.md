@@ -73,3 +73,5 @@ The memory fixture uses 15-second engine query limits, one thread and at most 64
 - [Wrapper native-library staging source](https://github.com/duckdb/duckdb-rs/blob/main/crates/libduckdb-sys/build_linked.rs)
 
 Article fences are contiguous excerpts between `article-example:start/end` in their matching source. Changes to source must be reflected in the held article and its writer manifest. No article output is fabricated from expected assertions.
+
+The SQLx `mysql-rsa` feature supports MySQL8.4 authentication in the isolated CI service when its plaintext-only CI flag is set. Deployed connections still default to TLS with server-identity verification.

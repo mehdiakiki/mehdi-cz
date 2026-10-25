@@ -43,7 +43,10 @@ test("the SQL series contains all thirty commissioned articles and real Rust sou
     const links = [...post.content.matchAll(/\]\((https:\/\/[^\s)]+)\)/g)].map((match) => match[1]);
     assert.ok(post.sources.length >= 2, `${post.slug}: missing research sources`);
     for (const source of post.sources) {
-      assert.ok(links.includes(source), `${post.slug}: cite the source beside the explanation: ${source}`);
+      assert.ok(
+        links.some((link) => link === source || link.split("#")[0] === source),
+        `${post.slug}: cite the source beside the explanation: ${source}`
+      );
     }
   }
 });

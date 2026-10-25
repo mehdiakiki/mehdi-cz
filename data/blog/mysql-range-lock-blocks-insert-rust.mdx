@@ -9,9 +9,9 @@ campaign: "editorial"
 summary: "Hold an indexed locking read open and compare an insert under REPEATABLE READ and READ COMMITTED."
 ---
 
-The insert has a new primary key. Its indexed value does not exist yet. Why would a request that only selected existing rows make it wait?
+A request has selected one row and left its transaction open. Another request inserts a new primary key with a new indexed value. The insert waits, even though it is not trying to replace the selected row.
 
-With InnoDB, a locking read can protect a range as well as the records found inside it. That protection can include a gap where no row exists. It makes sense when we ask the database to preserve a range while a transaction makes a decision. It is surprising when we think the locks correspond only to the rows returned to Rust.
+With InnoDB, a locking read can protect a range as well as the records found inside it. That protection can include a gap where no row exists. It prevents a new row from appearing in part of the range while the transaction makes its decision. Counting only the rows returned to Rust misses those locked gaps.
 
 Here is a small reproduction. A table has primary keys one and two, with indexed values ten and twenty. Connection A reads the interval starting at ten and ending before twenty, using a locking read. Connection B tries to insert a new row with value fifteen. The value is new, but it lies inside that interval.
 
@@ -78,7 +78,7 @@ The full binary is `experiments/sql-rust/mysql-mariadb-duckdb/src/bin/mysql_rang
 
 Under REPEATABLE READ, the fixture expects the insert to reach the short lock-wait limit and report error 1205. It then explicitly rolls back the writer transaction, commits the reader and tries the insert again. That later insert must succeed. Checking the second attempt matters: an unrelated invalid value or broken table should not be mistaken for evidence of a range lock.
 
-The other case uses READ COMMITTED for the reader. The fixture requires the insert to commit while the reader transaction is still open. Both cases clean up the inserted row before the next comparison. The article does not claim a measured waiting time; the server outcome and transaction ordering are the evidence.
+The other case uses READ COMMITTED for the reader. The fixture requires the insert to commit while the reader transaction is still open. Both cases clean up the inserted row before the next comparison. These are expected outcomes for the CI engine run. The writer's one-second lock-wait setting and error 1205 are the checks; this draft does not report a measured waiting time.
 
 ## The missing row is part of the protected range
 
@@ -90,11 +90,11 @@ The predicate also matters. An exact search for an existing row through a unique
 
 The fixture's two connections make this visible without a complete web service. In an application, the same reader might be a request that validates a batch, then performs unrelated work before committing. The insert can wait during all that extra work. First check transaction boundaries before assuming the insert itself is slow.
 
-## Changing isolation changes the promise
+## Decide whether new rows must be excluded
 
 MySQL documents [InnoDB isolation levels](https://dev.mysql.com/doc/refman/8.4/en/innodb-transaction-isolation-levels.html), including the differences in search locking. READ COMMITTED reduces gap locking for searches and index scans. It does not mean “no gap locks anywhere”: foreign-key checks and duplicate-key checks remain important exceptions.
 
-More importantly, it changes what concurrent transactions may observe. If an operation depends on preventing new records from appearing in a selected interval, removing that protection can break the business decision. A successful insert is not automatically evidence that the second isolation level is better for the application.
+The isolation change also affects what concurrent transactions may observe. If an operation depends on preventing new records from appearing in a selected interval, removing that protection can break the business decision. A successful insert is not automatically evidence that the second isolation level is better for the application.
 
 Write down the rule first. Does a reservation require that no new overlapping row can appear? Does a background task merely need to process the records currently selected? Those are different requirements. Use a constraint or a locking protocol that matches the rule, and test it with the competing operation present.
 
@@ -106,4 +106,4 @@ The related <ArticleLink slug="mysql-rust-deadlock-order-bounded-retry">deadlock
 
 For a real blocked insert, collect the waiting statement, the blocking transaction, its age, the isolation level and the relevant index plan. Avoid investigating only the request that finally timed out. The blocker may have finished its database work much earlier and remained open while doing something else.
 
-The smallest useful fix is often to shorten that transaction or make its search more precise. If the range really needs protection, keep that guarantee and account for contention. If it does not, change the read deliberately and rerun the competing operations. The empty gap is part of the design either way.
+If the request is only collecting rows for a report, check whether it needs FOR UPDATE at all. If it is making a decision that requires excluding new rows in that interval, keep a constraint or locking protocol that enforces that rule. In either case, rerun the insert while the reader is open. Change the operation deliberately rather than lowering isolation for the whole service to make this one wait disappear.
