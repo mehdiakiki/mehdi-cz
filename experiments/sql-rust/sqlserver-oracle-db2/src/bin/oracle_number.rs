@@ -2,7 +2,11 @@ use sql_rust_enterprise_examples::{exact_integer, oracle_connection, AnyResult};
 // article-example: number
 fn main() -> AnyResult<()> {
     let conn = oracle_connection()?;
-    for input in ["9223372036854775807", "9223372036854775808", "99999999999999999999999999999999999999"] {
+    for input in [
+        "9223372036854775807",
+        "9223372036854775808",
+        "99999999999999999999999999999999999999",
+    ] {
         let row = conn.query_row(
             "SELECT CAST(:1 AS NUMBER(38,0)), TO_CHAR(CAST(:1 AS NUMBER(38,0)), 'TM9', 'NLS_NUMERIC_CHARACTERS=''.,''') FROM dual",
             &[&input],
