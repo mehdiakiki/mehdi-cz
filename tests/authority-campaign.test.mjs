@@ -23,6 +23,13 @@ const sqlRustSeries = JSON.parse(
   )
 );
 
+const practicalAdviceDrafts = JSON.parse(
+  readFileSync(
+    new URL("../docs/editorial/practical-advice-50-drafts-2026-10-25.json", import.meta.url),
+    "utf8"
+  )
+);
+
 test("markdown word count ignores fenced code and inline markup", () => {
   assert.equal(markdownWordCount("One **clear** model.\n\n```rust\nlet hidden = true;\n```"), 3);
 });
@@ -222,6 +229,7 @@ test("the repository maps every written campaign source without counting unrelat
     report.unrelatedClusteredPosts.map((post) => post.slug).sort(),
     [
       ...sqlRustSeries.articles.map((article) => article.slug),
+      ...practicalAdviceDrafts.articles.map((article) => article.slug),
       "BufReader-rust",
       "a-filename-became-a-shell-command",
       "a-record-and-replay-harness-for-agent-tests",

@@ -71,6 +71,20 @@ export const rustSystemsAtlasEditorialSections = {
   "what-happens-when-a-process-exits": "types-memory-unsafe",
   "how-safe-rust-read-a-dead-value-issue-164250": "types-memory-unsafe",
   "linking-the-same-rust-binary-with-five-linkers": "cargo-build-linking",
+  "release-mutex-before-remote-api-call": "async-concurrency",
+  "detached-task-does-not-fix-slow-request": "async-concurrency",
+  "limit-bytes-before-collecting-response-body": "types-memory-unsafe",
+  "bound-task-fanout-before-spawning": "async-concurrency",
+  "arc-clones-retain-old-data": "types-memory-unsafe",
+  "metrics-counter-is-not-a-reservation-protocol": "async-concurrency",
+  "return-worker-failures-to-caller": "async-concurrency",
+  "check-drop-on-slow-rust-request-path": "async-concurrency",
+  "no-timestamp-in-dependency-cache-key": "cargo-build-linking",
+  "check-lockfile-before-blaming-rust-upgrade": "cargo-build-linking",
+  "test-generated-code-from-empty-output": "cargo-build-linking",
+  "keep-debug-symbols-for-shipped-binary": "cargo-build-linking",
+  "change-one-performance-variable-at-a-time": "types-memory-unsafe",
+  "generated-api-client-separate-rust-crate": "cargo-build-linking",
 };
 
 export const rustSystemsAtlasSections = [
