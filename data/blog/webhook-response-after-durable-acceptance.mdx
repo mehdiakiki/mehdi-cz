@@ -1,0 +1,71 @@
+---
+title: "A webhook response should follow durable acceptance."
+date: "2026-10-25T18:30:00Z"
+tags: ["rust", "webhooks", "inbox pattern", "recovery"]
+draft: true
+reviewed: false
+cluster: "reliable-data-integrations"
+campaign: "editorial"
+summary: "Persist a verified webhook before acknowledging durable acceptance. Keep received and applied states separate so a crash cannot turn deduplication into lost work."
+---
+
+The webhook endpoint puts an event into an in-memory channel and returns success. The process restarts before the worker receives it.
+
+The provider believes delivery succeeded. Your service has no record of the event.
+
+If the response promises acceptance that survives a restart, persist the event before sending that response. The exact acknowledgement contract belongs to the provider, so check it before choosing response codes or retry behaviour.
+
+## Store received work as pending
+
+Verify the signature and relevant request limits first. Then persist a scoped event identity, bounded payload or protected payload reference, and a pending state.
+
+This Rust SQLx excerpt shows the receipt operation inside a transaction:
+
+```rust
+sqlx::query(
+    "INSERT INTO webhook_receipts
+     (tenant_id, provider, event_id, payload_hash, state)
+     VALUES ($1, $2, $3, $4, 'pending')
+     ON CONFLICT (tenant_id, provider, event_id) DO NOTHING",
+)
+.bind(tenant_id)
+.bind(provider)
+.bind(event_id)
+.bind(payload_hash)
+.execute(&mut *tx)
+.await?;
+
+tx.commit().await?;
+```
+
+The surrounding handler must check conflicting payloads under an existing identity and persist the actual recoverable input. The excerpt omits that storage detail to keep the acknowledgement boundary visible.
+
+PostgreSQL's [conflict-handling documentation](https://www.postgresql.org/docs/18/sql-insert.html) explains the insert behaviour. A uniqueness check alone does not decide whether an earlier receipt was successfully processed.
+
+## Received is not applied
+
+The worker must be able to find pending receipts after a restart. It can claim work using a bounded lease or a transactional strategy appropriate to its store.
+
+When applying a local business effect, keep the applied-event claim and the business mutation in the same transaction. The [inbox-pattern article](/blog/the-inbox-pattern-deduplicate-before-business-logic-runs) explains that atomic boundary.
+
+Do not reuse a receipt row as a permanent “already processed” marker before the business mutation commits. That would recreate the loss in another form: a durable record exists, but every retry skips the missing effect.
+
+If processing calls another service, give that external effect its own durable intent and duplicate contract. A local receipt does not make several systems commit together.
+
+## Enumerate the crashes
+
+Stop before receipt commit: no success response should have been sent, and provider redelivery should remain useful.
+
+Stop after receipt commit but before response: the provider may redeliver. The duplicate should resolve to the existing receipt without losing its pending work.
+
+Stop after acknowledgement but before processing: the worker should recover the pending receipt from storage.
+
+Stop after business commit but before the worker records its transport-level completion: the applied-event claim should prevent a second committed local effect.
+
+Test these states against stored rows and actual worker recovery. An endpoint response test cannot establish them by itself.
+
+## Keep acceptance bounded
+
+Durable storage can fill too. Apply payload, rate, and retention limits, and define what happens when the receipt store is unavailable. Acknowledge only the promise the service can keep.
+
+Some providers expect synchronous processing or have unusual retry rules. Follow that documented contract. For an asynchronous receiver, a small durable acceptance step gives both sides a much clearer handoff than a successful send into process memory.

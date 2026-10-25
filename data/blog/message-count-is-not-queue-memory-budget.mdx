@@ -1,0 +1,57 @@
+---
+title: "A queue of 100 messages can still use too much memory."
+date: "2026-10-25T18:30:00Z"
+tags: ["rust", "backpressure", "memory", "queues"]
+draft: true
+reviewed: false
+cluster: "reliable-data-integrations"
+campaign: "editorial"
+summary: "Queue capacity counts entries, not payload bytes. Account for queued data, active workers, and blocked producers when choosing a memory budget."
+---
+
+The queue holds at most a hundred messages. That sounds small until one message contains a document and another contains a large archive.
+
+The capacity is doing exactly what it promises: limiting the number of entries. It says little about the memory those entries retain.
+
+For a service that accepts variable-size work, I would keep both an entry limit and a byte policy. They protect different things.
+
+## Count what the queue actually owns
+
+A message containing a Vec owns its backing allocation. A message containing an Arc may share one. A message containing a file path may retain very little memory but cause expensive work after it is removed.
+
+This Rust helper illustrates checked admission accounting for owned payload bytes:
+
+```rust
+fn fits_budget(used: usize, incoming: usize, limit: usize) -> bool {
+    used.checked_add(incoming)
+        .is_some_and(|total| total <= limit)
+}
+```
+
+It is only arithmetic. The queue owner must perform the budget check and reservation together. Two producers reading the same used value and reserving independently can exceed the limit.
+
+Define what incoming includes. Serialized byte length may be a useful acceptance limit, but parsed objects can use more memory. Container capacity, metadata, and shared allocations complicate precise heap accounting. An honest conservative budget is more useful than a fake exact number.
+
+## Removed from the queue does not mean released
+
+Once a worker receives a message, the channel has space again. The worker still owns the payload while it parses, calls an API, or waits for a database connection.
+
+If the byte budget protects total active memory, keep the reservation with the job until the relevant data is released. An owned permit can make that lifetime visible. Releasing it at dequeue time protects only the channel's storage.
+
+Now include blocked producers. A thousand senders can each hold a payload while waiting to enter a small channel. Admission before reading or constructing the full payload may be necessary at the HTTP boundary.
+
+The [backpressure article](/blog/where-backpressure-goes-when-a-stream-processor-cannot-keep-up) follows where waiting work goes. Here the question is specifically how much data it carries with it.
+
+## Give oversized messages their own outcome
+
+A message larger than the whole budget must not wait forever for capacity it can never obtain. Reject it, stream it through a separate bounded path, or store it outside process memory with an appropriate lifecycle.
+
+If the work expands data, apply limits after expansion too. A small compressed input can create a large parsed result. The next stage needs a contract, not an assumption that the first byte check solved everything.
+
+## Test mixed sizes and slow consumers
+
+Use several tiny messages and one large one. Hold the consumer at a signal, then inspect the reserved bytes and the number of producer-held payloads. Release work one piece at a time and confirm that reservations return exactly once.
+
+Add cancellation and a closed channel. A rejected send must not leak its reservation. A cancelled worker must release resources according to the job's ownership policy.
+
+An entry-only bound can be enough when payload size is already tightly constrained. Write down that upstream constraint and test it. Otherwise “the queue is bounded” can become a comforting sentence that hides most of the memory in the system.

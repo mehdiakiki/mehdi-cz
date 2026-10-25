@@ -1,0 +1,73 @@
+---
+title: "Give repair scripts a preview before they write."
+date: "2026-10-25T18:30:00Z"
+tags: ["rust", "reconciliation", "operations", "data repair"]
+draft: true
+reviewed: false
+cluster: "reliable-data-integrations"
+campaign: "editorial"
+summary: "Separate repair planning from application. Show the selected records and proposed changes, then reject stale versions instead of applying an old preview blindly."
+---
+
+“This script only updates the missing accounts.” That sentence is reassuring until a filter is wrong or the data changes after the operator checks it.
+
+A repair tool deserves a preview. The preview should show scope and proposed changes, not just the number of rows it found.
+
+For a tool that changes customer data, I prefer a plan-and-apply flow with explicit record versions. It gives the operator something concrete to inspect and gives the code a way to reject stale assumptions.
+
+## Plan the exact changes
+
+The plan can include the tenant, record identity, current version, proposed operation, and the reason for it. Bound the selection and require an explicit choice for a wider scope.
+
+A Rust model might be:
+
+```rust
+struct PlannedChange {
+    tenant_id: String,
+    record_id: i64,
+    expected_version: i64,
+    replacement_status: String,
+}
+```
+
+The model is intentionally small. A real plan also needs its schema version, creation context, policy limits, and an identity that connects review to application. Protect stored plans because they may contain sensitive business information.
+
+Show meaningful differences to the operator. “Will update 300 records” is not enough when 299 belong to another tenant. Include the selected scope and a safe sample or complete bounded list appropriate to the tool.
+
+The [reconciliation article](/blog/reconciliation-cross-system-sync) explains how to find drift. The repair interface should make the resulting decisions inspectable before performing them.
+
+## Check versions again when applying
+
+The database may change while somebody reads the preview. Use a conditional write rather than trusting the old snapshot:
+
+```rust
+let changed = sqlx::query(
+    "UPDATE accounts SET status = $1, version = version + 1
+     WHERE tenant_id = $2 AND id = $3 AND version = $4",
+)
+.bind(&plan.replacement_status)
+.bind(&plan.tenant_id)
+.bind(plan.record_id)
+.bind(plan.expected_version)
+.execute(&mut *tx)
+.await?
+.rows_affected();
+```
+
+Zero changed rows means the expected record version was not updated. Treat that as a conflict or absence according to the contract. Do not quietly remove the condition and retry the old write.
+
+PostgreSQL's [transaction-isolation documentation](https://www.postgresql.org/docs/18/transaction-iso.html) explains concurrent update behaviour. The application still chooses whether conflicts stop the whole plan or become explicit per-record outcomes.
+
+## Keep application and authorization together
+
+Recheck the operator's current authority at application time. A previously generated plan is not a permanent grant. Bind it to the relevant environment and refuse a production apply using a staging plan.
+
+Record applied, skipped, conflicted, and failed outcomes. A repair that changes some records before failing needs a resumable contract. Repeating it should not undo newer legitimate changes or duplicate external effects.
+
+For external writes, a database version check is only part of the design. Use provider preconditions or documented idempotency where available, and expose uncertainty where not.
+
+## Test the stale preview
+
+Generate a plan, modify one selected record through another connection, then apply. The changed record should produce the documented conflict. An unchanged record should follow the chosen atomic or per-record policy.
+
+Also test the wrong tenant and environment, an oversized scope, and a repeated apply. A preview is useful only if the apply path respects what it showed. Otherwise it is a nice report beside an uncontrolled script.

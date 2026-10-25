@@ -1,0 +1,58 @@
+---
+title: "Release the mutex before calling a remote API."
+date: "2026-10-25T18:30:00Z"
+tags: ["rust", "tokio", "concurrency", "mutex"]
+draft: true
+reviewed: false
+cluster: "rust-under-the-hood"
+campaign: "editorial"
+summary: "Keep network waits outside a shared-state lock, then check that the state is still current before applying the result. Shorter locks need a correctness policy too."
+---
+
+One request refreshes a cached record from a remote API. Every other request waits behind it, including requests that only need to read the current value.
+
+The cache is protected by a mutex. The refresh function acquired it before making the HTTP call and kept it until the response arrived.
+
+Changing to an async mutex may stop a thread from blocking while it waits for the lock. It does not make the lock available to anyone else during the remote call. The serialization is still there.
+
+## Copy the input under a short lock
+
+Take the information needed for the request, then release the guard. The following Rust excerpt assumes an async mutex and application-specific client methods:
+
+```rust
+let (version, request) = {
+    let state = shared.lock().await;
+    (state.version, state.refresh_request())
+};
+
+let response = client.fetch(request).await?;
+
+let mut state = shared.lock().await;
+if state.version == version {
+    state.apply(response);
+}
+```
+
+The owned request leaves the first scope. The lock guard does not. Other tasks can use the state while the network operation is waiting.
+
+The second version check is important. Another request may change the record during the fetch. Applying the old response unconditionally would turn a latency fix into a stale-write bug.
+
+Decide what should happen on a version conflict. Discarding the refresh can be correct for a cache. A user-initiated mutation may need an explicit conflict response or a new attempt. Keep that policy visible instead of silently retrying forever.
+
+Tokio's [shared-state tutorial](https://tokio.rs/tokio/tutorial/shared-state) explains the choice between mutex-protected data and a task that owns asynchronous work. The [Send-across-await article](/blog/rust-future-send-across-await) explains why a guard can also affect whether a future is spawnable.
+
+## Reproduce the wait without guessing its duration
+
+Use a mock client whose response waits for a release signal. Start the refresh and wait until it reaches that client. Before releasing it, ask another task to read the cache.
+
+With the original code, the reader cannot get the lock. With the smaller scope, it can. This tests the relationship directly; a sleep followed by “it seemed faster” does not.
+
+Add a second scenario where the record version changes while the fetch is paused. When the old response arrives, it must not overwrite the newer state. Check the stored fields, not only a conflict log line.
+
+## Sometimes one owner is clearer
+
+If several operations must use one stateful socket or a strict protocol sequence, passing commands to a dedicated owner task can be easier than repeatedly releasing and reacquiring a mutex. That task still needs bounded admission, deadlines, and an error path.
+
+There are also legitimate locks around awaited work. The question is whether serialization belongs to the resource's contract. An async mutex is a tool for that choice, not proof that the choice is harmless.
+
+For an ordinary cache refresh, I would keep the slow external wait outside the lock and make stale results explicit. Then measure lock wait and refresh failures separately. The service needs both acceptable concurrency and correct state.

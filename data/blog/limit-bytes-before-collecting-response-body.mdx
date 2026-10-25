@@ -1,0 +1,62 @@
+---
+title: "Set a byte limit before collecting a response body."
+date: "2026-10-25T18:30:00Z"
+tags: ["rust", "io", "memory", "security"]
+draft: true
+reviewed: false
+cluster: "rust-under-the-hood"
+campaign: "editorial"
+summary: "Buffer capacity does not limit total input. Read at most one byte beyond your accepted size, detect overflow, and apply separate time and decompression limits."
+---
+
+The service expects a small JSON document. It collects the entire response into a vector and parses it afterward.
+
+That is convenient while the upstream behaves. A bad response, a proxy error, or a hostile endpoint can turn the same code into a large allocation.
+
+Adding a buffered reader does not set a total input limit. It changes how reads are grouped. The collection can still grow until the input ends or memory runs out.
+
+## Check before you collect everything
+
+For a synchronous Rust reader, a small helper can read at most one byte beyond the accepted limit. That extra byte distinguishes an input exactly at the limit from an oversized one:
+
+```rust
+use std::io::{self, Read};
+
+fn read_bounded(reader: impl Read, max: usize) -> io::Result<Vec<u8>> {
+    let probe = max.checked_add(1)
+        .ok_or_else(|| io::Error::other("limit is too large"))?;
+    let mut bytes = Vec::new();
+    reader.take(probe as u64).read_to_end(&mut bytes)?;
+    if bytes.len() > max {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "response exceeds byte limit",
+        ));
+    }
+    Ok(bytes)
+}
+```
+
+Choose a modest application limit; this is not an allocator for arbitrary user-supplied sizes. On normal supported Rust targets, the conversion covers a usize limit that already passed the checked addition.
+
+Rust's [Read::take](https://doc.rust-lang.org/std/io/trait.Read.html#method.take) caps the bytes available through that adapter. The helper rejects overflow instead of returning a silently truncated document.
+
+The equivalent asynchronous implementation should count chunks before extending the collected body. Reject a chunk that would exceed the remaining budget, with checked arithmetic. Do not first collect the whole async body and call this helper on the resulting slice.
+
+## A header is useful, but not enough
+
+A declared Content-Length can support an early refusal. It is not your only enforcement point. The client may receive a streamed response, and automatic decompression can make the decoded body larger than its wire representation.
+
+Decide which limit protects which stage. A wire-byte limit protects transfer volume. A decoded-byte limit protects the data passed to the parser. A parser may need its own limits for nesting, field counts, or unusually large individual values.
+
+Also set a deadline. A reader that sends one byte at a time can stay below the byte budget while occupying a request for too long. Size, time, and concurrent requests are separate resources.
+
+The [BufReader explanation](/blog/BufReader-rust) covers buffering. Keep that mechanism separate from your application's acceptance rule.
+
+## Exercise the boundary values
+
+Use inputs just below the limit, exactly at it, and one byte above it. Include an empty body and an input that fails partway through reading. The error should remain an error; do not parse a partial prefix as a successful response.
+
+For an HTTP adapter, add a body with no declared size and a compressed body that expands beyond the decoded limit. Check that the adapter stops consuming rather than merely reporting the excess afterward.
+
+Some workflows genuinely process large files. They need streaming or bounded storage rather than a very large in-memory cap. For the small JSON endpoint, the useful improvement is simpler: make the expected size a rule the reader enforces before the parser sees the body.

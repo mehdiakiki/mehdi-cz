@@ -1,0 +1,65 @@
+---
+title: "Database pool full? Check who is holding the connections."
+date: "2026-10-25T18:30:00Z"
+tags: ["rust", "postgresql", "sqlx", "performance"]
+draft: true
+reviewed: false
+cluster: "reliable-data-integrations"
+campaign: "editorial"
+summary: "Find Rust handlers that keep a SQLx connection during unrelated work. Measure pool waits separately from queries before raising the connection limit."
+---
+
+The query takes a few milliseconds. The endpoint takes seconds. The database dashboard looks calm, but requests keep failing while waiting for a connection.
+
+Before adding more connections, follow one connection through the handler. It may spend most of its life doing nothing for the database.
+
+Imagine an endpoint that loads a customer, asks a remote service for a delivery quote, and then saves the selected quote. Keeping one connection for that whole function looks tidy. The remote call is the problem. Every slow quote keeps a scarce database session away from another request.
+
+## Look at the lifetime, not only the query
+
+This is the shape I would question in review. The application helpers are omitted so the connection lifetime stays visible:
+
+```rust
+let mut connection = pool.acquire().await?;
+let customer = load_customer(&mut connection, customer_id).await?;
+let quote = delivery_client.quote(&customer).await?;
+save_quote(&mut connection, customer_id, &quote).await?;
+```
+
+The connection is still owned while the delivery service answers. Making the HTTP client faster might help today. It does not fix this ownership choice.
+
+Give the first database operation a smaller scope:
+
+```rust
+let customer = {
+    let mut connection = pool.acquire().await?;
+    load_customer(&mut connection, customer_id).await?
+};
+
+let quote = delivery_client.quote(&customer).await?;
+
+let mut connection = pool.acquire().await?;
+save_quote(&mut connection, customer_id, &quote).await?;
+```
+
+These are handler excerpts, not a complete SQLx application. They assume the returned customer owns its data. It cannot borrow from a row that has already been dropped.
+
+SQLx documents that a checked-out connection [returns to its pool when dropped](https://docs.rs/sqlx/0.8.6/sqlx/struct.Pool.html). The inner scope makes that return happen before unrelated waiting.
+
+There is a correctness question too. The customer might change while the quote is calculated. Save against the version or relevant input that produced the quote, or reject a stale result. Holding an idle connection would not, by itself, protect those values anyway.
+
+## Three timings are more useful than one
+
+Record the time spent waiting to acquire a connection, the time executing database operations, and the total time the handler holds a connection. Use a monotonic clock for durations. Keep customer identifiers out of metric labels.
+
+Those measurements answer different questions. A slow query needs query investigation. A long hold with short queries needs a handler investigation. A long acquisition wait can be caused by either, or by a connection limit that is too small for legitimate work.
+
+For a small reproduction, use a pool with a few connections and a controlled delivery service that waits for a release signal. Start enough requests to occupy the pool. Then send a request that only needs the database. Compare whether it can progress before releasing the delivery calls. This gives a causal check without pretending that one laptop timing is a production capacity result.
+
+## A larger pool can still be the right answer
+
+Some services need more concurrent database work. After removing avoidable hold time, measure that workload and the database's available capacity. Count every service replica and worker pool before changing the number.
+
+Do not break a real transaction into unrelated checkouts just to improve a graph. Reads and writes that must commit together still need their transaction. The deeper [PostgreSQL transaction example](/blog/sql-postgresql-rust-service-transactions) shows that boundary.
+
+For this handler, the first useful change is smaller: return the connection while the application has no database work to do. Then measure again.

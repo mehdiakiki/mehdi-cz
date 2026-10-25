@@ -1,0 +1,55 @@
+---
+title: "Don't fix a flaky test with a longer sleep."
+date: "2026-10-25T18:30:00Z"
+tags: ["rust", "tokio", "testing", "retries"]
+draft: true
+reviewed: false
+cluster: "reliable-data-integrations"
+campaign: "editorial"
+summary: "Replace timing guesses with observable readiness and controlled time. Keep real transport deadlines separate from a deterministic retry-policy test."
+---
+
+The test starts a worker, sleeps for a short time, and checks its output. It passes locally and fails on a busy CI runner.
+
+Increasing the sleep may make the failure less frequent. It also makes the test slower and leaves the original guess in place: the worker probably finished by now.
+
+I would first ask which event the test actually needs to observe. That event often already has a natural signal.
+
+## Wait for readiness, not a duration
+
+If the test needs a mock server to accept connections, let the server return its listening address after binding. If it needs a worker to reach a certain operation, send a readiness signal there.
+
+For a retry-policy test, use a controlled transport that records calls and returns a chosen sequence of responses. The test should know when the first attempt happened before checking the next one.
+
+Tokio supports [paused time](https://docs.rs/tokio/1.48.0/tokio/time/fn.pause.html) on its current-thread test runtime with the relevant features. A small Rust example shows the separation:
+
+```rust
+#[tokio::test(start_paused = true)]
+async fn retry_wait_uses_the_configured_delay() {
+    let start = tokio::time::Instant::now();
+    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+    assert_eq!(start.elapsed(), std::time::Duration::from_secs(30));
+}
+```
+
+This example checks Tokio timer behaviour, not an API client's retry policy. In the real policy test, record attempts and assert that the next attempt occurs after the configured delay and within the remaining deadline.
+
+The existing [API failure-testing article](/blog/testing-an-api-integration-against-time-retries-and-bad-pages) covers retries and bad pages together. Deterministic timing makes those scenarios easier to inspect.
+
+## A fake clock has a boundary too
+
+Pausing Tokio time does not pause the standard library clock or a remote provider. A library using another time source may ignore the test's clock entirely.
+
+Keep the policy test close to the code that owns the deadline. Inject a clock or transport where necessary. Then use a smaller set of real integration checks for sockets, cancellation, and actual timeout propagation.
+
+Do not assert millisecond precision from a shared CI machine. Check meaningful bounds and recorded ordering. The exact completion time may vary while the important contract remains correct.
+
+## Preserve the assertion that found the problem
+
+When fixing the test, keep the behaviour it was meant to protect. Removing the final assertion or retrying the test until it passes does not explain the failure.
+
+Try the test under delayed scheduling or a deliberately stalled dependency. A readiness signal should still work because it reports a fact rather than predicting a duration. Put a bounded watchdog around the test so a broken signal becomes a clear failure instead of a job that hangs indefinitely.
+
+There are valid timing tests. If the requirement is that a real operation times out, elapsed time belongs in the evidence. Even then, a controlled dependency and sensible tolerance are better than an arbitrary sleep before looking at state.
+
+The goal is a test that waits for the thing it cares about. Once that relationship is explicit, the test usually becomes both faster and easier to trust.

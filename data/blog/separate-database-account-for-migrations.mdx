@@ -1,0 +1,59 @@
+---
+title: "Use a separate database account for migrations."
+date: "2026-10-25T18:30:00Z"
+tags: ["rust", "postgresql", "migrations", "security"]
+draft: true
+reviewed: false
+cluster: "reliable-data-integrations"
+campaign: "editorial"
+summary: "Separate schema ownership from normal application access. Test that the runtime account can do its work and cannot change the tables or security policies."
+---
+
+The application creates its tables during deployment. Later, the same connection string serves customer requests. Nothing broke, so nobody changes it.
+
+Now every request runs with the account that can change the schema. A mistake in a maintenance endpoint has the same database authority as a migration.
+
+I would separate these jobs early. The web process needs permission to run its queries. The migration process needs permission to change the structure. Those are different responsibilities, even when both processes use the same Rust repository.
+
+## Start with ownership
+
+For PostgreSQL, a useful arrangement is a non-login owner role, a controlled migration identity that can assume that role, and a runtime login with only the grants the application needs.
+
+Do not make the runtime login a member of the owner role. Removing one explicit grant does not help if membership gives the same power back. Check inherited roles, schema privileges, and routines the account may execute.
+
+Ownership also matters for [row security](https://www.postgresql.org/docs/18/ddl-rowsecurity.html): a table owner normally bypasses its policies. An application that owns its tables can therefore pass misleading tenant tests.
+
+The [separate-role Rust example](/blog/sql-postgresql-rust-row-security-tenant-context) demonstrates that distinction. Here, the deployment rule is the next step: the migration credential should never become the web process's default credential.
+
+## Make a denied operation part of the check
+
+After a migration, connect as the real runtime account. Run an allowed query first so a broken connection cannot look like a successful permission test.
+
+This SQLx excerpt illustrates the negative check against a disposable test table:
+
+```rust
+let error = sqlx::query(
+    "ALTER TABLE migration_probe ADD COLUMN forbidden integer",
+)
+.execute(&app_pool)
+.await
+.expect_err("runtime account must not alter the table");
+
+let database_error = error.as_database_error()
+    .expect("expected a PostgreSQL permission error");
+assert_eq!(database_error.code().as_deref(), Some("42501"));
+```
+
+The fixture must create the table with the migration owner. It should also confirm that the new column is absent. A connection failure or a misspelled table name is a different failure and should fail this test.
+
+Test the actual allowed reads and writes too. A role that can do nothing is easy to secure and useless to deploy. If the service writes generated IDs, include any sequence permissions it requires.
+
+## Keep the credentials apart during deployment
+
+Run migrations as a bounded deployment step. Record which revision ran them and whether they finished. Give that step access to its credential, then start the application with its own identity.
+
+Avoid solving a failed migration by copying the migration secret into the application environment. Fix the deployment path or the grants. Otherwise the exception quietly becomes the new architecture.
+
+Separate accounts do not make a migration safe. Old and new application versions may run together. An exclusive lock can still delay traffic. Destructive changes still need a rollout and recovery plan.
+
+For a small local prototype, one owner account can be a reasonable convenience. Before that prototype serves other people's data, make the roles explicit and exercise the denied path. The test is small. Discovering the missing boundary during an incident is much less pleasant.

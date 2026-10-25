@@ -1,0 +1,58 @@
+---
+title: "Put two tenants in your authorization tests."
+date: "2026-10-25T18:30:00Z"
+tags: ["rust", "postgresql", "authorization", "testing"]
+draft: true
+reviewed: false
+cluster: "reliable-data-integrations"
+campaign: "editorial"
+summary: "A one-tenant fixture cannot show cross-tenant access bugs. Exercise reads, writes, and reused database connections with two independent customer scopes."
+---
+
+The endpoint test creates a user, creates a record, and checks that the user can read it. Everything passes.
+
+That test says the happy path works. It says nothing about whether the same user can read another customer's record.
+
+For a service that separates customer data, I want two tenants in the fixture from the start. Give them similar-looking data. Make their external record IDs collide on purpose. The test should make a missing tenant condition hurt.
+
+## Cross the boundary through the real request path
+
+Testing a database policy directly is useful, but the API can fail earlier. It might trust a tenant header, map an account to the wrong tenant, or return a shared cache entry before querying the database.
+
+Set up one allowed request and one forbidden request using the same authenticated user. The request's target changes; the authenticated identity does not.
+
+In a Rust API test, the scenario might look like this. These helper names describe the fixture rather than a particular web framework:
+
+```rust
+let alice = fixture.user_in("tenant-a").await?;
+let own = fixture.record_in("tenant-a", "external-42").await?;
+let other = fixture.record_in("tenant-b", "external-42").await?;
+
+assert_eq!(api.get_record(&alice, own.id).await.status, 200);
+assert_eq!(api.get_record(&alice, other.id).await.status, 404);
+
+api.rename_record(&alice, other.id, "changed").await;
+assert_eq!(fixture.reload(other.id).await?.name, other.name);
+```
+
+The exact denial response is a product choice. Some APIs use 403; others use 404 to avoid revealing whether the record exists. Make the contract explicit and check that sensitive data is absent from the body.
+
+The write assertion matters. A handler can return a denial after it has already changed a row. Check the stored state using a separate, trusted fixture connection.
+
+## Reuse a connection between tenants
+
+Tenant context often lives in application state or database settings. A connection pool makes accidental reuse worth testing.
+
+Use a small pool and perform tenant A's request, then tenant B's request. Exercise failure and rollback as well as success. The second request must establish its own context rather than inherit whatever the first request left behind.
+
+The [Rust row-security example](/blog/sql-postgresql-rust-row-security-tenant-context) uses transaction-local context and a separate non-owner role. PostgreSQL documents [who bypasses row security](https://www.postgresql.org/docs/18/ddl-rowsecurity.html). Running every test as the table owner can give very comforting results for the wrong reason.
+
+Keep privileged setup connections separate from the application pool. The test should not accidentally make its API calls using the credential that seeded the tables.
+
+## Add the paths that do not look like reads
+
+Search, exports, bulk operations, background jobs, and attachment downloads also need the boundary. Start with the main read and write, then follow the places that use the same record identity.
+
+OWASP recommends [authorization checks on every request](https://cheatsheetseries.owasp.org/cheatsheets/Authorization_Cheat_Sheet.html). For the fixture, that means a previous allowed action must not grant the next action access by accident.
+
+Two tenants are not a complete security review. They are a cheap way to stop the most misleading happy-path test from being your only evidence. When the next feature adds a new route, reuse those competing records. Let the fixture keep asking the awkward question.

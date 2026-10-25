@@ -1,0 +1,58 @@
+---
+title: "Keep HTTP calls out of the checkout transaction."
+date: "2026-10-25T18:30:00Z"
+tags: ["rust", "mysql", "transactions", "outbox"]
+draft: true
+reviewed: false
+cluster: "reliable-data-integrations"
+campaign: "editorial"
+summary: "A slow shipping request should not hold stock locks. Commit a pending order and durable delivery intent, then recover the external step explicitly."
+---
+
+A customer buys the last item. Your handler changes the stock row, calls the shipping service, writes the order, and commits.
+
+Everything is inside one transaction. That feels safe until the shipping service becomes slow. Other customers now wait for a database lock because another company's HTTP endpoint has not answered.
+
+There is also a worse case. Shipping accepts the request, but the database transaction rolls back. The parcel request exists. The order does not. The transaction never included the remote service, even though the code put the call between its statements.
+
+## Give the external step a name
+
+For this design, I would store an order in a pending state and a shipping command in the same local transaction. The response can say that the order was accepted and shipping is pending. A worker performs the external step later.
+
+Here is the important part as a Rust SQLx excerpt. It assumes the stock change and order insert have already succeeded on this same transaction:
+
+```rust
+sqlx::query(
+    "INSERT INTO shipping_outbox
+     (command_id, order_id, state)
+     VALUES (?, ?, 'pending')",
+)
+.bind(command_id)
+.bind(order_id)
+.execute(&mut *tx)
+.await?;
+
+tx.commit().await?;
+```
+
+The schema needs a unique command identity. The real handler also needs authorization, stock checks, and a defined duplicate-order response. The existing [MySQL checkout example](/blog/mysql-rust-stock-reservation-transaction) covers the related writes. The change here is where shipping belongs.
+
+The worker claims pending work, calls shipping, and records the result. It should not hold the stock transaction open while doing that. A short claim or lease can coordinate workers, but it needs an expiry and recovery policy.
+
+## The outbox does not remove uncertain outcomes
+
+Consider a worker that sends the command successfully and crashes before marking it complete. It will find the same pending command after restarting.
+
+If the provider supports a documented idempotency key, send the same stable command identity again. If it offers an outcome lookup, use that to recover. If neither exists, represent uncertainty and give it an operational path. A new random identity on every attempt defeats deduplication.
+
+This is why “put it in a queue” is not a complete answer. The [outbox pattern](/blog/outbox-pattern) makes the local intent durable with the order. It does not promise one external effect under every failure.
+
+The customer experience needs the same honesty. Do not display “shipped” when the database only says “shipping requested.” Define when pending becomes confirmed, failed, or cancelled, and how stock is released if the business allows cancellation.
+
+## Test the awkward moment
+
+Use a controlled shipping adapter and stop execution at three places: before the local commit, after the commit but before the HTTP call, and after provider acceptance but before the worker records success.
+
+Read the stored order, stock, and command after each interruption. Then restart the worker. The useful assertion is that every accepted order has recoverable intent and that a repeated command follows the provider's duplicate contract. A green HTTP response alone proves little.
+
+There are systems that use a wider coordination protocol or deliberately keep a transaction open for a short external check. That choice needs a clear failure model and a strict deadline. For an ordinary checkout, I would first make the pending step explicit. It gives slow shipping somewhere to wait without keeping the stock row locked.

@@ -1,0 +1,62 @@
+---
+title: "Check whether Drop is making your Rust request slow."
+date: "2026-10-25T18:30:00Z"
+tags: ["rust", "tokio", "drop", "latency"]
+draft: true
+reviewed: false
+cluster: "rust-under-the-hood"
+campaign: "editorial"
+summary: "A handler can finish its visible work and still spend time destroying values. Trace scope exit and give expensive cleanup an explicit owner."
+---
+
+The last database query finishes. Your last application log says “done.” The request is still slow.
+
+Look at what goes out of scope after that log. Dropping a large object graph, joining a thread, or running custom cleanup is ordinary code. It can execute on the same thread that is serving the request.
+
+Rust makes cleanup reliable in many normal control-flow paths. It does not make cleanup free.
+
+## Put a timing boundary around scope exit
+
+This deliberately slow destructor is a diagnostic example, not a cleanup pattern to copy:
+
+```rust
+struct SlowDrop;
+
+impl Drop for SlowDrop {
+    fn drop(&mut self) {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+let started = std::time::Instant::now();
+{
+    let _resource = SlowDrop;
+}
+let elapsed = started.elapsed();
+```
+
+The duration is an artificial delay chosen for the example. It is not a measurement from a real service. The important observation is that execution does not leave the inner scope until synchronous destruction has run.
+
+Rust's [Drop documentation](https://doc.rust-lang.org/std/ops/trait.Drop.html) describes custom destruction and destruction of fields. A wrapper can therefore inherit cleanup cost from the values it owns even when it has no custom Drop implementation.
+
+In an async service, synchronous work during a poll can occupy a runtime worker. The [Tokio runtime explanation](/blog/tokio-main-deep-dive) helps connect that local cost to other tasks waiting on the same runtime.
+
+## Name expensive cleanup when possible
+
+If cleanup needs meaningful work or can fail, an explicit close or finish method often gives the caller a clearer contract. The caller can await it, handle the error, and include it in the operation's deadline.
+
+The [async cleanup article](/blog/async-cleanup-in-rust-when-drop-cannot-await) compares that approach with background cleanup. A destructor cannot simply await a remote release. Spawning cleanup from Drop also needs a live runtime and someone who owns shutdown.
+
+For CPU-heavy destruction of an owned allocation, moving ownership to a bounded blocking worker can be reasonable. Check the type's thread-safety requirements and the number of outstanding cleanups. An unbounded cleanup queue only moves the retained memory somewhere less visible.
+
+Do not move security-sensitive or transactional cleanup to best-effort work without reviewing the consequence. Releasing a remote lease, flushing a file, and freeing a vector have different failure contracts.
+
+## Follow the last owner
+
+With shared ownership, the expensive destructor runs when the last strong owner releases the value. That may be a request you did not expect. Trace ownership before blaming the function that originally allocated the object.
+
+To reproduce a latency issue, use controlled ownership and a drop marker. Keep a second task ready to make progress while the first releases the resource. Record where the destructor runs and whether it delays the other task.
+
+Do not make a precise timing assertion from an uncontrolled shared machine. Test the ownership and ordering deterministically, then measure cost under a recorded workload.
+
+Sometimes destruction is small enough that no special design is needed. The useful habit is simply to include scope exit in the investigation. The last visible await is not always the end of the work a request makes the runtime perform.

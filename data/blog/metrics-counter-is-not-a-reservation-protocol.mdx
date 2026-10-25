@@ -1,0 +1,58 @@
+---
+title: "Don't use a metrics counter to decide who can book the last place."
+date: "2026-10-25T18:30:00Z"
+tags: ["rust", "atomics", "concurrency", "correctness"]
+draft: true
+reviewed: false
+cluster: "rust-under-the-hood"
+campaign: "editorial"
+summary: "An atomic read followed by an atomic increment is still two operations. Use a reservation protocol and define what happens when a reservation is abandoned."
+---
+
+There is one place left. Two requests read the available count, both see one, and both proceed.
+
+The count is atomic. There is no data race on the integer. The booking rule is still broken because checking and reserving were separate operations.
+
+I find it useful to ask whether a counter observes work or authorizes work. A metric can describe how many requests completed. A reservation changes which request is allowed to proceed.
+
+## Make the state change one operation
+
+For a process-local capacity count, Rust can combine the check and decrement with an atomic update:
+
+```rust
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+fn reserve_one(remaining: &AtomicUsize) -> bool {
+    remaining
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+            n.checked_sub(1)
+        })
+        .is_ok()
+}
+```
+
+The update succeeds only when a decrement is possible. The closure may be called more than once, so it must not send an email, charge a card, or perform another side effect.
+
+Relaxed ordering is enough for this isolated arithmetic example because it does not publish or protect other data. It is not advice to make a larger booking protocol relaxed by default. If the integer coordinates access to another value, reason about that relationship separately. The [atomic ordering article](/blog/acquire-release-rust) explains that distinction, and Rust documents its [atomic memory model](https://doc.rust-lang.org/std/sync/atomic/index.html).
+
+Even sequentially consistent loads and increments would not make an ordinary check-then-increment pair indivisible. Stronger ordering does not merge two operations into one.
+
+## The reservation has a lifecycle
+
+After reserving, the request can fail, time out, or be cancelled. Decide whether the place is returned, held temporarily, or consumed by a completed operation.
+
+A process-local permit can return capacity when dropped. A business booking generally needs a durable reservation identity, expiry rules, and a transaction in shared storage. An in-memory atomic cannot coordinate two replicas or survive a restart.
+
+Avoid returning capacity twice. If both an error branch and a destructor release the same reservation, the count can exceed its real limit. An owned permit with one release path can make that mistake harder to write.
+
+Keep telemetry separate. Incrementing a completed-bookings metric after commit does not mean the metric should become the source of truth for the next booking.
+
+## Force both contenders to the last place
+
+Start two threads or tasks with a barrier immediately before the unsafe check. With capacity one, show that both can pass the old check before either updates it.
+
+Then run the reservation operation and assert exactly one success and a final count of zero. Add the abandoned-reservation case and check that capacity returns once. Do not rely on repeating an uncontrolled race until it happens to fail.
+
+For a distributed booking, move the same invariant into the real database test. Use competing transactions and read the committed result. The local atomic example teaches the check-and-act problem; it does not replace the storage contract.
+
+The practical rule is to choose one operation that grants the right to proceed, then make ownership of that right explicit. A count that looks accurate on a dashboard is not enough.

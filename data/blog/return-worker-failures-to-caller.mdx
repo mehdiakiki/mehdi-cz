@@ -1,0 +1,66 @@
+---
+title: "Send worker failures back to the caller."
+date: "2026-10-25T18:30:00Z"
+tags: ["rust", "tokio", "channels", "error handling"]
+draft: true
+reviewed: false
+cluster: "rust-under-the-hood"
+campaign: "editorial"
+summary: "Separate a worker's business error from a broken reply path. Use a typed result and observe worker lifetime instead of returning an empty success."
+---
+
+The request sends a command to a worker and waits for a reply. The worker fails before replying. The handler catches the receive error and returns an empty list.
+
+The user sees “no results.” The real outcome was “the worker did not provide a result.” That difference matters when someone tries to diagnose missing data.
+
+A reply channel needs an error contract just as much as an HTTP endpoint does.
+
+## Put the business result inside the reply
+
+Tokio's [oneshot channel](https://docs.rs/tokio/1.48.0/tokio/sync/oneshot/index.html) carries one message. The receiver also reports when the sender disappears without delivering one.
+
+Those are separate layers. A Rust reply can make both visible:
+
+```rust
+enum JobError {
+    InvalidInput,
+    UpstreamUnavailable,
+}
+
+enum RequestError {
+    WorkerGone,
+    Job(JobError),
+}
+
+async fn receive_reply(
+    reply: tokio::sync::oneshot::Receiver<Result<Vec<u8>, JobError>>,
+) -> Result<Vec<u8>, RequestError> {
+    reply.await
+        .map_err(|_| RequestError::WorkerGone)?
+        .map_err(RequestError::Job)
+}
+```
+
+The worker can return a business failure without crashing. A closed channel means the reply path ended; by itself, it does not explain whether the worker panicked, was cancelled, or deliberately abandoned the command.
+
+The existing [oneshot implementation article](/blog/oneshot-channel-rust) explains the underlying mechanism. For the service, the useful question is how those states reach the caller and operations team.
+
+## Somebody must observe the worker
+
+Keep a task owner or supervisor that joins the worker and records unexpected termination. Otherwise every caller may see WorkerGone while the only useful panic information vanishes with an ignored JoinHandle.
+
+Use a command identity to connect a request failure to a worker failure without copying the entire private command into logs. Keep public responses stable and internal diagnostics appropriately restricted.
+
+If the receiver goes away first, sending the reply can fail too. That does not automatically mean the work should roll back. A write may already be committed. Decide whether the worker stops before starting, completes a durable job, or records an outcome for later lookup.
+
+A reply timeout also means only that no reply arrived in time. It is not proof that the worker performed no side effect. The recovery path depends on the operation.
+
+## Check four different endings
+
+The small test set should include a successful reply, a typed job error, a sender dropped before replying, and an unexpectedly terminated worker. Check that no failure becomes a successful empty value.
+
+Add a receiver-disconnect case when work can change state. Inspect whether the write happened and whether its outcome remains observable. This is often where a neat command/reply abstraction needs a durable operation identity.
+
+Not every worker needs a supervisor framework. A task handle owned by a service lifecycle can be enough for a small process. What matters is that its failure has an owner.
+
+An empty list is a valid answer only when the job completed and found nothing. Keeping that meaning precise makes client behaviour, retries, and incident investigation much easier to understand.

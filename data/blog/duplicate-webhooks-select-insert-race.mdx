@@ -1,0 +1,63 @@
+---
+title: "Don't handle duplicate webhooks with SELECT, then INSERT."
+date: "2026-10-25T18:30:00Z"
+tags: ["rust", "postgresql", "webhooks", "idempotency"]
+draft: true
+reviewed: false
+cluster: "reliable-data-integrations"
+campaign: "editorial"
+summary: "Two webhook handlers can both pass an existence check. Use a unique database claim, bind it to the payload, and commit it with the business change."
+---
+
+The webhook handler checks whether it has seen an event. It has not, so it updates the account and records the event ID.
+
+Run the same handler twice at the same time. Both requests can finish the check before either inserts the ID. Both now believe they are first.
+
+This bug can hide for a long time because a sequential duplicate test passes. Send the event, wait for completion, send it again: no problem. The missing case is overlap.
+
+## Let the database choose the winner
+
+Use a unique key for the identity you want to claim. Include the provider and tenant when event IDs are only unique inside those scopes. Do not assume an ID string is globally unique because it looks random.
+
+The Rust SQLx excerpt below assumes a unique constraint on the three identity columns:
+
+```rust
+let claimed: Option<String> = sqlx::query_scalar(
+    "INSERT INTO received_events
+     (tenant_id, provider, event_id, payload_hash)
+     VALUES ($1, $2, $3, $4)
+     ON CONFLICT (tenant_id, provider, event_id)
+     DO NOTHING
+     RETURNING event_id",
+)
+.bind(tenant_id)
+.bind(provider)
+.bind(event_id)
+.bind(payload_hash)
+.fetch_optional(&mut *tx)
+.await?;
+```
+
+When a row is returned, this transaction owns the first claim. It can apply the business update and commit both changes together. PostgreSQL's [INSERT documentation](https://www.postgresql.org/docs/18/sql-insert.html) explains the conflict handling used here.
+
+When no row is returned, load the existing event under the same identity and compare its payload hash. A repeated identity with different content deserves a conflict or quarantine decision. Silently calling it a duplicate can hide a provider bug or an attack.
+
+Choose what the hash covers. Raw bytes work when the provider promises identical redelivery bytes. If you canonicalize a parsed event, define that format and preserve the fields whose meaning matters. Do not casually normalize away a changed amount or destination.
+
+## Keep the claim with the business effect
+
+Committing a “seen” record before the business update creates another failure. A crash between those commits leaves an event that will be skipped forever, even though its effect never happened.
+
+Keep an applied-event claim and the local business mutation in one transaction. If you first persist a received event for later processing, give it an explicit pending state. Reception and successful application are different facts.
+
+The same principle appears in the [PostgreSQL transaction example](/blog/sql-postgresql-rust-service-transactions). The handler also needs a deliberate response for an existing event. Returning the earlier result is useful when available; a generic database error is not a duplicate contract. See [idempotency keys](/blog/idempotency-key) for that part.
+
+## Make the test concurrent on purpose
+
+Create two handler tasks and use a barrier just before the claim. Release both together. After both finish, read the business row and the claim table using a separate connection.
+
+Assert one committed effect, one claim, and the expected responses. Then repeat the identity with changed content and assert that the business row stays unchanged.
+
+The unique constraint is the protection. The test demonstrates the case your previous test missed. An in-process mutex can help a single process, but it cannot coordinate two replicas or another writer using the same database.
+
+If the handler sends email or calls another provider, a local claim cannot make that external action atomic. Store durable intent for it and design its retry path separately.

@@ -1,0 +1,56 @@
+---
+title: "Don't detach a task just to hide a slow request."
+date: "2026-10-25T18:30:00Z"
+tags: ["rust", "tokio", "cancellation", "background jobs"]
+draft: true
+reviewed: false
+cluster: "rust-under-the-hood"
+campaign: "editorial"
+summary: "Dropping a Tokio JoinHandle leaves its task running. Decide who owns an export after a disconnect and whether completion must survive a restart."
+---
+
+An export takes too long for the HTTP request. Someone wraps it in a spawned task, returns immediately, and calls the endpoint fixed.
+
+The response got faster. Several questions moved out of view. Who notices a failure? Can the user cancel it? What happens during deployment? Will a repeated request start another export?
+
+I would answer those questions before choosing the task primitive. Background execution is a lifecycle decision, not just a way to make a handler stop waiting.
+
+## Dropping the handle does not stop the task
+
+Tokio documents that dropping a [JoinHandle](https://docs.rs/tokio/1.48.0/tokio/task/struct.JoinHandle.html) detaches the task. It can keep running, and its returned result is no longer available through that handle.
+
+If a request disconnects while the handler owns a JoinHandle, dropping the handler can therefore leave work behind. That may be exactly what you want. It should be a deliberate promise.
+
+For request-owned tasks, keep an owner that asks for cancellation when it goes away. This small Rust wrapper illustrates that policy:
+
+```rust
+struct RequestTask<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for RequestTask<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+```
+
+This is not a durable job system. Aborting is a cancellation request, not proof that every effect was undone. It also does not reliably stop work already running in a blocking task. A real owner should observe task completion where its lifecycle allows it.
+
+The [cancellation-safety article](/blog/rust-async-cancellation-safety) explains why dropping a future is only safe when its operations tolerate that interruption. A task may have committed a database write before its next await.
+
+## Persistent exports need persistent state
+
+If the export should continue after the user closes the tab or the service restarts, store a job before returning an acceptance response. Give it a stable identity, owner, input version, state, and result location.
+
+A worker can claim it with a lease and record progress. The lease needs recovery after a crash. The work needs a duplicate policy, especially when it calls external services or writes shared records.
+
+Expose a status route and decide how cancellation works. “Cancellation requested” and “cancelled with no further work” may be different states. A user should not be told that a completed external action was reversed merely because the local task was stopped.
+
+## Test the missing owner
+
+Start a controlled export and disconnect the request while it waits for a signal. Check whether work stops or continues according to the chosen contract. If it continues, verify that somebody records its result or failure.
+
+Then stop the service with accepted work in progress. A durable design should recover it from the store. A request-owned design should not pretend that recovery is guaranteed.
+
+Some short telemetry or best-effort work may be acceptable to lose. Keep its volume bounded and make that loss policy explicit. It should not be the accidental architecture for customer exports.
+
+The code review question is simple: after this handler disappears, who owns the work? If the answer is nobody, spawning it has probably hidden the problem.

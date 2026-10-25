@@ -1,0 +1,58 @@
+---
+title: "Decide what happens when the queue is full."
+date: "2026-10-25T18:30:00Z"
+tags: ["rust", "tokio", "backpressure", "api design"]
+draft: true
+reviewed: false
+cluster: "reliable-data-integrations"
+campaign: "editorial"
+summary: "A bounded worker queue needs an admission policy. Choose between waiting, rejecting, and durable acceptance, and tell callers which promise they received."
+---
+
+Replacing an unbounded queue with a bounded one is a good start. The next question is what happens to the request that arrives when it is full.
+
+Does it wait? For how long? Does it receive an error? Has the service already accepted responsibility for finishing the work?
+
+If the code has no answer, the waiting often moves into HTTP handlers. The queue stays small while a large number of requests retain bodies, connections, and response state outside it.
+
+## Pick an admission contract
+
+For short request-owned work, a bounded wait can make sense. The request has a deadline, waits briefly for capacity, and fails before enqueueing if the deadline expires.
+
+For work that can be refused immediately, try to enqueue and return a clear overload outcome when there is no space. Tokio's [bounded channel module](https://docs.rs/tokio/1.48.0/tokio/sync/mpsc/index.html) describes the channel's backpressure behaviour.
+
+Here is the immediate-admission decision in Rust:
+
+```rust
+match sender.try_send(command) {
+    Ok(()) => Admission::Queued,
+    Err(tokio::sync::mpsc::error::TrySendError::Full(command)) => {
+        Admission::Busy(command)
+    }
+    Err(tokio::sync::mpsc::error::TrySendError::Closed(command)) => {
+        Admission::Unavailable(command)
+    }
+}
+```
+
+This is a handler excerpt with an application-specific result type. Full and closed are different situations. A temporarily occupied worker is not the same as a worker that has stopped.
+
+Queued also does not mean finished. The HTTP handler may still need to await a reply. If it returns acceptance and promises completion after a restart, an in-memory channel is insufficient. Persist that accepted work and provide an outcome identity.
+
+## A waiting sender is still work in the system
+
+An awaited send applies pressure to its caller. That is useful when the caller can stop producing. It is less useful when another layer keeps creating new callers without a limit.
+
+Follow the path from the client to the worker. Count connections waiting for admission, bodies buffered before admission, commands in the channel, and operations already running. The [backpressure article](/blog/where-backpressure-goes-when-a-stream-processor-cannot-keep-up) follows that movement between layers.
+
+If you use a timeout around sending, understand cancellation. A command that was never admitted and a command already running need different responses. Do not retry a possible external write as if it definitely never started.
+
+For a clean admission timeout, reserving channel capacity before constructing or committing to the command can make ownership clearer. Still define what happens if the request disappears immediately after admission.
+
+## Stall the worker in a test
+
+Use a worker that waits for an explicit signal. Fill the queue, send one more request, and check the documented outcome. Then close the worker and check the unavailable path.
+
+After releasing the worker, account for every accepted command. Rejected requests should leave no business effect. If the design promises durable acceptance, interrupt the process and demonstrate recovery from the store.
+
+The right policy depends on the product. A live autocomplete query and a paid report export should not inherit the same behaviour accidentally. Put that choice in the handler contract, where the next engineer can see it, rather than hiding it behind a queue capacity number.
