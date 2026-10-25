@@ -12,11 +12,20 @@ import { writingTier, writingThemeOf } from "../data/writing-tiers.mjs";
 const series = JSON.parse(
   readFileSync("docs/editorial/sql-rust-proposed-series-2026-10-25.json", "utf8")
 );
-const approval = JSON.parse(readFileSync("docs/editorial/sql-rust-release-2026-10-25.json", "utf8"));
+const approval = JSON.parse(
+  readFileSync("docs/editorial/sql-rust-release-2026-10-25.json", "utf8")
+);
 const posts = series.articles.map((article) => {
   const source = readFileSync(`data/blog/${article.slug}.mdx`, "utf8");
   const { data, content } = matter(source);
-  return { ...article, ...data, sourceHash: articleReviewHash(source), source, content, path: `/blog/${article.slug}` };
+  return {
+    ...article,
+    ...data,
+    sourceHash: articleReviewHash(source),
+    source,
+    content,
+    path: `/blog/${article.slug}`,
+  };
 });
 
 test("the SQL series contains all thirty commissioned articles and real Rust sources", () => {
@@ -73,27 +82,39 @@ test("all thirty approved SQL articles are immediately public with dates before 
     assert.equal(writingTier(post.slug), "article", post.slug);
     assert.ok(writingThemeOf(post.slug), post.slug);
   }
-  assert.deepEqual(editorialSeries.find((item) => item.slug === approval.series).parts, posts.map((post) => post.slug));
+  assert.deepEqual(
+    editorialSeries.find((item) => item.slug === approval.series).parts,
+    posts.map((post) => post.slug)
+  );
 });
 
 test("the real scheduler requests all thirty absent articles and stops after they are live", async () => {
   const now = new Date(`${approval.approved_on}T00:00:00Z`);
-  const check = (items, sitemap) => checkLivePublications({
-    posts: items,
-    now,
-    siteUrl: "https://www.mehdi.cz",
-    fetchImpl: async () => new Response(sitemap, { status: 200 }),
-  });
+  const check = (items, sitemap) =>
+    checkLivePublications({
+      posts: items,
+      now,
+      siteUrl: "https://www.mehdi.cz",
+      fetchImpl: async () => new Response(sitemap, { status: 200 }),
+    });
   const missing = await check(posts, "<urlset></urlset>");
   assert.equal(missing.checkFailed, false);
   assert.equal(missing.shouldDeploy, true);
-  assert.deepEqual(missing.missing.map((post) => post.slug).sort(), posts.map((post) => post.slug).sort());
-  const live = await check(posts, posts.map((post) => `<loc>https://www.mehdi.cz/blog/${post.slug}</loc>`).join(""));
+  assert.deepEqual(
+    missing.missing.map((post) => post.slug).sort(),
+    posts.map((post) => post.slug).sort()
+  );
+  const live = await check(
+    posts,
+    posts.map((post) => `<loc>https://www.mehdi.cz/blog/${post.slug}</loc>`).join("")
+  );
   assert.equal(live.shouldDeploy, false);
   assert.deepEqual(live.missing, []);
   for (const flags of [{ draft: true }, { reviewed: false }]) {
     const protectedPosts = posts.map((post) => ({ ...post, ...flags }));
-    assert.ok(protectedPosts.every((post) => publicArticleHref(protectedPosts, post.slug, now) === null));
+    assert.ok(
+      protectedPosts.every((post) => publicArticleHref(protectedPosts, post.slug, now) === null)
+    );
     assert.equal((await check(protectedPosts, "<urlset></urlset>")).shouldDeploy, false);
   }
 });

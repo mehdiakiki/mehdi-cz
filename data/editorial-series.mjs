@@ -60,11 +60,13 @@ export const editorialSeries = [
     ],
   },
   {
-    "slug": "sql-databases-from-rust",
-    "title": "SQL databases from Rust",
-    "description": "Use PostgreSQL, MySQL, SQLite, MariaDB, SQL Server, Oracle, Db2 and DuckDB from Rust. Work through transactions, locks, types and query plans.",
-    "introduction": "Start with the database your application already uses, then follow a specific failure. These thirty articles show Rust examples for lost updates, busy writers, retries, schema changes, nullable values and reporting queries.",
-    "parts": [
+    slug: "sql-databases-from-rust",
+    title: "SQL databases from Rust",
+    description:
+      "Use PostgreSQL, MySQL, SQLite, MariaDB, SQL Server, Oracle, Db2 and DuckDB from Rust. Work through transactions, locks, types and query plans.",
+    introduction:
+      "Start with the database your application already uses, then follow a specific failure. These thirty articles show Rust examples for lost updates, busy writers, retries, schema changes, nullable values and reporting queries.",
+    parts: [
       "sql-postgresql-rust-service-transactions",
       "mysql-rust-stock-reservation-transaction",
       "sql-sqlite-rust-local-database",
@@ -94,8 +96,8 @@ export const editorialSeries = [
       "an-empty-oracle-string-became-none-in-rust",
       "an-oracle-number-did-not-fit-in-a-rust-i64",
       "duckdb-parquet-projection-filter-plan-rust",
-      "duckdb-memory-limit-scratch-rust"
-    ]
+      "duckdb-memory-limit-scratch-rust",
+    ],
   },
 ];
 

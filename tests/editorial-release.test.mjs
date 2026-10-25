@@ -18,7 +18,9 @@ const approval = JSON.parse(
   await readFile(new URL("../docs/editorial/release-2026-10-25.json", import.meta.url), "utf8")
 );
 const approvedSlugs = new Set(approval.articles.map((article) => article.slug));
-const editorialSeries = allEditorialSeries.filter((series) => series.parts.every((slug) => approvedSlugs.has(slug)));
+const editorialSeries = allEditorialSeries.filter((series) =>
+  series.parts.every((slug) => approvedSlugs.has(slug))
+);
 const posts = await Promise.all(
   approval.articles.map(async ({ slug }) => {
     const source = await readFile(new URL(`../data/blog/${slug}.mdx`, import.meta.url), "utf8");

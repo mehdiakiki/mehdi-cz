@@ -75,6 +75,13 @@ test("all sixty editorial articles have one reader series and the daily series r
   const slugs = editorialSeries.flatMap((series) => series.parts);
   assert.equal(slugs.length, 60);
   assert.equal(new Set(slugs).size, 60);
-  assert.ok(editorialSeries.filter((series) => series.slug !== "sql-databases-from-rust").every((series) => series.parts.length === 10));
-  assert.equal(editorialSeries.find((series) => series.slug === "sql-databases-from-rust").parts.length, 30);
+  assert.ok(
+    editorialSeries
+      .filter((series) => series.slug !== "sql-databases-from-rust")
+      .every((series) => series.parts.length === 10)
+  );
+  assert.equal(
+    editorialSeries.find((series) => series.slug === "sql-databases-from-rust").parts.length,
+    30
+  );
 });

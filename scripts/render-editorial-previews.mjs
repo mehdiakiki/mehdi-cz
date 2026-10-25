@@ -150,7 +150,10 @@ assert.equal(articleSchemas.length, 1, "A production article must emit one Artic
 assert.equal(articleSchemas[0].url, articleUrl);
 assert.equal(articleSchemas[0]["@id"], `${articleUrl}#article`);
 assert.ok(articleSchemas[0].author.length > 0);
-const sqlHubHtml = await readFile(".next/server/app/blog/series/sql-databases-from-rust.html", "utf8");
+const sqlHubHtml = await readFile(
+  ".next/server/app/blog/series/sql-databases-from-rust.html",
+  "utf8"
+);
 const blogIndexHtml = await readFile(".next/server/app/blog.html", "utf8");
 assert.ok(blogIndexHtml.includes('href="/blog/series/sql-databases-from-rust"'));
 for (const article of sqlSeries.articles) {
@@ -160,11 +163,16 @@ for (const article of sqlSeries.articles) {
   assert.ok(sqlHubHtml.includes(`href="/blog/${article.slug}"`), article.slug);
   assert.ok(publicArticleHref(allBlogs, article.slug, now), article.slug);
   assert.doesNotMatch(html, /<meta\b[^>]*name="robots"[^>]*content="[^"]*noindex/i, article.slug);
-  assert.deepEqual([...html.matchAll(canonicalPattern)].map((match) => match[1]), [url]);
-  const entities = [...html.matchAll(schemaPattern)].flatMap((match) => {
-    const value = JSON.parse(match[1]);
-    return Array.isArray(value) ? value : [value];
-  }).filter((value) => value["@type"] === "Article");
+  assert.deepEqual(
+    [...html.matchAll(canonicalPattern)].map((match) => match[1]),
+    [url]
+  );
+  const entities = [...html.matchAll(schemaPattern)]
+    .flatMap((match) => {
+      const value = JSON.parse(match[1]);
+      return Array.isArray(value) ? value : [value];
+    })
+    .filter((value) => value["@type"] === "Article");
   assert.equal(entities.length, 1, article.slug);
   assert.equal(entities[0].headline, post.title);
   assert.equal(entities[0].description, post.summary);
