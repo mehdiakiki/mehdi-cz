@@ -1,0 +1,166 @@
+---
+title: "The Brotli Bug and the Many Copies of the Decoder on My Laptop"
+date: "2026-10-27T15:55:00+01:00"
+lastmod: "2026-10-27T15:55:00+01:00"
+tags: ["security", "c", "rust", "http", "linux"]
+draft: false
+reviewed: true
+reviewedHash: "32eab2c21d14783e214f419f65bb3dfb6adc6a65836d7c543093fc8e359db7c8"
+cluster: "reliable-data-integrations"
+campaign: "editorial"
+summary: "A bug in the Brotli decoder made many HTTP clients unsafe. I checked my laptop. The version strings said 1.2.0 for fixed and unfixed copies alike, so I had to find another way to tell them apart."
+---
+
+Last week a bug in the Brotli decoder got a lot of attention. Brotli is a compression format. Your browser and many HTTP clients can ask a server to send a page compressed with it, and then decompress it. So the decoder reads bytes from the network, and if it has a memory bug, whoever controls the server controls those bytes.
+
+The advisory is CVE-2026-111497, published on 22 October 2026 with a CVSS 4.0 score of 9.2, which is critical. It is an out-of-bounds write in the Google Brotli decoder. Versions 1.0.3 through 1.2.0 are affected, and 1.0.10, 1.1.1 and 1.2.1 are fixed. These three releases came out on 21 October. But the fix commit itself is dated 27 February 2026. Its title, "Detect and report invalid stream earlier", does not talk about security, and no release carried it for almost eight months. People first called the bug "node2shell", and later "HTTP2Shell".
+
+So on Sunday I asked my own laptop what it has ([system.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/brotli-decoder-copies/results/system.txt)):
+
+```text
+$ curl -V | tr ' ' '\n' | grep '^brotli/'
+brotli/1.2.0
+$ command -v node
+DIR/.nvm/versions/node/v26.12.1/bin/node
+$ node --version
+v26.12.1
+$ node -p process.versions.brotli
+1.2.0
+$ pacman -Qi brotli | grep -E '^(Version|Build Date)'
+Version         : 1.2.0-1
+Build Date      : Sat 03 Jan 2026 06:30:15 PM GMT
+```
+
+curl uses Brotli 1.2.0, from a package built in January. I looked also at the three branches of my distribution on my mirror:
+
+```text
+  stable    brotli-1.2.0-1-x86_64.pkg.tar.zst
+  testing   brotli-1.2.0-1-x86_64.pkg.tar.zst
+  unstable  brotli-1.2.1-1-x86_64.pkg.tar.zst
+```
+
+So on Sunday the fix did not reach my distribution yet. The stable branch still had 1.2.0.
+
+Then I saw a problem. My `node` is v26.12.1, and the Node advisory lists exactly this version as fixed. But it says Brotli 1.2.0, like curl. So the version string cannot tell me which copy is fixed.
+
+## A harmless fingerprint of the fix
+
+I did not want to give a crafted stream to a real decoder. Instead I read the fix and looked for a mark that it leaves, something I can check without any input.
+
+The fix (commit `0ed4268`) changes the function that reads a block switch. A block switch is a small command inside the stream that tells the decoder to change its code table for the next part of the data. In 1.2.0 this function returns a plain `bool`, and `false` means two things: "the stream is malformed" or "I need more input". The fix makes it return an error code, and it adds a new one, `BROTLI_DECODER_ERROR_FORMAT_BLOCK_SWITCH`, with the number -17. Before, -17 was a reserved slot.
+
+The library has a function, `BrotliDecoderErrorString`, that turns an error number into text. So I can ask a Brotli library: what is error -17? I built 1.2.0 and 1.2.1 from source, and I made a tiny C program that loads a library and asks exactly this ([fingerprint.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/brotli-decoder-copies/results/fingerprint.txt)):
+
+```text
+== built from source: Brotli 1.2.0 (before the fix)
+...
+version:       1.2.0
+error -16:     _ERROR_FORMAT_DISTANCE
+error -17:     INVALID
+error -18:     _ERROR_COMPOUND_DICTIONARY
+
+== built from source: Brotli 1.2.1 (after the fix)
+...
+version:       1.2.1
+error -16:     _ERROR_FORMAT_DISTANCE
+error -17:     _ERROR_FORMAT_BLOCK_SWITCH
+error -18:     _ERROR_COMPOUND_DICTIONARY
+
+== system /usr/lib (the library curl links)
+...
+version:       1.2.0
+error -16:     _ERROR_FORMAT_DISTANCE
+error -17:     INVALID
+error -18:     _ERROR_COMPOUND_DICTIONARY
+```
+
+Good, that is what I wanted to see. The 1.2.0 build says `INVALID`, the 1.2.1 build knows the new name. And the system library, the one curl uses, says `INVALID`. So it is not fixed.
+
+## Four node binaries
+
+Now `node`. The official Node binary carries its own copy of Brotli, and it shows the Brotli error codes in `node:zlib`. So I checked also the constant there, for every `node` on my laptop. There are four, one from my distribution and three that I downloaded with nvm ([versions.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/brotli-decoder-copies/results/versions.txt)):
+
+```text
+  /usr/bin/node (distro)                     brotli=1.2.0  block_switch=absent  needs_system_lib=yes
+  DIR/.nvm/versions/node/v22.23.1/bin/node   brotli=1.1.0  block_switch=absent  needs_system_lib=no
+  DIR/.nvm/versions/node/v22.4.1/bin/node    brotli=1.1.0  block_switch=absent  needs_system_lib=no
+  DIR/.nvm/versions/node/v26.12.1/bin/node   brotli=1.2.0  block_switch=-17     needs_system_lib=no
+```
+
+Only v26.12.1 knows the constant. Its release notes explain why it still says 1.2.0: Node did not move to Brotli 1.2.1. It applied the one fix commit on top of its own 1.2.0, and in the same change it exposed the new constant. So in this Node, "1.2.0" means "1.2.0 plus one patch". The two v22 builds are older than the fixed 22.23.4.
+
+The distribution's `node` is a different case. It has no copy of its own: it links the system library, and `fingerprint.txt` showed that this library is not fixed. The constant tells me nothing here, because it is compiled into Node. When my distribution ships 1.2.1, this `node` gets the fix at its next start and still prints `absent`.
+
+## Counting the copies
+
+That made me curious. How many copies of Brotli live on this laptop? Every copy carries the same built-in dictionary, that is a block of about 120 KiB of text. So I searched ten directories for it, and then I checked each file ([inventory.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/brotli-decoder-copies/results/inventory.txt)). I found 26 files. Two of them are only the `libbrotlicommon` half of a library, and seven are versions of one program, but still.
+
+My first scan said that the browsers link the system library. It was wrong. I had used `ldd`, and `ldd` also lists the libraries that come in through other libraries, for example through the font library (`libfreetype` reads WOFF2 fonts, and WOFF2 is Brotli inside, so it links the system decoder). It was not obvious for me until I looked at the files themselves with `readelf -d`, which only reads the file. Google Chrome and Firefox have no Brotli library in their own list and import no Brotli function. They carry their own copy. Chromium from my distribution is the opposite: it links the system library directly ([shared-users.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/brotli-decoder-copies/results/shared-users.txt)).
+
+So there are two groups. The first one uses the shared library: curl through libcurl, the distribution's `node`, Chromium and Electron from my distribution, the font stack, and libraries like libsoup and Qt 6 Network. One update of the `brotli` package fixes all of them, but a program gets the fix only at its next start, when [the loader](/blog/how-the-dynamic-loader-finds-a-shared-library) opens the library again, as in [my post about static and dynamic linking](/blog/static-or-dynamic-linking-what-changes-in-the-binary-and-at-startup).
+
+The second group carries its own copy: Google Chrome, Firefox, VS Code, Zoom, Ghostscript, Qt 5 WebEngine, a database shell, the downloaded Node builds, three copies of a server runtime, a terminal that ships its own Brotli 1.1.0 ([bundled-libs.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/brotli-decoder-copies/results/bundled-libs.txt)), and a Go tool, k9s, with the Go port `andybalholm/brotli` v1.2.0 ([go-modules.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/brotli-decoder-copies/results/go-modules.txt)). An update of the `brotli` package does not touch these. Some of them are packages too (Firefox, Chrome, k9s), but for them the fix comes only with a new build of that package.
+
+One program surprised me more. It keeps its old versions on disk, seven of them ([one-tool-builds.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/brotli-decoder-copies/results/one-tool-builds.txt)). Only the two newest have the fixed error name. The two oldest say Bun 1.4.3 inside. The other five all say Bun 1.4.4, and three of them do not have the fix. Their revisions after the plus sign all differ, so these are five builds with one version number. So again, the version number did not tell me.
+
+## The shape of the bug, in small
+
+The real decoder has two loops: a fast loop, for when there is surely enough input, and a careful "safe" loop near the end of the input, which can stop and ask for more. In 1.2.0, on the safe path, a `false` from the block switch became "need more input". On the fast path the value was thrown away. According to the Node advisory, the decoder then believed it only had to wait for more data, and its streaming code went on adding input bytes to a small internal buffer of eight bytes. The fix makes both paths check the code.
+
+I wanted to feel why a `bool` was the problem. So I made a small test, a tiny decoder of my own, not Brotli, with one function that returns `false` both for "malformed" and for "need more input". My toy copies the safe path: it reads every `false` as "need more input", stores the byte in an 8 byte buffer and goes on. I built it with AddressSanitizer, that is a compiler option that checks every memory access at run time ([c-asan.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/brotli-decoder-copies/results/c-asan.txt)):
+
+```text
+==2728501==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x7ba0b4ce0018 at pc 0x55b6e10b249f bp 0x7ffd682db030 sp 0x7ffd682db020
+WRITE of size 1 at 0x7ba0b4ce0018 thread T0
+...
+0x7ba0b4ce0018 is located 0 bytes after 8-byte region [0x7ba0b4ce0010,0x7ba0b4ce0018)
+```
+
+The addresses change on every run. The report points at line 31 of my file, `d->out[d->written] = d->in[d->pos];`. My input has 20 malformed bytes, so the loop keeps writing past the end, 12 bytes too far. AddressSanitizer stops it at the first one.
+
+Then I wrote the same thing in Rust, with a type that has three states instead of two: `Decoded`, `NeedMoreInput`, `Malformed`. A type is a set of values (I wrote about this in [what a type is](/blog/what-is-a-type-a-set-of-values-a-promise-about-operations-or-both) and in [why Option adds one member to a set](/blog/a-type-is-a-set-why-human-has-two-members-and-option-human-has-three)), and here the set has three members. So "malformed" and "need more input" cannot be the same value by accident. If I forget one arm of the `match`, it does not compile:
+
+```text
+error[E0004]: non-exhaustive patterns: `Step::Malformed` not covered
+```
+
+If I ignore the value, like the C fast path does, the compiler warns, because I marked the type `#[must_use]`:
+
+```text
+warning: unused `Step` that must be used
+```
+
+And if I ignore the warning too, the write past the buffer stops with a panic, not with silent damage:
+
+```text
+index out of bounds: the len is 8 but the index is 8
+```
+
+But here it is easy to say too much, so I read the real ports ([ports.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/brotli-decoder-copies/results/ports.txt)). Both translate the C code closely, and until last week both had the same `bool` at this spot. The Go port returns a `bool` in [v1.2.0](https://github.com/andybalholm/brotli/blob/v1.2.0/decode.go#L1089), and its fast-path wrapper drops it. In [v1.2.7](https://github.com/andybalholm/brotli/blob/v1.2.7/decode.go#L1135), published on 23 October, it returns an error code. The Rust port `brotli-decompressor` returns a `bool` in [6.1.1](https://github.com/dropbox/rust-brotli-decompressor/blob/6.1.1/src/decode.rs#L1486), from 21 October, and like in the C, its callers turn a `false` into "need more input" or drop it on the fast path. In [6.2.0](https://github.com/dropbox/rust-brotli-decompressor/blob/6.2.0/src/decode.rs#L1490), published on Sunday morning, it returns `BrotliDecoderErrorCode`. Both maintainers changed it within days of the advisory. So Rust did not remove the two meanings. Someone had to change the type, and then the compiler could help.
+
+## What I do now
+
+I wait for 1.2.1 in the stable branch, I update, and I restart the programs that use the library (or I just reboot). A fixed library file on disk does not change a process that is already running.
+
+I do not trust the version string. For a shared Brotli library, I ask it for error -17. You can do it without compiling anything:
+
+```sh
+python3 -c 'import ctypes; f=ctypes.CDLL("libbrotlidec.so.1").BrotliDecoderErrorString; f.restype=ctypes.c_char_p; print(f(-17))'
+```
+
+On my laptop it prints `b'INVALID'`, so not fixed. I tested it against my two builds too: 1.2.0 prints `b'INVALID'`, and 1.2.1 prints `b'_ERROR_FORMAT_BLOCK_SWITCH'`.
+
+For a Node with its own copy, I read the constant in `node:zlib`. For a Node that links the system library, I check the library. For a Go program, `go version -m` shows the version of the port inside. For other bundled programs I search the file for the text `_ERROR_FORMAT_BLOCK_SWITCH`, but this works only if the error table is in the file at all. In Chrome it is not, so there my check says nothing.
+
+My scan has limits too. It looks only in ten directories and at files over 120 KiB, where the dictionary is stored as plain bytes. It does not look in `/var`, where system flatpak apps live, inside compressed files like jars or AppImages, or in my project folders. And the fingerprint shows only that the fixed code is present. It does not prove that every path in that decoder is safe.
+
+On the same Sunday I also checked whether my laptop still trusted [the cracked eMudhra keys](/blog/my-laptop-still-trusted-the-cracked-emudhra-keys). Same lesson both times: the answer was not in a version number, it was in what the machine really loads. I collect these notes under [reliable data integrations](/blog/topics/reliable-data-integrations).
+
+## Sources
+
+- [CVE-2026-111497 record](https://www.cve.org/CVERecord?id=CVE-2026-111497) (Google, published 22 October 2026) and [GitHub advisory GHSA-9v8h-qqgm-4m35](https://github.com/advisories/GHSA-9v8h-qqgm-4m35)
+- [Brotli fix commit 0ed4268](https://github.com/google/brotli/commit/0ed4268a4401abcb4472096340477cf4af7d1a2b) (27 February 2026) and [release v1.2.1](https://github.com/google/brotli/releases/tag/v1.2.1) (21 October 2026)
+- [Node.js October 2026 security releases](https://nodejs.org/en/blog/vulnerability/october-2026-security-releases) and [Node.js 26.12.1 release notes](https://nodejs.org/en/blog/release/v26.12.1)
+- [Aikido Security, "Node2Shell evolves to HTTP2Shell"](https://www.aikido.dev/blog/python-packages-vulnerable-node2shell-brotli-cve-2026-111497) (23 October 2026, updated 24 October)
+- Go port dates: [v1.2.0](https://proxy.golang.org/github.com/andybalholm/brotli/@v/v1.2.0.info) (3 June 2025) and [v1.2.7](https://proxy.golang.org/github.com/andybalholm/brotli/@v/v1.2.7.info) (23 October 2026)
+- Rust port dates: [6.1.1](https://crates.io/api/v1/crates/brotli-decompressor/6.1.1) (21 October 2026) and [6.2.0](https://crates.io/api/v1/crates/brotli-decompressor/6.2.0) (25 October 2026)

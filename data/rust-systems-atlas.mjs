@@ -69,6 +69,8 @@ export const rustSystemsAtlasEditorialSections = {
   "how-a-stack-overflow-is-detected-guard-pages-and-signals": "types-memory-unsafe",
   "how-each-thread-gets-its-own-copy-of-a-variable-thread-local-storage": "async-concurrency",
   "what-happens-when-a-process-exits": "types-memory-unsafe",
+  "how-safe-rust-read-a-dead-value-issue-164250": "types-memory-unsafe",
+  "linking-the-same-rust-binary-with-five-linkers": "cargo-build-linking",
 };
 
 export const rustSystemsAtlasSections = [

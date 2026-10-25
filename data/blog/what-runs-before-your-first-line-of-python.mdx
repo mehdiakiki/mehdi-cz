@@ -1,0 +1,204 @@
+---
+title: "What Runs Before Your First Line of Python"
+date: "2026-10-28T15:45:00+01:00"
+lastmod: "2026-10-28T15:45:00+01:00"
+tags: ["python", "security", "supply-chain", "linux", "performance"]
+draft: false
+reviewed: true
+reviewedHash: "6c7726e9d7df4e301823b4cb8217692e597b08c1df6a3bf2717235fe5fd9bbc0"
+cluster: "reliable-ai-systems"
+campaign: "editorial"
+summary: "On 21 October a file of twelve bytes made Python run a stealer at every start, pip included. I built my own harmless startup hook to see exactly when it runs and what stops it, and I measured what Python 3.15 changes."
+---
+
+On 21 October, LiteLLM 1.107.0 on PyPI carried a stealer for about two hours. LiteLLM is a Python library that gives one interface to call many language model providers. SafeDep lists 1.106.2 and the two 1.107.0 release candidates as clean. What interested me was not the stealer itself. It was how it ran.
+
+Installing a wheel does not run code of the package. A wheel contains the files to copy, and pip copies them. So the attacker did not need any install step. The wheel put three files in site-packages, that is the folder where pip puts installed packages. Two of them run at every Python start: `cook.pth`, twelve bytes with one line `import cook`, and a `sitecustomize.py`. SafeDep wrote that the stealer runs in every Python process, pip, editor language servers and CI jobs included. To be exact: every process of the Python environment where it was installed.
+
+And the project on GitHub stayed clean. LiteLLM's own report says the attacker used stolen GitHub tokens to point the official release pipeline at a lookalike repository, `Berri-AI/litellm`. The pipeline built, signed and published from there.
+
+I wanted to see exactly when a `.pth` file runs, and what stops it. So I made a small experiment on my laptop. I did not touch the real package. I built my own harmless hook and watched it.
+
+## I built my own startup hook
+
+A wheel is just a zip file. So I made a tiny one by hand: a module, a `.pth` file with one import line, and the small metadata files.
+
+```text
+  Length      Date    Time    Name
+---------  ---------- -----   ----
+      342  2026-10-25 13:50   startlog.py
+       16  2026-10-25 13:50   startlog.pth
+       97  2026-10-25 13:50   startlog-0.0.1.dist-info/METADATA
+       85  2026-10-25 13:50   startlog-0.0.1.dist-info/WHEEL
+      341  2026-10-25 13:50   startlog-0.0.1.dist-info/RECORD
+```
+
+`startlog.pth` is one line, `import startlog`, sixteen bytes. The module appends one line to a log file: the process id, the executable and the arguments. It writes only in my experiment folder, and only when an environment variable asks for it.
+
+I installed it in a fresh virtualenv, never in my real Python. Then I ran five normal commands: `python -c pass`, `python -m pip --version`, a small script, `python -m json.tool`, and `python -m pip install` of a second tiny wheel. The log:
+
+```text
+pid=2906978 exe=DIR/out/venv314/bin/python argv=-c
+pid=2906979 exe=DIR/out/venv314/bin/python argv=-m --version
+pid=2906982 exe=DIR/out/venv314/bin/python argv=DIR/out/script.py
+pid=2906984 exe=DIR/out/venv314/bin/python argv=-m
+pid=2906985 exe=DIR/out/venv314/bin/python argv=-m install --quiet --no-index --no-build-isolation DIR/out/hooks/tinydep-0.0.1-py3-none-any.whl
+```
+
+Five starts, five lines. The second and the fifth lines are pip, and the fourth is `json.tool`. Why is the name `pip` not there? At startup `sys.argv[0]` is still `-m`, and Python puts the module path there only later, when it has found the module. So my hook ran before Python even looked for the module I asked for. And pip ran my code before it installed anything. You do not need to import the bad package. Python only has to start in that environment.
+
+## Where it runs, and what does not stop it
+
+I traced the system calls with `strace`:
+
+```text
+openat(AT_FDCWD, "DIR/out/venv314/lib/python3.14/site-packages/startlog.pth", O_RDONLY|O_CLOEXEC) = 3
+openat(AT_FDCWD, "DIR/out/venv314/lib/python3.14/site-packages/__pycache__/startlog.cpython-314.pyc", O_RDONLY|O_CLOEXEC) = 3
+openat(AT_FDCWD, "DIR/out/venv314/lib/python3.14/site-packages/startlog.pth", O_RDONLY|O_CLOEXEC) = 3
+```
+
+The `site` module, that is the part of the standard library that sets up `sys.path` at startup, opens the `.pth` file before my program runs one line. For each line that begins with `import` and a space or a tab, it calls `exec()`. In the 3.14 source these are three lines, and I saved them with the results.
+
+But look again: the same file is opened two times. This one I did not expect. In a 3.14 virtualenv, `site.py` reads the site-packages of the venv twice, first from a function `venv()`, then again from `main()`. My hook still wrote one line, because the second `import startlog` finds the module already loaded. So I made a small test with a `.pth` line that has a direct side effect. On 3.14 it ran two times per start, on 3.15.1 one time.
+
+Then the question that matters: which flags turn the hook off?
+
+```text
+python      -c pass -> hook ran 1 time(s)
+python -S   -c pass -> hook ran 0 time(s)
+python -s   -c pass -> hook ran 1 time(s)
+python -E   -c pass -> hook ran 1 time(s)
+python -I   -c pass -> hook ran 1 time(s)
+python -P   -c pass -> hook ran 1 time(s)
+```
+
+Only `-S` stops it, because it disables the `site` module completely. `-I` surprised me a little. Isolated mode sounds like the strong one, and the documentation even talks about restrictions against injecting malicious code. But `-I` includes `-E`, `-P` and `-s`: ignore the `PYTHON*` environment variables, do not put the script folder in `sys.path`, and skip the user site-packages. In a virtualenv, pip installs packages in the main site-packages, so none of these helps. And `-S` breaks pip, virtualenvs and many packages, so it is not an option for normal programs.
+
+I tested also a `sitecustomize.py` with the same flags. Again only `-S` skipped it. So there are two doors at startup, not one.
+
+## The source was clean, the wheel was not
+
+SafeDep found one visible change in the sdist, that is the source distribution, a `.tar.gz` that PyPI keeps next to the wheels. In its `pyproject.toml`, the `[tool.maturin]` section had one more line: `data = "cook"`. With it, the build tool copied a `cook/` folder into the wheel, and the sdist did not contain this folder. The RECORD of the wheel shows where the files went, for example `litellm-1.107.0.data/purelib/cook.pth`. Files under `.data/purelib/` go straight into site-packages, so they are easy to miss when you look only at the package folder.
+
+I made the same shape with hatchling 1.32.4, a common build backend. Two settings make it: the sdist takes only `src` and `pyproject.toml`, and the wheel force-includes a folder `extra`.
+
+```text
+== sdist contents (tar tzf) ==
+.gitignore
+PKG-INFO
+pyproject.toml
+src/demoproj/__init__.py
+
+== wheel contents (unzip -Z1) ==
+demoproj-0.0.1.dist-info/METADATA
+demoproj-0.0.1.dist-info/RECORD
+demoproj-0.0.1.dist-info/WHEEL
+demoproj_extra/marker.py
+demoproj/__init__.py
+```
+
+`demoproj_extra` is in the wheel, not in the sdist. Without the sdist setting, hatchling put `extra/marker.py` in the sdist too. Then I tried the normal `uv build`, which builds the wheel from the sdist. It failed:
+
+```text
+FileNotFoundError: Forced include not found: UVCACHE/demoproj-0.0.1/extra
+```
+
+So this wheel cannot even be built again from its own sdist. They are two separate uploads. And pip uses the sdist only when it cannot find a wheel, and 1.107.0 had seven wheels, for Linux, macOS and Windows. Reading the repository, or even the sdist, is not reading what you install.
+
+The model I keep from this: the site-packages of an environment is part of every program that runs in it. Whatever is there can run before my first line.
+
+## What my laptop already runs
+
+Then I looked at my own machine, read only, with a small script. It covers the system Python 3.14 and my user site-packages, not every environment on the laptop:
+
+```text
+python: 3.14.3
+
+site-packages: /usr/lib/python3.14/site-packages (present)
+  .pth files: 1, .start files: 0
+  EXEC distutils-precedence.pth
+       import os; var = 'SETUPTOOLS_USE_DISTUTILS'; enabled = os.environ.get(var, 'local') == 'local'; enabled and __import__('_distutils_hack').add_shim();
+
+site-packages: DIR/.local/lib/python3.14/site-packages (absent)
+```
+
+One file, from the Manjaro package python-setuptools 82.0.0, and it is legitimate. `distutils` is an old packaging module. This line installs a shim, a small finder in front of the import system, so that `import distutils` loads the copy inside setuptools. My user site-packages does not exist. So on Sunday, in these two places, one file ran code at every start, and it is a known good one. (I did the same kind of inventory for the [Brotli decoder](/blog/the-brotli-bug-and-the-many-copies-on-my-laptop).)
+
+It is the Python version of the code that runs before `main` in native programs, like [constructors and init_array](/blog/the-code-that-runs-before-main-start-constructors-and-init-array), or [everything between execve and main](/blog/what-happens-when-you-run-a-program-from-execve-to-main).
+
+## Python 3.15 makes startup faster
+
+Python 3.15 came out on 9 October, and it changes startup for another reason: speed. PEP 810 (a PEP is a Python Enhancement Proposal, the document that describes a change) adds explicit lazy imports. You write `lazy import json`, and the module is loaded only at its first use. A global switch, `-X lazy_imports=all` or `PYTHON_LAZY_IMPORTS=all`, makes every import lazy.
+
+I made a small CLI-like script for Python 3.15.1. It imports `json`, `csv`, an XML parser, an HTTP client, `email`, `decimal`, etc., but `--version` uses none of them. I counted the modules with `python -v`, which prints one line per module initialized. (`-X importtime` printed 160 lines. Eleven of them are failed lookups, like the Windows module `nt` seven times, and three modules that `-v` counts are not in its output at all, so the two numbers differ a little.)
+
+```text
+case                       importtime lines    modules initialised
+eager, --version                        160                    152
+lazy keyword, --version                  62                     63
+lazy all, --version                      55                     56
+eager, full run                         160                    152
+lazy keyword, full run                  160                    152
+```
+
+To print a version, the eager script initializes 152 modules, the lazy one 63. The 89 it skipped are the modules I marked lazy and what they import, like `ssl`, `socket` and `typing`. In a full run, the lazy script initializes the same 152.
+
+For the time I used my method from [interleaving the runs](/blog/compare-two-versions-by-interleaving-the-runs): warm up, then 40 rounds, and every round runs the three variants one after the other. I pinned everything to one performance core with `taskset -c 2`, because this laptop mixes fast and slow cores. Honestly, the laptop was not quiet: the load was about 2.5, and the swap was completely full (`free -m` showed 20479 of 20479 MiB used). So the exact numbers move with the state of the machine.
+
+```text
+variant        median      q1      q3     min     max
+eager            40.7    39.8    42.2    39.0    48.2
+lazy-keyword     15.9    15.7    16.4    15.5    19.3
+lazy-all         15.1    15.0    15.7    14.6    19.8
+```
+
+But the result is clear. The ranges do not overlap, and in all 40 rounds the eager run was slower than the lazy run next to it, by at least 22.1 ms. The median went from 40.7 to 15.9 ms, so less than half. It does not remove the cost, it moves it to the first use.
+
+## The new .start files in Python 3.15
+
+The same Python 3.15 also changes the `.pth` door. PEP 829 adds `.start` files. A `.start` file lists entry points like `pkg.mod:callable`, and Python calls them at startup. I tried it with `startmark:run`:
+
+```text
+top-level code of startmark.py ran
+startmark.run() ran
+```
+
+So a `.start` file still runs code at every start: Python imports the module, which runs all its top-level code, and then it calls the function. A `cook.start` with `cook:run` would work for the attacker too. What changes is the audit: you see a module and a function name, not a line for `exec()`.
+
+The `import` lines in `.pth` files still run on 3.15, but they are deprecated, with a message only under `-v`. When a `startlog.start` sits next to `startlog.pth`, Python ignores the import line:
+
+```text
+import lines in DIR/out/venv315/lib/python3.15/site-packages/startlog.pth are suppressed due to matching DIR/out/venv315/lib/python3.15/site-packages/startlog.start file.
+```
+
+The `site` documentation gives the schedule: from Python 3.18 these lines are silently ignored, and from 3.20 Python warns about them.
+
+## What I check now
+
+In every virtualenv I list the `.pth` files that run code, with the Python of that environment:
+
+```sh
+for d in $(python -c 'import site; print(*site.getsitepackages())'); do
+  grep -l '^[[:space:]]*import[[:space:]]' "$d"/*.pth 2>/dev/null
+done
+```
+
+On 3.15 I look also at `.start` files, and everywhere at `sitecustomize.py`. The script `scan_pth.py` in the fixture does all three.
+
+Before I trust a new release, I look at the wheel, not only at the repository: `unzip -l`, then its RECORD, and especially any `.data/purelib/` path or `.pth` file.
+
+I pin exact versions in a lock file, with hashes. Then a new release reaches me only when I choose it. It would not protect somebody who upgraded during those two hours, but it stops the silent upgrade.
+
+If an environment installed 1.107.0, do not run pip there first: every Python start runs the planted files again. From the shell, delete the planted files and stop the background Python process that the backdoor started. Reinstall, better in a new environment. And assume the keys on that machine are stolen: rotate them. LiteLLM's report gives the same steps.
+
+The tradeoffs are real. You cannot turn off site-packages for normal work, `-S` breaks too much. `.pth` files do good things too, like the setuptools shim. And `.start` files are easier to read, but they still run code. The scripts are in [`experiments/python-startup-hooks`](https://github.com/mehdiakiki/mehdi-cz/tree/main/experiments/python-startup-hooks). This topic is part of my notes on [reliable AI systems](/blog/topics/reliable-ai-systems), because a library like LiteLLM sits inside many AI applications.
+
+## Sources
+
+- SafeDep, Kunal Singh, [Compromised LiteLLM 1.107.0 on PyPI Installs a Credential Stealer and Backdoor](https://safedep.io/litellm-pypi-compromise-credential-stealer-backdoor/), 21 October 2026.
+- LiteLLM, [Contained: Oct 21, 2026 LiteLLM release v1.107.0 Compromised](https://docs.litellm.ai/blog/security-incident-oct-21-2026), 21 October 2026, and [The attack chain behind the v1.107.0 LiteLLM release](https://docs.litellm.ai/blog/security-incident-oct-21-2026-attack-chain), 23 October 2026.
+- LiteLLM on PyPI, [project page](https://pypi.org/project/litellm/).
+- Python, [Python 3.15.0](https://www.python.org/downloads/release/python-3150/) (9 October 2026) and [Python 3.15.1](https://www.python.org/downloads/release/python-3151/) (21 October 2026).
+- Python documentation: [What's New In Python 3.15](https://docs.python.org/3.15/whatsnew/3.15.html), [the site module](https://docs.python.org/3.15/library/site.html), [command line options](https://docs.python.org/3.15/using/cmdline.html).
+- [PEP 829, Package Startup Configuration Files](https://peps.python.org/pep-0829/).
+- Python Packaging User Guide, [Package Formats](https://packaging.python.org/en/latest/discussions/package-formats/).

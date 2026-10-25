@@ -1,0 +1,252 @@
+---
+title: "How Safe Rust Read a Dead Value: Issue 164250"
+date: "2026-10-29T15:35:00+01:00"
+lastmod: "2026-10-29T15:35:00+01:00"
+tags: ["rust", "borrow checker", "memory safety", "lifetimes", "compiler-internals", "types"]
+draft: false
+reviewed: true
+reviewedHash: "933feef6bb9e58d875c820207c48a2cf8a4cdd6e444717e26abcf4b0d84b8853"
+cluster: "rust-under-the-hood"
+campaign: "editorial"
+summary: "A 16-line program without unsafe reads a String after it is dropped. Every Rust on my laptop accepts it, and variants compile back to Rust 1.4 from 2015. I looked at the dead memory with gdb and AddressSanitizer, and found the check that the borrow checker skips."
+---
+
+On 13 October, Juho Snellman opened [issue 164250](https://github.com/rust-lang/rust/issues/164250) in the Rust repository: "struct's lifetime requirements can be bypassed via covariant field assignment". Inside is a program of 16 lines, without one `unsafe`, that reads a `String` after the `String` is dead.
+
+Safe Rust promises that this cannot happen, so the issue has the label I-unsound, which Rust uses for "A soundness hole (worst kind of bug)". In a note at the top, lcnr, a lead of the [types team](https://github.com/rust-lang/team/blob/main/teams/types.toml), explains why it is "only `P-high`": "it's 11 years old", so it "cannot actually be that easy to hit". The note also says that "to exploit this you need an intentionally malicious `Drop` implementation."
+
+My [Rust Failure Atlas](/rust-failure-atlas) is a guide to Rust programs that fail. This one is the opposite: it should fail, and it does not. On Sunday I made an experiment with every Rust toolchain on my laptop: compile it, look at the dead memory, find how old it is and which check is missing. Everything is in [`experiments/rust-issue-164250`](https://github.com/mehdiakiki/mehdi-cz/tree/main/experiments/rust-issue-164250), and `run.sh` makes it again.
+
+## The program from the issue
+
+```rust
+use std::sync::Mutex;
+static KEPT: Mutex<Vec<Box<dyn std::any::Any + Send>>> = Mutex::new(Vec::new());
+struct Q<T: 'static + Send>(Option<T>);
+impl<T: 'static + Send> Drop for Q<T> {
+    fn drop(&mut self) { if let Some(t) = self.0.take() { KEPT.lock().unwrap().push(Box::new(t)); } }
+}
+fn main() {
+    {
+        let l = String::from("hello world, this is long enough");
+        let mut q = Q(None);
+        q.0 = Some(&l);
+    }
+    let _z = String::from("XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX");
+    let k = KEPT.lock().unwrap();
+    println!("{}", k[0].downcast_ref::<&'static String>().unwrap());
+}
+```
+
+Let me read it slowly. `KEPT` is a global list. `dyn Any` accepts only `'static` types, that is, types that borrow nothing that can die before the end of the program. `Q` has the same requirement, `T: 'static + Send`, and its `Drop` moves the value from the field into `KEPT`. This is legal only because of the requirement.
+
+In `main`, `q` starts empty, then `q.0 = Some(&l)` puts a reference to the local `l` inside. This reference is not `'static`, so the line should be an error. It is not. At the end of the block, `q` is dropped first and its `Drop` moves the reference into `KEPT`. Then `l` is dropped and its bytes are freed. `_z` is a new `String` with 32 `X`, and the last line prints the dead `l` through the kept reference.
+
+## Every Rust on my laptop accepts it
+
+I compiled it with every toolchain, without `-O` (debug) and with `-O` (release), and ran each binary under strace to see what it writes to stdout. All of them accept it:
+
+| Toolchain | Debug build prints | Release build prints |
+| --- | --- | --- |
+| 1.81.0, 1.88.0 | 32 times `X` | a panic, `Bad address (os error 14)` |
+| 1.98.0 (my stable), 1.99.0, 1.99.1, 1.100.0-beta.7, nightly from 2026-09-16 | 32 times `X` | 32 bytes of binary data |
+
+The debug builds print the 32 `X` of `_z`, as the issue says. The release builds do not. Here is 1.99.1 in release, from [`results/toolchains.txt`](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/rust-issue-164250/results/toolchains.txt):
+
+```text
+    write(1, "H\211\362H\213\7H\213\0H\213x\10H\213p\20\377%\31\337\3\0\314\314\314\314\314\314\314\314\314\n", 33) = 33
+```
+
+And 1.81.0 in release (the big number changes on every run):
+
+```text
+    write(1, 0x2, 140720562270039)          = -1 EFAULT (Bad address)
+    stderr: thread 'main' panicked at library/std/src/io/stdio.rs:1118:9:
+    stderr: failed printing to stdout: Bad address (os error 14)
+```
+
+Same source, three behaviors. I did not expect this. So what is in the dead `String`?
+
+## Looking at the dead String with gdb
+
+A `String` is three words: the capacity, the address of its bytes, and the length. rustc chooses the order of the fields ([I measured this for other types](/blog/where-a-type-becomes-a-layout-fields-padding-and-reordering)), and here the address is the second word. I stopped the 1.99.1 debug build in gdb two times, at the end of the block while `l` is alive, and inside `println!` ([`results/inside-debug.txt`](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/rust-issue-164250/results/inside-debug.txt)):
+
+```text
+before the end of the block, l is at 0x7fffffffe648, its three words:
+0x7fffffffe648:	0x0000000000000020	0x00005555555ad220
+0x7fffffffe658:	0x0000000000000020
+0x5555555ad220:	"hello world, this is long enough"
+...
+during println, the kept reference points to 0x7fffffffe648, the three words there:
+0x7fffffffe648:	0x0000000000000020	0x00005555555ad220
+0x7fffffffe658:	0x0000000000000020
+0x5555555ad220:	'X' <repeats 32 times>
+...
+_z is at 0x7fffffffe668, its three words:
+0x7fffffffe668:	0x0000000000000020	0x00005555555ad220
+0x7fffffffe678:	0x0000000000000020
+```
+
+`0x20` is 32, the capacity and the length. The kept reference points to the old place of `l`, and its three words did not change. But the bytes at `0x5555555ad220` are now `X`, and `_z` uses the same buffer. When `l` was dropped, its 32 bytes went back to the allocator, and `_z` asked for 32 bytes and got the same block. I think this is why the issue uses two strings of the same length.
+
+The release build is more strange. In hex (strace shows octal escapes), its 32 bytes start with `48 89 f2 48 8b 07`, which look like x86 instructions. I compared them with the formatting function in the same binary ([`results/inside-release.txt`](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/rust-issue-164250/results/inside-release.txt)):
+
+```text
+0000000000015360 <<&&alloc::string::String as core::fmt::Display>::fmt>:
+   15360:	48 89 f2             	mov    %rsi,%rdx
+   15363:	48 8b 07             	mov    (%rdi),%rax
+   15366:	48 8b 00             	mov    (%rax),%rax
+   15369:	48 8b 78 08          	mov    0x8(%rax),%rdi
+   1536d:	48 8b 70 10          	mov    0x10(%rax),%rsi
+   15371:	ff 25 19 df 03 00    	jmp    *0x3df19(%rip)        # 53290 <_DYNAMIC+0x2a8>
+...
+```
+
+The 32 bytes are the whole function that formats this value for `println!`, 23 bytes until the `jmp`, and then 9 bytes of `int3` padding. The program printed its own machine code. In gdb, at the start of this function:
+
+```text
+first argument (rdi): 0x7fffffffe758
+the kept reference points to 0x7fffffffe740, the three words there:
+0x7fffffffe740:	0x00007fffffffe758	0x0000555555569360
+0x7fffffffe750:	0x0000000000000020
+```
+
+The first word equals the first argument of the function. The second word is the address of the function itself (gdb loads the program at `0x555555554000`, plus `0x15360`). The third word is still 32. My reading: the optimizer reused the stack place of the dead `l` for the `core::fmt::rt::Argument` that `println!` builds, that is a pointer to the value and a pointer to the function that formats it. Seen as a `String`, the function pointer becomes "the address of the bytes".
+
+With 1.81 and 1.88, the dead `String` said that its bytes are at address `0x2`, so `write` got EFAULT and std panicked.
+
+## What AddressSanitizer says
+
+With nightly and `-Zsanitizer=address -g`, the program stops before it prints anything ([`results/asan.txt`](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/rust-issue-164250/results/asan.txt)):
+
+```text
+==3073771==ERROR: AddressSanitizer: stack-use-after-scope on address 0x7b7a441d0108 at pc 0x560fc1e4e5db bp 0x7ffd1352cae0 sp 0x7ffd1352cad8
+READ of size 8 at 0x7b7a441d0108 thread T0
+...
+  This frame has 7 object(s):
+...
+    [160, 184) '_z' (line 13)
+    [224, 232) 'q' (line 10)
+    [256, 280) 'l' (line 9) <== Memory access at offset 264 is inside this variable
+```
+
+ASan gives every variable its own place in the frame, with guard bytes around it, and it marks `l` as dead when its block ends. The read is 8 bytes after the start of `l` (offset 264): the second word, the address of the bytes. I translated the frames with `addr2line`:
+
+```text
+#0 <alloc::raw_vec::RawVecInner>::non_null::<u8> DIR/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/alloc/src/raw_vec/mod.rs:627
+#1 <&alloc::string::String as core::fmt::Display>::fmt DIR/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/fmt/mod.rs:2872
+...
+#6 repro::main src/repro.rs:15
+```
+
+The formatting code of `println!` on line 15 reads the pointer of a `String` that died on line 12.
+
+## How far back it goes
+
+One comment says that a variant "compiles since rust 1.4.0 (2015)", so `run.sh` also tests ten old releases from static.rust-lang.org ([`results/history-summary.txt`](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/rust-issue-164250/results/history-summary.txt)):
+
+```text
+rustc            commit date  lifetime_bound  closure_bound  static_bound  repro_old  repro
+1.0.0            2015-05-13   no              no             no            other      other
+1.3.0            2015-09-15   no              no             no            other      other
+1.4.0            2015-10-27   yes             yes            no            other      other
+1.10.0           2016-07-03   yes             yes            no            other      other
+1.17.0           2017-04-24   yes             yes            no            no         other
+1.18.0           2017-06-06   yes             yes            yes           yes        other
+1.20.0           2017-08-27   yes             yes            yes           yes        other
+1.40.0           2019-12-16   yes             yes            yes           yes        other
+1.60.0           2022-04-04   yes             yes            yes           yes        other
+1.63.0           2022-08-08   yes             yes            yes           yes        yes
+...
+1.100.0-nightly  2026-09-16   yes             yes            yes           yes        yes
+```
+
+`lifetime_bound` (a `'b: 'a` bound) and `closure_bound` (`F: FnMut(&T)`) come from the comments, `static_bound` is the smallest `T: 'static` form, and `repro` is the program of the issue. `repro_old` is `repro` with a `thread_local!` instead of the `static Mutex`, `Box<Any>` instead of `Box<dyn Any + Send>`, and no `Send`. "no" is the normal "`l` does not live long enough", and "other" an unrelated error (the old `Reflect` trait, `dyn`, `Mutex::new` in a `static`).
+
+So 1.0.0 and 1.3.0 still checked the bound. From 1.4.0 on, every version I tested compiles the lifetime and closure variants, and from 1.18.0 also the `'static` ones, where `repro_old` already prints the 32 `X`.
+
+## Where the compiler checks the requirement
+
+Why was `q.0 = Some(&l)` accepted? I made smaller programs ([`results/companions.txt`](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/rust-issue-164250/results/companions.txt)). First, covariance in normal code:
+
+```rust
+let mut value = Some("static text");
+let local = String::from("local text");
+value = Some(local.as_str());
+```
+
+This compiles. `value` starts with a `&'static str` and then holds a borrow of `local`, because a longer lifetime can be used where a shorter one is expected. The [Rustonomicon](https://doc.rust-lang.org/nomicon/subtyping.html) says that `&'a T` is covariant over `'a`. `Option` and `Q` are covariant too, so a `Q<&'static String>` can go where a `Q<&'short String>` is expected. (More about variance in [the PhantomData article](/blog/rust-phantomdata-variance-drop-check).)
+
+Now the requirement, with `struct Q<T: 'static>(Option<T>);` and no `Drop`. The base program, `let mut q = Q(None);` and then `q.0 = Some(&l);`, is accepted: the type of `q` breaks `T: 'static`, but nothing relies on it. Then I changed one line at a time:
+
+| Change | Result on 1.99.1 |
+| --- | --- |
+| `Q(Some(&l))` instead of `Q(None)` and the assignment | E0597, "this usage requires that `l` is borrowed for `'static`" |
+| `let mut q: Q<&String>` instead of `let mut q` | E0597, "type annotation requires that `l` is borrowed for `'static`" |
+| `drop(q);` at the end | E0597, "argument requires that `l` is borrowed for `'static`" |
+
+And the program of the issue with one more line, `drop(q);` at the end of the block, is rejected too. This one surprised me.
+
+The compiler checks `T: 'static` everywhere I tried, but not on the inferred type of the variable itself. The borrow checker can print its work (`-Zdump-mir=main`, in [`results/mir.txt`](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/rust-issue-164250/results/mir.txt)). It gives a number to every lifetime. `'?0` is `'static` (rustc's source calls it the only "global" region), `'?5` is the lifetime inside `Q(None)`, and `'?42` is the lifetime in the type of `q`:
+
+```text
+| '?5: '?0 due to Predicate(src/repro.rs:3:13: 3:20 (#0)) at Single(bb1[4]) (src/repro.rs:10:21: 10:28 (#0)
+| '?5: '?42 due to Assignment at Single(bb1[4]) (src/repro.rs:10:21: 10:28 (#0)
+| '?42 | U0 | {bb1[5..=15]}
+```
+
+`'a: 'b` means "`'a` outlives `'b`". The first line is the requirement, checked at the constructor (`3:13` is the `'static` in `struct Q`, `10:21` is `Q(None)`), and `None` borrows nothing, so it holds. The second line is covariance: the value moves into `q`, whose lifetime may be shorter. The third line is that lifetime: for the borrow checker, a set of points in MIR, the simplified form of the function ([rustc dev guide](https://rustc-dev-guide.rust-lang.org/borrow-check/region-inference.html)). Here it is a few points of block `bb1`, until `q` is dropped. Nothing asks `'?42` to outlive `'?0`, so the borrow of `l` must only live until the drop of `q`, and it does.
+
+The model I keep: a bound on a struct is checked at the doors, when you build a value, write a type or call a function. Covariance lets a value enter with a long lifetime, and inside the variable the lifetime becomes shorter. The drop at the end of the block is not a door: the compiler inserts it by itself. And `Drop` trusts a promise that nobody checked for this variable.
+
+## What the fix changes
+
+[Pull request 164277](https://github.com/rust-lang/rust/pull/164277), "require MIR local types to be well-formed", was opened by Li-Zheng-Rong on the same day. The compiler part is 8 lines in `compiler/rustc_borrowck/src/type_check/mod.rs`:
+
+```rust
+        if self.body.local_kind(local) == LocalKind::Temp {
+            self.prove_clause(
+                ty::ClauseKind::WellFormed(local_decl.ty.into()),
+                Locations::All(local_decl.source_info.span),
+                ConstraintCategory::Boring,
+            );
+        }
+```
+
+For every variable and temporary of the function (this is what `LocalKind::Temp` means in [rustc's source](https://github.com/rust-lang/rust/blob/dc44e7f2c436b6041742e138b9c2176f093196d5/compiler/rustc_middle/src/mir/mod.rs#L893-L900)), the borrow checker must now prove that its type is well-formed: that the type respects the bounds on its own definition. For `q`, the type is `Q<&'?42 String>`, so it must prove `&'?42 String: 'static`, the constraint that was missing. The rest is tests. One is a version of the issue's program, and it expects the error my programs never got:
+
+```text
+LL |     value.0 = Some(&text);
+   |     ---------------^^^^^-
+   |     |              |
+   |     |              borrowed value does not live long enough
+   |     assignment requires that `text` is borrowed for `'static`
+```
+
+The tests also show a cost: with the fix, my harmless `bound_unchecked.rs`, without any `Drop`, is an error too (test `local-type-wf-no-drop.rs`), so some code that compiles today would stop compiling.
+
+When I write this, the pull request is still open, so I could not test it: no nightly has it, and building rustc needs more disk than my laptop has free. One commenter built it on Windows: both reproducers fail with E0597, and `cargo check` of an application with about 400 crates in its dependency tree shows no new errors. They added: "This is a single-machine check, not a substitute for crater." (Crater builds the public crates with a compiler change.)
+
+## How worried should we be
+
+Not very, but not zero. You need three things together: a struct with a bound (like `T: 'static`, `'b: 'a` or `F: FnMut(T)`), a `Drop` that uses this bound to send a reference somewhere that lives longer (a global, a thread, another variable), and a variable whose inferred type breaks the bound. In the issue, the value starts with `None` and gets a short borrow later. One comment uses an array of two values instead, and the pull request tests both. Normal `Drop` implementations clean up their own data. They do not send references away, and lcnr writes that it is "very likely that this unsoundness has not caused memory unsafety by accident".
+
+It still matters, because safe Rust promises this for every program. And Rust tracks these bugs in the open. On Sunday, 169 open issues had the I-unsound label (53 P-high, none P-critical), and 577 were closed. Someone asked if 164250 is a duplicate of the famous [issue 25860](https://github.com/rust-lang/rust/issues/25860) from 2015 (implied bounds and variance, still open, and the base of [cve-rs](https://github.com/Speykious/cve-rs/blob/54ba036df90ef0853f8411e52b73fa830be485c2/src/lifetime_expansion.rs)). A contributor answered: "It's not. Superficial similarity does not mean they are the same."
+
+What should a Rust user do?
+
+- Nothing dramatic: update the toolchain when the fix reaches a release.
+- In code review, look for this shape: a `Drop` that relies on a bound of its own type to move data out of `self`.
+- Where it matters, run the tests under AddressSanitizer or Miri: ASan caught this one, and in the issue Miri reports "a dangling reference (use-after-free)" for the array variant. Both see only the paths that the tests run, both need nightly, and Miri is slow.
+
+No flag I tried closes this hole: on nightly, the new trait solver (`-Znext-solver=globally`) and the new borrow checker Polonius (`-Zpolonius=next`) accept it too ([`results/flags.txt`](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/rust-issue-164250/results/flags.txt)). The fix has to come from the compiler. There is more about rustc in [Rust under the hood](/blog/topics/rust-under-the-hood).
+
+## Sources
+
+- [rust-lang/rust#164250](https://github.com/rust-lang/rust/issues/164250), the issue
+- [rust-lang/rust#164277](https://github.com/rust-lang/rust/pull/164277), the fix
+- [rust-lang/rust#25860](https://github.com/rust-lang/rust/issues/25860)
+- [`LocalKind`](https://github.com/rust-lang/rust/blob/dc44e7f2c436b6041742e138b9c2176f093196d5/compiler/rustc_middle/src/mir/mod.rs#L893-L900) and [universal regions](https://github.com/rust-lang/rust/blob/dc44e7f2c436b6041742e138b9c2176f093196d5/compiler/rustc_borrowck/src/universal_regions.rs) in rustc
+- [Subtyping and Variance](https://doc.rust-lang.org/nomicon/subtyping.html), the Rustonomicon
+- [Region inference (NLL)](https://rustc-dev-guide.rust-lang.org/borrow-check/region-inference.html), the rustc dev guide
+- [cve-rs `src/lifetime_expansion.rs`](https://github.com/Speykious/cve-rs/blob/54ba036df90ef0853f8411e52b73fa830be485c2/src/lifetime_expansion.rs)
