@@ -1,0 +1,190 @@
+---
+title: "What Happens When a Process Exits"
+date: "2026-10-22T18:45:00+01:00"
+lastmod: "2026-10-22T18:45:00+01:00"
+tags: ["from source to process", "linux", "kernel", "c", "rust"]
+draft: false
+reviewed: true
+reviewedHash: "d45c5173c57f5710e221d4ca6538d56616a6958f25b116cb49c4bc370bcc4f4e"
+cluster: "rust-under-the-hood"
+campaign: "editorial"
+summary: "A line printed twice, output lost with _exit, a Drop that never runs, a zombie without memory. I followed the end of C and Rust processes with strace and /proc: stdio buffers, exit handlers, exit codes, exit_group, and what the kernel cleans up."
+---
+
+When I prepared this experiment, the first run of my small program printed one line twice. The program starts four child processes, one after the other. Each child ends in a different way, and the parent prints one line per child with the status that `waitpid` returned:
+
+```text
+$ ./codes exit > out.txt; cat out.txt   (the children end with exit)
+exit code 3                raw status 0x0300: exited, exit status 3
+exit code 3                raw status 0x0300: exited, exit status 3
+exit code 300              raw status 0x2c00: exited, exit status 44
+kill(getpid(), SIGTERM)    raw status 0x000f: killed by signal 15 (Terminated)
+kill(getpid(), SIGKILL)    raw status 0x0009: killed by signal 9 (Killed)
+```
+
+Four children, five lines. Only the parent prints, and only once per child. So who printed the second "exit code 3"? The answer is in the way a process ends, which is the subject of this last part. [The first part of this series](/blog/what-happens-when-you-run-a-program-from-execve-to-main) followed a program from `execve` to `main`; this one follows it from `main` to the end.
+
+## Buffers that nobody flushed
+
+I made first a smaller program. It prints a line with a newline, or a text without newline, and ends with `exit` or with `_exit`. I ran it with stdout to a pipe, and with stdout to a terminal (with `script`, which gives the program a pseudo-terminal), and counted the bytes that arrived:
+
+```text
+$ ./buffering exit line | cat   (stdout is a pipe)
+a line with a newline
+$ ./buffering _exit line | cat
+$ script -q -c './buffering _exit line' /dev/null   (stdout is a terminal)
+a line with a newline
+bytes that arrived, for each case:
+  stdout    end    printed                bytes
+  pipe      exit   a line with a newline  22
+  pipe      exit   no newline here        15
+  pipe      _exit  a line with a newline  0
+  pipe      _exit  no newline here        0
+  terminal  exit   a line with a newline  22
+  terminal  exit   no newline here        15
+  terminal  _exit  a line with a newline  22
+  terminal  _exit  no newline here        0
+```
+
+With `exit`, everything arrives. With `_exit`, a complete line arrives on a terminal, but not in a pipe, and a text without newline never arrives. The reason is the buffer of stdio. setbuf(3) gives the rules: "Normally, all files are block buffered. If a stream refers to a terminal (as stdout normally does), it is line buffered." So `printf` only copies the text in a buffer in the memory of the process, and the `write` comes later: at the newline on a terminal, when the buffer is full in a pipe, or at the end. strace shows where:
+
+```text
+$ strace -e trace=write,exit_group ./buffering exit text > out.txt
+write(1, "no newline here", 15)         = 15
+exit_group(0)                           = ?
++++ exited with 0 +++
+$ strace -e trace=write,exit_group ./buffering _exit text > out.txt
+exit_group(0)                           = ?
++++ exited with 0 +++
+```
+
+`exit` makes the `write` and then `exit_group`. `_exit` goes directly to `exit_group`, and the 15 bytes disappear with the memory of the process. The _exit(2) man page says it: "Open stdio(3) streams are not flushed."
+
+Now the line printed twice makes sense. My parent printed into a file, so its stdout was block buffered, and the line "exit code 3" was still in the buffer when it called `fork` for the second child. [The part about fork](/blog/what-fork-really-copies-copy-on-write-measured) showed that the child gets a copy of all the memory, so it got a copy of this buffer too. This child ended with `exit(300)`, and `exit` flushed its copy: the line went to the file a first time, from the child, and later a second time, from the parent. With `_exit` in the children, each line comes once:
+
+```text
+$ ./codes _exit > out.txt; cat out.txt   (the children end with _exit)
+exit code 3                raw status 0x0300: exited, exit status 3
+exit code 300              raw status 0x2c00: exited, exit status 44
+kill(getpid(), SIGTERM)    raw status 0x000f: killed by signal 15 (Terminated)
+kill(getpid(), SIGKILL)    raw status 0x0009: killed by signal 9 (Killed)
+```
+
+This is why a child that does not call `execve` should end with `_exit`. For me this bug is a good example, because it needs so little: a buffer, a `fork` and an `exit`.
+
+## What exit does before the end
+
+`exit` does a little more than the flush. This program registers two functions with `atexit`, prints "main ends; " without newline, and returns from `main`:
+
+```text
+$ ./handlers | cat
+main ends; handler registered second
+handler registered first
+$ strace -e trace=write,exit_group ./handlers > out.txt
+write(1, "main ends; handler registered se"..., 62) = 62
+exit_group(0)                           = ?
++++ exited with 0 +++
+$ ./handlers now | cat   (ends with _exit)
+```
+
+The exit(3) man page gives the order: "All functions registered with atexit(3) and on_exit(3) are called, in the reverse order of their registration", and then "All open stdio(3) streams are flushed and closed." The output follows it: the second handler runs first, and both handlers can still print, because the flush comes after them. strace shows one single `write` of 62 bytes, the text of `main` and of the two handlers together. [The part about the code before main](/blog/the-code-that-runs-before-main-start-constructors-and-init-array) met this reverse order already, with an `atexit` handler and the destructors. With `_exit`, nothing at all: no handler, no flush.
+
+## Rust: process::exit
+
+The Rust program creates a value with a `Drop` that prints to stderr, prints with `print!` without newline, and then returns normally, calls `std::process::exit(3)`, or calls `std::process::abort()`:
+
+```text
+$ ./exit_rs return > out.txt 2> err.txt
+  exit status: 0
+  stdout: print! without a newline
+  stderr: drop of the guard in main
+$ ./exit_rs exit > out.txt 2> err.txt
+  exit status: 3
+  stdout: print! without a newline
+  stderr: 
+$ ./exit_rs abort > out.txt 2> err.txt
+  exit status: 134
+  stdout: 
+  stderr: 
+```
+
+With `process::exit`, the `Drop` never runs. The documentation of Rust 1.98 warns about it: "no destructors on the current stack or any other thread's stack will be run". But the text of `print!` arrived, although Rust's stdout is a `LineWriter` and the text has no newline. The 1.98 source explains why: `process::exit` first calls `rt::cleanup()`, which calls `io::cleanup()`, with the comment "Flush the data and disable buffering during shutdown". Only after that, it calls the `exit` of the C library. With `abort` nothing is flushed, and the documentation of `abort` says that "Rust IO buffers (eg, from `BufWriter`) will not be flushed". The status 134 is 128 + 6, SIGABRT, as in [the part about stack overflows](/blog/how-a-stack-overflow-is-detected-guard-pages-and-signals).
+
+strace shows the cleanup:
+
+```text
+$ strace -e trace=write,exit_group,sigaltstack,munmap ./exit_rs exit > /dev/null   (from the write on)
+write(1, "print! without a newline", 24) = 24
+sigaltstack({ss_sp=NULL, ss_flags=SS_DISABLE, ss_size=8192}, NULL) = 0
+munmap(0x7fd4c84f5000, 12288)           = 0
+exit_group(3)                           = ?
++++ exited with 3 +++
+```
+
+The flush, then std disables and unmaps its alternate signal stack of 12 KiB, the one that the first part saw created before `main`, and then `exit_group(3)`.
+
+## The status that the parent sees
+
+Back to the statuses of the first program. The raw status is a 16-bit number from the kernel: the exit code in the high byte (0x0300 for 3), or the signal number in the low byte (0x000f for SIGTERM). `exit(300)` arrived as 44, because only 8 bits are kept: 300 - 256 = 44. The Rust documentation of `exit` says the same: "only the eight least-significant bits are considered". The shell then puts everything into one number:
+
+```text
+$ sh -c 'exit 300'; echo $?
+44
+$ sh -c 'kill -TERM $$'; echo $?
+143
+$ sh -c 'kill -KILL $$'; echo $?
+137
+```
+
+For a process killed by a signal, the shell shows 128 + the signal number: 143 for SIGTERM (15), 137 for SIGKILL (9), and the 139 and 134 of the part about stack overflows. A program that really exits with code 143 looks the same in `$?`. In fact, only `waitpid` can tell the two cases apart.
+
+## One exit_group for all threads
+
+What happens to the other threads? Here the main thread calls `exit(5)` while a second thread waits in `pause()`:
+
+```text
+$ strace -f -e trace=exit_group,pause ./threads_exit
+1314589 pause( <unfinished ...>
+1314588 exit_group(5)                   = ?
+1314589 <... pause resumed>)            = ?
+1314589 +++ exited with 5 +++
+1314588 +++ exited with 5 +++
+```
+
+The second thread never called anything to end, and it ended with the status 5 of the main thread. exit_group(2): "This system call terminates all threads in the calling process's thread group." And `_exit` uses it too: the notes of _exit(2) say that "Since glibc 2.3, the wrapper function invokes exit_group(2)".
+
+## What stays after the end
+
+The last program checks what the kernel cleans up. The child touches 64 MiB, takes a lock on a file with `flock`, writes one byte into a pipe to the parent, sleeps 300 ms, and calls `_exit(7)` without freeing the memory, closing the files or releasing the lock. The parent waits for the end with `waitid` and the flag `WNOWAIT`, which, says wait(2), leaves "the child in a waitable state", so the child stays visible before the real `waitpid`:
+
+```text
+$ ./zombie
+child 1314593: touched 64 MiB, took a lock, wrote to the pipe, sleeps 300 ms, then calls _exit(7)
+child alive:                     State: S (sleeping) VmRSS:    66516 kB    open fds: 5
+parent, child alive:             flock(LOCK_EX | LOCK_NB) on lockfile: busy
+parent:                          read() on the pipe returned 0 after 299 ms
+child exited, not waited for:    State: Z (zombie)   VmRSS: (no VmRSS line) open fds: 0
+parent, child exited:            flock(LOCK_EX | LOCK_NB) on lockfile: got the lock
+    PID    PPID STAT COMMAND
+1314593 1314592 Z    zombie <defunct>
+parent:                          waitpid: exit status 7
+    PID    PPID STAT COMMAND
+```
+
+While the child sleeps, it has 66,516 kB of resident memory and 5 open file descriptors, and the lock is busy. The parent's second `read` on the pipe returned 0, end of file, after 299 ms: the kernel closed the write end when the child exited. After the exit, the child is still there, with the state Z, but it has no memory line at all, no open file descriptor, and the lock is free: flock(2) says that the lock is released "when all such file descriptors have been closed", and the kernel closed them. `ps` shows the child as `<defunct>`. wait(2) explains what remains: "The kernel maintains a minimal set of information about the zombie process (PID, termination status, resource usage information)". After `waitpid` returned the 7, `ps` finds nothing anymore. That is the end of a process: everything is freed at once, except a few bytes for the parent.
+
+## From source to exit
+
+This was the last part of the series. When I look back, the path of one small program was long: the compiler left holes in the object files, the linker filled them and wrote an ELF file of segments, `execve` mapped these segments and built a stack with the arguments, the environment and the auxiliary vector, and the dynamic loader found the libraries and filled the GOT. Code ran before `main`. Then the memory came page by page, from page faults, `brk` and `mmap`, the system calls crossed into the kernel or stayed in the vDSO, a guard page or a limit waited below each stack, and every thread got its own `fs`. And at the end, a few handlers, one flush, one `exit_group`, and the kernel took everything back except the exit status. Every step was visible with a small program and a tool: readelf, objdump, strace, gdb, `/proc`, etc.
+
+## References
+
+- exit(3), the exit handlers and the flush of the streams: https://man7.org/linux/man-pages/man3/exit.3.html
+- _exit(2), what is not flushed, and exit_group in glibc: https://man7.org/linux/man-pages/man2/_exit.2.html
+- setbuf(3), the buffering of stdio streams: https://man7.org/linux/man-pages/man3/setbuf.3.html
+- exit_group(2): https://man7.org/linux/man-pages/man2/exit_group.2.html
+- wait(2), zombies and `WNOWAIT`: https://man7.org/linux/man-pages/man2/wait.2.html
+- flock(2), when a lock is released: https://man7.org/linux/man-pages/man2/flock.2.html
+- Rust 1.98.0, `std::process::exit` and `abort`: https://github.com/rust-lang/rust/blob/1.98.0/library/std/src/process.rs
+- Rust 1.98.0, the runtime cleanup and the flush of stdout: https://github.com/rust-lang/rust/blob/1.98.0/library/std/src/rt.rs and https://github.com/rust-lang/rust/blob/1.98.0/library/std/src/io/stdio.rs
+- The programs and the saved outputs of this part: https://github.com/mehdiakiki/mehdi-cz/tree/main/experiments/from-source-to-process/p20

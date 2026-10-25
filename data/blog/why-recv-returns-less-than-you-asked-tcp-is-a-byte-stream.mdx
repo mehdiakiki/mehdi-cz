@@ -1,0 +1,140 @@
+---
+title: "Why recv() Returns Less Than You Asked: TCP Is a Byte Stream"
+date: "2026-07-12T17:25:00+01:00"
+lastmod: "2026-07-12T17:25:00+01:00"
+tags: ["following a tcp connection", "networking", "linux", "tcp", "python"]
+draft: false
+reviewed: true
+reviewedHash: "3ad73722ed23212bbc8c3a80086f16b1028d0afd76c84ef82be527ce4e028706"
+cluster: "reliable-data-integrations"
+campaign: "editorial"
+summary: "Three send() calls arrived in one recv(), and one send() of 1 MiB arrived in seventeen. TCP keeps the bytes and their order, not the boundaries between your writes. I broke a small JSON reader with two inputs and fixed it with a length prefix and with lines."
+---
+
+The reader in this experiment is a few lines of Python, and it failed on both inputs that I gave it:
+
+```text
+== reader: broken
+  two small messages: 44 bytes, JSONDecodeError: Extra data: line 1 column 23 (char 22)
+  one message of about 300 kB: 65536 bytes, JSONDecodeError: Unterminated string starting at: line 1 column 19 (char 18)
+```
+
+The sender did nothing special. It wrote each JSON message with one `sendall()`, and the reader took one `recv()` as one message. In the first case one `recv()` returned two messages, and in the second case it returned a piece of one message. The connection is the same kind that this series opened in [its first part](/blog/what-happens-when-your-program-calls-connect), and this time I look only at the bytes that it carries. To see why the reader failed, I looked first at the two directions of the problem separately.
+
+## Three sends, one recv
+
+A sender calls `send()` three times with three short lines. I turned Nagle off on this socket (`TCP_NODELAY`, see [the previous part about Nagle and delayed ACK](/blog/why-a-small-write-can-wait-40-milliseconds-nagle-and-delayed-ack)), so the kernel sends each one at once. The receiver waits 100 ms, then calls `recv(4096)` one time:
+
+```text
+send(b'first\n') returned 6
+send(b'second\n') returned 7
+send(b'third\n') returned 6
+one recv(4096) returned 19 bytes: b'first\nsecond\nthird\n'
+sender data_segs_out:3
+```
+
+The last line comes from `ss -ti` on the sender: the kernel counted three data segments, one for each send. So the three writes really left separately. The receiver kernel put the bytes of the three segments one after the other in the receive buffer of the socket, and `recv()` took everything that was there, 19 bytes.
+
+This is the whole idea of a byte stream, that is: TCP promises that the bytes arrive, all of them and in the same order. It does not keep the places where one `send()` ended and the next one started. These places do not exist on the receiving side. RFC 9293 says it in one sentence: "TCP provides a reliable, in-order, byte-stream service to applications". The important word here is the third one, "byte-stream".
+
+## One send, seventeen recv
+
+Now the other direction. The sender writes 1 MiB with one `sendall()`. Under strace it is one single system call that sends everything:
+
+```text
+sendto(4, "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"..., 1048576, 0, NULL, 0) = 1048576
+```
+
+The receiver calls `recv(65536)` in a loop until it has the 1 MiB, and it notes the size of each piece:
+
+```text
+17 recv() calls in 0.4 ms, total 1048576 bytes
+smallest 108, largest 65536
+first 12 sizes: 65482 65482 65536 65536 65536 65536 65536 65536 65536 65536 65536 65536
+most common sizes: 65536 x14, 65482 x2, 108 x1
+```
+
+Seventeen calls for one send, and the sizes are not all equal: 65482 two times, then full buffers of 65536, and 108 bytes at the end. The second run gave 18 calls, with two pieces of 32741 after the first two. Then I gave `recv()` a buffer of 1 MiB, big enough for everything:
+
+```text
+3 recv() calls in 0.9 ms, total 1048576 bytes
+smallest 65482, largest 917612
+first 12 sizes: 65482 65482 917612
+```
+
+Even with space for all the data, the first call returned only 65482 bytes. The receiver was simply faster than the sender: at the moment of the first `recv()`, only this part had arrived. The recv(2) man page describes exactly this: the receive calls "normally return any data available, up to the requested amount", and they do not wait for more. The size of a `recv()` tells you how much had arrived when you asked. Nothing else.
+
+On a real network the pieces depend also on the speed of the network and on segments of about 1448 bytes, so they are even less predictable.
+
+## The broken reader
+
+Here is the reader from the beginning:
+
+```python
+def read_broken(sock):
+    time.sleep(0.05)
+    return sock.recv(65536)
+```
+
+and the program passes the result to `json.loads()`. The sleep of 50 ms is on purpose, it makes the reader a bit slower than the sender, like a busy server. The bug needs this. If the reader calls `recv()` before the second message arrives, it gets only the first one, and the code looks correct.
+
+The two inputs break it in the two possible ways:
+
+- Two small messages of 22 bytes, sent quickly. The reader got 44 bytes in one `recv()`, both messages, and `json.loads()` said "Extra data" after the first 22 characters.
+- One message of about 300 kB. The reader got the first 65536 bytes, because that was its buffer size, and `json.loads()` said "Unterminated string": the long string inside the message was cut.
+
+So the bug is not only "messages get glued together". It is also "a message gets cut". And it depends on the timing, on the buffer sizes, on the network etc., not on the code that you see.
+
+## Two framings that work
+
+The fix is to put the message boundaries into the bytes, because TCP does not keep them. The two usual ways are a length in front of each message, and a separator after each message.
+
+With a length prefix, the sender writes 4 bytes with the size, then the message. The reader needs a helper that loops until it has exactly n bytes:
+
+```python
+def recv_exactly(sock, n):
+    data = bytearray()
+    while len(data) < n:
+        chunk = sock.recv(n - len(data))
+        if not chunk:
+            raise EOFError(f"connection closed after {len(data)} of {n} bytes")
+        data += chunk
+    return bytes(data)
+
+
+def read_framed(sock):
+    (size,) = struct.unpack("!I", recv_exactly(sock, 4))
+    return recv_exactly(sock, size)
+```
+
+Note the `if not chunk`: `recv()` returns an empty result when the other side closed the connection (recv(2): "the return value will be 0"). Without this test the loop never ends.
+
+With lines, the sender writes each JSON message followed by `\n`, and the reader keeps a buffer: it reads until the buffer contains a newline, gives back the first line, and keeps the rest for the next call. Both readers survived both inputs:
+
+```text
+== reader: framed
+  two small messages: 22 bytes, id 1; 22 bytes, id 2
+  one message of about 300 kB: 300021 bytes, id 3
+== reader: lines
+  two small messages: 22 bytes, id 1; 22 bytes, id 2
+  one message of about 300 kB: 300021 bytes, id 3
+```
+
+Neither is free. A length prefix is simple and works for any bytes, but the sender must know the size before it sends, and the reader must not trust the length blindly: a broken or hostile peer can announce 4 GB, so a real reader checks a maximum before it allocates anything. Lines are easy to read with your eyes and to debug, but a message must never contain the separator (JSON without indentation does not, it escapes newlines inside strings), and the reader also needs a maximum line length, or one endless line fills its memory.
+
+Real protocols use these same two ideas. HTTP/1.1 uses lines for the headers and a `Content-Length` for the body. gRPC puts a 5-byte header with a flag and a length in front of every message, as I described in [gRPC Streaming vs Unary](/blog/grpc-streaming-vs-unary), and WebSocket has a length in every frame header, see [WebSockets From the Wire Up](/blog/websockets-from-the-wire-up). In fact they all had to solve the same problem as my broken reader.
+
+In Python there are also two shortcuts. `sock.makefile("rb").readline()` gives a buffered line reader. And `recv(n, socket.MSG_WAITALL)` asks the kernel to wait until n bytes are there, but recv(2) says that the call "may still return less data than requested" if a signal arrives, an error happens or the peer disconnects, so the loop is still needed for correct code.
+
+## What I look for now
+
+When I read network code now, I look first at one thing: what happens with the return value of `recv()`. If the code treats it as one message, or if it assumes that `recv(n)` returns n bytes, the code is correct only when the timing is kind. A loop with a buffer, a length or a separator, and a test for the empty result: this is what a reader of a byte stream must have.
+
+The outputs are in [p04-coalesce.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/following-a-tcp-connection/results/p04-coalesce.txt), [p04-split.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/following-a-tcp-connection/results/p04-split.txt), [p04-framing.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/following-a-tcp-connection/results/p04-framing.txt) and [p04-strace.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/following-a-tcp-connection/results/p04-strace.txt), and the readers are in `p04_stream.py` in the [fixture](https://github.com/mehdiakiki/mehdi-cz/tree/main/experiments/following-a-tcp-connection).
+
+## Further reading
+
+- [recv(2), Linux manual page](https://man7.org/linux/man-pages/man2/recv.2.html)
+- [RFC 9293, Transmission Control Protocol (TCP)](https://www.rfc-editor.org/rfc/rfc9293.html#section-2.2), section 2.2
+- [RFC 9112, HTTP/1.1](https://www.rfc-editor.org/rfc/rfc9112.html#section-6.3), section 6.3 for the message body length
+- [socket, Python 3.14 documentation](https://docs.python.org/3.14/library/socket.html), for `sendall()` and `makefile()`

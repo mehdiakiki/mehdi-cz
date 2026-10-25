@@ -1,0 +1,142 @@
+---
+title: "SQLite WAL Mode: Fewer fsyncs, a Different Promise"
+date: "2026-10-07T16:10:00+01:00"
+lastmod: "2026-10-07T16:10:00+01:00"
+tags: ["what survives a crash", "sqlite", "databases", "linux", "performance"]
+draft: false
+reviewed: true
+reviewedHash: "f268d9af65e05706674bd48dcca45437ef611d230248f4d69f61f5a3b215eb29"
+cluster: "reliable-data-integrations"
+campaign: "editorial"
+summary: "In WAL mode, a SQLite commit with synchronous=FULL is one frame and one fdatasync, and with NORMAL it is no sync at all. I followed both with strace on my laptop, measured them, and quote what the documentation promises after an application crash and after a power loss."
+---
+
+One line changes the commit protocol of SQLite completely: `PRAGMA journal_mode=WAL`. In [the previous part](/blog/how-sqlite-commits-a-transaction-followed-with-strace), one INSERT in the default rollback mode cost four sync calls and three real flushes. In WAL mode the same INSERT costs one sync, or none, depending on one more setting. And with fewer syncs comes a different promise, which the SQLite documentation describes very clearly. I wanted to see both sides on my laptop.
+
+## Two new files
+
+The WAL documentation summarizes the idea in one sentence: "The original content is preserved in the database file and the changes are appended into a separate WAL file." It is the write-ahead log of [part 9](/blog/write-ahead-logging-from-scratch), in a real database. The WAL file is `test.db-wal`.
+
+There is a second file, `test.db-shm`, the wal-index. It helps readers find pages in the WAL, and "the wal-index is implemented using an ordinary file that is mmapped for robustness." In the traces below you will see SQLite prepare it with eight writes of 1 byte, at offsets 4,095, 8,191 and so on up to 32,767: that makes a file of 32 KiB that it can map in memory. It is never synced, and it does not need to be: the file format documentation says that "the wal-index is transient. After a crash, the wal-index is reconstructed from the original WAL file."
+
+## Three commits with FULL
+
+To separate the commits from the checkpoint, I traced one `sqlite3` process that runs three INSERTs, then `PRAGMA wal_checkpoint`, then exits. The `.print` commands of the CLI write a marker to standard output before each step, and my strace viewer shows them in order:
+
+```text
+== journal_mode=wal, synchronous=FULL: one process, three INSERTs, a checkpoint, exit
+  open      test.db (O_RDWR|O_CREAT)
+  open      test.db-wal (O_RDWR|O_CREAT)
+  open      test.db-shm (O_RDWR|O_CREAT)
+  ftruncate test.db-shm to 3 bytes
+  pwrite64  1 bytes at offset 4095 to test.db-shm
+  pwrite64  1 bytes at offset 8191 to test.db-shm
+  pwrite64  1 bytes at offset 12287 to test.db-shm
+  pwrite64  1 bytes at offset 16383 to test.db-shm
+  pwrite64  1 bytes at offset 20479 to test.db-shm
+  pwrite64  1 bytes at offset 24575 to test.db-shm
+  pwrite64  1 bytes at offset 28671 to test.db-shm
+  pwrite64  1 bytes at offset 32767 to test.db-shm
+  write     12 bytes to stdout: -- insert 1
+  pwrite64  32 bytes at offset 0 to test.db-wal
+  fdatasync test.db-wal
+  fdatasync ./
+  pwrite64  24 bytes at offset 32 to test.db-wal
+  pwrite64  4096 bytes at offset 56 to test.db-wal
+  fdatasync test.db-wal
+  write     12 bytes to stdout: -- insert 2
+  pwrite64  24 bytes at offset 4152 to test.db-wal
+  pwrite64  4096 bytes at offset 4176 to test.db-wal
+  fdatasync test.db-wal
+  write     12 bytes to stdout: -- insert 3
+  pwrite64  24 bytes at offset 8272 to test.db-wal
+  pwrite64  4096 bytes at offset 8296 to test.db-wal
+  fdatasync test.db-wal
+  write     14 bytes to stdout: -- checkpoint
+  fdatasync test.db-wal
+  pwrite64  4096 bytes at offset 4096 to test.db
+  ftruncate test.db to 8192 bytes
+  fdatasync test.db
+  write     6 bytes to stdout: 0|3|3
+  write     8 bytes to stdout: -- exit
+  unlink    test.db-shm
+  unlink    test.db-wal
+  fsync, fdatasync or sync_file_range calls: 7
+```
+
+The first INSERT creates the WAL. It writes the 32-byte WAL header, syncs it, and syncs the directory, because the WAL is a new file (part 4 again). Then the commit itself: a frame, which is a 24-byte frame header and the 4,096 bytes of the changed page, and one fdatasync.
+
+Insert 2 and insert 3 show the normal case: one frame appended, one fdatasync. That is all. No journal of old pages, no second flush for a header, no write to the database file. One commit is one sync.
+
+But how does SQLite know, after a crash, where the valid WAL ends? Like my log in [part 8](/blog/an-append-only-log-that-survives-a-torn-last-record), with more care. The file format documentation says that "a frame is considered valid if and only if" its salt values (two numbers in the WAL header that change at every checkpoint that starts the WAL again) match the WAL header and its checksum matches a checksum computed over everything before it. The frame of a commit also records the size of the database after the commit, and only frames up to the last commit frame count. The salts solve the problem I left open in part 8: a reused WAL can contain old frames with correct checksums, but their salts belong to the previous use.
+
+## The checkpoint
+
+The database file was not touched during the three commits. The checkpoint does that: "Moving the WAL file transactions back into the database is called a "checkpoint"." In the trace: fdatasync of the WAL, one page written into `test.db`, fdatasync of the database. The output `0|3|3` means: not blocked, 3 frames in the WAL, 3 frames checkpointed.
+
+Look at the database write: one page, at offset 4,096, written once. The three INSERTs changed this same page three times, and the WAL has three versions of it, but the checkpoint copies only the last one. This is one of the reasons why WAL mode writes less.
+
+By default, SQLite checkpoints automatically "when the WAL file reaches a threshold size of 1000 pages", and when the last connection closes, which is why my process deleted the `-wal` and `-shm` files at exit.
+
+## NORMAL: commits without any sync
+
+The same script with `synchronous=NORMAL`:
+
+```text
+  write     12 bytes to stdout: -- insert 1
+  pwrite64  32 bytes at offset 0 to test.db-wal
+  fdatasync test.db-wal
+  fdatasync ./
+  pwrite64  24 bytes at offset 32 to test.db-wal
+  pwrite64  4096 bytes at offset 56 to test.db-wal
+  write     12 bytes to stdout: -- insert 2
+  pwrite64  24 bytes at offset 4152 to test.db-wal
+  pwrite64  4096 bytes at offset 4176 to test.db-wal
+  write     12 bytes to stdout: -- insert 3
+  pwrite64  24 bytes at offset 8272 to test.db-wal
+  pwrite64  4096 bytes at offset 8296 to test.db-wal
+  write     14 bytes to stdout: -- checkpoint
+  fdatasync test.db-wal
+  pwrite64  4096 bytes at offset 4096 to test.db
+  ftruncate test.db to 8192 bytes
+  fdatasync test.db
+```
+
+The commits have no sync at all. Only the new WAL header at the beginning, and the checkpoint, sync anything. This is what the pragma documentation describes: "the WAL file is synchronized before each checkpoint and the database file is synchronized after each completed checkpoint and the WAL file header is synchronized when a WAL file begins to be reused after a checkpoint, but no sync operations occur during most transactions."
+
+## The numbers
+
+I ran the three interesting settings in the same session, so that the comparison is fair:
+
+```text
+== machine load: load average: 4.73, 4.45, 3.86
+  journal_mode=wal    synchronous=FULL      500 transactions:    1393 per second,  0.718 ms each, 1.01 disk flushes each, 500 rows
+  journal_mode=wal    synchronous=NORMAL   5000 transactions:   32247 per second,  0.031 ms each, 0.00 disk flushes each, 5000 rows
+  journal_mode=delete synchronous=FULL      500 transactions:     623 per second,  1.605 ms each, 3.02 disk flushes each, 500 rows
+```
+
+WAL with FULL: 1,393 transactions per second, one flush each. The rollback journal with FULL in the same session: 623 per second, three flushes each. (In the run of the previous part, the same rollback setting gave 302 per second. The laptop is not a quiet machine, so I compare only numbers from one run.) WAL with NORMAL: 32,247 per second, practically no flushes: the automatic checkpoints sync a few times in 5,000 transactions, which rounds to 0.00 per transaction.
+
+## The different promise
+
+So NORMAL is 23 times faster than FULL in WAL mode. That is a big number for one setting. What does it give up? The documentation answers in three sentences that I want to quote exactly:
+
+> WAL mode is always consistent with synchronous=NORMAL, but WAL mode does lose durability. A transaction committed in WAL mode with synchronous=NORMAL might roll back following a power loss or system crash. Transactions are durable across application crashes regardless of the synchronous setting or journal mode.
+
+The last sentence is [the first part](/blog/your-data-is-not-on-disk-when-write-returns) of this series in SQLite's words: the frames are in the page cache, so a crash of the application loses nothing. The middle sentence is the machine crash: if the power would go, the frames written since the last sync can be lost, and with them the last transactions. Consistent means that the database comes back as it was after some earlier commit, never half of one, because the checksums and the commit frames tell SQLite where to stop.
+
+And FULL in WAL mode is a different case than FULL in rollback mode. The same page says that "FULL is atomic, consistent, isolated, and durable (ACID) in WAL mode", while in rollback mode FULL "is not necessarily durable across a power loss", which is the missing directory sync of the previous part. So on this laptop WAL with FULL is faster than the default and also gives the stronger promise.
+
+## Choosing between them
+
+My opinion after these traces: NORMAL in WAL mode is a reasonable setting when you can say how much you are ready to lose. On this machine, frames that were not synced are in the page cache, and with the default writeback settings of part 1 they can stay there for about 30 seconds, or until the next checkpoint. So "maybe not durable" here means: up to about the last 30 seconds of commits before a power cut, and, as the documentation promises, never a corrupt database. For a cache, a history, a list of recently opened files, etc., that is acceptable. For anything where an `ok` goes to a person, FULL in WAL mode costs one flush per commit and keeps the promise.
+
+The next part puts this choice next to the same choice in PostgreSQL, MySQL and Redis.
+
+The traces are in [p14-trace.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/what-survives-a-crash/results/p14-trace.txt) and the timings in [p14-bench.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/what-survives-a-crash/results/p14-bench.txt), from the [fixture](https://github.com/mehdiakiki/mehdi-cz/tree/main/experiments/what-survives-a-crash).
+
+## Further reading
+
+- [Write-Ahead Logging, SQLite documentation](https://www.sqlite.org/wal.html)
+- [Pragma statements supported by SQLite: synchronous](https://www.sqlite.org/pragma.html#pragma_synchronous)
+- [Database File Format: the WAL file format](https://www.sqlite.org/fileformat2.html)

@@ -1,0 +1,152 @@
+---
+title: "Checkpointing a Log Without Losing the Tail"
+date: "2026-09-25T08:30:00+01:00"
+lastmod: "2026-09-25T08:30:00+01:00"
+tags: ["what survives a crash", "rust", "databases", "checkpoints", "reliability"]
+draft: false
+reviewed: true
+reviewedHash: "d472ebd203e71d9946b392743f000fbe85bd4edafb064fc6460df7bbf4d15caf"
+cluster: "reliable-data-integrations"
+campaign: "editorial"
+summary: "A log needs a checkpoint, and the naive one loses data: on a plain restart it dropped two acknowledged operations, and after a crash it counted one twice. Log segments, a durable snapshot and a strict order fix it, and my simulator checks every crash point."
+---
+
+The store said `ok` to six operations. I stopped it normally, started it again, and two of them were gone:
+
+```text
+== kv --bug lose-tail: the commands, then a clean restart, no crash
+snapshot covers 0, replayed 1 records, cut 0 bytes of torn tail
+a=1
+b=2
+c=5
+e=5
+```
+
+No crash, no power cut, no kill. The commands were `put a 1`, `put b 2`, `add c 5`, `put d 4`, `add c 3`, `put e 5`, so the correct result is `c=8` and a key `d`. Both changes to these keys were acknowledged and are lost. The variant is called `lose-tail`, and it is the most natural way to write a checkpoint. This part is about why, and about the version that keeps everything.
+
+## Why a log needs a checkpoint
+
+The store from [the previous part](/blog/write-ahead-logging-from-scratch) keeps its whole history in the log. That is correct, but the log grows forever, and every start replays all of it. So after one year of puts, the start reads one year of puts. A checkpoint fixes both: write the current map into a snapshot file, and then the old part of the log is not needed anymore.
+
+The obvious version has one log file: write the snapshot, then truncate the log to zero. And a real store cannot stop accepting writes while it writes a big snapshot, so the snapshot is written in the background, from a copy of the map taken at the beginning. Operations continue during that time and go to the log.
+
+To make this order deterministic in a test, my store splits the checkpoint into two commands: `begin-checkpoint` copies the map, and `end-checkpoint` writes the snapshot and cleans the log. The commands of the test put two operations in the middle, where a real store would have a background thread:
+
+```text
+commands: put a 1; put b 2; add c 5; begin-checkpoint; put d 4; add c 3; end-checkpoint; put e 5
+```
+
+Now the lost data is easy to explain. Do you see it already? The copy was taken before `put d 4` and `add c 3`. Those two records were in the log when `end-checkpoint` truncated it, so they are in nothing anymore: not in the snapshot, not in the log. These records, written between the start of the snapshot and the cleaning of the log, are the "tail" in the title of this part.
+
+## A second problem in the same design
+
+The simulator from [part 7](/blog/building-a-tiny-crash-simulator-from-strace-output) found something worse in the same variant:
+
+```text
+== bug: one log, truncated after the snapshot
+  events: 27 (6 ack, 8 data, 2 dirsync, 3 meta, 8 sync)
+  crash points: 28
+  process crash: 28 states, 7 bad
+  machine crash: 42 states (12 distinct), 9 bad (3 distinct)
+  first bad process state: crash after event 21 of 27 (rename snapshot.tmp -> snapshot): 5 operations acknowledged, recovered [('a', '1'), ('b', '2'), ('c', '13'), ('d', '4')] is not the result of any allowed prefix
+```
+
+`c` is 13 after this crash, and it is a process crash, so kill -9 can find it. I did not plan this bug: I wrote the variant for the lost tail, and the simulator found a second problem in it. The snapshot was already renamed, and the log was not truncated yet. So recovery loaded the snapshot (`c=5`) and then replayed the whole log, which still contained `add c 5`: 5 plus 5 plus 3. With only puts this would be invisible, because writing the same value twice changes nothing. With an increment, one record applied twice is wrong. The snapshot does not say where it ends in the log, so recovery cannot know which records it already contains. The next part looks at this problem in recovery itself.
+
+## Segments
+
+The version without these problems splits the log into numbered segment files. Here is the beginning of a checkpoint:
+
+```rust
+    fn begin_checkpoint(&mut self) {
+        let covered = self.segment;
+        if self.bug != Bug::LoseTail {
+            self.start_segment(self.segment + 1);
+        }
+        self.pending = Some((covered, self.map.clone()));
+    }
+```
+
+(The `lose-tail` line is the bug variant.) The important step is `start_segment`: the store creates `log.000002`, syncs the directory, and from now on new records go there. The copy of the map is the state at the end of `log.000001`, no more and no less. So the snapshot covers segment 1, and it says so: its first record is `snapshot 1`. Everything that comes later, the tail, is in segment 2, which the checkpoint never touches.
+
+At the end, the store writes the snapshot with the method of [part 3](/blog/how-to-save-a-file-without-losing-it-write-fsync-rename) and [part 4](/blog/why-the-directory-needs-fsync-too), and only then deletes the old segment. Under strace, the part of the run from `begin-checkpoint` to the last `ok`:
+
+```text
+  open      log.000002 (O_WRONLY|O_CREAT|O_APPEND)
+  fsync     ./
+  write     15 bytes to log.000002
+  fdatasync log.000002
+  write     5 bytes to stdout: ok 4
+  write     15 bytes to log.000002
+  fdatasync log.000002
+  write     5 bytes to stdout: ok 5
+  open      snapshot.tmp (O_WRONLY|O_CREAT|O_TRUNC)
+  write     74 bytes to snapshot.tmp
+  fsync     snapshot.tmp
+  rename    snapshot.tmp -> snapshot
+  fsync     ./
+  unlink    log.000001
+  fsync     ./
+  write     15 bytes to log.000002
+  fdatasync log.000002
+  write     5 bytes to stdout: ok 6
+```
+
+Read the second half slowly, it is the important part. The snapshot data is synced, then renamed, then the directory is synced: now the snapshot is durable. Only after that, `log.000001` is deleted, and the directory is synced again, so the deletion is durable too. Recovery loads the snapshot, reads its number, and replays only the segments after it. If the crash comes after the rename but before the unlink, `log.000001` is still there, recovery ignores it because the snapshot covers it, and it deletes it.
+
+## The wrong order, for comparison
+
+The variant `snapshot-not-durable` has the segments but not the order: it renames the snapshot without the fsync of its data and deletes the old segment. A clean restart is perfect. After a machine crash it is not:
+
+```text
+== bug: old segments deleted before the snapshot is durable
+  events: 27 (6 ack, 7 data, 3 dirsync, 5 meta, 6 sync)
+  crash points: 28
+  process crash: 28 states, 0 bad
+  machine crash: 54 states (16 distinct), 6 bad (2 distinct)
+  first bad machine state: crash after event 23 of 27 (unlink log.000001)
+    promises printed before the crash: ['ok 1\n', 'ok 2\n', 'ok 3\n', 'ok 4\n', 'ok 5\n']
+    model: 5 of 5 name operations kept
+    model: log.000002: content of its last fsync, 0 of 0 unsynced writes kept
+    model: snapshot: new file, no data, 0 of 1 unsynced writes kept
+    on disk: log.000002: 30 bytes
+    on disk: snapshot: 0 bytes
+    checker: 5 operations acknowledged, recovered [('c', '3'), ('d', '4')] is not the result of any allowed prefix
+```
+
+The name operations reached the disk, including the unlink of `log.000001`, but the snapshot has 0 bytes: its data was still only in the page cache, like the 256 MiB of [the first part](/blog/your-data-is-not-on-disk-when-write-returns). Recovery sees a damaged snapshot, ignores it, and replays what is left: the tail in `log.000002`. Five operations were acknowledged and only the last two survive. It is the zero-length file of [part 5](/blog/the-zero-length-file-problem-and-what-ext4-does-about-it), now inside my own store: the empty file is the snapshot, and it was the only copy of most of the data.
+
+And the correct version, under the same simulator:
+
+```text
+== segments: switch the log, write the snapshot durably, then delete old segments
+  events: 29 (6 ack, 7 data, 4 dirsync, 5 meta, 7 sync)
+  crash points: 30
+  process crash: 30 states, 0 bad
+  machine crash: 45 states (13 distinct), 0 bad (0 distinct)
+```
+
+Zero bad states, at every crash point, process and machine.
+
+## The same rule one level higher
+
+There is an article on this site about sync jobs, [When to Advance a Sync Checkpoint After Partial Success](/blog/when-to-advance-a-sync-checkpoint-after-partial-success), and its main rule is: "Advance a checkpoint only after every effect covered by that checkpoint is durable or safely repeatable." I find it interesting that the same rule appears here, inside a storage engine. Deleting a log segment is advancing a checkpoint. It is allowed only when the snapshot that covers this segment is durable. And the snapshot must say what it covers, otherwise "safely repeatable" depends on the kind of operation, like the `c=13` above.
+
+## What it costs
+
+The segment design is not free either:
+
+- Every checkpoint writes the whole map, so the cost grows with the data, not with the changes. Real systems write snapshots less often, or only the changed pages.
+- `begin-checkpoint` copies the map in memory. For a large map this is a lot of memory; real systems use copy-on-write tricks for this.
+- A checkpoint costs one file fsync for the snapshot and three directory fsyncs: for the new segment, for the rename, and for the unlink. On my laptop each of them is in the range of [part 4](/blog/why-the-directory-needs-fsync-too), a few hundred microseconds.
+- Recovery is shorter, but it is now more complicated: it reads a snapshot, chooses segments, deletes old ones, and in my store it even writes a new checkpoint when it replayed something.
+
+That last point is the next part. Recovery writes files too, so recovery can crash too.
+
+The store is `kv.rs` and the driver is `simkv.py` in the [fixture](https://github.com/mehdiakiki/mehdi-cz/tree/main/experiments/what-survives-a-crash). The outputs are [p10-restart.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/what-survives-a-crash/results/p10-restart.txt), [p10-order.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/what-survives-a-crash/results/p10-order.txt) and [p10-simkv.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/what-survives-a-crash/results/p10-simkv.txt).
+
+## Sources
+
+- [rename(2), Linux manual page](https://man7.org/linux/man-pages/man2/rename.2.html)
+- [fsync(2), Linux manual page](https://man7.org/linux/man-pages/man2/fsync.2.html)
+- [unlink(2), Linux manual page](https://man7.org/linux/man-pages/man2/unlink.2.html)

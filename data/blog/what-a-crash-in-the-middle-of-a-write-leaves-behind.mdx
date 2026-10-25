@@ -1,0 +1,132 @@
+---
+title: "What a Crash in the Middle of a Write Leaves Behind"
+date: "2026-09-13T20:50:00+01:00"
+lastmod: "2026-09-13T20:50:00+01:00"
+tags: ["what survives a crash", "linux", "kernel", "concurrency", "reliability"]
+draft: false
+reviewed: true
+reviewedHash: "34df951ee244a83fdacb0c5432893166b4bc7296f552e970cf1d50233819dd73"
+cluster: "reliable-data-integrations"
+campaign: "editorial"
+summary: "One write() call of 1 GiB, killed after 50 ms, left a file of 110 MB. I measured what a single call leaves after kill -9, what another process sees during it, and when appends from four processes mix. Power loss is worse, and I explain why from documentation."
+---
+
+One `write()` call, one buffer of 1 GiB, and a `kill -9` some milliseconds after the call started. What size does the file have?
+
+I was not sure. One call, one system call boundary, so maybe the kernel finishes it, or maybe it writes nothing. So I made the experiment four times, with different delays:
+
+```text
+== kill -9 about 0.02 s after the write() call started, exit status 137
+buffer of 1073741824 bytes ready, calling write() once
+file size 46448640 bytes = 11340 pages of 4 KiB + 0 bytes, content is a prefix of the buffer: true
+== kill -9 about 0.05 s after the write() call started, exit status 137
+buffer of 1073741824 bytes ready, calling write() once
+file size 109744128 bytes = 26793 pages of 4 KiB + 0 bytes, content is a prefix of the buffer: true
+== kill -9 about 0.1 s after the write() call started, exit status 137
+buffer of 1073741824 bytes ready, calling write() once
+file size 189890560 bytes = 46360 pages of 4 KiB + 0 bytes, content is a prefix of the buffer: true
+== kill -9 about 0.2 s after the write() call started, exit status 137
+buffer of 1073741824 bytes ready, calling write() once
+file size 430432256 bytes = 105086 pages of 4 KiB + 0 bytes, content is a prefix of the buffer: true
+```
+
+Neither. The file has whatever the kernel had copied when the signal arrived: 46 MB after about 20 ms, 110 MB after 50 ms, 430 MB after 200 ms. And without a kill, the same call returned after 457 ms with all 1,073,741,824 bytes.
+
+Two details are interesting. The size is always a whole number of pages: "+ 0 bytes" in every run. And the content is always a prefix of the buffer: every page that is in the file is the right page, at the right place. The program has a partial file, but not a damaged one.
+
+## One call, many pages
+
+The kernel does not copy a buffer in one step. In Linux 6.6, a buffered write on ext4 goes to `generic_perform_write` in `mm/filemap.c`, which copies the data into the page cache one page at a time (each step is at most `PAGE_SIZE` bytes). Before each page, it checks this:
+
+```c
+		if (fatal_signal_pending(current)) {
+			status = -EINTR;
+			break;
+		}
+```
+
+SIGKILL is a fatal signal. So the loop stops between two pages, and at the end the function returns `written` if it copied something. The process is dying anyway, so nobody reads this return value, but the file keeps the pages that were copied and the size that covers them. That is the whole number of pages in my results.
+
+So "one call" is not "one step". After a process crash in the middle of a big write, the file can end anywhere on a page boundary. Remember this for the log in a later part: its last record can be cut by a crash even when the program writes each record with one call.
+
+## What another process sees
+
+The next question: while the call is still running, what does another program see? I started a small Python program that prints the size of the file every time it changes (it checks every 5 ms), and then I ran the same 1 GiB write, without a kill:
+
+```text
+== a second process prints the file size each time it changes, while one write() of 1 GiB runs
+buffer of 1073741824 bytes ready, calling write() once
+    502.4 ms  size 10256384
+    507.6 ms  size 21557248
+    512.7 ms  size 32313344
+...
+    922.2 ms  size 1044942848
+    927.4 ms  size 1052717056
+    932.6 ms  size 1062227968
+write() returned 1073741824 after 440 ms
+    937.8 ms  size 1073741824
+```
+
+The reader saw 84 different sizes while the one write call was running, and the final size just after it returned. Each of them was a real state of the file: a reader that opened the file at that moment would read a file of that size, with the first part of the new content.
+
+This is the same lesson as the save in [part 3](/blog/how-to-save-a-file-without-losing-it-write-fsync-rename), from the other side. If another program can open the file while you write it, it can read half of it, even if your program is not dead and even if you use one call. To publish a complete file, write it under another name and rename it.
+
+## Several processes appending to one file
+
+Logs often have several writers. The write(2) man page has a promise for this case: with `O_APPEND`, "the file offset is first set to the end of the file before writing. The adjustment of the file offset and the write operation are performed as an atomic step." So two appends cannot write to the same place. But can they mix their bytes?
+
+I started four processes at the same moment (they wait for a start file). Each process appends records filled with its own letter, `A`, `B`, `C` or `D`, with `O_APPEND`. Then a checker cuts the file in pieces of the record size, and counts the pieces that contain only one letter, and the mixed ones:
+
+```text
+== 4 processes append to one file with O_APPEND at the same time, 1 write() call(s) per record
+  records of      100 bytes: file 4000000 bytes, expected 4000000, records per writer [10000, 10000, 10000, 10000], mixed records 0
+  records of    65536 bytes: file 268435456 bytes, expected 268435456, records per writer [1024, 1024, 1024, 1024], mixed records 0
+  records of  1048576 bytes: file 268435456 bytes, expected 268435456, records per writer [64, 64, 64, 64], mixed records 0
+  records of 16777216 bytes: file 268435456 bytes, expected 268435456, records per writer [4, 4, 4, 4], mixed records 0
+```
+
+Zero mixed records, from 100 bytes to 16 MiB. I expected problems with the big records, so I checked my checker with a second version of the writers, which write each record with two calls of half the size:
+
+```text
+== 4 processes append to one file with O_APPEND at the same time, 2 write() call(s) per record
+  records of      100 bytes: file 4000000 bytes, expected 4000000, records per writer [517, 26, 5, 1278], mixed records 38174
+  records of    65536 bytes: file 268435456 bytes, expected 268435456, records per writer [6, 44, 288, 3], mixed records 3755
+  records of  1048576 bytes: file 268435456 bytes, expected 268435456, records per writer [11, 16, 0, 17], mixed records 212
+  records of 16777216 bytes: file 268435456 bytes, expected 268435456, records per writer [1, 1, 3, 3], mixed records 8
+```
+
+Now most records are mixed, from 95% of them at 100 bytes to half of them at 16 MiB. So the start file works: the four writers really run at the same time, and the checker sees it when they mix. With one call per record, nothing mixed.
+
+Why even for 16 MiB? In the same kernel version, `ext4_buffered_write_iter` in `fs/ext4/file.c` takes the lock of the inode (`inode_lock(inode)`), calls `generic_perform_write`, and only then unlocks. So two buffered writes to the same file on ext4 do not run at the same time. The write(2) man page describes the POSIX side in its BUGS section: writes to regular files "shall be atomic with respect to each other", and Linux fixed the update of the file offset in 3.14.
+
+People often say that appends are atomic only up to `PIPE_BUF`, 4,096 bytes. That limit is for pipes and FIFOs, not for regular files. On ext4 here the real unit is one write call, and the rule for a log with several writers is simple: one record, one call, and check the return value, because a short write would be a broken record.
+
+But this is about running processes. A crash is another story, as the first experiment showed: a writer killed in the middle of a 16 MiB record leaves a partial record at the end of the file, and the other writers continue after it.
+
+## When the machine dies instead
+
+Everything above was a process crash, so the page cache stayed and every copied page reached the disk later. A power loss is different, and here I can only report documentation, because I do not cut the power of my laptop.
+
+After a power loss, what is on the disk is what writeback had written, not what the program wrote, and nothing promises that it was written in the same order. SQLite, for example, writes its whole commit protocol on the assumption that "write operations will be reordered by the operating system". So a big write can be on the disk partly, and not always as a prefix. And at the level of the device, even one block can be torn. My SSD reports a logical block size of 512 bytes (in the machine facts of [the first part](/blog/your-data-is-not-on-disk-when-write-returns)), and a page of 4 KiB is eight of them. The SQLite documentation is careful about this: "SQLite has traditionally assumed that a sector write is not atomic. However, SQLite does always assume that a sector write is linear", which means that after a power failure in the middle of a sector, the first or the last bytes are changed.
+
+PostgreSQL has a setting only for this problem, `full_page_writes`. Its documentation explains: "a page write that is in process during an operating system crash might be only partially completed, leading to an on-disk page that contains a mix of old and new data". So PostgreSQL writes the full page into its log the first time the page changes after each checkpoint, to be able to repair a torn page.
+
+So a crash in the middle of a write can leave three different things, depending on the crash:
+
+- After kill -9: a clean prefix, cut at a page boundary, which other processes could already read.
+- After a power loss, at the file level: some of the pages, not always a prefix.
+- After a power loss, at the device level: maybe a block that is half old and half new.
+
+## Consequences for a program that writes files
+
+For me the first lesson is that one write call is not atomic for a crash, so anything that I append can end with a cut, and the code that reads it must expect this. The second is about readers: another process can open the file in the middle of a write, so if it must see only complete files, I write a temp file and rename it, like in part 3. With several appenders on ext4, one record must be one write call, because two calls are already enough to mix the records of different processes. And every record needs something that a reader can check, a length and a checksum, so that it sees where the valid data ends. This is the subject of the log in a later part, and it is also the reason why databases do not trust a page without a checksum or a full copy in their log.
+
+The program is `bigwrite.rs`, the size watcher is `watchsize.py`, and the outputs are [p06-bigwrite.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/what-survives-a-crash/results/p06-bigwrite.txt), [p06-reader.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/what-survives-a-crash/results/p06-reader.txt) and [p06-append.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/what-survives-a-crash/results/p06-append.txt).
+
+## References
+
+- [write(2), Linux manual page (O_APPEND and the BUGS section)](https://man7.org/linux/man-pages/man2/write.2.html)
+- [mm/filemap.c in Linux 6.6 (generic_perform_write)](https://elixir.bootlin.com/linux/v6.6/source/mm/filemap.c)
+- [fs/ext4/file.c in Linux 6.6 (ext4_buffered_write_iter)](https://elixir.bootlin.com/linux/v6.6/source/fs/ext4/file.c)
+- [SQLite: Atomic Commit In SQLite, section 2, hardware assumptions](https://www.sqlite.org/atomiccommit.html)
+- [PostgreSQL 18 documentation: full_page_writes](https://www.postgresql.org/docs/18/runtime-config-wal.html)

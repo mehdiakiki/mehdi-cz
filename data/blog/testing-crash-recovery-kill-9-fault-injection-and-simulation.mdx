@@ -1,0 +1,107 @@
+---
+title: "Testing Crash Recovery: What kill -9, Fault Injection and Simulation Each Catch"
+date: "2026-10-23T20:35:00+01:00"
+lastmod: "2026-10-23T20:35:00+01:00"
+tags: ["what survives a crash", "testing", "reliability", "rust", "databases"]
+draft: false
+reviewed: true
+reviewedHash: "f99ae05a431d3c8735d39d29597cae16e8a268b2d1790e44964fb589e625b60b"
+cluster: "reliable-data-integrations"
+campaign: "editorial"
+summary: "I tested my key-value store and four versions with one bug each, using kill -9, fault injection, crash simulation and damaged files. Each method found some bugs and missed others, and one bug was invisible to all three crash methods. The table, the real tools, and a look back."
+---
+
+During this series I tested my key-value store in several ways, each one in its own part: a loop of kill -9, an LD_PRELOAD shim that makes calls fail, a simulator of lost page caches. Each test found something. But I never asked the fair question: given one bug, which method finds it? So in this last part I made one more experiment: I took five programs, the correct store and four versions with exactly one bug each, and I gave each program to every method.
+
+## Five programs
+
+All five are the same `kv.rs` from [part 9](/blog/write-ahead-logging-from-scratch), with a flag that switches on one bug:
+
+- `none`: the correct store.
+- `ack-before-fsync`: prints `ok` before the fdatasync of the record (part 9).
+- `no-dir-fsync`: never syncs a directory, so new segments, renames and deletions are not durable ([part 4](/blog/why-the-directory-needs-fsync-too)).
+- `double-apply`: the snapshot does not say which log segment it covers, so recovery can apply increments twice ([part 11](/blog/recovery-code-must-survive-a-crash-too)).
+- `no-crc-check`: recovery checks the lengths of the records but not their CRCs ([part 8](/blog/an-append-only-log-that-survives-a-torn-last-record)).
+
+## Four methods
+
+1. A kill -9 loop: a workload of 60 operations (puts and increments, a checkpoint after every 10), killed at a random moment between 0 and 60 ms, 200 times per program.
+2. Fault injection with the shim of [part 12](/blog/when-fsync-fails-what-postgresql-learned-in-2018): for each of `fdatasync`, `fsync` and `write`, with `EIO` and with `ENOSPC`, make the call number 1, 2, and so on up to 15 fail. That is 90 runs per program, on a short workload of 10 commands.
+3. The simulator of [part 7](/blog/building-a-tiny-crash-simulator-from-strace-output), on the same short workload: every crash point, process and machine.
+4. Damaged files, the idea of the fuzzer of part 8 applied to the store: run the short workload, then set the last 1, 2 or 3 bytes of the log to zero, or flip one bit of the last byte, and recover.
+
+The checker is the same for the first three methods: recovery must give the state after some prefix of the operations, and the prefix must contain every operation that got its `ok`. For damaged files, the damage destroys data on purpose, so the rule is weaker: the state must be the result of some prefix, with or without the acknowledgements, but never something that no prefix gives.
+
+## What each method found
+
+The script prints a table at the end:
+
+```text
+variant               kill -9 loop   fault injection   simulator, process   simulator, machine   damaged files
+none                      0 of 200           0 of 90              0 of 45              0 of 70          0 of 4
+ack-before-fsync          0 of 200           0 of 90              0 of 45              8 of 78          0 of 4
+no-dir-fsync              0 of 200           0 of 90              0 of 38            69 of 236          0 of 4
+double-apply             17 of 200           4 of 90              4 of 45              6 of 70          0 of 4
+no-crc-check              0 of 200           0 of 90              0 of 45              0 of 70          4 of 4
+```
+
+The first row is the most important one, and it is easy to forget: the correct store has zero bad results in every method. A test that complains about a correct program is useless, because people stop reading it.
+
+What does it mean for each bug? `ack-before-fsync` is found only by the simulator, in the machine crash states. With kill -9, the record was in the page cache when the `ok` was printed, so nothing is lost. With fault injection, my shim returns an error, but it never loses data, so the record is there too. The bug exists only when the page cache disappears, and only the simulator removes it.
+
+`no-dir-fsync` is the same story, even stronger: 69 of 236 machine states are bad, and no other method sees one. A name that is not durable is a problem only after a power cut.
+
+`double-apply` is found by all three crash methods. It is a bug in the order of the program itself, so any crash in the right window shows it: 17 of 200 random kills, and 4 of 90 fault runs. The script prints the first fault that found it: `fsync #4 with EIO`. The fourth fsync is the directory sync just after the first snapshot rename, so the injected error stops the store inside the window of part 11. Fault injection is a precise kill at a chosen call.
+
+`no-crc-check` is the interesting one. All three crash methods give zero, and the damaged files give 4 of 4:
+
+```text
+  no-crc-check, damaged files: last byte set to zero: recovered [('b', '2'), ('c', '10'), ('d', '4'), ('e', '\x00')]
+```
+
+The last record was `put e 5`, and its last byte became zero. Without the CRC check, recovery accepted the record with its wrong byte and returned `e` with a value that nobody ever wrote. The correct store, with the same damage, rejected the record and returned the state before it. Why can no crash method see this? Because none of them produces a record with wrong bytes inside: kill -9 cuts between pages, the shim makes calls fail, and my simulator keeps the data of a write or cuts it, but never changes it. The CRC protects against something that my crash models never do, and the test must do it on purpose. For me this is the most useful line of the table.
+
+## What each method really tests
+
+After this table, I see the four methods like this:
+
+- kill -9 tests the program's own order of operations, with the page cache alive. It is cheap and it finds real bugs, like `double-apply`. It cannot find anything about durability, because the kernel keeps everything.
+- Fault injection tests the error paths, and it is a deterministic crash at a chosen call. Its limit is the one of part 12: a shim changes return values, not the state of the page cache.
+- Simulation tests durability: what remains when the page cache is gone. It is only as good as its model, and part 7 explained which states my model allows and which it never produces.
+- Damaging the files tests the format: does the reader detect bytes that are wrong? No crash model does this for you.
+
+So one method is never enough. The bugs that each method finds are almost disjoint.
+
+## The real tools
+
+My scripts are small versions of ideas that researchers and developers built properly, with real filesystems, devices, clusters, etc. These are documented tools; I did not run them here.
+
+ALICE, from the OSDI 2014 paper "All File Systems Are Not Created Equal" by Pillai and others, records the system calls of an application and generates the crash states that different filesystems allow, then runs the application's own checker on them. That is my simulator with real filesystem models. The authors analyzed eleven applications and found 60 vulnerabilities.
+
+CrashMonkey, from "Finding Crash-Consistency Bugs with Bounded Black-Box Crash Testing" by Mohan, Martinez, Ponnapalli, Raju and Chidambaram (OSDI 2018), tests the filesystems themselves: it generates small workloads systematically, simulates crashes after the persistence points, and checks the result. With the workload generator ACE, the paper reports 24 known bugs reproduced and 10 new bugs found in widely used Linux filesystems.
+
+dm-log-writes is a device-mapper target in the Linux kernel. It "takes 2 devices, one to pass all IO to normally, and one to log all of the write operations to", with marks that allow a replay of the log up to a chosen point. Its documentation says that it "is intended for file system developers wishing to verify the integrity of metadata or data". It works below the filesystem, so it sees what really reached the device.
+
+LazyFS is "A FUSE file system with an internal dedicated page cache that only flushes data if explicitly requested by the application. This is useful for simulating power failures and losing unsynced data." A command clears the unsynced data on demand. That is the lost page cache of this series, as a real filesystem that an unmodified program can use.
+
+And FoundationDB built simulation testing into the whole database: "Simulation is able to conduct a deterministic simulation of an entire FoundationDB cluster within a single-threaded process", and the same page explains that this determinism makes a simulated run perfectly repeatable. So a bug found once can be replayed again and again.
+
+## Looking back
+
+Twenty parts ago, the question was simple: when write returns, where is the data? The answer was the page cache, and almost everything after that followed from [the first part](/blog/your-data-is-not-on-disk-when-write-returns): there are two kinds of crash, and they lose different things.
+
+From there the series went down and up again. fsync is the call that waits for the device, and its cost explains a lot of database design. To save a file I need a temp file, an fsync, a rename, and an fsync of the directory too, because a name is also data. ext4 helps careless programs with a heuristic, but a heuristic is not a promise. After a crash in the middle of a write there is a prefix, so a log needs a length and a checksum to find its own end. In my store the difficult part was always the order: the `ok` after the sync, the old log deleted only after the snapshot is durable, and a recovery that can crash and start again. When fsync fails, for me the right reaction is to stop. The databases turn these choices into settings, and behind every setting there is a number of seconds. And then the smaller tools: group commit shares one sync, mmap gives the timing to the kernel, checksums find damage that nobody reports, and one rename switches many files at once.
+
+The same ideas appear one level higher, in systems that exchange messages instead of pages. [The inbox pattern](/blog/the-inbox-pattern-deduplicate-before-business-logic-runs) claims the identity of a message in the same transaction as its effect, like my snapshot carries the number of the segment it covers. And [retried agent actions](/blog/make-retried-agent-actions-idempotent-before-adding-autonomy) have to treat "unknown" as a real result, which is the crash point between my fdatasync and my `ok`.
+
+What I take from the whole series is not really a list of calls, it is more a habit: for every "it is saved" in a program, I want to know which crash it survives, and which test would show me if it does not.
+
+The test script is `crashtest.py` (with `kvcheck.py`) in the [fixture](https://github.com/mehdiakiki/mehdi-cz/tree/main/experiments/what-survives-a-crash), and the full output is [p20-crashtest.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/what-survives-a-crash/results/p20-crashtest.txt). All the series is under the tag [what survives a crash](/blog/tags/what-survives-a-crash/page/1).
+
+## Sources
+
+- [Pillai and others, "All File Systems Are Not Created Equal: On the Complexity of Crafting Crash-Consistent Applications", OSDI 2014](https://www.usenix.org/conference/osdi14/technical-sessions/presentation/pillai)
+- [Mohan, Martinez, Ponnapalli, Raju and Chidambaram, "Finding Crash-Consistency Bugs with Bounded Black-Box Crash Testing", OSDI 2018](https://www.usenix.org/conference/osdi18/presentation/mohan)
+- [dm-log-writes, Linux kernel documentation](https://docs.kernel.org/admin-guide/device-mapper/log-writes.html)
+- [LazyFS, README of the project](https://github.com/dsrhaslab/lazyfs)
+- [FoundationDB: Simulation and Testing](https://apple.github.io/foundationdb/testing.html)

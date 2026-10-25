@@ -1,0 +1,167 @@
+---
+title: "Why Freeing Memory Does Not Shrink Your Process"
+date: "2026-10-15T09:05:00+01:00"
+lastmod: "2026-10-15T09:05:00+01:00"
+tags: ["from source to process", "linux", "memory management", "c", "rust"]
+draft: false
+reviewed: true
+reviewedHash: "62eccce22d062502e381fa612bdd5143736d26df85df3e047e61e31f873cc0ec"
+cluster: "rust-under-the-hood"
+campaign: "editorial"
+summary: "I freed 999,000 of one million small blocks and the process did not become one kilobyte smaller. malloc_stats, strace and malloc_trim show why: the heap can only shrink from its top, glibc keeps the free pages, and threads multiply the arenas. Rust behaves the same."
+---
+
+I allocated one million blocks of 100 bytes, then freed all of them except one block in a thousand. Here is the resident memory of the process after each step, read from `/proc/self/statm`:
+
+```text
+$ SHOW_STATS=1 ./shrink 1 1000
+1 thread(s), 1000000 blocks of 100 bytes, keep every 1000:
+  start                                                Rss    1696 KiB
+  after malloc of all blocks                           Rss  118948 KiB
+  after free of all blocks except every 1000th         Rss  118948 KiB
+```
+
+999,000 calls to `free`, and the Rss did not change by one kilobyte. For the operating system, my program still uses about 116 MiB, but its live blocks need only about 120 KB. A monitoring tool would say that this process never released its memory. Actually it released it to malloc, but malloc did not give it back to the kernel.
+
+The previous part, [about brk and mmap](/blog/when-malloc-asks-the-kernel-for-memory-brk-and-mmap), showed how malloc gets memory from the kernel. This part is about the way back, and why it is so much harder.
+
+## The heap can only shrink from the top
+
+Small blocks live in the heap, one contiguous area that malloc grows with `brk`. My million blocks of 100 bytes take 112 bytes each with malloc's header, so they fill about 112 MB of heap, one after the other. The block that I keep every 1000 blocks sits every 112 KB in this area, from the bottom to the top.
+
+`brk` can only move the end of the heap. mallopt(3) describes the rule with `M_TRIM_THRESHOLD`: "When the amount of contiguous free memory at the top of the heap grows sufficiently large, free(3) employs sbrk(2) to release this memory back to the system." The important words are "at the top". My last kept block is near the top of the heap, so the free memory at the top is small, and everything below is holes between kept blocks. No hole can be given back with `brk`.
+
+glibc can tell how much it holds. `malloc_stats()` printed this right after the frees:
+
+```text
+Arena 0:
+system bytes     =  112029696
+in use bytes     =     120192
+Total (incl. mmap):
+system bytes     =  120033280
+in use bytes     =    8123776
+max mmap regions =          1
+max mmap bytes   =    8003584
+```
+
+The arena, that is the heap of the main thread, has 112,029,696 bytes from the system and 120,192 in use: the 1,000 kept blocks of 112 bytes, and a little more. The total includes one mapping of 8 MB: my array of one million pointers, which came from `calloc` and got its own `mmap`, as in the previous part.
+
+Now the opposite test, where I free every block:
+
+```text
+$ ./shrink 1 0   (free all the blocks)
+1 thread(s), 1000000 blocks of 100 bytes, keep every 0:
+  start                                                Rss    1760 KiB
+  after malloc of all blocks                           Rss  119012 KiB
+  after free of all blocks                             Rss    9768 KiB
+```
+
+Here the memory came back, and strace shows how it came back. I counted also the `brk` and `madvise` calls during each step of both runs:
+
+```text
+$ strace -s 80 -e trace=brk,madvise,write ./shrink 1 1000, system calls during each step
+  after malloc of all blocks                       brk  831   madvise    0
+  after free of all blocks except every 1000th     brk    1   madvise    0
+  after malloc_trim(0)                             brk    1   madvise  999
+  after free of the kept blocks too                brk    1   madvise    0
+$ strace -s 80 -e trace=brk,madvise,write ./shrink 1 0, system calls during each step
+  after malloc of all blocks                       brk  831   madvise    0
+  after free of all blocks                         brk    1   madvise    0
+```
+
+The allocation grew the heap in 831 steps of `brk`. When I free everything, the free chunks join together into one big free area at the top, and one single `brk` gives back about 110 MB. When I keep one block in a thousand, the same frees make one small `brk` at the top, and the rest stays.
+
+## malloc_trim gives back the holes
+
+glibc has a function for this case: `malloc_trim(0)`. After it, the Rss falls from 118,948 KiB to 13,700 KiB, and the kept blocks are still there:
+
+```text
+  after malloc_trim(0)                                 Rss   13700 KiB
+  after free of the kept blocks too                    Rss    9580 KiB
+```
+
+Good, that is what I wanted to see. The strace table says how: 999 calls to `madvise` during this step, one for each hole between two kept blocks. Here are the first ones:
+
+```text
+$ grep madvise trace_1000.txt | head -n 3
+madvise(0x56193eba2000, 102400, MADV_DONTNEED) = 0
+madvise(0x56193ebbc000, 110592, MADV_DONTNEED) = 0
+madvise(0x56193ebd8000, 106496, MADV_DONTNEED) = 0
+```
+
+Each hole is about 108 KB, and `madvise(MADV_DONTNEED)` tells the kernel: I do not need the content of these pages. The madvise(2) man page describes what happens next for private anonymous memory: the pages are freed, the range stays mapped, and the next access gives pages filled with zeros. So the address space of the heap does not change, but the physical memory behind the holes is gone. Only the pages that contain kept blocks, and the headers of the free chunks at the edges of the holes, stay in RAM.
+
+Why does `free` not do this itself? I can only guess from what I measured: every `madvise` is a system call, and every page given back costs a page fault later, when malloc uses the hole again (the part about demand paging measured about a microsecond per page). For a program that frees and allocates all the time, keeping the pages is faster. For a program that had one big peak and then stays small, it is wasted memory.
+
+The last 9.5 MB that remain are the start of the process and my 8 MB array of pointers.
+
+## Threads have their own heaps
+
+With threads, glibc does not use one heap. I made the same test with 8 threads, each one allocating and freeing its own part of the blocks:
+
+```text
+$ SHOW_STATS=1 ./shrink 8 1000
+8 thread(s), 1000000 blocks of 100 bytes, keep every 1000:
+  start                                                Rss    1756 KiB
+  after malloc of all blocks                           Rss  119200 KiB
+  after free of all blocks except every 1000th         Rss  119216 KiB
+Arena 0:
+system bytes     =     139264
+in use bytes     =       8704
+Arena 1:
+system bytes     =   14004224
+in use bytes     =      16160
+...
+Arena 8:
+system bytes     =   14004224
+in use bytes     =      16160
+```
+
+Nine arenas now: arena 0 for the main thread, which did almost nothing, and one arena for each of my 8 threads, each with 14 MB from the system and 16 KB in use. glibc gives threads separate arenas so that they do not wait for the same lock in every `malloc`. mallopt(3) says that the limit of arenas "is usually calculated as a multiple of the number of available CPUs", so on a machine with 16 CPUs a program with many threads can have dozens of them. The same problem then exists in every arena: memory freed in one thread's arena cannot help another arena, and each one keeps its holes.
+
+`MALLOC_ARENA_MAX=1` forces all the threads to share one arena:
+
+```text
+$ SHOW_STATS=1 MALLOC_ARENA_MAX=1 ./shrink 8 1000
+8 thread(s), 1000000 blocks of 100 bytes, keep every 1000:
+  start                                                Rss    1632 KiB
+  after malloc of all blocks                           Rss  119172 KiB
+  after free of all blocks except every 1000th         Rss  119176 KiB
+Arena 0:
+system bytes     =  112029696
+in use bytes     =     120704
+```
+
+In fact, one arena with 112 MB, exactly like the single thread. In my test the total is the same in both cases, because every thread allocated the same amount once. In a real server, where threads allocate in waves, several arenas can each keep their own peak, and fewer arenas means less memory held and more waiting for locks. In both runs `malloc_trim(0)` brought the Rss down to about 14 MB, so it worked on all the arenas.
+
+## Rust uses the same allocator
+
+A Rust program uses glibc's malloc by default (the two `brk` calls of the Rust hello world in [the first part of this series](/blog/what-happens-when-you-run-a-program-from-execve-to-main) came from this malloc too), so I expected the same result:
+
+```text
+$ ./shrink_rs
+Rust, 1000000 boxes of 100 bytes, keep every 1000:
+  start                                                Rss    2116 KiB
+  after creating all boxes                             Rss  119308 KiB
+  after dropping all boxes except every 1000th         Rss  119308 KiB
+  after malloc_trim(0)                                 Rss   14060 KiB
+  kept boxes still readable, sum of first bytes: 124128
+```
+
+Same story. Dropping a `Box` calls `free`, the Rss does not move, and `malloc_trim`, declared in an `extern "C"` block, gives the holes back. The ownership rules of Rust decide when memory is freed, not where it goes after that.
+
+## Other allocators
+
+Other allocators choose differently, and I did not measure them here (they are not installed on this machine). The jemalloc manual describes an option `opt.dirty_decay_ms`, with a default of 10 seconds: unused dirty pages are released gradually over this time instead of being kept forever. The mimalloc documentation says that when one of its pages becomes empty, "the memory is marked to the OS as unused", and that its many small free lists, one per mimalloc page, make empty pages more likely. Both are a different tradeoff between memory and speed, and both can be used from C or as a Rust global allocator.
+
+## What to do when a process stays big
+
+First I would look at the numbers of malloc itself: `malloc_stats()`, or `mallinfo2()`, shows the memory held against the memory in use, and if they are far apart, the memory is free inside malloc. Then remember that a heap shrinks with `brk` only from the top, so one long-lived small block at the end keeps everything below it. `malloc_trim(0)` gives back the free pages of all the arenas with `madvise`, and the price is page faults when the memory is used again, so after a known peak it is cheap to call. With many threads, count the arenas and try `MALLOC_ARENA_MAX`. And if the pattern is "a big peak, then small for a long time", an allocator that returns memory over time can fit better than tuning glibc.
+
+## Sources
+
+- mallopt(3), `M_TRIM_THRESHOLD`, `M_ARENA_MAX` and the arena limit: https://man7.org/linux/man-pages/man3/mallopt.3.html
+- madvise(2), `MADV_DONTNEED`: https://man7.org/linux/man-pages/man2/madvise.2.html
+- The jemalloc manual, `opt.dirty_decay_ms`: https://jemalloc.net/jemalloc.3.html
+- mimalloc, eager page purging and free list sharding: https://microsoft.github.io/mimalloc/
+- The programs and the saved outputs of this part: https://github.com/mehdiakiki/mehdi-cz/tree/main/experiments/from-source-to-process/p16

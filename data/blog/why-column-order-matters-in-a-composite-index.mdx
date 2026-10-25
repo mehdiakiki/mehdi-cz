@@ -1,0 +1,136 @@
+---
+title: "Why Column Order Matters in a Composite Index"
+date: "2026-07-11T10:00:00+01:00"
+lastmod: "2026-07-11T10:00:00+01:00"
+tags: ["inside a database index", "databases", "sqlite", "indexing", "pagination"]
+draft: false
+reviewed: true
+reviewedHash: "f2abeb108c4d15cfecf1f95319569b754d21172ba040ba5210f59c4671cd1cc1"
+campaign: "editorial"
+summary: "Two indexes with the same two columns in a different order. For the same query, one reads 1,885 entries and the other 27,243. I measured why on a SQLite table of one million rows, and found that the leftmost-column rule has an exception called skip-scan."
+---
+
+Here is a question that looks like a detail. A query filters on two columns, `country` and `created_at`. You create an index on both. Does the order of the two columns in the index matter, if the query uses both of them anyway?
+
+On my table of one million users, the answer is yes, by a factor of five in time and a factor of 14 in entries read. I made the same query use `(country, created_at)` and then `(created_at, country)`, and I wanted to understand exactly where the difference comes from, because the rule people repeat ("equality columns first, then the range column") was never obvious for me.
+
+The table is the same as in the whole series: one million generated users, created from 2023 to the end of 2025, from 20 countries (Germany, `DE`, has 69,849 of them). The [first part](/blog/an-index-is-a-second-copy-of-your-data) showed that an index is a sorted copy of its columns plus the rowid, and the [second part](/blog/reading-explain-query-plan-scan-versus-search) how to read a plan.
+
+## How the entries are sorted
+
+An index on `(country, created_at)` sorts its entries by country first. Inside one country, it sorts by `created_at`. And inside one `created_at` value, by the rowid, because the rowid is always the last part of an index entry. So the index looks like a phone book: all of `AU` in date order, then all of `BR` in date order, and so on.
+
+Now the query:
+
+```text
+SELECT count(email) FROM users WHERE country = 'DE' AND created_at > '2025-12-01';
+QUERY PLAN
+`--SEARCH users USING INDEX users_country_created (country=? AND created_at>?)
+1885
+...
+Virtual Machine Steps:               9440
+```
+
+The equality `country = 'DE'` selects one block of the index, and this block is sorted by date. So `created_at > '2025-12-01'` is one contiguous piece at the end of the block. SQLite seeks to the first entry with `DE` and a date after December 1, reads forward, and stops at the first entry of the next country. 1,885 entries, 1,885 matching rows, nothing read for nothing. Both terms are in the parentheses of the plan, so both are used for the seek. Median time: 453.2 µs.
+
+## The other order
+
+The same query, forced to use an index on `(created_at, country)`:
+
+```text
+SELECT count(email) FROM users INDEXED BY users_created_country WHERE country = 'DE' AND created_at > '2025-12-01';
+QUERY PLAN
+`--SEARCH users USING INDEX users_created_country (created_at>?)
+1885
+Page cache hits:                     3108
+Page cache misses:                   610
+Fullscan Steps:                      0
+Sort Operations:                     0
+Virtual Machine Steps:               112756
+```
+
+Look at the parentheses: only `created_at>?`. This index is sorted by date first, so the range gives a contiguous piece again, but now it contains every user created after December 1, from all 20 countries: 27,243 entries. Inside this piece the countries are mixed, in the order of the dates, so the `DE` entries are not together and the index cannot jump to them. SQLite reads all 27,243 entries and checks the country on each one.
+
+It checks it in the index entry itself, without reading the table, so the number of pages is almost the same (3,108 hits and 610 misses, against 3,524 page reads in total for the first index). But the virtual machine did 112,756 steps instead of 9,440, and the time is 2.24 ms instead of 453.2 µs. Five times slower, for exactly the same result. Same columns, same query, only the order is different.
+
+So this is the rule, and now I see why it is a rule. After an equality on the first column, the second column is still sorted, and a range on it is one piece. After a range on the first column, the second column is not sorted anymore inside the piece, and it can only be used as a filter. So the columns compared with `=` go first, and the column compared with a range goes after them. The SQLite documentation has the same rule: "The right-most column that is used can employ inequalities."
+
+## Only the second column
+
+What about a query on `created_at` alone, with only the index `(country, created_at)`? The usual answer is: the index is useless, because the query does not use its first column. Actually, without statistics, SQLite agrees:
+
+```text
+SELECT count(email) FROM users WHERE created_at > '2025-12-01';
+QUERY PLAN
+`--SCAN users
+27243
+```
+
+A full table scan, 3,054,498 virtual machine steps. But after `ANALYZE`, which writes this line into `sqlite_stat1`:
+
+```text
+users|users_country_created|1000000 50000 1
+```
+
+(one million entries, about 50,000 per country, and about 1 per country and date) the same query gets another plan:
+
+```text
+SELECT count(email) FROM users WHERE created_at > '2025-12-01';
+QUERY PLAN
+`--SEARCH users USING INDEX users_country_created (ANY(country) AND created_at>?)
+27243
+```
+
+`ANY(country)` is a skip-scan, that is a scan that jumps from one country to the next. SQLite takes the first country of the index and does the normal seek for `country = 'AU' AND created_at > ...`, reads that piece, then jumps to the next country and does it again. 20 countries, two small seeks for each (in the bytecode, one `SeekGT` on the country alone to jump over the current country, and one on the country and the date), and almost every entry that it reads is a match. 7.72 ms, against 50.21 ms for the table scan.
+
+The documentation explains the conditions, and they match what I saw. Skip-scan "only becomes profitable" when each value of the first column repeats "about 18 or more" times, and "a skip-scan is never used on a database that has not been analyzed". Without statistics, SQLite cannot know that there are only 20 countries. With 50,000 rows per country, it is very profitable. If the first column had one million different values, a skip-scan would need two million seeks, and the table scan would be better. So the leftmost-column rule is true for most cases, but in SQLite it has this exception, and the exception depends on statistics. (Statistics get their own part later in this series.)
+
+## The order is already there
+
+The same index also answers "the three newest users from Germany" without any sort:
+
+```text
+SELECT id, email FROM users WHERE country = 'DE' ORDER BY created_at DESC LIMIT 3;
+QUERY PLAN
+`--SEARCH users USING INDEX users_country_created (country=?)
+```
+
+No `USE TEMP B-TREE`. Inside the `DE` block, the entries are already in date order, so SQLite starts at the end of the block and reads backwards: 30 instructions, 6.4 µs. With an index on `country` alone, the plan becomes `SEARCH users USING INDEX users_country (country=?)` plus `USE TEMP B-TREE FOR ORDER BY`. SQLite must read all 69,849 users of Germany to know which three are the newest: 908,053 instructions and 46.57 ms.
+
+## Pages of a list
+
+This is also why the order of columns decides which pagination is cheap. Another article on this site, [Cursor Pagination vs Offset Pagination](/blog/cursor-vs-offset-pagination), explains the two styles and says that a cursor needs a unique, ordered key, like a `(timestamp, id)` pair. I measured both for "users of Germany, newest first, 20 per page", with the index `(country, created_at)`:
+
+```text
+rows 0 to 19: offset median 18.5 us (min 17.9 us, max 28.4 us, 15 runs)
+    cursor median 18.5 us (min 18.0 us, max 19.9 us, 15 runs), same rows: True
+rows 2000 to 2019: offset median 75.4 us (min 74.2 us, max 117.6 us, 15 runs)
+    cursor median 29.2 us (min 28.7 us, max 30.2 us, 15 runs), same rows: True
+rows 20000 to 20019: offset median 599.1 us (min 579.0 us, max 1.08 ms, 15 runs)
+    cursor median 28.7 us (min 28.3 us, max 34.0 us, 15 runs), same rows: True
+rows 60000 to 60019: offset median 1.73 ms (min 1.70 ms, max 1.78 ms, 15 runs)
+    cursor median 32.0 us (min 28.6 us, max 46.3 us, 15 runs), same rows: True
+```
+
+The offset version, `ORDER BY created_at DESC, id DESC LIMIT 20 OFFSET 60000`, walks through 60,000 index entries to throw them away, so its time grows with the page number. The cursor version asks for `(created_at, id) < (?, ?)` with the values of the last row of the previous page. The plan is `SEARCH users USING INDEX users_country_created (country=? AND created_at<?)`: one seek in the `DE` block, then 20 entries. Around 30 µs on every page, and the same rows as the offset version.
+
+I liked one detail here. The cursor needs the id as a tie-breaker, and I did not have to add it to the index: every SQLite index entry ends with the rowid already, so `(country, created_at)` is in fact `(country, created_at, rowid)`, exactly the order of `ORDER BY created_at DESC, id DESC`.
+
+## The rule in PostgreSQL 18 and MySQL 8.4
+
+The PostgreSQL 18 documentation gives the same rule as an "exact rule": "equality constraints on leading columns, plus any inequality constraints on the first column that does not have an equality constraint, will always be used to limit the portion of the index that is scanned". Conditions on later columns are checked in the index, like my second index did. PostgreSQL 18 also has a skip scan for B-tree indexes, and its documentation says it is "generally only taken when there are so few distinct" values in the first column that most of the index can be skipped. MySQL 8.4 has a "Skip Scan Range Access Method" too, with more conditions, for example that the query uses only columns of the index. I did not measure these two, but the shape is the same everywhere: the first columns decide where the index can jump.
+
+## Choosing the order
+
+So I start from the queries, not from the columns. The columns compared with `=` go first, and the column with the range or the ORDER BY goes after them. The plan confirms it: the terms inside the parentheses are the ones used for the jump, and the others are only filters. An index on `(a, b)` also serves the queries on `a` alone, so a second index on `a` is usually wasted space. It does not serve the queries on `b` alone, except with a skip-scan, and that needs `ANALYZE` and few values of `a`.
+
+One question stays open. What if two important queries need two different orders? Then there is no single good order, and you pay for two indexes, with everything that [part 3](/blog/what-an-index-costs-on-every-insert) measured on each insert.
+
+The scripts are in the [fixture of this series](https://github.com/mehdiakiki/mehdi-cz/tree/main/experiments/inside-a-database-index), and the complete output is in [p04-column-order.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/inside-a-database-index/results/p04-column-order.txt), with the bytecode of the skip-scan in [p04-skip-scan.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/inside-a-database-index/results/p04-skip-scan.txt).
+
+## Further reading
+
+- SQLite, [The SQLite Query Optimizer Overview](https://sqlite.org/optoverview.html): the rules for multi-column indexes, and the skip-scan optimization.
+- SQLite, [Query Planning](https://sqlite.org/queryplanner.html): multi-column indices and sorting with an index.
+- PostgreSQL 18, [Multicolumn Indexes](https://www.postgresql.org/docs/18/indexes-multicolumn.html).
+- MySQL 8.4, [Range Optimization](https://dev.mysql.com/doc/refman/8.4/en/range-optimization.html), section "Skip Scan Range Access Method".

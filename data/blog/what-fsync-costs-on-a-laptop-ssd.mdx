@@ -1,0 +1,153 @@
+---
+title: "What fsync Costs on a Laptop SSD"
+date: "2026-09-01T15:55:00+01:00"
+lastmod: "2026-09-01T15:55:00+01:00"
+tags: ["what survives a crash", "linux", "performance", "databases", "rust"]
+draft: false
+reviewed: true
+reviewedHash: "c7b7a05492d3ac2a2ba26a91f9d28fd85cdec99c3545a3c892d8a32197864ae6"
+cluster: "reliable-data-integrations"
+campaign: "editorial"
+summary: "I measured 1,000 rounds of a 4 KiB write followed by a sync on my laptop: about 540 microseconds for an append, 208 for an overwrite in place, a slowest round eleven times the median, and 3.6 microseconds on tmpfs, where fsync waits for nothing."
+---
+
+542 microseconds. This is the median time of one round of "append 4 KiB to a file, then fsync" on my laptop. So one writer that appends records and syncs each one can make around 1,650 of them durable per second, whatever the CPU does. Later in this part, the same 4 KiB cost less than half of this.
+
+In [the first part](/blog/your-data-is-not-on-disk-when-write-returns) I measured one big fsync of 256 MiB. But this is not how a database uses fsync. A database writes a small record, a commit, and it must sync it before it answers. So this time I measured the small case, many times, and I looked at the whole distribution, not only at the average.
+
+## Four ways to make 4 KiB durable
+
+The program does 1,000 rounds, and in each round one block of 4 KiB must be durable before the next round starts. There are four modes:
+
+1. append-fsync: write 4 KiB at the end of the file, then fsync.
+2. append-fdatasync: the same with fdatasync, which may skip metadata that is not needed to read the data back.
+3. overwrite-fdatasync: the file is first filled with 1,000 blocks and synced, and then every round rewrites one existing block with pwrite and calls fdatasync. The size of the file never changes.
+4. dsync: the file is opened with `O_DSYNC`, so every write waits by itself. The open(2) man page describes it "as though each write(2) was followed by a call to fdatasync(2)".
+
+Each round is timed. Around each round, the program reads also the counters of the disk (`/sys/block/nvme0n1/stat`), like in the first part: KiB written and flush requests, for the whole disk.
+
+Here are the four summaries (I cut the histograms, they come later):
+
+```text
+== 1000 rounds of 4 KiB with a sync after each, ext4 on NVMe, machine load: load average: 2.27, 3.52, 5.81
+append-fsync: 1000 rounds of 4 KiB, 1651 rounds per second
+  min 403 us, p50 542 us, p90 688 us, p99 1108 us, max 5968 us
+  whole disk during the loop: 1000 flushes, 28484 KiB written
+...
+append-fdatasync: 1000 rounds of 4 KiB, 1609 rounds per second
+  min 408 us, p50 536 us, p90 731 us, p99 1188 us, max 3519 us
+  whole disk during the loop: 1000 flushes, 32724 KiB written
+...
+overwrite-fdatasync: 1000 rounds of 4 KiB, 4263 rounds per second
+  min 197 us, p50 208 us, p90 215 us, p99 280 us, max 378 us
+  whole disk during the loop: 1000 flushes, 4000 KiB written
+...
+dsync: 1000 rounds of 4 KiB, 1693 rounds per second
+  min 402 us, p50 499 us, p90 715 us, p99 1269 us, max 5345 us
+  whole disk during the loop: 1000 flushes, 29100 KiB written
+```
+
+Several things are in these lines.
+
+The three append modes cost the same: between 499 and 542 microseconds in the median, around 1,600 to 1,700 rounds per second. fdatasync did not help at all. I expected a small gain, so I read the man page again. fdatasync may skip metadata, but not the file size: "a change to the file size (st_size, as made by say ftruncate(2)), would require a metadata flush". And an append changes the size every time. `O_DSYNC` is the same work done inside write, so it gives the same numbers.
+
+The overwrite mode, in contrast, is 2.6 times faster: 208 microseconds in the median, 4,263 rounds per second. Here nothing in the metadata changes that matters for reading the data back, so fdatasync can really skip the metadata.
+
+And the disk counters show why. Every mode has exactly 1,000 flushes for 1,000 rounds, so every sync, even the cheap one, asked the SSD to flush its cache. But the bytes are different. The overwrite loop wrote 4,000 KiB, exactly 4 KiB per round, my block and nothing more. The append loops wrote between 28 and 33 KiB per round, and 28 KiB in the median round: my 4 KiB plus 24 KiB that I did not write myself.
+
+## The 24 KiB that I did not write
+
+These 24 KiB are the journal. When the size of the file changes, ext4 must make the new size and the new block allocation durable too, so the sync commits a journal transaction. The ext4 documentation describes the shape of a transaction in the journal: a descriptor block that says where the following blocks belong, then copies of the changed metadata blocks, then a commit block, which "indicates that a transaction has been completely written to the journal". With 4 KiB blocks, a few metadata blocks plus a descriptor and a commit come quickly to 24 KiB.
+
+ext4 has also a lighter mode, fast commits, that writes "the minimal delta needed to recreate the affected metadata". It is a feature of the filesystem, `fast_commit`, and somebody must switch it on with mke2fs or tune2fs. On my laptop `/proc/fs/ext4/nvme0n1p2/fc_info` says `0 commits` after two weeks of uptime, so this filesystem does not use it, and every append pays a full commit.
+
+So the cost of an append is not only the data. It is the data, the journal commit, and the flush. The overwrite pays only the data and the flush.
+
+This explains a choice that databases make. PostgreSQL syncs its write-ahead log with fdatasync by default on Linux, and it prepares its log files before it needs them. Its documentation for `wal_init_zero` says that filling new log files with zeroes "ensures that space is allocated before we need to write WAL records". In my terms: they want the cheap overwrite mode, not the append mode.
+
+## The tail
+
+The median is the nice number. Here is the histogram of the append-fsync loop:
+
+```text
+append-fsync: 1000 rounds of 4 KiB, 1651 rounds per second
+...
+      256 - 512     us   382  #######################################
+      512 - 1024    us   606  #############################################################
+     1024 - 2048    us     8  #
+     2048 - 4096    us     3  #
+     4096 - 8192    us     1  #
+```
+
+Each `#` is up to 10 rounds. 988 rounds are between 256 microseconds and 1 millisecond. Then 12 rounds are slower, and the slowest one took 5,968 microseconds, eleven times the median. For a database that does one sync per commit, this slow round is a user who waits eleven times longer, for nothing that he did.
+
+The overwrite loop is different. Its maximum was 378 microseconds, less than the median of the append loop:
+
+```text
+overwrite-fdatasync: 1000 rounds of 4 KiB, 4263 rounds per second
+...
+      128 - 256     us   981  ###################################################################################################
+      256 - 512     us    19  ##
+```
+
+So the cheap mode is not only faster, it is also much more stable on this machine. I liked that.
+
+## Why is one round slow?
+
+My first idea was the other programs on the laptop. It is a working machine, and other programs write to the same disk. This is why the program records the disk counters around each round. Here is the median round and the five slowest rounds of the append-fsync loop:
+
+```text
+  median round: 542 us, whole disk during it: 28 KiB written, 1 flushes
+  slow round:   5968 us, whole disk during it: 28 KiB written, 1 flushes
+  slow round:   3612 us, whole disk during it: 28 KiB written, 1 flushes
+  slow round:   2211 us, whole disk during it: 24 KiB written, 1 flushes
+  slow round:   2171 us, whole disk during it: 28 KiB written, 1 flushes
+  slow round:   1781 us, whole disk during it: 28 KiB written, 1 flushes
+```
+
+The idea did not survive. During the slowest round, the whole disk wrote 28 KiB and executed one flush, like during the median round. Nobody else wrote to the disk at the same moment, and my round did not write more. (The counters show only writes and flushes; about reads I cannot say anything.) The other append modes in the results file look the same: the slow rounds wrote 24 to 36 KiB with one flush.
+
+So the extra time was waiting, and from user space I cannot see where. The commit of ext4 is done by a kernel thread of the journal, which must be scheduled. The flush is done inside the SSD, and the SSD does not tell me what else it was doing. I see the start and the end of my call, and these counters, nothing in between. This is the limit of this experiment: I can say what the slow rounds were not, but not what they were.
+
+And the flush alone? On ext4, an fdatasync on a file that has nothing to write still asks the SSD to flush its cache, so I measured this case separately, later, as a fifth mode: 1,000 fdatasync calls on a 4 KiB file that is already synced.
+
+```text
+flush-only: 1000 rounds of fdatasync with nothing to write, 12351 rounds per second
+  min 49 us, p50 53 us, p90 63 us, p99 139 us, max 771 us
+  whole disk during the loop: 1000 flushes, 0 KiB written
+```
+
+One flush per call, and zero bytes written. So of the 208 microseconds of an overwrite round, about 53 are the flush, and the rest is mostly the write of the 4 KiB block to the device. (This run came later, and the machine was a little less loaded, so the comparison is only approximate.)
+
+## The tmpfs trap
+
+Now the same append-fsync loop, but the file is in `/dev/shm`:
+
+```text
+== the same append-fsync loop on tmpfs (tmpfs at /dev/shm), machine load: load average: 2.27, 3.52, 5.81
+append-fsync: 1000 rounds of 4 KiB, 24190 rounds per second
+  min 2.1 us, p50 3.6 us, p90 5.9 us, p99 14 us, max 31 us
+  whole disk during the loop: 0 flushes, 0 KiB written
+```
+
+3.6 microseconds in the median, 150 times faster than the same code on ext4, and zero flushes. Same code, same loop. The kernel documentation says that tmpfs "lives completely in the page cache and optionally on swap". There is no device behind it, so fsync has nothing to wait for. The program cleaned the file after the loop, and the script removed the directory.
+
+This is the one place in this series where I ran a disk experiment on tmpfs on purpose, because the trap is real. On my laptop `/tmp` is tmpfs too (`df -T /tmp` says it). So a benchmark of a database, or a test of a durability setting, that runs in `/tmp` measures memory, and it reports numbers that no real disk can give.
+
+## Where I would spend the effort
+
+The price of durability is not one number. On this laptop, the same 4 KiB cost 208 microseconds or 542 microseconds depending on whether the file size changed, and the slowest round took 5,968 microseconds, for reasons that the counters cannot show. If you want many durable writes per second, the layout of your file matters more than the choice between fsync, fdatasync and `O_DSYNC`: overwrite space that you allocated before, and fdatasync becomes cheap. (I measured only fdatasync in this mode. fsync must also save the new modification time, so it can still need a journal commit.) If you append, all three cost the same.
+
+And always look at the tail. A median of 0.5 ms hides rounds of 6 ms. A later part of the series shows how databases put many records behind one fsync, which is the other way to pay less.
+
+The program is [synccost.rs](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/what-survives-a-crash/synccost.rs) in the fixture, the full output with all histograms is [p02-synccost.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/what-survives-a-crash/results/p02-synccost.txt), the flush-only run is in [p02-flush.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/what-survives-a-crash/results/p02-flush.txt), and the `fc_info` and `df` outputs are in [p02-facts.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/what-survives-a-crash/results/p02-facts.txt).
+
+## Sources
+
+- [fsync(2), Linux manual page](https://man7.org/linux/man-pages/man2/fsync.2.html)
+- [open(2), Linux manual page (O_DSYNC)](https://man7.org/linux/man-pages/man2/open.2.html)
+- [ext4 journal (jbd2), Linux kernel documentation](https://docs.kernel.org/filesystems/ext4/journal.html)
+- [tune2fs(8), Linux manual page](https://man7.org/linux/man-pages/man8/tune2fs.8.html)
+- [Tmpfs, Linux kernel documentation](https://docs.kernel.org/filesystems/tmpfs.html)
+- [Block layer statistics in /sys/block/dev/stat, Linux kernel documentation](https://docs.kernel.org/block/stat.html)
+- [PostgreSQL 18 documentation: Write Ahead Log settings (wal_sync_method, wal_init_zero)](https://www.postgresql.org/docs/18/runtime-config-wal.html)

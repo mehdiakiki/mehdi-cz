@@ -1,0 +1,213 @@
+---
+title: "How the Dynamic Loader Finds a Shared Library"
+date: "2026-09-17T21:15:00+01:00"
+lastmod: "2026-09-17T21:15:00+01:00"
+tags: ["from source to process", "linux", "linker", "c", "rust"]
+draft: false
+reviewed: true
+reviewedHash: "ab75a221fe3704fed7935a52856871f3075098caf83eac4c76d1cdb4e935baf9"
+cluster: "rust-under-the-hood"
+campaign: "editorial"
+summary: "I built a small shared library and a program that needs it, got the famous cannot open shared object file, and fixed it three ways while LD_DEBUG=libs showed every directory the loader tried, including why RPATH and RUNPATH give different answers."
+---
+
+I linked my program with `-lgreet`, and the linker found a file called `libgreet.so`. But this name is not in the program:
+
+```text
+$ gcc -O2 main.c -Llib -lgreet -o prog && readelf -d prog | grep NEEDED
+ 0x0000000000000001 (NEEDED)             Shared library: [libgreet.so.1]
+ 0x0000000000000001 (NEEDED)             Shared library: [libc.so.6]
+```
+
+The program needs `libgreet.so.1`, with a `.1`. And it gives no directory at all. So when it starts, someone must find a file with this name somewhere on the disk. In [the first part of this series](/blog/what-happens-when-you-run-a-program-from-execve-to-main) the loader did this for `libc.so.6` in a few system calls, with its cache. Here I made a library of my own, put it in a place the loader does not know, and watched how it searches.
+
+## A library with a soname
+
+The library has one function:
+
+```c
+#include <stdio.h>
+
+void greet(void)
+{
+    printf("hello from %s\n", GREETING);
+}
+```
+
+`GREETING` is a macro, so I can build two copies that print different things, which I need later. The build follows the usual convention:
+
+```sh
+gcc -O2 -fPIC -shared -DGREETING='"lib/libgreet.so.1"' -Wl,-soname,libgreet.so.1 greet.c -o lib/libgreet.so.1.0
+ln -s libgreet.so.1.0 lib/libgreet.so.1
+ln -s libgreet.so.1 lib/libgreet.so
+```
+
+```text
+$ ls -l lib (type, name, target)
+lrwxrwxrwx libgreet.so -> libgreet.so.1
+lrwxrwxrwx libgreet.so.1 -> libgreet.so.1.0
+-rwxr-xr-x libgreet.so.1.0  
+$ readelf -d lib/libgreet.so.1.0 | grep SONAME
+ 0x000000000000000e (SONAME)             Library soname: [libgreet.so.1]
+```
+
+Three names for one file, and each one has a user. `libgreet.so.1.0` is the real file, with its full version. `libgreet.so` is for the linker: `-lgreet` means "look for libgreet.so". And `libgreet.so.1` is the soname, written inside the library with `-Wl,-soname`. When the linker builds the program, it copies the soname of the library into NEEDED, not the file name it opened. This is the explanation of my first surprise.
+
+Why so complicated? The soname changes only when the library breaks compatibility. Version 1.0 can become 1.1 with a new file, and the link `libgreet.so.1` moves to it: every program that needs `libgreet.so.1` gets the new version without a rebuild. A version 2 gets a new soname, and old programs keep the old one.
+
+## The first run
+
+```text
+$ ./prog
+./prog: error while loading shared libraries: libgreet.so.1: cannot open shared object file: No such file or directory
+exit status 127
+```
+
+The message starts with `./prog:` but the program did not run yet. It is the loader that speaks, before `main`. `LD_DEBUG=libs` asks the loader to tell what it does:
+
+```text
+$ LD_DEBUG=libs ./prog
+    854239:	find library=libgreet.so.1 [0]; searching
+    854239:	 search cache=/etc/ld.so.cache
+    854239:	 search path=/usr/lib/glibc-hwcaps/x86-64-v3:/usr/lib/glibc-hwcaps/x86-64-v2:/usr/lib		(system search path)
+    854239:	  trying file=/usr/lib/glibc-hwcaps/x86-64-v3/libgreet.so.1
+    854239:	    (no such file)
+    854239:	  trying file=/usr/lib/glibc-hwcaps/x86-64-v2/libgreet.so.1
+    854239:	    (no such file)
+    854239:	  trying file=/usr/lib/libgreet.so.1
+    854239:	    (no such file)
+```
+
+First the cache, then the default directory `/usr/lib` (on this system `/lib` is a link to it). Before `/usr/lib` itself, the loader tries two subdirectories, `glibc-hwcaps/x86-64-v3` and `x86-64-v2`. These are places for versions of a library compiled for newer processors. The loader knows which levels this CPU supports:
+
+```text
+$ /usr/lib/ld-linux-x86-64.so.2 --help | tail -n 4
+Subdirectories of glibc-hwcaps directories, in priority order:
+  x86-64-v4
+  x86-64-v3 (supported, searched)
+  x86-64-v2 (supported, searched)
+$ grep -c avx512f /proc/cpuinfo
+0
+```
+
+x86-64-v4 needs AVX-512, and this laptop has none, so v4 is not even tried. I did not expect to see a detail of the CPU in a library search.
+
+## Fix 1: LD_LIBRARY_PATH
+
+```text
+$ LD_LIBRARY_PATH=lib ./prog
+hello from lib/libgreet.so.1
+```
+
+It works, but look at the cost in the debug output:
+
+```text
+    854241:	find library=libc.so.6 [0]; searching
+    854241:	 search path=lib/glibc-hwcaps/x86-64-v3:lib/glibc-hwcaps/x86-64-v2:lib		(LD_LIBRARY_PATH)
+    854241:	  trying file=lib/glibc-hwcaps/x86-64-v3/libc.so.6
+    854241:	    (no such file)
+    854241:	  trying file=lib/glibc-hwcaps/x86-64-v2/libc.so.6
+    854241:	    (no such file)
+    854241:	  trying file=lib/libc.so.6
+    854241:	    (no such file)
+    854241:	 search cache=/etc/ld.so.cache
+    854241:	  trying file=/usr/lib/libc.so.6
+```
+
+`LD_LIBRARY_PATH` is used for every library, not only mine. Now `libc.so.6` is searched first in my directory, three failed tries, and only then in the cache. For one library in one directory this is nothing. With a long `LD_LIBRARY_PATH` and a program with many libraries, every start tries every directory for every library. And the variable goes to every child process too. It is good for a test, not as the normal way to run a program.
+
+## Fix 2: a path inside the program
+
+The linker can write a search path into the program with `-Wl,-rpath`. With `$ORIGIN` the path is relative to the directory of the executable itself:
+
+```text
+$ gcc -O2 main.c -Llib -lgreet -Wl,-rpath,'$ORIGIN/lib' -o prog_runpath && readelf -d prog_runpath | grep PATH
+ 0x000000000000001d (RUNPATH)            Library runpath: [$ORIGIN/lib]
+```
+
+The binutils 2.46 linker that gcc uses here writes `RUNPATH`. With `--disable-new-dtags` it writes the older `RPATH`:
+
+```text
+$ gcc -O2 main.c -Llib -lgreet -Wl,--disable-new-dtags,-rpath,'$ORIGIN/lib' -o prog_rpath && readelf -d prog_rpath | grep PATH
+ 0x000000000000000f (RPATH)              Library rpath: [$ORIGIN/lib]
+```
+
+The loader expands `$ORIGIN` to the real directory (I replaced the long path with DIR):
+
+```text
+    854246:	find library=libgreet.so.1 [0]; searching
+    854246:	 search path=DIR/lib/glibc-hwcaps/x86-64-v3:DIR/lib/glibc-hwcaps/x86-64-v2:DIR/lib		(RUNPATH from file ./prog_runpath)
+    854246:	  trying file=DIR/lib/glibc-hwcaps/x86-64-v3/libgreet.so.1
+    854246:	    (no such file)
+    854246:	  trying file=DIR/lib/glibc-hwcaps/x86-64-v2/libgreet.so.1
+    854246:	    (no such file)
+    854246:	  trying file=DIR/lib/libgreet.so.1
+```
+
+Because the path is relative to the program, I can move the program and its `lib` directory together, and start it from another directory:
+
+```text
+$ cp -a prog_runpath lib moved/ && cd / && DIR/moved/prog_runpath
+hello from lib/libgreet.so.1
+```
+
+OK, now it works without any variable. And the soname matters for real: when I hid the link `libgreet.so.1`, the start failed again, although `libgreet.so.1.0` was still in the directory.
+
+```text
+$ mv lib/libgreet.so.1 lib/libgreet.so.1.away && ./prog_runpath
+./prog_runpath: error while loading shared libraries: libgreet.so.1: cannot open shared object file: No such file or directory
+exit status 127
+```
+
+## RPATH and RUNPATH are not the same
+
+Both entries contain the same path, so do they behave the same? ld.so(8) gives the order of the search: first `DT_RPATH` (only if there is no `DT_RUNPATH`), then `LD_LIBRARY_PATH`, then `DT_RUNPATH`, then the cache, then the default directories. To see it, I built a second copy of the library in `other/` that prints another text, and ran both programs with `LD_LIBRARY_PATH=other`:
+
+```text
+$ LD_LIBRARY_PATH=other ./prog_runpath
+hello from other/libgreet.so.1
+$ LD_LIBRARY_PATH=other ./prog_rpath
+hello from lib/libgreet.so.1
+```
+
+Same path in the file, opposite winners. With RUNPATH the environment variable comes first, so a user can replace the library for a test. With RPATH the path in the file comes before the variable, and the user cannot override it this way. That is probably why the newer RUNPATH is now the default. The man page gives also one more difference, which I did not test: RUNPATH is used only for the direct dependencies of the file, while RPATH applies to the whole tree of dependencies below it.
+
+## Fix 3: the cache
+
+The third way is the one that every system library uses: install the library in a directory that `ldconfig` knows, and let `ldconfig` rebuild `/etc/ld.so.cache`. I did not change the system for this experiment, I only read the cache:
+
+```text
+$ ldconfig -p | head -n 1
+3589 libs found in cache `/etc/ld.so.cache'
+$ ldconfig -p | grep -E 'libc.so.6|libgcc_s.so.1'
+	libgcc_s.so.1 (libc6,x86-64) => /usr/lib/libgcc_s.so.1
+	libgcc_s.so.1 (libc6) => /usr/lib32/libgcc_s.so.1
+	libc.so.6 (libc6,x86-64) => /usr/lib/libc.so.6
+	libc.so.6 (libc6) => /usr/lib32/libc.so.6
+$ cat /etc/ld.so.conf
+# Dynamic linker/loader configuration.
+# See ld.so(8) and ldconfig(8) for details.
+
+include /etc/ld.so.conf.d/*.conf
+include /usr/lib/ld.so.conf.d/*.conf
+```
+
+3,589 libraries, each with its soname, its kind (64-bit or 32-bit) and its path. This is the file the loader mapped in the first part. The Rust hello world finds `libgcc_s.so.1` here in one try:
+
+```text
+$ LD_DEBUG=libs ./hello_rs 2>&1 | grep -A3 'find library=libgcc_s'
+    854269:	find library=libgcc_s.so.1 [0]; searching
+    854269:	 search cache=/etc/ld.so.cache
+    854269:	  trying file=/usr/lib/libgcc_s.so.1
+```
+
+## Which fix for which case
+
+So which one to use? To test a library for one run, `LD_LIBRARY_PATH` is fine, but it applies to all the libraries and to the child processes too. For a program that comes with its own libraries in a known place next to it, `-Wl,-rpath,'$ORIGIN/...'` is the clean way, and with this toolchain it gives RUNPATH. A library for the whole system goes in a standard directory, with a soname and the symlinks, and `ldconfig` puts it in the cache. And when a start fails with this error, `LD_DEBUG=libs` is the first thing to run: it shows every directory and every file that the loader tried.
+
+## References
+
+- ld.so(8), the search order, `$ORIGIN`, the glibc-hwcaps directories and `LD_DEBUG`: https://man7.org/linux/man-pages/man8/ld.so.8.html
+- ldconfig(8): https://man7.org/linux/man-pages/man8/ldconfig.8.html
+- The ld manual, `-rpath`, `-soname` and `--enable-new-dtags`: https://sourceware.org/binutils/docs/ld/Options.html
+- The programs and the saved outputs of this part: https://github.com/mehdiakiki/mehdi-cz/tree/main/experiments/from-source-to-process/p07

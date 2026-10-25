@@ -1,0 +1,144 @@
+---
+title: "Planner Statistics Go Stale Too: ANALYZE and a Plan That Changes"
+date: "2026-07-28T17:25:00+01:00"
+lastmod: "2026-07-28T17:25:00+01:00"
+tags: ["inside a database index", "databases", "sqlite", "query plans", "statistics"]
+draft: false
+reviewed: true
+reviewedHash: "11262a0b563956975fd2e3c5ea69907cd0bb84ef2349bb04a10e9f1087b3ae64"
+campaign: "editorial"
+summary: "Without statistics, SQLite picked the wrong index and took 97 ms instead of 0.9 ms. ANALYZE fixed it. Then I changed the data, and the old statistics kept a slow plan that PRAGMA optimize did not see. Statistics are derived data too, and they can also live in an open connection."
+---
+
+Same table, same two indexes, same query:
+
+```text
+planner's choice ('IS', 'inactive'): SEARCH users USING INDEX users_status (status=?)
+    count 952, median 97.36 ms (min 84.60 ms, max 130.18 ms, 9 runs)
+forced users_country ('IS', 'inactive'): SEARCH users USING INDEX users_country (country=?)
+    count 952, median 900.9 us (min 872.4 us, max 1.10 ms, 9 runs)
+```
+
+The query is `SELECT count(email) FROM users WHERE country = ? AND status = ?`, here for the inactive users of Iceland. The table has an index on `country` and one on `status`, and SQLite chose `status`. With the other index, forced with `INDEXED BY`, the same answer comes a hundred times faster.
+
+SQLite did not choose badly because it is stupid. It chose without information. In this series we saw that an index is derived data, a copy computed from the table. In this part there is a second layer: the statistics about the indexes. They are also computed from the data, stored in the database, and wrong as soon as the data changes. And there is a third layer, in the open connection itself.
+
+The table is again the one million users from [part 1](/blog/an-index-is-a-second-copy-of-your-data). The status is very skewed: 930,260 inactive, 49,956 suspended, 19,784 active. Iceland has 1,023 users.
+
+## A guess of ten rows
+
+In [part 6](/blog/when-the-database-ignores-your-index) we saw the guess that SQLite uses without statistics: about 10 rows for each value. So for the planner, `country = 'IS'` finds about 10 rows, and `status = 'inactive'` also finds about 10 rows. Both indexes look the same, and it took `users_status`. In reality, that index gave 930,260 entries to check one by one against the country, while `users_country` gives 1,023.
+
+For another pair of values, `('US', 'active')`, the same choice of `users_status` was the right one, by luck. The planner made the same decision for both, because for it the two questions look the same.
+
+## What ANALYZE writes
+
+`ANALYZE` reads the indexes and writes what it found into two tables:
+
+```text
+    sqlite_stat1: users|users_country|1000000 50000
+    sqlite_stat1: users|users_status|1000000 333334
+    sqlite_stat4: users_status sample ('active', rowid 889913) nEq 19784 1
+    sqlite_stat4: users_status sample ('inactive', rowid 98150) nEq 930260 1
+...
+    sqlite_stat4: users_status sample ('suspended', rowid 318530) nEq 49956 1
+```
+
+`sqlite_stat1` has one line per index. The first number is the number of rows in the index, and the second is the average number of rows for one value: 50,000 per country and 333,334 per status. For a skewed column, this average is almost useless. No status has 333,334 rows.
+
+`sqlite_stat4` exists because this SQLite was built with STAT4. It stores sample entries of each index: my script decodes the sample, which is a record like the ones in part 1, and prints its `nEq`. For the sample `('active', 889913)`, `nEq` says that 19,784 rows have the same status, and 1 row has the same status and rowid. There are 10 samples for this index (8 of them are 'inactive'), so the planner knows the real count of each status.
+
+After ANALYZE, in a new connection:
+
+```text
+new connection ('IS', 'inactive'): SEARCH users USING INDEX users_country (country=?)
+    count 952, median 922.5 us (min 896.9 us, max 1.25 ms, 9 runs)
+new connection ('US', 'active'): SEARCH users USING INDEX users_status (status=?)
+    count 5501, median 13.20 ms (min 12.86 ms, max 16.23 ms, 9 runs)
+```
+
+Now the plan depends on the values. Same statement, two different indexes, and both are the right choice. The values are bound parameters, and the documentation of `sqlite3_prepare_v2` explains this: with STAT4, when the value of a parameter compared to an indexed column might influence the plan, the statement is compiled again after the binding changes.
+
+## The data changes, the statistics do not
+
+Then I changed the data, the kind of change an application does one day in a migration: old inactive accounts are closed.
+
+```text
+-- UPDATE users SET status = 'closed' WHERE status = 'inactive' AND created_at < '2025-12-01'
+    rows: 1000000 {'active': 19784, 'closed': 904938, 'inactive': 25322, 'suspended': 49956}
+```
+
+904,938 rows changed, and 'inactive' went from 930,260 rows to 25,322. The statistics still say 930,260. Now the inactive users of the US. Which index will SQLite choose?
+
+```text
+app connection, old statistics ('US', 'inactive'): SEARCH users USING INDEX users_country (country=?)
+    count 7143, median 56.71 ms (min 55.20 ms, max 58.99 ms, 9 runs)
+forced users_status ('US', 'inactive'): SEARCH users USING INDEX users_status (status=?)
+    count 7143, median 2.18 ms (min 2.15 ms, max 2.34 ms, 9 runs)
+```
+
+With the old numbers, `users_country` (279,444 users in the US) looks better than `users_status` (930,260 inactive, in the old statistics). With the real numbers, `users_status` has only 25,322 entries. The stale plan is 26 times slower.
+
+The documented answer for this is `PRAGMA optimize`, which runs ANALYZE "on tables that might benefit". It has a debug mode that prints what it would do. Before the first ANALYZE, it printed `ANALYZE "main"."users"`. Now:
+
+```text
+    PRAGMA optimize(0xffff), debug mode: []
+after PRAGMA optimize ('US', 'inactive'): SEARCH users USING INDEX users_country (country=?)
+    count 7143, median 58.91 ms (min 58.18 ms, max 63.26 ms, 9 runs)
+```
+
+Nothing to do, and the plan stays slow. In fact this is exactly what the documentation describes, when you read it closely: the table is analyzed again only if an index has no statistics, or if "the number of rows in the table has increased or decreased by 10-fold since the last time ANALYZE was run". My migration changed 90% of the rows, but not the number of rows. So for `PRAGMA optimize` nothing happened.
+
+I tested also the size rule, by deleting rows. With 10 times fewer rows (100,000 left), the debug mode still printed nothing. With 20 times fewer (50,000), it printed `ANALYZE "main"."users"`. So the 10-fold limit is real, but not exact, and only a plain `ANALYZE` repaired my migration.
+
+## Where a connection keeps its statistics
+
+Here is the part I did not expect. I ran that `ANALYZE` from another process, with the `sqlite3` shell, like a nightly maintenance job would do. The application's connection was open the whole time:
+
+```text
+app connection ('US', 'inactive'): SEARCH users USING INDEX users_country (country=?)
+    count 7143, median 56.30 ms (min 53.33 ms, max 57.18 ms, 9 runs)
+new connection ('US', 'inactive'): SEARCH users USING INDEX users_status (status=?)
+    count 7143, median 2.10 ms (min 2.08 ms, max 2.27 ms, 9 runs)
+app connection after ANALYZE sqlite_schema ('US', 'inactive'): SEARCH users USING INDEX users_status (status=?)
+    count 7143, median 2.14 ms (min 2.09 ms, max 2.23 ms, 9 runs)
+```
+
+The new statistics were in the file, and a new connection used them. The connection that was already open did not. The documentation of ANALYZE explains it: "The query planner loads the content of the statistics tables into memory when the schema is read." The open connection had read the schema before, so its planner kept the old numbers in memory (this second ANALYZE changed only rows of the statistics tables, which existed already, not the schema, so the open connection had no reason to read the schema again). The fix is also documented: `ANALYZE sqlite_schema` makes the connection read the statistics again, and after it the plan was correct.
+
+So the statistics are not only in the database file. There is a copy in each connection, and it can be older than the file.
+
+## And a plan can stay in a statement
+
+One more layer. In the connection that ran the first ANALYZE, Python's `sqlite3` module had kept the prepared statement from before, in its statement cache:
+
+```text
+same connection ('IS', 'inactive'): SEARCH users USING INDEX users_country (country=?)
+    count 952, median 2.23 ms (min 2.03 ms, max 2.40 ms, 9 runs)
+same connection ('US', 'active'): SEARCH users USING INDEX users_country (country=?)
+    count 5501, median 57.45 ms (min 54.69 ms, max 60.16 ms, 9 runs)
+```
+
+The statement was compiled again once after ANALYZE, with the first values it received, `('IS', 'inactive')`, and it got the country index. Then it kept this plan for `('US', 'active')`, where the status index is four times faster (13.20 ms in the new connection). In a new connection, the same statement prepared after ANALYZE changed its plan with the values, as shown above.
+
+It was reproducible, I saw it in every run, so I looked in the source of SQLite 3.51.2. A prepared statement remembers which parameters can change its plan, and a new value for one of them makes it compile again. When the statement is compiled again after a schema change (my first ANALYZE created the two statistics tables, and this is a schema change), it keeps this list from its old version (`sqlite3VdbeSwap` in [vdbeaux.c](https://sqlite.org/src/file?name=src/vdbeaux.c&ci=version-3.51.2)). My statement was first prepared without statistics, when no parameter could change the plan, so after ANALYZE a new value did not make it compile again. So a plan is derived data too, computed from the statistics, and a prepared statement can keep an old one.
+
+The SQLite documentation recommends `PRAGMA optimize=0x10002` when a long-lived connection opens, and `PRAGMA optimize` from time to time. Honestly, with what I measured, I would add one thing: run it before the application prepares its statements, and if another process runs ANALYZE, give the open connections a way to read the statistics again.
+
+## Statistics are derived state
+
+OK, so now there are three copies of the same truth, and each one can be stale. The table is the truth. The statistics are computed from it and stored in `sqlite_stat1` and `sqlite_stat4`. Each connection keeps them in memory. And each prepared statement keeps a plan computed from them. None of them updates itself when the data changes.
+
+PostgreSQL solves the first part differently. Its documentation says that the autovacuum daemon "will automatically issue ANALYZE commands whenever the content of a table has changed sufficiently", and the threshold is compared with "the total number of tuples inserted, updated, or deleted since the last ANALYZE". So there, an UPDATE of 904,938 rows counts, even if the number of rows does not change. In SQLite, nothing runs in the background: you choose when ANALYZE runs, and after a big change in the data, it is your job to run it.
+
+The output of all these steps is in [p07-stale-statistics.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/inside-a-database-index/results/p07-stale-statistics.txt).
+
+## Further reading
+
+- SQLite, [ANALYZE](https://sqlite.org/lang_analyze.html): what it stores, that statistics are not updated as the content changes, and `ANALYZE sqlite_schema`.
+- SQLite, [PRAGMA optimize](https://sqlite.org/pragma.html#pragma_optimize): the mask bits and the rules for when a table is analyzed.
+- SQLite, [Database File Format](https://sqlite.org/fileformat2.html#stat1tab): the sqlite_stat1 and sqlite_stat4 tables.
+- SQLite, [The SQLite Query Optimizer Overview](https://sqlite.org/optoverview.html): the default guess of 10 duplicates per value.
+- SQLite, [sqlite3_prepare_v2](https://sqlite.org/c3ref/prepare.html): when a statement is compiled again because of a bound value.
+- SQLite source of version 3.51.2: [vdbeaux.c](https://sqlite.org/src/file?name=src/vdbeaux.c&ci=version-3.51.2) (`sqlite3VdbeSwap`) and [analyze.c](https://sqlite.org/src/file?name=src/analyze.c&ci=version-3.51.2) (the statistics tables are created only when they do not exist).
+- PostgreSQL 18, [Routine Vacuuming](https://www.postgresql.org/docs/18/routine-vacuuming.html): "Updating Planner Statistics" and "The Autovacuum Daemon".

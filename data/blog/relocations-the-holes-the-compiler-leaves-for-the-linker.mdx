@@ -1,0 +1,242 @@
+---
+title: "Relocations: The Holes the Compiler Leaves for the Linker"
+date: "2026-09-10T16:30:00+01:00"
+lastmod: "2026-09-10T16:30:00+01:00"
+tags: ["from source to process", "linker", "c", "rust", "compiler internals"]
+draft: false
+reviewed: true
+reviewedHash: "e859352bff17051e3032677b3ccb0e94d5c5c262adb095d9ee59e435eae3cf3b"
+cluster: "rust-under-the-hood"
+campaign: "editorial"
+summary: "An object file is full of zero bytes where addresses should be, with a note for each one. I followed these notes through the linker and the loader, computed the filled bytes by hand, and counted the relative relocations that a PIE still needs at startup: 3 in C, 607 in Rust."
+---
+
+What does the compiler write when it does not know an address? I looked at a function that only calls another function, in an object file:
+
+```text
+0000000000000020 <call_greet>:
+  20:	e9 00 00 00 00       	jmp    25 <call_greet+0x5>
+			21: R_X86_64_PLT32	greet-0x4
+```
+
+`e9` is a jump, and the four bytes after it should say where to jump. They are zeros. The line under the instruction is a note for the linker: at offset 0x21, put the address of `greet`, with -4. In the program, after linking, the same instruction is `e9 0b 00 00 00`.
+
+These notes are relocations. In [the previous part](/blog/why-undefined-reference-is-a-linker-error-not-a-compiler-error) one of them produced "undefined reference", because the linker had nothing to put in the hole. Here I follow them in the normal case, from the compiler to the linker and then to the loader, because some holes are still open when the program starts. The tools are the same as in [the first part](/blog/what-happens-when-you-run-a-program-from-execve-to-main): gcc 15.2.1, binutils 2.46, rustc 1.98.0, glibc 2.43.
+
+## Four kinds of holes
+
+The file `holes.c` touches four things that the compiler cannot place alone:
+
+```c
+extern int total;
+void greet(void);
+
+int counter = 1;
+int *pointer = &counter;
+
+int read_counter(void)
+{
+    return counter;
+}
+
+int read_total(void)
+{
+    return total;
+}
+
+void call_greet(void)
+{
+    greet();
+}
+```
+
+A global of this file, a global of another file, a function of another file, and a pointer whose value is an address. A second file, `other.c`, defines `total` and `greet` and has the `main` that calls everything. After `gcc -O2 -c holes.c`, readelf lists the notes:
+
+```text
+Relocation section '.rela.text' at offset 0x248 contains 3 entries:
+    Offset             Info             Type               Symbol's Value  Symbol's Name + Addend
+0000000000000002  0000000400000002 R_X86_64_PC32          0000000000000000 counter - 4
+0000000000000012  0000000600000002 R_X86_64_PC32          0000000000000000 total - 4
+0000000000000021  0000000800000004 R_X86_64_PLT32         0000000000000000 greet - 4
+
+Relocation section '.rela.data.rel.local' at offset 0x290 contains 1 entry:
+    Offset             Info             Type               Symbol's Value  Symbol's Name + Addend
+0000000000000000  0000000400000001 R_X86_64_64            0000000000000000 counter + 0
+```
+
+Each entry has three parts: where the hole is (offset in the section), what kind of value to write (the type), and which symbol plus an addend. The x86-64 psABI gives a formula for each type. With S the address of the symbol, A the addend and P the address of the hole:
+
+- `R_X86_64_PC32` is S + A - P: a distance from the hole to the symbol, on 32 bits. The two `mov` instructions read `counter` and `total` relative to the instruction pointer.
+- `R_X86_64_PLT32` is the same idea for a call or a jump: the distance to the function, or to a small stub (the PLT) when the function is in a shared library.
+- `R_X86_64_64` is S + A: the full 64-bit address. This is the hole inside the data, the value of `pointer`.
+
+Why -4? The distance is counted from the end of the instruction, because the processor has already moved the instruction pointer when it executes it. The hole is the last 4 bytes of the instruction, so the end is the hole plus 4. The addend -4 corrects exactly this.
+
+Interesting detail: `total` is in another file, and the compiler used the same direct `PC32` access as for `counter`. With `-fPIE`, the default here, gcc expects that the variables of a program are in the program itself. A shared library is compiled differently, I come back to this below.
+
+## The linker fills the holes
+
+I linked `holes.o` with `other.o` and disassembled the same functions:
+
+```text
+0000000000001190 <read_counter>:
+    1190:	8b 05 8a 2e 00 00    	mov    0x2e8a(%rip),%eax        # 4020 <counter>
+--
+00000000000011a0 <read_total>:
+    11a0:	8b 05 8a 2e 00 00    	mov    0x2e8a(%rip),%eax        # 4030 <total>
+--
+00000000000011b0 <call_greet>:
+    11b0:	e9 0b 00 00 00       	jmp    11c0 <greet>
+```
+
+Let me check the first one by hand. The hole is 2 bytes after the start of `read_counter`, so P = 0x1192. `counter` is at S = 0x4020 (nm says it too). S + A - P = 0x4020 - 4 - 0x1192 = 0x2e8a. And the bytes are `8a 2e 00 00`, which is 0x2e8a in little endian. Good, the formula works.
+
+The jump: the hole is at 0x11b1, `greet` is at 0x11c0, and 0x11c0 - 4 - 0x11b1 = 0xb, the `0b` in `e9 0b 00 00 00`. The note said PLT32, but `greet` is in the program, so the linker could jump directly and no PLT stub was needed. And `read_total` got the same displacement 0x2e8a as `read_counter`, by chance: `total` is 16 bytes after `counter`, and the instruction is also 16 bytes later.
+
+These holes are closed forever. They are distances inside the program, and the program moves as one block, so the distances are the same at any load address.
+
+## The holes that stay open until the program starts
+
+`pointer` is different. Its value is an absolute address, and a PIE is loaded at a random address. The linker cannot know the final value. So it writes what it knows and leaves a new note for the loader:
+
+```text
+$ readelf -x .data prog
+
+Hex dump of section '.data':
+  0x00004010 00000000 00000000 18400000 00000000 .........@......
+  0x00004020 01000000 00000000 20400000 00000000 ........ @......
+  0x00004030 29000000                            )...
+```
+
+At 0x4028, the 8 bytes `20 40 00 00 00 00 00 00` are 0x4020, the address of `counter` if the program would be loaded at zero. Next to it, 0x4020 holds `01`, the value of `counter`, and 0x4030 holds `29`, which is 41, the value of `total`. And the dynamic relocation table has the note for the loader:
+
+```text
+Relocation section '.rela.dyn' at offset 0x548 contains 9 entries:
+    Offset             Info             Type               Symbol's Value  Symbol's Name + Addend
+0000000000003dd0  0000000000000008 R_X86_64_RELATIVE                         1180
+0000000000003dd8  0000000000000008 R_X86_64_RELATIVE                         1130
+0000000000004018  0000000000000008 R_X86_64_RELATIVE                         4018
+0000000000004028  0000000000000008 R_X86_64_RELATIVE                         4020
+0000000000003fc0  0000000100000006 R_X86_64_GLOB_DAT      0000000000000000 __libc_start_main@GLIBC_2.34 + 0
+...
+```
+
+`R_X86_64_RELATIVE` at 0x4028 with 0x4020: at startup, write the load address plus 0x4020 here. It needs no symbol, only the base. The three others of this type are not mine: an entry of `.init_array` and of `.fini_array` (addresses of functions that run before and after `main`), and `__dso_handle`, which points to itself. The `GLOB_DAT` lines are addresses of symbols from other objects, like `__libc_start_main` in libc, so they need a real symbol lookup. (The two `JUMP_SLOT` relocations for `puts` and `printf` get their own part soon.)
+
+So a PIE is not completely linked. A part of the work moves to every start of the program. Without PIE, nothing stays:
+
+```text
+$ nm prog_nopie | grep -wE 'counter|pointer'
+0000000000404020 D counter
+0000000000404028 D pointer
+$ readelf -x .data prog_nopie
+
+Hex dump of section '.data':
+  0x00404010 00000000 00000000 00000000 00000000 ................
+  0x00404020 01000000 00000000 20404000 00000000 ........ @@.....
+  0x00404030 29000000                            )...
+
+$ readelf -rW prog_nopie | grep -c RELATIVE
+0
+```
+
+With `-no-pie` the program always lives at 0x400000, so the linker writes the final value 0x404020 and there is no RELATIVE relocation at all. This is the price of address randomization for the program: a few writes at startup, and pages that the loader must modify.
+
+## Code for a shared library
+
+For a shared library, gcc uses `-fPIC`, and the code changes:
+
+```text
+$ gcc -O2 -fPIC -c holes.c -o holes_pic.o && objdump -dr holes_pic.o
+0000000000000000 <read_counter>:
+   0:	48 8b 05 00 00 00 00 	mov    0x0(%rip),%rax        # 7 <read_counter+0x7>
+			3: R_X86_64_REX_GOTPCRELX	counter-0x4
+   7:	8b 00                	mov    (%rax),%eax
+   9:	c3                   	ret
+```
+
+Now reading `counter` is two instructions: first load the address of `counter` from a table, the GOT, then read the value. In a shared library, another object can provide its own `counter` and win (this is called interposition, and a later part about LD_PRELOAD uses it), so the code cannot assume where it is. The GOT is the place where the loader writes the final address, once per variable. One relocation for many uses, and the code pages stay untouched and shareable between processes.
+
+## Counting what is left at startup
+
+How many holes stay open in my three programs from the first part? I counted the dynamic relocations by type:
+
+```text
+$ count relocations by type: hello_c_dyn
+Relocation section '.rela.dyn' at offset 0x528 contains 8 entries:
+Relocation section '.rela.plt' at offset 0x5e8 contains 1 entry:
+    R_X86_64_GLOB_DAT        5
+    R_X86_64_JUMP_SLOT       1
+    R_X86_64_RELATIVE        3
+$ count relocations by type: hello_rs
+Relocation section '.rela.dyn' at offset 0xfb0 contains 673 entries:
+Relocation section '.rela.plt' at offset 0x4ec8 contains 1 entry:
+    R_X86_64_GLOB_DAT       66
+    R_X86_64_JUMP_SLOT       1
+    R_X86_64_RELATIVE      607
+```
+
+3 relative relocations in C, 607 in Rust. Where do they point?
+
+```text
+$ python3 reloc_sections.py hello_rs (where the RELATIVE relocations point)
+  .data.rel.ro      384
+  .got              214
+  .data               6
+  .init_array         2
+  .fini_array         1
+```
+
+384 are in `.data.rel.ro`, the section of constant data that contains addresses, the same place as the `&str` static in the part about variables. Vtables, tables of function pointers, etc. are this kind of data too. I did not expect the 214 in the GOT. The Rust code calls many functions through the GOT, even functions that are inside the same binary, and each of these GOT entries needs its relocation in a PIE.
+
+Each RELA entry takes 24 bytes, so these 673 entries are the 16,152 bytes of `.rela.dyn`. glibc itself uses a packed format, RELR, where one 8-byte word can describe many neighbouring addresses. libc has 35 entries that relocate 1,096 locations. LLD can produce it too, with `-z pack-relative-relocs`:
+
+```text
+$ count relocations by type: hello_rs_relr
+Relocation section '.rela.dyn' at offset 0xfd0 contains 66 entries:
+Relocation section '.relr.dyn' at offset 0x1600 contains 25 entries which relocate 607 locations:
+Relocation section '.rela.plt' at offset 0x16c8 contains 1 entry:
+    R_X86_64_GLOB_DAT       66
+    R_X86_64_JUMP_SLOT       1
+```
+
+The same 607 locations in 25 entries of 8 bytes: 200 bytes instead of 14,568.
+
+## What the loader says about its work
+
+glibc's loader can print statistics with `LD_DEBUG=statistics`:
+
+```text
+    785569:	runtime linker statistics:
+    785569:	  total startup time in dynamic loader: 55559 cycles
+    785569:	            time needed for relocation: 1054 cycles (1.8%)
+    785569:	                 number of relocations: 96
+    785569:	      number of relocations from cache: 7
+    785569:	        number of relative relocations: 3
+    785569:	           time needed to load objects: 21177 cycles (38.1%)
+```
+
+The cycles are counted with the time stamp counter, which runs at 2.496 GHz on this machine (I measured it with a small program), so 55,559 cycles are 22 microseconds. This is much less than the 170 microseconds that dynamic linking added to a start in the first part, so most of that difference is outside the time that the loader measures for itself. I did not measure where. One run is noisy, so I ran each program 21 times and took the median. The load average was 6.7 at that moment:
+
+```text
+program          runs    loader total, cycles    relocation, cycles
+hello_c_dyn        21  median    54969 (min 47182)  median    987 (min 774)
+hello_rs           21  median    72830 (min 65291)  median   7026 (min 4888)
+hello_rs_relr      21  median    73649 (min 66557)  median   8165 (min 5754)
+```
+
+Relocation in Rust takes 7 times longer than in C, but it is still only 2.8 microseconds, about a tenth of the loader's time. Loading the objects (opening, mapping) costs more. And the packed format did not make the loader faster here, it was even a bit slower. It made the file smaller, and that is all I can see on this machine.
+
+One more thing I noticed: the counter "number of relative relocations" is 3 and 607, exactly the `RELACOUNT` of the two programs, and 0 for the RELR version, although its 607 relocations are still processed. libc's 1,096 RELR relocations are not in it either. In the glibc source (`elf/rtld.c`), this line is the sum of the `RELACOUNT` tags of the loaded objects, so it shows only one format.
+
+## The holes, in order
+
+At compile time, every address that the compiler does not know becomes zeros and a note. At link time, the linker closes every hole that is a distance inside the program. At load time, the loader closes the rest: absolute addresses in a PIE (RELATIVE), and addresses in other libraries (GLOB_DAT, JUMP_SLOT). The Rust binary has many more of the last kind, mostly because of its constant tables and its calls through the GOT. For a hello world it costs a few microseconds. I am curious how this grows for a big program with thousands of vtables, but I did not measure it here.
+
+## References
+
+- The x86-64 psABI, relocation types and their formulas: https://gitlab.com/x86-psABIs/x86-64-ABI
+- elf(5), relocation entries: https://man7.org/linux/man-pages/man5/elf.5.html
+- ld.so(8), `LD_DEBUG`: https://man7.org/linux/man-pages/man8/ld.so.8.html
+- glibc 2.43, `elf/rtld.c` and the loader statistics: https://sourceware.org/git/?p=glibc.git;a=blob;f=elf/rtld.c;hb=refs/tags/glibc-2.43
+- The saved outputs of this part: https://github.com/mehdiakiki/mehdi-cz/tree/main/experiments/from-source-to-process/results

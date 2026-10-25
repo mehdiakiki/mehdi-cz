@@ -1,0 +1,163 @@
+---
+title: "What a System Call Costs, and Why Some Calls Skip the Kernel"
+date: "2026-10-16T22:05:00+01:00"
+lastmod: "2026-10-16T22:05:00+01:00"
+tags: ["from source to process", "linux", "kernel", "c", "rust"]
+draft: false
+reviewed: true
+reviewedHash: "d742b8ead324eeae2bfd86b8bd3f09361b8bec4c548911f7d7121860fe47a7cb"
+cluster: "rust-under-the-hood"
+campaign: "editorial"
+summary: "On a performance core of my laptop a function call costs 0.6 ns, getpid as a system call 81 ns, and clock_gettime 14 ns through the vDSO but 108 ns as a real system call. I measured both kinds of cores, counted the calls with strace and dumped the vDSO."
+---
+
+Here is the cost of four kinds of calls on my laptop, measured in a loop of one to ten million calls, pinned to one performance core:
+
+```text
+$ taskset -c 2 ./cost   (a performance core)
+  empty function call                              0.6 ns per call (min    0.6, max    0.6)
+  syscall(SYS_getpid)                             81.4 ns per call (min   79.7, max   86.8)
+  clock_gettime(CLOCK_MONOTONIC), vDSO            13.8 ns per call (min   13.7, max   14.4)
+  syscall(SYS_clock_gettime, CLOCK_MONOTONIC)    107.7 ns per call (min  106.0, max  110.8)
+```
+
+A system call that does almost nothing, `getpid`, costs 130 times a function call. And the same `clock_gettime` costs 14 ns or 108 ns, depending only on how I call it. Each line is the median of 7 rounds, and the min and the max are close, so the numbers were stable during this run. Between runs they were not: in [another full run](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/from-source-to-process/results/p17-cost-run2.txt) of the fixture, while another experiment was running, probably on the same core, the raw `clock_gettime` took 182 ns and `process::id()` 135 ns, but `getpid` only 68 ns. So I trust the orders of magnitude here, not the exact nanoseconds.
+
+Since [the first part of this series](/blog/what-happens-when-you-run-a-program-from-execve-to-main), I counted system calls everywhere: 32 before the hello world prints its line, 999 `madvise` calls in `malloc_trim`, etc. This part measures what one of them costs, and shows the trick that the kernel uses to avoid some of them.
+
+## The measurement
+
+Each case is a small loop. The empty function is marked `noinline` and has an empty `asm` statement, so that the compiler keeps a real call (I checked [in the disassembly](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/from-source-to-process/results/p17-empty-function.txt) that the loop contains `call empty_function`, and that the function is two instructions, `mov` and `ret`). The results go to a `volatile` variable, so the compiler cannot remove the loops. `syscall(SYS_getpid)` is the generic glibc function that makes a raw system call with a number, so there is no caching and no shortcut: every call enters the kernel.
+
+## What 81 ns pays for
+
+`getpid` does almost no work in the kernel: it reads one field of the current task. So most of the 81 ns is the round trip itself. The `syscall` instruction jumps to the entry code of the kernel, which switches to the kernel stack and saves the user registers, the kernel checks the system call number, does the work, and returns with `sysret`, restoring everything. Around this, the kernel adds protections against speculative execution attacks. The kernel lists them for this processor:
+
+```text
+$ grep -r . /sys/devices/system/cpu/vulnerabilities/ | sort
+gather_data_sampling:Not affected
+indirect_target_selection:Not affected
+itlb_multihit:Not affected
+l1tf:Not affected
+mds:Not affected
+meltdown:Not affected
+mmio_stale_data:Not affected
+reg_file_data_sampling:Mitigation: Clear Register File
+retbleed:Not affected
+spec_rstack_overflow:Not affected
+spec_store_bypass:Mitigation: Speculative Store Bypass disabled via prctl
+spectre_v1:Mitigation: usercopy/swapgs barriers and __user pointer sanitization
+spectre_v2:Mitigation: Enhanced / Automatic IBRS; IBPB: conditional; PBRSB-eIBRS: SW sequence; BHI: BHI_DIS_S
+srbds:Not affected
+tsa:Not affected
+tsx_async_abort:Not affected
+vmscape:Mitigation: IBPB before exit to userspace
+```
+
+This processor is "Not affected" by Meltdown, so the kernel does not need separate page tables for user and kernel mode, which used to make every system call much more expensive on older processors. Some mitigations are active, for Spectre v2 and for register file data sampling. I did not measure how much each one costs, so I only give this list as context for the numbers: they are the numbers of this kernel with these protections, not of system calls in general.
+
+The raw `clock_gettime` system call costs more than `getpid`, 108 against 81 ns, because the kernel must also read the clock and convert it. So roughly 80 ns of round trip, and 25 ns of real work.
+
+## The efficiency core
+
+The same program on an efficiency core:
+
+```text
+$ taskset -c 10 ./cost   (an efficiency core)
+  empty function call                              1.0 ns per call (min    1.0, max    1.0)
+  syscall(SYS_getpid)                            177.5 ns per call (min  172.4, max  194.7)
+  clock_gettime(CLOCK_MONOTONIC), vDSO            19.5 ns per call (min   18.9, max   20.1)
+  syscall(SYS_clock_gettime, CLOCK_MONOTONIC)    234.3 ns per call (min  228.5, max  242.5)
+```
+
+A function call is 1.7 times slower there, but a system call is more than 2 times slower: 177 ns for `getpid`. The transition into the kernel costs relatively more on these cores. The benchmark series has a part about this difference between the two kinds of cores of this laptop, [The Benchmark Ran on an Efficiency Core](/blog/the-benchmark-ran-on-an-efficiency-core). For system calls, the core where a thread runs can double the price.
+
+## 14 ns without entering the kernel
+
+Now the strange line: `clock_gettime` through glibc costs 13.8 ns, much less than the 80 ns of a round trip into the kernel. In fact it does not enter the kernel at all. strace confirms it. I ran the same program with only 1,000 iterations per round:
+
+```text
+$ strace -c -e trace=getpid,clock_gettime ./cost 1000
+% time     seconds  usecs/call     calls    errors syscall
+------ ----------- ----------- --------- --------- ----------------
+ 58.18    0.014600           2      7000           getpid
+ 41.82    0.010493           1      7000           clock_gettime
+------ ----------- ----------- --------- --------- ----------------
+100.00    0.025093           1     14000           total
+```
+
+7 rounds of 1,000 raw `getpid` calls and 1,000 raw `clock_gettime` calls: 7,000 each. But the program also made 7 rounds of 10,000 `clock_gettime` calls through glibc, plus two more per round for the timing, and none of these 70,000 calls is in the list. For the kernel, they never happened.
+
+They run in the vDSO, the small library that the kernel maps into every process. It is the `[vdso]` line of [the part about /proc/self/maps](/blog/reading-proc-self-maps-line-by-line), and its address is `AT_SYSINFO_EHDR` in [the auxiliary vector](/blog/what-is-on-the-stack-when-a-process-starts-argv-envp-and-auxv). To see it as a library, I made a program that copies these pages from its own memory into a file:
+
+```text
+$ ./vdso_dump vdso.so
+[vdso] at 0x7fa0ad4ef000-0x7fa0ad4f1000, getauxval(AT_SYSINFO_EHDR) = 0x7fa0ad4ef000
+wrote 8192 bytes
+$ readelf -h vdso.so | grep -E 'Type|Machine'
+  Type:                              DYN (Shared object file)
+  Machine:                           Advanced Micro Devices X86-64
+$ readelf --dyn-syms -W vdso.so | grep FUNC
+     1: 0000000000000a50   832 FUNC    WEAK   DEFAULT   12 clock_gettime@@LINUX_2.6
+     2: 00000000000007c0   603 FUNC    GLOBAL DEFAULT   12 __vdso_gettimeofday@@LINUX_2.6
+     3: 0000000000000d90    97 FUNC    WEAK   DEFAULT   12 clock_getres@@LINUX_2.6
+     4: 0000000000000d90    97 FUNC    GLOBAL DEFAULT   12 __vdso_clock_getres@@LINUX_2.6
+     5: 00000000000007c0   603 FUNC    WEAK   DEFAULT   12 gettimeofday@@LINUX_2.6
+     6: 0000000000000a20    44 FUNC    GLOBAL DEFAULT   12 __vdso_time@@LINUX_2.6
+     7: 0000000000000e30   161 FUNC    GLOBAL DEFAULT   12 __vdso_sgx_enter_enclave@@LINUX_2.6
+     8: 0000000000000a20    44 FUNC    WEAK   DEFAULT   12 time@@LINUX_2.6
+     9: 0000000000000a50   832 FUNC    GLOBAL DEFAULT   12 __vdso_clock_gettime@@LINUX_2.6
+    11: 0000000000000e00    43 FUNC    GLOBAL DEFAULT   12 __vdso_getcpu@@LINUX_2.6
+    12: 0000000000000e00    43 FUNC    WEAK   DEFAULT   12 getcpu@@LINUX_2.6
+```
+
+A real ELF shared object of 8 KiB, with a dynamic symbol table, like any library from the earlier parts. I liked this one. `clock_gettime` is 832 bytes of code at offset 0xa50. The vdso(7) man page explains the reason in one sentence: some system calls are used so often by user space that the cost of entering the kernel dominates. The page lists four functions for x86-64; this kernel exports also `clock_getres` and an SGX helper.
+
+How can user code read a kernel clock? The kernel writes the data that the clock needs (the last time base and the conversion factors) into the `[vvar]` pages, which every process can read, and the clock source is the time stamp counter of the processor:
+
+```text
+$ cat /sys/devices/system/clocksource/clocksource0/current_clocksource
+tsc
+```
+
+The vDSO code reads the TSC with an instruction that user space is allowed to use, and computes the time with the data from `[vvar]`. Same result as the system call, without the round trip. The benchmark series measured all the clocks that `clock_gettime` offers, and which of them enter the kernel, in [Which Clock to Use When You Measure Time](/blog/which-clock-to-use-when-you-measure-time).
+
+## Rust
+
+The Rust standard library uses the same paths:
+
+```text
+$ taskset -c 2 ./cost_rs
+  empty function call (black_box)                  0.5 ns per call (min    0.5, max    0.6)
+  std::process::id()                              79.3 ns per call (min   77.2, max   82.9)
+  Instant::now()                                  14.9 ns per call (min   14.5, max   15.4)
+```
+
+`Instant::now()` costs 14.9 ns, the vDSO `clock_gettime` plus a little. `std::process::id()` costs 79 ns, a full system call every time:
+
+```text
+$ strace -c -e trace=getpid,clock_gettime ./cost_rs 1000
+% time     seconds  usecs/call     calls    errors syscall
+------ ----------- ----------- --------- --------- ----------------
+100.00    0.010893           1      7000           getpid
+------ ----------- ----------- --------- --------- ----------------
+100.00    0.010893           1      7000           total
+```
+
+7,000 `getpid` calls for 7,000 calls of `process::id()`: nothing is cached. And no `clock_gettime` at all, although the program called `Instant::now()` 70,000 times. If a Rust program needs its process id in a hot loop, it should read it once.
+
+## The order of magnitude to remember
+
+- A function call is about a nanosecond.
+- A vDSO call is about 15 ns: a function call that reads shared kernel data.
+- A real system call is about 80 to 110 ns on a performance core of this laptop, and twice that on an efficiency core, before the kernel does any real work.
+
+So a program that makes a million system calls per second spends about 8% of one core only on entering and leaving the kernel. This is why the earlier parts were interested in the number of calls: buffers, caches and the vDSO are all ways to make fewer of them.
+
+## References
+
+- vdso(7): https://man7.org/linux/man-pages/man7/vdso.7.html
+- syscall(2), calling a system call by number: https://man7.org/linux/man-pages/man2/syscall.2.html
+- The kernel documentation of the hardware vulnerabilities and their mitigations: https://docs.kernel.org/admin-guide/hw-vuln/index.html
+- clock_gettime(2): https://man7.org/linux/man-pages/man2/clock_gettime.2.html
+- The programs and the saved outputs of this part: https://github.com/mehdiakiki/mehdi-cz/tree/main/experiments/from-source-to-process/p17

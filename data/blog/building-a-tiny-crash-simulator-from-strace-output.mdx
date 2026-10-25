@@ -1,0 +1,158 @@
+---
+title: "Building a Tiny Crash Simulator From strace Output"
+date: "2026-09-16T18:45:00+01:00"
+lastmod: "2026-09-16T18:45:00+01:00"
+tags: ["what survives a crash", "testing", "python", "linux", "reliability"]
+draft: false
+reviewed: true
+reviewedHash: "b8c4a7385b5de4d3c380969066231cd85c941928e6aae230dc633026896b9c53"
+cluster: "reliable-data-integrations"
+campaign: "editorial"
+summary: "kill -9 could not tell a save with fsync from a save without it. So I wrote a small Python simulator that replays the strace output of a program and lists what a machine crash could leave at every moment. It found the zero-length file and the missing directory fsync."
+---
+
+In [part 3](/blog/how-to-save-a-file-without-losing-it-write-fsync-rename) two programs gave me the same outcome under 300 kills: the save with fsync before the rename, and the same save without it. Zero cut files for both. And I know that one of them can lose the file after a power cut. A test that cannot see the difference is not a test for this problem.
+
+I cannot cut the power of my laptop, and even if I could, a crash at a random moment would almost never hit the bad moment. So I wanted something else: a program that looks at what another program asked to the kernel, and tells me what the disk could contain if the machine would stop after any of these steps. This part builds it. It is small: the engine and the strace parser are about 540 lines of Python, with the standard library only, and the next parts use it again.
+
+## Record what the program asks
+
+strace already prints every system call with its arguments. The simulator runs the program under strace with a fixed list of calls:
+
+```python
+def run_traced(cmd, workdir, trace):
+    """Run cmd in workdir under strace; the trace file receives every relevant system call."""
+    strace = ["strace", "-f", "-qq", "-xx", "-s", "16777216", "-e", "signal=none",
+              "-e", "trace=" + SYSCALLS, "-o", trace]
+    return subprocess.run(strace + cmd, cwd=workdir, stdout=subprocess.DEVNULL).returncode
+```
+
+Each option has a reason. `-f` follows threads and child processes. `-xx` prints every string as hexadecimal escapes, so a quote or a comma inside the data cannot break my parser. `-s 16777216` prints buffers up to 16 MiB in full, because the simulator needs the real bytes of every write, not the first 32. The list of calls (`SYSCALLS`) is the file part of the system: open, openat and creat, write, pwrite64 and writev, fsync and fdatasync, rename and renameat2, unlink, link, symlink, mkdir, truncate and ftruncate, close, lseek and dup, plus clone and fork to know which threads share their file descriptors.
+
+## Replay it on a small model
+
+The trace is replayed on a model of the filesystem with three tables:
+
+- inodes, each one with its kind (file, directory, symlink) and, for a file, its bytes;
+- names, from a path to an inode, like a directory does;
+- file descriptors per process, with the inode, the offset and the `O_APPEND` flag. Threads share one table, a forked child gets a copy.
+
+Every system call becomes one event of five kinds. A write or a truncate is a data event on an inode. A create, rename, unlink, link, symlink or mkdir is a name event. An fsync on a file is a sync of that inode, and an fsync on a directory is a sync of that directory. And a write to file descriptor 1, the standard output, is an ack: this is how a program tells the world "it is done". The checker can then ask a precise question: did the program already promise something when the crash happened?
+
+## The model of a crash
+
+This is the important part, so I wrote it down at the top of the program, and it is printed at the start of every result:
+
+```text
+Model of a crash after operation k:
+  process crash: every operation up to k is kept (the page cache survives).
+  machine crash: the data of a file is kept up to its last fsync; later writes to it are kept
+  in order, as a prefix, and the last kept write may be cut at a 4 KiB page boundary.
+  Name operations (create, rename, unlink, link, symlink, mkdir) are kept in order, as a prefix;
+  an fsync of a directory keeps every name operation before it that touched that directory.
+```
+
+The process crash is easy, we saw it for real in [the first part](/blog/your-data-is-not-on-disk-when-write-returns): everything that the program gave to the kernel survives. So there is one state per crash point.
+
+The machine crash gives many states. For every file, the data of its last fsync is safe, and after that anything from "no later write" to "all later writes" is possible, with the last write maybe cut in the middle. For the names, the same idea: everything up to the last directory fsync is safe, and after that, any prefix of the name operations. And the two are independent: the simulator combines every possible content of every file with every possible set of names.
+
+Is this model correct? It is a choice, and for me it is important to say it clearly. It is pessimistic where POSIX is vague: nothing connects the data of a file and its name, so a name can be on the disk before the data it points to. It is optimistic in other places: it keeps the order of the writes inside one file, it does not tear a sector, and it keeps the order of the name operations. And it is not ext4. ext4 has a journal and the heuristic from [part 5](/blog/the-zero-length-file-problem-and-what-ext4-does-about-it), so some states that the model allows will not happen on my laptop.
+
+## A checker with promises
+
+The simulator does not know what is correct for a program. A checker does. For the save program of part 3, `doc.txt` must be the old version or the new version, complete, and after the program printed `saved`, it must be the new one:
+
+```python
+def check(state, acks):
+    entry = state.get("doc.txt")
+    data = entry[1] if entry else None
+    if any(a.strip() == "saved" for a in acks):
+        if data != NEW:
+            return "the program printed saved, but doc.txt is not the new version"
+    elif data not in (OLD, NEW):
+        return "doc.txt is neither the old version nor the new version"
+    return None
+```
+
+The save program writes the same document as in part 3: 64 pieces of 4 KiB. I ran four variants of it. For each crash point the simulator builds the process state and all machine states, and gives every state to the checker. Here are the counts:
+
+```text
+== naive save: O_TRUNC and write in place (save naive)
+  events: 66 (1 ack, 65 data)
+  crash points: 67
+  process crash: 67 states, 64 bad
+  machine crash: 2277 states (66 distinct), 2209 bad (65 distinct)
+...
+== temp file and rename, no fsync (save rename)
+  events: 67 (1 ack, 64 data, 2 meta)
+  crash points: 68
+  process crash: 68 states, 0 bad
+  machine crash: 2473 states (131 distinct), 194 bad (130 distinct)
+...
+== temp file, fsync, rename (no directory fsync) (save safe)
+  events: 68 (1 ack, 64 data, 2 meta, 1 sync)
+  crash points: 69
+  process crash: 69 states, 0 bad
+  machine crash: 2219 states (67 distinct), 2 bad (2 distinct)
+...
+== temp file, fsync, rename, fsync of the directory (save durable)
+  events: 69 (1 ack, 64 data, 1 dirsync, 2 meta, 1 sync)
+  crash points: 70
+  process crash: 70 states, 0 bad
+  machine crash: 2218 states (67 distinct), 0 bad (0 distinct)
+```
+
+("meta" is my name for the name events.) The naive save is bad even for a process crash: 64 of 67 crash points leave a truncated or cut file, the same thing that 233 kills found in part 3, but now for every point and not only for the points that a random kill hits.
+
+The second and third variants are where kill -9 was blind. Both have 0 bad process states, like in part 3. But the machine crash finds 194 bad states for the save without fsync and 2 for the save without the directory fsync. Only the full version, with both fsyncs, has zero bad states. Four programs, four different answers, and the order of the answers is the order of the articles.
+
+## Two bad states in detail
+
+The report prints the first bad machine state of each variant. For the save without fsync:
+
+```text
+  first bad machine state: crash after event 66 of 67 (rename doc.txt.tmp -> doc.txt)
+    promises printed before the crash: none
+    model: 2 of 2 name operations kept
+    model: doc.txt: new file, no data, 0 of 64 unsynced writes kept
+    on disk: doc.txt: empty file
+    checker: doc.txt is neither the old version nor the new version
+```
+
+Read it from the top. The crash is just after the rename. Both name operations reached the disk: the creation of `doc.txt.tmp` and the rename. But the 64 writes into the temp file were never synced, and in this state none of them reached the disk. So `doc.txt` is now the new inode, and the new inode is empty. This is the zero-length file problem of 2009 from part 5, found by a program that knows nothing about history. I liked that a lot.
+
+All 194 bad states of this variant come from the last two crash points: 64 just after the rename, and 130 after the program printed `saved`, where even the old version is not good enough anymore.
+
+And the save with fsync but without the directory fsync:
+
+```text
+  first bad machine state: crash after event 68 of 68 (stdout: saved)
+    promises printed before the crash: ['saved\n']
+    model: 0 of 2 name operations kept
+    model: doc.txt: content from before the run, 0 of 0 unsynced writes kept
+    on disk: doc.txt: old version, complete
+    checker: the program printed saved, but doc.txt is not the new version
+```
+
+Here the data was safe, because of the fsync. But no name operation was made durable, so the disk still has the old name table: `doc.txt` is the old version. Not a broken file, but a lost update after a promise. This is the hole of [part 4](/blog/why-the-directory-needs-fsync-too), and on ext4 it is a real one: the rename comes after the file fsync, in a new journal transaction, and nothing commits it before the program says `saved`.
+
+## What it cannot do
+
+This simulator is a toy, and I know already some of its limits:
+
+- The model is mine. A state that it reports as possible may be impossible on ext4. The empty `doc.txt` above is an example: on my laptop, `auto_da_alloc` starts the writeback at the rename. A state that it does not report may be possible on another filesystem, for example a write cut in the middle of a sector, or two writes of one file that reach the disk in the opposite order.
+- It knows only the system calls in its list. A program that writes through mmap, or uses `io_uring`, is invisible.
+- It assumes that fsync works. When fsync fails, a later part shows that things are worse.
+- The number of states grows fast with the number of files that have unsynced data at the same time.
+
+The real research tool for this idea is ALICE, from the paper "All File Systems Are Not Created Equal: On the Complexity of Crafting Crash-Consistent Applications" by Pillai and others at OSDI 2014. It records the system calls of an application, generates crash states under the rules of different filesystems, and checks them with the application's own checker. With it, the authors analyzed eleven widely used applications and found 60 vulnerabilities. My version is the same idea in a small size that I can read in one evening, and that is enough for the programs of this series.
+
+Now I have two tests: kill -9 told me that both saves were fine, the simulator told me that one of them can lose the file. Neither is a real power cut, but together they see more than each one alone. The next part uses it on an append-only log, where the interesting crash point is the last record.
+
+The code is `crashsim.py` (the engine), `stracelib.py` (the parser) and `simsave.py` (this experiment) in the [fixture](https://github.com/mehdiakiki/mehdi-cz/tree/main/experiments/what-survives-a-crash), and the full output is [p07-simsave.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/what-survives-a-crash/results/p07-simsave.txt).
+
+## References
+
+- [strace(1), Linux manual page](https://man7.org/linux/man-pages/man1/strace.1.html)
+- [fsync(2), Linux manual page](https://man7.org/linux/man-pages/man2/fsync.2.html)
+- [Pillai, Chidambaram, Alagappan, Al-Kiswany, Arpaci-Dusseau and Arpaci-Dusseau, "All File Systems Are Not Created Equal: On the Complexity of Crafting Crash-Consistent Applications", OSDI 2014](https://www.usenix.org/conference/osdi14/technical-sessions/presentation/pillai)

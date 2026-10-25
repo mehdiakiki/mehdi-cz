@@ -1,0 +1,108 @@
+---
+title: "Measuring Something Faster Than the Clock"
+date: "2026-09-29T13:50:00+01:00"
+lastmod: "2026-09-29T13:50:00+01:00"
+tags: ["when the benchmark lies", "rust", "benchmarking", "assembly", "performance"]
+draft: false
+reviewed: true
+reviewedHash: "83b30de2502fcbe2b1752153c79641ce3c024b8110b7ca134f7be5b8bef54c00"
+campaign: "editorial"
+summary: "Timed one call at a time, a small hash function and an empty loop both take 15 ns: the clock measures itself. With more calls per measurement, the same function costs 0.79 ns per call, or 3.02 ns when each call waits for the previous one."
+---
+
+How long does one call of a small hash function take? I timed one call, 100,000 times, and took the median: 15 nanoseconds. Then I timed, in exactly the same way, a loop that does almost nothing: also 15 nanoseconds.
+
+So my measurement of the function was a measurement of the clock. [The previous part](/blog/which-clock-to-use-when-you-measure-time) found that one reading of the monotonic clock costs about 14 ns on this laptop. A timing sample needs two readings, and the function is much faster than that. In this part I measure the function anyway, and I find that it has two different costs, depending on how it is used.
+
+## The function and three loops
+
+The function is the last step of splitmix64, a version of the generator of Java 8's `SplittableRandom` that Sebastiano Vigna wrote in C. It is a common way to mix the bits of a 64-bit number:
+
+```rust
+fn mix(mut x: u64) -> u64 {
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xbf58476d1ce4e5b9);
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x94d049bb133111eb);
+    x ^= x >> 31;
+    x
+}
+```
+
+Two multiplications, three shifts and three xors. The program has three loops that each make K calls. In `independent`, the calls do not depend on each other: each one mixes a new number `i` (through `black_box`, so the compiler can not compute anything in advance), and the results are combined with a cheap xor. In `dependent`, each call mixes the result of the previous call:
+
+```rust
+fn dependent(k: u64) -> u64 {
+    let mut x = 1;
+    for _ in 0..k {
+        x = mix(x);
+    }
+    x
+}
+```
+
+And `empty` is the loop of `independent` without `mix`, to see what the loop and the clock cost alone. A timing sample is one call of one of these loops with a given K: `Instant::now()`, the loop, `elapsed()`, divided by K.
+
+## The table
+
+Pinned to CPU 2, this is the first of three runs in the result file. Each cell is the median and the minimum of the samples, in nanoseconds per call:
+
+```text
+        K  samples              independent                dependent               empty loop
+        1   100000   median  15.00 min  13.00   median  17.00 min  13.00   median  15.00 min  12.00
+       10   100000   median   2.20 min   1.80   median   4.00 min   3.60   median   1.60 min   1.40
+      100   100000   median   0.96 min   0.90   median   3.11 min   3.00   median   0.50 min   0.36
+     1000   100000   median   0.79 min   0.79   median   3.02 min   2.93   median   0.39 min   0.26
+  1000000      101   median   0.79 min   0.77   median   3.05 min   2.94   median   0.24 min   0.24
+cpu 2 at 4074 MHz right after the run
+```
+
+The first line is the problem of the beginning. With K = 1, all three loops give 15 to 17 ns, and the empty loop is not faster than the real work. The minimum, 12 to 13 ns, is the smallest step of the clock that the previous part measured. One call of `mix` is completely hidden inside the cost of one reading of the clock: the time between two timestamps contains the end of the first call and the start of the second.
+
+With K = 10, the cost of the clock is shared by ten calls. The numbers drop to 2.2 and 4.0 ns, but the empty loop still takes 1.6 ns per turn, and this is mostly the clock divided by ten. With K = 100, the clock adds about 0.15 ns per call, and with K = 1,000 about 0.015 ns, so from there the numbers stop moving: 0.79 ns for `independent` and about 3.0 ns for `dependent`. K = 1,000,000 gives the same. For K of 1,000 and more, the three runs agree within about 0.1 ns.
+
+So the rule is simple: put enough calls in one sample that the clock becomes small, and check that the result stops changing when K grows. Here the estimate was stable from K = 1,000. With K = 1,000,000 one sample lasts up to 3 ms, so I took only 101 of them to keep the run short. Longer samples also catch more interruptions, which is one more reason not to make K bigger than needed.
+
+## Two costs for one function
+
+Now the interesting part: the same function costs 0.79 ns per call in one loop and 3.02 ns in the other. Neither number is wrong. They answer two different questions.
+
+The assembly of `dependent` shows two calls per turn of the loop. One call is this:
+
+```asm
+	movq	%rax, %r8
+	shrq	$30, %r8
+	xorq	%rax, %r8
+	imulq	%rdx, %r8
+	movq	%r8, %rax
+	shrq	$27, %rax
+	xorq	%r8, %rax
+	imulq	%rcx, %rax
+	movq	%rax, %r8
+	shrq	$31, %r8
+	xorq	%rax, %r8
+```
+
+Every instruction needs the result of the one before it, and the next call needs the result of this one. So the processor can not start anything early: the time of a call is the sum of the latencies of these steps. The frequency read right after the run was about 4.07 GHz, and 3.02 ns at this clock is about 12 cycles per call. It is the latency of the chain.
+
+In `independent`, the next call does not wait for the previous one. The processor executes instructions out of order, so it can work on several calls at the same time, and a new call can start before the last one is finished. Then the limit is how many instructions per cycle the core can execute, not how long one chain is. 0.79 ns is about 3.2 cycles per call, almost four times less. This number is the throughput.
+
+I did not measure the internals of the core (there is no `perf` here), so "the processor overlaps the calls" is the usual explanation, not something I observed directly. What I measured is the fact: the same instructions, with and without a dependency between calls, and a factor of almost four. I liked that.
+
+The empty loop is a small warning too. It takes 0.24 to 0.39 ns per turn for the loop and the `black_box`, and the `independent` loop pays this cost as well. I would not subtract it, because in an out-of-order core the costs of two things executed together do not simply add up. It is better to say that 0.79 ns is the cost of one `mix` together with the loop around it.
+
+## Which one is "the speed of mix"?
+
+It depends on the program that uses it. If the function hashes many independent keys, as in a hash table that inserts a batch of values, the throughput number is the right one. If each output is the input of the next call, as in a random generator whose state goes through the function, the latency number is the right one, and the function is four times more expensive.
+
+A microbenchmark usually measures only one of the two, and often by accident: a loop like `independent` is the natural way to write a benchmark, and it gives the smaller number. So when I report a number for something this small, I write which one I measured.
+
+## Small things, big loops
+
+When the thing to measure is faster than the clock, I do not time it alone. I put a loop of K calls in each sample, with `black_box` on the input and the output as in [the first part of this series](/blog/the-benchmark-that-measured-nothing), and I increase K until the result stops changing. Then I decide, before looking at the number, whether the question is latency or throughput, and I write the loop that matches it. And I look at the assembly, because a loop of a few nanoseconds is exactly where the compiler likes to change the work.
+
+The program, the assembly and the three runs are in [the fixture](https://github.com/mehdiakiki/mehdi-cz/tree/main/experiments/when-the-benchmark-lies), in [p11-faster-than-the-clock.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/when-the-benchmark-lies/results/p11-faster-than-the-clock.txt).
+
+## Further reading
+
+- [Sebastiano Vigna: splitmix.c, the C version of splitmix64 and the source of the mixing function](https://prng.di.unimi.it/splitmix.c)

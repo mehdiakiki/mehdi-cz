@@ -1,0 +1,134 @@
+---
+title: "The Average Hides the Slow Requests"
+date: "2026-09-19T18:05:00+01:00"
+lastmod: "2026-09-19T18:05:00+01:00"
+tags: ["when the benchmark lies", "rust", "linux", "statistics", "performance"]
+draft: false
+reviewed: true
+reviewedHash: "c4f68ab663998974f86946b30b23ac16f03ea9bc3133488216ed1a8ff8df0a07"
+campaign: "editorial"
+summary: "I timed four million single Vec::push calls: mean 22.8 ns, slowest 315,684 ns. The slow ones were not the reallocations but page faults, and huge pages made them bigger. Then a simulated request handler where the mean is a time that no request had."
+---
+
+Four million calls of `Vec::push`, each one timed alone. The mean is 22.8 nanoseconds. The slowest one took 315,684 nanoseconds.
+
+The textbook says that pushing to a growing vector costs "amortized O(1)": sometimes the vector must grow, but if you divide by the number of pushes, the cost per push stays constant. This is true. And it says nothing about the slowest push, which here was more than 16,000 times slower than the median. I wanted to see where these slow pushes come from, and what the usual summaries of a benchmark say about them.
+
+## Every push, timed
+
+The loop is simple:
+
+```rust
+for i in 0..N {
+    let cap = v.capacity();
+    let start = Instant::now();
+    v.push(black_box(i as u64));
+    let ns = start.elapsed().as_nanos() as u32;
+    times[i] = ns;
+    if v.capacity() != cap {
+        grew.push(i);
+    }
+}
+```
+
+It records the time of each push, and the pushes that changed the capacity, that is the reallocations. One warning before the numbers: each measurement includes about the cost of one reading of the clock, and a push alone is much cheaper than that. So the typical value below, about 19 ns, is probably mostly the clock. A later part of the series measures what one reading costs. Here only the slow pushes matter, and they are thousands of times bigger than the clock.
+
+This is the first round, pinned to CPU 2, with a vector that starts empty:
+
+```text
+grow: 4000000 pushes, 21 reallocations, 8162 page faults, AnonHugePages 8192 kB, total 91.1 ms
+  mean 22.8 ns  median 19 ns  p90 23 ns  p99 27 ns  p99.9 1182 ns  p99.99 2392 ns  max 315684 ns
+  the slowest 0.1% of pushes take 9.4% of the total time
+  the 21 reallocating pushes take 0.3% of the total time
+  last reallocations: push 2097152 took 94672 ns, push 1048576 took 61768 ns, push 524288 took 29656 ns, push 262144 took 23983 ns
+         16 -        31 ns   3987325  #########################
+         32 -        63 ns      5486  #############
+         64 -       127 ns       549  #########
+        128 -       255 ns       280  #########
+        256 -       511 ns        42  #####
+        512 -      1023 ns         6  #
+       1024 -      2047 ns      5585  #############
+       2048 -      4095 ns       550  #########
+       4096 -      8191 ns        60  #####
+       8192 -     16383 ns       103  #########
+      16384 -     32767 ns         8  #
+      32768 -     65535 ns         2  #
+      65536 -    131071 ns         1  #
+     262144 -    524287 ns         3  #
+```
+
+The histogram has a log scale in both directions. Each bucket is twice as wide as the previous one, and each group of four `#` means ten times more pushes, so the bar of 3,987,325 pushes and the bar of 3 pushes fit on the same screen.
+
+Read from the top: almost everything is in the bucket of 16 to 31 ns. The median, p90 and p99 are all there. Then there is a second group, 5,585 pushes between 1 and 2 microseconds, which appears first at p99.9. And at the bottom, 3 pushes between 262 and 524 microseconds.
+
+Look at the mean again: 22.8 ns. It is only 3.8 ns more than the median. All the slow pushes together moved the mean by a few nanoseconds, while the slowest 0.1 percent of the pushes take 9.4 percent of the total time. The mean is not wrong. It is just a number in which the rare slow events disappear.
+
+## The reallocations are not the slow part
+
+My first idea was that the slow pushes are the reallocations. The vector doubles its capacity when it is full, so the push that triggers it must copy everything to a new place. But the program says that the 21 reallocations take only 0.3 percent of the total time, and the biggest one, when the vector grows from 2,097,152 elements (16 MiB) to twice that, took 95 microseconds. Copying 16 MiB in 95 microseconds would mean more than 170 GB per second, and that looked much too fast for a laptop.
+
+So I looked at the system calls with `strace`:
+
+```text
+mremap(0x7f61fc49b000, 4198400, 8392704, MREMAP_MAYMOVE) = 0x7f61fbc9a000
+mremap(0x7f61fbc9a000, 8392704, 16781312, MREMAP_MAYMOVE) = 0x7f61fac99000
+mremap(0x7f61fac99000, 16781312, 33558528, MREMAP_MAYMOVE) = 0x7f61f8c98000
+```
+
+For big blocks, the memory comes directly from the kernel, and glibc's `realloc` grows it with `mremap`. The manual page explains why this is cheap: "mremap() changes the mapping between virtual addresses and memory pages. This can be used to implement a very efficient realloc(3)." The kernel moves the page table entries to a new range of addresses, and the bytes stay where they are. So the reallocations are real, and they are slow compared to a normal push, but they are not the slowest pushes.
+
+## The slow pushes are page faults
+
+The other two modes of the program separate the causes. `reserved` creates the vector with its full capacity, so it never reallocates, but its memory was never touched. `touched` writes the whole memory once before the measurement:
+
+```text
+touched: 4000000 pushes, 0 reallocations, 3908 page faults, AnonHugePages 14336 kB, total 74.7 ms
+  mean 18.7 ns  median 18 ns  p90 20 ns  p99 24 ns  p99.9 32 ns  p99.99 124 ns  max 42506 ns
+  the slowest 0.1% of pushes take 0.5% of the total time
+```
+
+With touched memory the second group is gone: p99.9 is 32 ns and p99.99 is 124 ns. The slowest push, 42.5 microseconds, is something else that I can not identify from here, probably an interrupt or another program. The `reserved` mode, without reallocations but with untouched memory, has the same 1 to 2 microsecond group as `grow`. So those pushes are page faults: the first write to each new page of 4 KiB stops the loop, and the kernel gives the process a page filled with zeros. I measured the same kind of cost in [the part about the first run](/blog/why-the-first-run-is-slower), about one microsecond per page.
+
+(The fault counter includes 3,908 faults of the array that stores the times, 16 MB. They happen between the measurements, not inside them, and the `touched` line shows them alone.)
+
+And the 3 pushes between 262 and 524 microseconds? Look at `AnonHugePages 8192 kB` in the first line. This laptop has transparent huge pages set to `always`, so when the kernel can, it maps a 2 MiB page at once instead of a 4 KiB page. Then one page fault must fill 2 MiB with zeros, not 4 KiB. The process can disable this for itself with `prctl(PR_SET_THP_DISABLE)`, without root, so I tested it:
+
+```text
+grow,nothp: 4000000 pushes, 21 reallocations, 11739 page faults, AnonHugePages 0 kB, total 85.8 ms
+  mean 21.4 ns  median 18 ns  p90 20 ns  p99 24 ns  p99.9 1149 ns  p99.99 2298 ns  max 76901 ns
+```
+
+No huge pages, more small faults (11,739 instead of 8,162), and the slowest push is now the biggest reallocation, 77 microseconds. The pushes of 262 to 524 microseconds are gone. So with huge pages there are fewer faults but each one is much bigger: the same work, but a different tail. The kernel documentation describes both sides: huge pages need only "a single page fault for each 2M virtual region touched by userland", but they also mean a "larger clear-page copy-page in page faults". All the `nothp` runs of the result file had a maximum between 24 and 77 microseconds, and all the `grow` and `reserved` runs with huge pages a maximum between 241 and 343 microseconds.
+
+I did not expect this one. The kernel can only map a huge page if it has a free block of 2 MiB. The result file records the free blocks of the memory before each run: about 5 GiB were free, but cut in small pieces, and there were only 8 to 10 free blocks of 2 MiB. That is enough for 16 to 20 MiB of huge pages, and the runs got between 8 and 18 MiB. So the slowest push of this tiny benchmark depended on how fragmented the memory of the whole machine was at that moment. When I ran this part a second time, there was not one free block of 2 MiB, the processes got no huge pages at all, and no push took more than 176 microseconds ([p08-average-and-tail.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/when-the-benchmark-lies/results/second-run/p08-average-and-tail.txt)).
+
+## A request handler
+
+Vectors are a small example. The same shape appears everywhere where most of the work is fast and a small part is slow. I made a simulated request handler: a normal request hashes 256 numbers, and one request in a hundred (chosen with a fixed random generator) also hashes 2,000,000 more numbers. 20,000 requests, each one timed:
+
+```text
+20000 requests, times in microseconds
+  mean 23.2  median 0.4  p90 0.4  p99 0.6  p99.9 2543.6  max 2582.2
+  requests over 100 us: 186; requests between half and twice the mean: 0
+  pages of 10 requests that contain at least one request over 100 us: 175 of 2000 (8.8%)
+```
+
+The mean is 23.2 microseconds. And zero requests took between half and twice this time. The requests take either about 0.4 microseconds or about 2.5 milliseconds, and the mean is a time that no request had.
+
+The median says 0.4 microseconds, and this is true for most requests. But p99 says 0.6 microseconds too, because the slow requests are 186 of 20,000, 0.93 percent: just less than one percent, so they are not in p99. Only p99.9 shows them.
+
+The last line is the one that users feel. A page of a web application often makes several requests, and the user waits for the slowest one. If I group the requests by ten, 8.8 percent of the "pages" contain at least one slow request. So a problem that p99 does not show is visible for almost one page in eleven. Another series on this site found the same shape for `fsync` on this laptop, with a slowest round eleven times the median: [What fsync Costs on a Laptop SSD](/blog/what-fsync-costs-on-a-laptop-ssd).
+
+## What a summary should show
+
+I do not think the mean is useless. It is the right number for total cost: four million pushes really took 91 ms. But it is the wrong number for the experience of one request, and the median is not much better.
+
+The harness of [the first part](/blog/the-benchmark-that-measured-nothing) prints the minimum, the median, p90 and the maximum, and for a loop of identical calls this is enough. For a latency benchmark I want more: the median, p99, p99.9 and the maximum, the number of runs, and a histogram with log buckets like the one above, because it shows groups that percentiles can only hint at. And I want to know which percentile matches what a user sees: if one user action makes ten requests, the p99 of single requests is not the p99 of the user. In the next part, I look at a way to measure latency that hides even the slow requests themselves.
+
+The programs and the full output are in [the fixture](https://github.com/mehdiakiki/mehdi-cz/tree/main/experiments/when-the-benchmark-lies), in [p08-average-and-tail.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/when-the-benchmark-lies/results/p08-average-and-tail.txt).
+
+## Sources
+
+- [mremap(2), Linux manual page](https://man7.org/linux/man-pages/man2/mremap.2.html)
+- [prctl(2), Linux manual page (PR_SET_THP_DISABLE)](https://man7.org/linux/man-pages/man2/prctl.2.html)
+- [Linux kernel documentation: Transparent Hugepage Support](https://www.kernel.org/doc/html/v6.6/admin-guide/mm/transhuge.html)

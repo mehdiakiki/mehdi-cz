@@ -1,0 +1,152 @@
+---
+title: "What an Index Costs on Every Insert"
+date: "2026-07-07T22:30:00+01:00"
+lastmod: "2026-07-07T22:30:00+01:00"
+tags: ["inside a database index", "databases", "sqlite", "performance", "write amplification"]
+draft: false
+reviewed: true
+reviewedHash: "72ef5ea2afd96a66a9dde7719ba624b4cb1edc98bc660fb7c98b5e53eb518b1c"
+campaign: "editorial"
+summary: "I inserted one million rows into SQLite with 0, 1, 3 and 6 indexes. The table alone took 0.8 s and six indexes took 8.5 s, but the biggest cost was not the number of indexes: one index on a random column made SQLite pass 4 GB to write() for a 106 MB file."
+---
+
+Everybody knows that indexes make writes slower. I knew it too, but I did not know how much, or why exactly. My idea was simple: each index is one more b-tree to update, so each index adds a similar cost, and six indexes cost six times one index. Let me show why this idea is wrong.
+
+In [the first part of this series](/blog/an-index-is-a-second-copy-of-your-data) we saw that an index is a second copy of a column, sorted, with the rowid of each row. So every INSERT writes the row in the table and one entry in every index. I made an experiment to see what this costs: one million users, inserted from Python in one transaction, into an empty table that already has its indexes. The rows are generated before the timer starts, and each line is 3 runs:
+
+```text
+no index: median 789.61 ms (min 671.22 ms, max 808.14 ms, 3 runs)
+    file 67457024 bytes, wchar 67466280, write_bytes 67481600, users_email 0 pages, load average 4.86 4.15 3.67
+1 index (email): median 4.18 s (min 4.18 s, max 4.19 s, 3 runs)
+    file 106086400 bytes, wchar 4050089008, write_bytes 106115072, users_email 9431 pages, load average 5.12 4.24 3.70
+3 indexes: median 5.53 s (min 5.52 s, max 5.66 s, 3 runs)
+    file 150507520 bytes, wchar 4316304448, write_bytes 150544384, users_email 9431 pages, load average 5.09 4.28 3.73
+6 indexes: median 8.45 s (min 8.29 s, max 8.57 s, 3 runs)
+    file 244502528 bytes, wchar 4858553432, write_bytes 244551680, users_email 9431 pages, load average 5.23 4.37 3.77
+```
+
+These times move between runs, sometimes by a lot, but the order of the lines and the byte counts stay the same. The three indexes are on email, created_at and country. The six add status, (country, created_at) and (status, created_at).
+
+The table alone takes 0.79 s. One index makes it 4.18 s, five times slower. But with three indexes it is 5.53 s, and with six 8.45 s. So the email index alone adds 3.4 s, and the next five together add 4.3 s, less than 0.9 s each. Why is one index so much more expensive than the others?
+
+## 4 GB for a 106 MB file
+
+Look at the `wchar` column. It comes from `/proc/self/io` and it counts the bytes that the process passed to `write()` calls. Without an index it is 67,466,280, almost exactly the size of the file: every page was written one time. With the email index, the file is 106 MB and `wchar` is 4,050,089,008. SQLite wrote 4 GB to make a 106 MB file. I did not expect this number at all.
+
+So what happened? The reason is the cache. SQLite keeps the pages it is changing in its own page cache, and by default this cache is about 2 MB, so around 500 pages. A big transaction changes many more pages than this. When the cache is full of changed pages, SQLite has to write one of them to the file to make room. This is called a spill, and the documentation of the counter says it clearly: dirty pages "written to disk in the middle of a transaction due to the page cache overflowing".
+
+Now think where the new entries go. The table gets its rows at the end, because the rowid grows: the same last page is filled, then the next one, and each full page is written once. The emails are random, so each new email goes to a random leaf of the index, somewhere in 9,431 pages. That leaf is almost never in the cache. SQLite reads it, adds the entry, and later spills it, and soon the same page comes back for another email. So almost every insert writes one page of 4096 bytes: one million inserts, about 4 GB.
+
+`created_at` grows with the id, like the rowid, so its index fills its pages in order. Country and status have few values, so their new entries go to the end of a few ranges ("US", "IN", ...), and these pages stay in the cache. This is why they add much less.
+
+And `write_bytes`? It is the number of bytes the kernel counted for the storage device, at the moment pages became dirty in its own page cache. It stays at the file size: 106,115,072. The 4 GB of rewrites went into pages that were already dirty in the kernel's memory, so the kernel counted each page only once for the SSD. Here the cost of the random index is CPU time and system calls, not the disk.
+
+## The same keys, in another order
+
+To see only the order, I made a small table `t(id INTEGER PRIMARY KEY, k TEXT)` with an index on `k`, and I inserted the same one million keys of 16 characters, once sorted and once shuffled. At the end both indexes contain exactly the same entries:
+
+```text
+sorted, cache_size default (-2000): median 798.28 ms (min 772.14 ms, max 1.19 s, 3 runs)
+    wchar 53945392, index t_k 6992 pages, 3588227 bytes unused, load average 4.67 4.33 3.78
+shuffled, cache_size default (-2000): median 3.75 s (min 3.29 s, max 4.16 s, 3 runs)
+    wchar 3556860976, index t_k 6790 pages, 2763259 bytes unused, load average 4.91 4.40 3.81
+```
+
+The shuffled order is 4.7 times slower, and it passes 66 times more bytes to `write()`. In the `sqlite3` shell, with `.stats on`, the same two inserts show the spills directly:
+
+```text
+INSERT INTO a(k) SELECT k FROM keys.sorted_keys;
+Page cache hits:                     221129
+Page cache misses:                   5922
+Page cache writes:                   13167
+Page cache spills:                   12733
+...
+INSERT INTO b(k) SELECT k FROM keys.shuffled_keys;
+Page cache hits:                     1356610
+Page cache misses:                   861295
+Page cache writes:                   868283
+Page cache spills:                   867839
+```
+
+12,733 spills for the sorted keys, so each page once. 867,839 for the shuffled keys, almost one per row.
+
+There is a common belief about random inserts: they leave the index fragmented, with half-empty pages. Here it did not happen. The shuffled index has 6,790 pages and the sorted one 6,992: the random order made the smaller index. Both leave some free space in their pages, and the smallest index of all came from `CREATE INDEX` after the insert, with 6,143 pages and only 120,911 unused bytes, because it sorts all the entries first and fills the pages one after another.
+
+## Two patches, and where they stop
+
+The first patch is a bigger cache. The documentation of the spill counter even suggests it, and `PRAGMA cache_size = -1048576` gives SQLite 1 GiB:
+
+```text
+1 index (email), cache_size -1048576: median 1.88 s (min 1.77 s, max 1.93 s, 3 runs)
+    file 106086400 bytes, wchar 106099236, write_bytes 106106880, users_email 9431 pages, load average 5.05 4.38 3.79
+6 indexes, cache_size -1048576: median 4.83 s (min 4.83 s, max 4.99 s, 3 runs)
+    file 244502528 bytes, wchar 244535884, write_bytes 244543488, users_email 9431 pages, load average 4.67 4.33 3.78
+```
+
+No more spills: `wchar` is the file size again, and one index costs 1.88 s instead of 4.18 s. For the key test, shuffled went from 3.75 s to 1.52 s. But it works only while the index fits in the cache. The cost of the random order did not disappear (1.52 s against 0.84 s for the sorted keys with the same cache): each insert still goes down a different path of the tree. And a real table grows, the cache does not.
+
+The second patch is for bulk loads only: insert first, create the indexes after.
+
+```text
+6 indexes created after the insert: median 3.68 s (min 3.35 s, max 4.00 s, 3 runs)
+    file 227049472 bytes, wchar 496213684, write_bytes 381952000, users_email 8524 pages, load average 4.88 4.34 3.77
+```
+
+3.68 s instead of 8.45 s for the same six indexes, and a smaller file, because `CREATE INDEX` builds each index from sorted entries (8,524 pages for the email index instead of 9,431). The bigger `write_bytes` comes from the temporary files of the sort. But an application that receives users one by one cannot do this. Its indexes must exist all the time, because the queries need them all the time.
+
+## One transaction per row is a different cost
+
+All the inserts above were in one transaction. Applications often do the opposite: one INSERT, one commit. So I made another test: 1000 new users added to the full table of one million rows, each insert in its own transaction, with no index and with the six indexes:
+
+```text
+== 0 indexes, 1000 rows, load average 5.25 4.48 3.85
+one transaction per row: median 1.28 ms, p99 5.24 ms, max 8.97 ms, total 1.52 s
+    per row: wchar 17014 bytes, write_bytes 24666 bytes
+the same rows in one transaction: total 2.09 ms, 2.1 us per row
+    per row: wchar 98 bytes, write_bytes 106 bytes
+== 6 indexes, 1000 rows, load average 5.55 4.56 3.87
+one transaction per row: median 1.84 ms, p99 8.04 ms, max 12.68 ms, total 2.35 s
+    per row: wchar 100179 bytes, write_bytes 107753 bytes
+the same rows in one transaction: total 31.70 ms, 31.7 us per row
+    per row: wchar 9168 bytes, write_bytes 8683 bytes
+```
+
+Inside one transaction, the six indexes cost about 30 µs per row. With a commit per row, a row costs 1.28 ms without any index. So the commit is about 600 times more expensive than one row without indexes, and 40 times more than the work of all six indexes.
+
+Where does a millisecond go? I traced 20 of these commits with `strace`: 80 calls to `fdatasync`, so 4 per commit, and 20 calls to `unlink`. Here are the 4 syncs of one commit:
+
+```text
+openat(AT_FDCWD<.>, "out/p03-trace.db-journal", O_RDWR|O_CREAT|O_NOFOLLOW|O_CLOEXEC, 0644) = 4<out/p03-trace.db-journal>
+fdatasync(4<out/p03-trace.db-journal>) = 0
+fdatasync(5<out>) = 0
+fdatasync(4<out/p03-trace.db-journal>) = 0
+fdatasync(3<out/p03-trace.db>) = 0
+unlink("out/p03-trace.db-journal") = 0
+```
+
+This is the rollback journal of SQLite's default mode. Before it changes the database file, SQLite copies the original pages into a new journal file and syncs it. It syncs the directory, because the journal file is new. It writes the number of pages into the journal header and syncs again. Then it writes the new pages into the database, syncs the database, and deletes the journal. Every sync waits for the SSD, and this is the millisecond. In fact the number of syncs does not depend on the indexes at all.
+
+What the indexes change is the size of each commit. Almost every page that the commit touches is written two times, the old version into the journal and the new one into the database. Without indexes this is 17,014 bytes per row. With six indexes it is 100,179 bytes, about 24 pages, for one row of maybe 60 bytes of data. That is write amplification: the useful data is 60 bytes, and the device receives more than a thousand times more. In the big transaction it was the other kind, 4.86 GB of `write()` calls for a 245 MB file, but the kernel cache stopped that one before the device.
+
+So these are two different costs, and it is better to not mix them. If a loop of single inserts is slow, the first fix is a transaction around the loop, not fewer indexes. If a big import is slow, look at the indexes, the order of the keys and the cache.
+
+## Other databases fight the same problem
+
+The problem of random index pages is not special to SQLite. MySQL's InnoDB documentation explains its change buffer with the same observation: "inserts into secondary indexes happen in a relatively random order", so InnoDB can keep changes for secondary index pages that are not in memory and merge them later. Interesting detail: in MySQL 8.4 the default of `innodb_change_buffering` is `none`, and the manual says that before 8.4 it was `all`. PostgreSQL has another trick for updates: a HOT update ("heap-only tuple") adds no new index entries, if the update does not change any indexed column and the new row version fits in the same page. I did not measure these, they are from the documentation.
+
+## The bill
+
+So my first idea, that six indexes cost six times one index, was wrong in an interesting way. The number of indexes matters less than where their new entries land. An index on a growing value, like a timestamp, costs little, because its new entries go to the last page. An index on random values (emails, UUIDs, hashes, etc.) sends every insert to a random page, and with a small cache SQLite writes one page per row. `.stats on` shows it as spills.
+
+For a big import, one transaction and the indexes created after the import was the cheapest way I found. For many small writes, the commit is the cost, and a transaction around them helps much more than removing an index. And an index that no query uses is pure cost, on every write, for the whole life of the table.
+
+The programs are in the [fixture of this series](https://github.com/mehdiakiki/mehdi-cz/tree/main/experiments/inside-a-database-index), and the full output is in [p03-insert-cost.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/inside-a-database-index/results/p03-insert-cost.txt).
+
+## Sources
+
+- SQLite, [Atomic Commit In SQLite](https://sqlite.org/atomiccommit.html): the rollback journal, the two flushes of the journal, the directory sync.
+- SQLite, [Status Parameters for database connections](https://sqlite.org/c3ref/c_dbstatus_options.html): the meaning of the cache hit, miss, write and spill counters.
+- SQLite, [PRAGMA cache_size](https://sqlite.org/pragma.html#pragma_cache_size).
+- Linux kernel documentation, [The /proc Filesystem](https://docs.kernel.org/filesystems/proc.html): `wchar` and `write_bytes` in `/proc/PID/io`.
+- MySQL 8.4, [Change Buffer](https://dev.mysql.com/doc/refman/8.4/en/innodb-change-buffer.html) and [innodb_change_buffering](https://dev.mysql.com/doc/refman/8.4/en/innodb-parameters.html).
+- PostgreSQL 18, [Heap-Only Tuples (HOT)](https://www.postgresql.org/docs/18/storage-hot.html).

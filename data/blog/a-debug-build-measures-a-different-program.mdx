@@ -1,0 +1,238 @@
+---
+title: "A Debug Build Measures a Different Program"
+date: "2026-08-31T21:35:00+01:00"
+lastmod: "2026-08-31T21:35:00+01:00"
+tags: ["when the benchmark lies", "rust", "c", "cargo", "compiler internals"]
+draft: false
+reviewed: true
+reviewedHash: "60e663afdea773dc91bc056f58ae4ed19713ff1a2adea04cef1c874c6bb8a404"
+campaign: "editorial"
+summary: "A test called score_is_fast measured 44,646 ns per call under cargo test and 1,136 ns with --release, one run each. I compare four optimization levels in Rust and two in C, and I show in the assembly what a debug build really measures."
+---
+
+For this part I wrote a small test with a timer inside. It is called `score_is_fast`, and here is what it printed with a normal `cargo test`:
+
+```text
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.01s
+test tests::score_is_fast ... score: 44645.6 ns per call
+```
+
+Then I ran the same test with one more flag, `cargo test --release`:
+
+```text
+    Finished `release` profile [optimized] target(s) in 0.00s
+test tests::score_is_fast ... score: 1135.6 ns per call
+```
+
+Same source, same laptop, same minute, and the second number is 39 times smaller. These are two single runs of 1,000 calls, and the factor is not stable: when I ran this part a second time, the numbers were 43,620 and 1,791 ns, so 24 times ([p02-debug-build.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/when-the-benchmark-lies/results/second-run/p02-debug-build.txt)). So which one is the speed of `score`?
+
+Both numbers are correct measurements. They are measurements of two different programs. In [the first part of this series](/blog/the-benchmark-that-measured-nothing), the optimizer removed the work I wanted to measure. Here the problem is the opposite: nothing is removed, and a lot is added.
+
+## What cargo test builds
+
+The answer is already in the first line of the output: the `test` profile, "unoptimized + debuginfo". The Cargo book documents it. `cargo test` uses the `test` profile, and the `test` profile inherits from `dev`, the profile of a normal `cargo build`. The defaults of `dev` are `opt-level = 0`, `debug-assertions = true` and `overflow-checks = true`. So a timer inside a test measures code that the compiler did not optimize at all, plus checks that the release build does not have.
+
+`cargo bench` is different: its `bench` profile inherits from `release`. But a timer in a normal test, or a quick measurement in a binary built with `cargo run`, uses the debug code.
+
+## Four levels, the same three functions
+
+To see how big the difference is, I made three small functions over 4,096 `u64` values:
+
+```rust
+#[no_mangle]
+fn sum_iter(data: &[u64]) -> u64 {
+    data.iter().sum()
+}
+
+#[no_mangle]
+fn sum_index(data: &[u64]) -> u64 {
+    let mut s = 0;
+    for i in 0..data.len() {
+        s += data[i];
+    }
+    s
+}
+
+#[no_mangle]
+fn score(data: &[u64]) -> u64 {
+    data.iter().map(|&x| x * 3).filter(|x| x % 2 == 0).sum()
+}
+```
+
+(`#[no_mangle]` only keeps the names readable in the assembly.)
+
+I built them with `rustc +1.98.0` four times, with `-C opt-level=0`, `1`, `2` and `3`, and I measured them with the harness of the series, pinned to CPU 2. I ran the four builds in three rounds, one after the other in each round, so that a change of the machine during the experiment touches all of them. Each line below is the median of the three round medians:
+
+```text
+opt-level=0 score               28097.622 ns/call  (median of 3 runs)
+opt-level=0 sum_index           13272.802 ns/call  (median of 3 runs)
+opt-level=0 sum_iter             7239.135 ns/call  (median of 3 runs)
+opt-level=1 score                1166.430 ns/call  (median of 3 runs)
+opt-level=1 sum_index            2997.985 ns/call  (median of 3 runs)
+opt-level=1 sum_iter             1065.900 ns/call  (median of 3 runs)
+opt-level=2 score                1166.197 ns/call  (median of 3 runs)
+opt-level=2 sum_index             344.204 ns/call  (median of 3 runs)
+opt-level=2 sum_iter              345.357 ns/call  (median of 3 runs)
+opt-level=3 score                1218.866 ns/call  (median of 3 runs)
+opt-level=3 sum_index             354.328 ns/call  (median of 3 runs)
+opt-level=3 sum_iter              372.775 ns/call  (median of 3 runs)
+```
+
+In rustc 1.98.0, `-O` means `-C opt-level=3` (the help text says it, and the result file has the line), and level 3 is also what `cargo build --release` uses. So I compare level 0 with level 3. The debug build is 19 times slower for `sum_iter`, 37 times slower for `sum_index` and 23 times slower for `score`.
+
+There is no single "debug factor". It depends on the code.
+
+And one small thing that I liked. The assembly of these three functions is identical at levels 2 and 3. I checked it, the result file has the comparison. So the difference between 345 and 373 ns for `sum_iter` does not come from the instructions. It is not random either: level 3 was slower in all three rounds, and when I ran this part a second time the gap was bigger, 279 against 327 ns. The same instructions in two binaries are at different addresses, and the address alone may change the speed; a later part of the series looks at this. Keep this in mind: 8 percent appeared here without any change of code.
+
+## What the debug loop does
+
+Here is `sum_index` at level 0. I cut the start and the end:
+
+```asm
+.LBB217_1:
+	leaq	40(%rsp), %rdi
+	callq	<core::ops::range::Range<usize> as core::iter::traits::iterator::Iterator>::next
+	movq	%rax, 56(%rsp)
+	movq	%rdx, 64(%rsp)
+	testq	$1, 56(%rsp)
+	je	.LBB217_3
+	movq	24(%rsp), %rcx
+	movq	64(%rsp), %rax
+	movq	%rax, 8(%rsp)
+	cmpq	%rcx, %rax
+	jb	.LBB217_4
+	jmp	.LBB217_5
+...
+.LBB217_4:
+	movq	16(%rsp), %rax
+	movq	8(%rsp), %rcx
+	movq	(%rax,%rcx,8), %rdx
+	movq	32(%rsp), %rcx
+	movq	%rcx, %rax
+	addq	%rdx, %rax
+	movq	%rax, (%rsp)
+	cmpq	%rcx, %rax
+	jb	.LBB217_7
+	jmp	.LBB217_6
+.LBB217_5:
+...
+	callq	*core::panicking::panic_bounds_check@GOTPCREL(%rip)
+...
+.LBB217_7:
+	leaq	.Lanon.da8acc334b5dc0e145900f60b27edc10.119(%rip), %rdi
+	callq	*core::panicking::panic_const::panic_const_add_overflow@GOTPCREL(%rip)
+```
+
+Three different costs are visible, for every element.
+
+First, the call to `Range::next`. In Rust, `for i in 0..n` is an iterator, and in a debug build the method `next` is a real function call, one per element. The answer comes back in two registers and goes directly to the stack.
+
+Second, the bounds check: `cmpq %rcx, %rax` compares `i` with the length, and if `i` is not below it, the code jumps to `.LBB217_5`, which calls `panic_bounds_check`.
+
+Third, the overflow check. After `addq %rdx, %rax`, the code compares the new sum with the old one. If the new sum is smaller, the addition wrapped around, and it jumps to `panic_const_add_overflow`. With unsigned numbers this one comparison is enough to detect an overflow, nice.
+
+And everything lives in memory. `i` is at `8(%rsp)`, the sum at `32(%rsp)`, the slice at `16(%rsp)` and `24(%rsp)`. Every turn loads them and stores them again.
+
+At level 3 the same function is the vector loop of the first part: two 16-byte loads and two vector additions per turn, with no call, no bounds check (the compiler can see that `i` stays below the length) and no overflow check (these are off when debug assertions are off, says the rustc documentation).
+
+## Iterators are not free in a debug build
+
+`score` is the most interesting case for me, because the source looks so innocent. At level 0, `score` itself is only the construction of the pipeline:
+
+```asm
+score:
+	pushq	%rax
+	callq	<[u64]>::iter
+	movq	%rax, %rdi
+	movq	%rdx, %rsi
+	callq	<core::slice::iter::Iter<u64> as core::iter::traits::iterator::Iterator>::map::<u64, work::score::{closure#0}>
+...
+```
+
+`iter`, `map`, `filter` and `sum` are real functions. And inside `sum`, the path for one element goes through at least six function calls that I could find in the debug assembly: the `map` adapter calls the first closure (the multiplication, with its own overflow check), then the `filter` adapter calls the second closure (the test, which calls the `%` operator as a function), then the closure of `sum` does the addition, with an overflow check again.
+
+At level 3 there are no calls at all. This is the loop, two elements per turn:
+
+```asm
+.LBB19_5:
+	movq	(%rdi,%rcx,8), %r9
+	movq	8(%rdi,%rcx,8), %r10
+	leaq	(%r9,%r9,2), %r9
+	testb	$1, %r9b
+	cmovneq	%r8, %r9
+	addq	%rax, %r9
+	leaq	(%r10,%r10,2), %rax
+	testb	$1, %al
+	cmovneq	%r8, %rax
+	addq	%r9, %rax
+	addq	$2, %rcx
+```
+
+`leaq (%r9,%r9,2)` is `x * 3`, `testb $1` checks if it is odd, and `cmovneq` replaces an odd value with zero (`r8` is zero) without any jump. The closures and the adapters disappeared completely. They were only a way to describe this loop to the compiler.
+
+## The ranking changes too
+
+The factor is bad, but for me the worse problem is that the order between the functions changes.
+
+At level 0, `sum_iter` takes 7,239 ns and `sum_index` takes 13,273 ns. A debug benchmark says clearly that iterators are almost two times faster than indexing. At level 3 they take 373 and 354 ns, the same within the noise. I did not expect this. So if I would optimize my code with a debug build, I would rewrite indexing loops into iterators and win nothing in the real program.
+
+Level 1 is not a small version of the release build either. `score` is already as fast as at level 2 (1,166 ns at both levels), but `sum_index` is still 8.7 times slower than at level 2. "A little bit optimized" is a third program, with its own ranking.
+
+## C has the same problem, smaller
+
+I made the same experiment with a plain C sum and gcc 15.2.1, `-O0` against `-O2`. Each run prints five measurements of 20,000 calls:
+
+```text
+== gcc -O0, round 1, taskset -c 2
+sum:    7921.5 ns per call
+sum:    7796.4 ns per call
+sum:    7648.0 ns per call
+sum:    7579.9 ns per call
+sum:    7381.6 ns per call
+== gcc -O2, round 1, taskset -c 2
+sum:    1016.8 ns per call
+sum:    1013.4 ns per call
+sum:    1012.7 ns per call
+sum:    1012.9 ns per call
+sum:    1016.8 ns per call
+```
+
+About 7.5 times slower, and about 7.3 times in the other two rounds. The reason is visible in the inner loop at `-O0`:
+
+```asm
+.L3:
+	movq	-8(%rbp), %rax
+	leaq	0(,%rax,8), %rdx
+	movq	-24(%rbp), %rax
+	addq	%rdx, %rax
+	movq	(%rax), %rax
+	addq	%rax, -16(%rbp)
+	addq	$1, -8(%rbp)
+```
+
+`i` lives at `-8(%rbp)` and the sum at `-16(%rbp)`, in memory, and every turn reads and writes them. At `-O2` the loop is four instructions with everything in registers:
+
+```asm
+.L3:
+	addq	(%rdi), %rax
+	addq	$8, %rdi
+	cmpq	%rdx, %rdi
+	jne	.L3
+```
+
+So C at `-O0` is 7.3 to 7.6 times slower, and Rust at level 0 is 19 to 37 times slower. But the two factors are not comparable. The debug C sum, about 7,500 ns, is almost as fast as the debug Rust `sum_iter`, 7,239 ns. The big Rust factor comes mostly from the other side: in the release build rustc made a vector loop with two accumulators (373 ns), and gcc `-O2` made a scalar loop (1,013 ns). As in the first part, the two compilers made two different loops. What Rust at level 0 really adds is visible in `sum_index` and `score`: the checks and the calls of the iterators. This is why a debug build of Rust code says more about how many iterators and checks the code has than about its speed.
+
+## Measure the program you ship
+
+My conclusion is simple. A performance number belongs to one build, and the build is part of the result.
+
+When I see a timing, I look first for the line that cargo prints, `Finished` and the name of the profile. If it says `unoptimized`, the number tells me how slow the debug build is, and nothing else. For benchmarks I use `cargo bench` or `--release`. If I need checks in the measured program, for example overflow checks in production, then I turn them on in the release profile and measure that build, because then they are part of the program I ship.
+
+And I never compare two numbers from two different profiles. The ranking above shows why.
+
+The programs and the full output are in [the fixture of the series](https://github.com/mehdiakiki/mehdi-cz/tree/main/experiments/when-the-benchmark-lies), in [p02-debug-build.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/when-the-benchmark-lies/results/p02-debug-build.txt).
+
+## Sources
+
+- [The Cargo Book: Profiles](https://doc.rust-lang.org/1.98.0/cargo/reference/profiles.html)
+- [The rustc book: Codegen options (opt-level, debug-assertions, overflow-checks)](https://doc.rust-lang.org/1.98.0/rustc/codegen-options/index.html)

@@ -1,0 +1,126 @@
+---
+title: "Group Commit: How Databases Make fsync Cheaper"
+date: "2026-10-14T15:15:00+01:00"
+lastmod: "2026-10-14T15:15:00+01:00"
+tags: ["what survives a crash", "rust", "concurrency", "databases", "performance"]
+draft: false
+reviewed: true
+reviewedHash: "010936563afc611c7eba22a15bbb9ea58d5f094ac561b5904c2d1b06769ef80d"
+cluster: "reliable-data-integrations"
+campaign: "editorial"
+summary: "With every writer syncing alone, my laptop made about 1,800 records per second durable, with 1 or 16 writers. With group commit, one fdatasync for all waiting records, 16 writers reached 15,822. A small delay before the sync helped 16 writers and hurt one, as PostgreSQL documents."
+---
+
+In [part 9](/blog/write-ahead-logging-from-scratch) my store made about 1,960 puts per second durable, and each put needed only about 2 microseconds without the sync. The limit was the fdatasync after each put, around half a millisecond on this laptop ([part 2](/blog/what-fsync-costs-on-a-laptop-ssd)). So what happens when 16 clients write at the same time? Do they get 16 times more, or do they wait in a line?
+
+To answer it, I made a small Rust program. And the answer depends completely on one design decision.
+
+## The test
+
+Records of 100 bytes go to one log file. There are 1, 2, 4, 8 or 16 writer threads, each one runs for one second, and the rule is the rule of the whole series since [its first part](/blog/your-data-is-not-on-disk-when-write-returns): a writer may continue only when its record is durable. The program measures records per second, the latency of each commit (from the call to the return, p50 and p99), how many records each fdatasync covered on average, and the flush requests that the disk received. There are three strategies, and here is the first.
+
+## Every writer for itself
+
+Each writer takes a lock, writes its record, calls fdatasync, and releases the lock:
+
+```text
+== records of 100 bytes, each one durable before its writer continues, 1 second per line, machine load: load average: 3.57, 3.56, 3.65
+  alone         1 writers:   1867 records/s, p50    485 us, p99   1177 us,  1.00 records per fdatasync, 100.21 disk flushes per 100 records
+  alone         2 writers:   1607 records/s, p50    543 us, p99   3953 us,  1.00 records per fdatasync, 100.00 disk flushes per 100 records
+  alone         4 writers:   2038 records/s, p50    449 us, p99   1011 us,  1.00 records per fdatasync, 100.00 disk flushes per 100 records
+  alone         8 writers:   1969 records/s, p50    451 us, p99   3295 us,  1.00 records per fdatasync, 100.20 disk flushes per 100 records
+  alone        16 writers:   1828 records/s, p50    456 us, p99 181372 us,  1.00 records per fdatasync, 100.00 disk flushes per 100 records
+```
+
+The throughput does not move: around 1,600 to 2,000 records per second, with one writer or with sixteen. Each record has its own fdatasync, so the disk received about one flush per record, and the disk is the line where everybody waits.
+
+The p50 latency looks fine, about 450 microseconds: most calls get the lock quickly. But look at the p99 with 16 writers: 181,372 microseconds, 0.18 seconds. The documentation of Rust's `Mutex` promises that one thread at a time holds the lock, and it says nothing about which waiting thread gets it next. My reading is that some threads got it again and again, while one percent of the commits waited a very long time. Sixteen threads wait for one lock, and nothing promises them a turn.
+
+## One fsync for everybody
+
+The second strategy is group commit. The writers put their records into a shared queue. If nobody is syncing, the writer becomes the leader: it takes everything in the queue, writes it with one write call, calls fdatasync once, marks all these records as durable, and wakes everybody. If a leader is already busy, the writer waits, and either its record is in the next batch, or it becomes the next leader itself:
+
+```rust
+    fn commit_grouped(&self, record: &[u8]) {
+        let mut q = self.queue.lock().unwrap();
+        let mine = q.next;
+        q.next += 1;
+        q.pending.extend_from_slice(record);
+        while q.durable <= mine {
+            if q.leader {
+                q = self.done.wait(q).unwrap();
+                continue;
+            }
+            q.leader = true;
+            if !self.delay.is_zero() {
+                drop(q);
+                thread::sleep(self.delay);
+                q = self.queue.lock().unwrap();
+            }
+            let batch = std::mem::take(&mut q.pending);
+            let upto = q.next;
+            drop(q);
+            let mut file = self.file.lock().unwrap();
+            file.write_all(&batch).expect("write");
+            file.sync_data().expect("fdatasync");
+            drop(file);
+            q = self.queue.lock().unwrap();
+            q.durable = upto;
+            q.leader = false;
+            q.syncs += 1;
+            self.done.notify_all();
+        }
+    }
+```
+
+The important line for correctness is the `while`: a writer returns only when `durable` is past its own sequence number. Nobody returns because "somebody is syncing". It returns because the sync that contained its record has finished. (The `delay` part is the third strategy, below.)
+
+```text
+  group         1 writers:   1539 records/s, p50    486 us, p99   4375 us,  1.00 records per fdatasync, 100.19 disk flushes per 100 records
+  group         2 writers:   2968 records/s, p50    539 us, p99   1476 us,  1.50 records per fdatasync, 66.69 disk flushes per 100 records
+  group         4 writers:   4752 records/s, p50    867 us, p99   2210 us,  2.49 records per fdatasync, 40.21 disk flushes per 100 records
+  group         8 writers:   8554 records/s, p50    922 us, p99   1975 us,  4.39 records per fdatasync, 22.85 disk flushes per 100 records
+  group        16 writers:  15822 records/s, p50    945 us, p99   4283 us,  8.31 records per fdatasync, 12.04 disk flushes per 100 records
+```
+
+With one writer there is nobody to share with, so nothing gets better (1,539 records per second here against 1,867; the alone lines already move between 1,607 and 2,038). But with 16 writers it is another story: 15,822 records per second, more than eight times the first strategy, with 8.31 records per fdatasync and 12 flushes per 100 records. The durability is the same, every record is synced before its writer continues. Only the cost is shared.
+
+The price is latency. With 16 writers, the p50 went from 456 microseconds, every writer alone, to 945 with group commit. A writer that arrives while a sync is running must wait for that sync to finish, and then for the next one, which contains its record: about two syncs instead of one.
+
+And why 8 records per sync with 16 writers, not 16? My reading of the numbers: the writers split into two groups. While the leader syncs a batch of about eight, the eight other writers put their records into the queue. When the sync ends, the first eight wake up and immediately add new records, but the next leader takes the queue at once, with the waiting eight. So the batches alternate between two halves.
+
+## Waiting on purpose
+
+What if the leader waits a little before it takes the queue, so that more records arrive? The third strategy waits 200 microseconds:
+
+```text
+  group+delay   1 writers:   1187 records/s, p50    793 us, p99   1453 us,  1.00 records per fdatasync, 100.00 disk flushes per 100 records
+  group+delay   2 writers:   2447 records/s, p50    772 us, p99   1406 us,  2.00 records per fdatasync, 50.12 disk flushes per 100 records
+  group+delay   4 writers:   4881 records/s, p50    791 us, p99   1209 us,  4.00 records per fdatasync, 25.00 disk flushes per 100 records
+  group+delay   8 writers:  10170 records/s, p50    736 us, p99   1885 us,  7.99 records per fdatasync, 12.51 disk flushes per 100 records
+  group+delay  16 writers:  17012 records/s, p50    834 us, p99   3953 us, 15.96 records per fdatasync,  6.28 disk flushes per 100 records
+```
+
+For one writer it is only a loss: 1,187 records per second instead of 1,539, because every commit now waits 200 microseconds for nobody. For many writers it works: the batches are full (15.96 records per sync with 16 writers), the throughput is the best of the three, 17,012 per second, and even the p50 latency is lower than without the delay, because the two alternating halves become one batch. This one surprised me: I expected the delay to make every commit slower.
+
+PostgreSQL has this knob, and its documentation describes this result in advance. `commit_delay` "can improve group commit throughput by allowing a larger number of transactions to commit via a single WAL flush, if system load is high enough that additional transactions become ready to commit within the given interval. However, it also increases latency by up to the commit_delay for each WAL flush." And then the part that my one-writer line shows: "Because the delay is just wasted if no other transactions become ready to commit, a delay is only performed if at least commit_siblings other transactions are active when a flush is about to be initiated." The default `commit_delay` is zero, and `commit_siblings` is five. A good default: wait only when there is somebody to wait for.
+
+Redis uses the same idea for its strictest mode: the persistence documentation says that `appendfsync always` "supports group commit, so if there are multiple parallel writes Redis will try to perform a single fsync operation."
+
+## What group commit does not do
+
+First, one commit is not faster. A single writer still pays a full sync, and with a delay it pays even more.
+
+The promise also stays the same, and this is the difference with the `ack-before-fsync` variant of part 9, which also made the writer continue earlier, but by lying. Here every `ok` still comes after the fdatasync that covers the record.
+
+And group commit needs concurrency: with few writers there is nothing to group, and the code is more complex than a lock: a writer that returns one batch too early is a durability bug that no benchmark will show.
+
+So my opinion: if a system must make many small things durable, a correct way to pay less is to share the sync, not to skip it. And the delay is a setting to tune with the real number of concurrent writers, not a constant to copy.
+
+The program is `groupcommit.rs` in the [fixture](https://github.com/mehdiakiki/mehdi-cz/tree/main/experiments/what-survives-a-crash), and the full output is [p16-groupcommit.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/what-survives-a-crash/results/p16-groupcommit.txt).
+
+## Further reading
+
+- [PostgreSQL 18: Write Ahead Log settings (commit_delay, commit_siblings)](https://www.postgresql.org/docs/18/runtime-config-wal.html)
+- [Redis persistence (appendfsync always and group commit)](https://redis.io/docs/latest/operate/oss_and_stack/management/persistence/)
+- [std::sync::Mutex in the Rust 1.98.0 documentation](https://doc.rust-lang.org/1.98.0/std/sync/struct.Mutex.html)

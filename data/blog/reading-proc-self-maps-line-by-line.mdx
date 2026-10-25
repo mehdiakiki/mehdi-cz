@@ -1,0 +1,185 @@
+---
+title: "Reading /proc/self/maps Line by Line"
+date: "2026-10-01T14:20:00+01:00"
+lastmod: "2026-10-01T14:20:00+01:00"
+tags: ["from source to process", "linux", "memory layout", "c", "rust"]
+draft: false
+reviewed: true
+reviewedHash: "4c53a04cfadadcf9fa46fca48b0c4020303322d9e501a89d931fdd99ef207d67"
+cluster: "rust-under-the-hood"
+campaign: "editorial"
+summary: "I printed the memory map of a small C program and of a Rust program and explained every column and every line, then watched the addresses move with ASLR, stop moving with setarch -R, and go back to 0x400000 with -no-pie."
+---
+
+Every process on Linux can read the list of its own memory. It is a text file, `/proc/self/maps`, and it has one line per mapping. I made a small C program that allocates a small block and a big block, prints the address of six things, and then prints this file:
+
+```text
+main 0x55ca74e0d0e0, counter 0x55ca74e10068, small 0x55cab2556010, large 0x7f29a5308010, local 0x7ffc507fa9c4, puts 0x7f29a548ee00
+55ca74e0c000-55ca74e0d000 r--p 00000000 103:02 1969203                   maps
+55ca74e0d000-55ca74e0e000 r-xp 00001000 103:02 1969203                   maps
+55ca74e0e000-55ca74e0f000 r--p 00002000 103:02 1969203                   maps
+55ca74e0f000-55ca74e10000 r--p 00002000 103:02 1969203                   maps
+55ca74e10000-55ca74e11000 rw-p 00003000 103:02 1969203                   maps
+55cab2556000-55cab2577000 rw-p 00000000 00:00 0                          [heap]
+7f29a5308000-7f29a540c000 rw-p 00000000 00:00 0 
+7f29a540c000-7f29a5430000 r--p 00000000 103:02 11023609                  /usr/lib/libc.so.6
+7f29a5430000-7f29a55a1000 r-xp 00024000 103:02 11023609                  /usr/lib/libc.so.6
+7f29a55a1000-7f29a55ef000 r--p 00195000 103:02 11023609                  /usr/lib/libc.so.6
+7f29a55ef000-7f29a55f3000 r--p 001e2000 103:02 11023609                  /usr/lib/libc.so.6
+7f29a55f3000-7f29a55f5000 rw-p 001e6000 103:02 11023609                  /usr/lib/libc.so.6
+7f29a55f5000-7f29a55ff000 rw-p 00000000 00:00 0 
+7f29a562d000-7f29a562e000 r--p 00000000 103:02 11020445                  /usr/lib/ld-linux-x86-64.so.2
+7f29a562e000-7f29a5658000 r-xp 00001000 103:02 11020445                  /usr/lib/ld-linux-x86-64.so.2
+7f29a5658000-7f29a5663000 r--p 0002b000 103:02 11020445                  /usr/lib/ld-linux-x86-64.so.2
+7f29a5663000-7f29a5665000 r--p 00036000 103:02 11020445                  /usr/lib/ld-linux-x86-64.so.2
+7f29a5665000-7f29a5666000 rw-p 00038000 103:02 11020445                  /usr/lib/ld-linux-x86-64.so.2
+7f29a5666000-7f29a5667000 rw-p 00000000 00:00 0 
+7ffc507db000-7ffc507fd000 rw-p 00000000 00:00 0                          [stack]
+7ffc509bb000-7ffc509bf000 r--p 00000000 00:00 0                          [vvar]
+7ffc509bf000-7ffc509c1000 r-xp 00000000 00:00 0                          [vdso]
+ffffffffff600000-ffffffffff601000 --xp 00000000 00:00 0                  [vsyscall]
+```
+
+The whole memory of the process in 23 lines. In [the first part of this series](/blog/what-happens-when-you-run-a-program-from-execve-to-main) I used this file twice to see what the kernel prepared before the first instruction. Here I want to understand every column and every line, because after this part the series is using it all the time.
+
+## Six columns
+
+Take the second line: `55ca74e0d000-55ca74e0e000 r-xp 00001000 103:02 1969203 maps`.
+
+1. `55ca74e0d000-55ca74e0e000` is the address range, in hex. The start is included and the end is not, and both are multiples of the page size, 4 KiB. This one is exactly one page.
+2. `r-xp` are the permissions: read, no write, execute. The last letter is `p` for private, which proc_pid_maps(5) describes as "copy on write": if the process writes to such a page, it gets its own copy and the file does not change. `s` would mean shared.
+3. `00001000` is the offset in the file where this mapping starts. The man page suggests comparing it with the program headers of `readelf -l`, and this is exactly the code segment from the second part, at offset 0x1000 in the file.
+4. `103:02` is the device, major and minor number, in hex. 0x103 is 259 and `/proc/partitions` lists 259:2 as `nvme0n1p2`, the partition with my home directory. `stat` gives the same number for the file: `10302`.
+5. `1969203` is the inode of the file. `ls -i maps` prints the same number.
+6. `maps` is the path (I removed the long directory). It is empty for anonymous memory, and in brackets for some special areas.
+
+## The program itself
+
+The first five lines are my program, and the markers in the first line tell where things are:
+
+- `main` at 0x55ca74e0d0e0 is in the `r-xp` line, the code.
+- `counter`, a global variable, at 0x55ca74e10068 is in the last line, `rw-p` with offset 0x3000.
+- The first `r--p` line, offset 0, has the ELF header and the program headers, and the third one (offset 0x2000) has the constants.
+
+The fourth line is the interesting one. It is `r--p` and its offset is 0x2000 again. This page was writable in the file: it is the start of the writable segment, with the GOT and `.init_array`. The loader wrote the relocations there and then made it read-only, the RELRO protection from [the part about the PLT and the GOT](/blog/how-a-call-to-printf-finds-printf-the-plt-and-the-got). Before that `mprotect`, these two last lines were one `rw-p` line. The kernel keeps one line per range with the same permissions and the same origin, so one `mprotect` on half of a range cuts it in two.
+
+## The heap, and two lines that are two things each
+
+`small`, the 100-byte block, is at 0x55cab2556010, in the line called `[heap]`. This line is 0x21000 bytes, 132 KiB, for one block of 100 bytes: malloc asked the kernel for more than it needed, at once. A later part looks at how malloc decides this.
+
+`large`, the 1 MiB block, is not in the heap. It is at 0x7f29a5308010, at the start of an anonymous line without a name: 7f29a5308000-7f29a540c000. But this line is 0x104000 bytes, a bit more than 1 MiB. Strange. The strace of the same run explains it:
+
+```text
+mmap(NULL, 12288, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x7f29a5409000
+...
+mmap(NULL, 1052672, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x7f29a5308000
+```
+
+The first `mmap` is the 12 KiB area of the main thread that the loader creates at startup (the first part explained it), from 0x7f29a5409000 to 0x7f29a540c000. The second is malloc's mapping for my 1 MiB block, 1,052,672 bytes, and it ends exactly at 0x7f29a5409000. Two anonymous areas, next to each other, with the same permissions: the kernel shows them as one line. So one line of the map is not always one `mmap` call, and to know what is inside an anonymous line, I need strace or gdb.
+
+The same happens after libc. The line 7f29a55f5000-7f29a55ff000 is 40 KiB: the 31,600 bytes of libc's zeroed data (its `.bss`, mapped at 0x7f29a55f5000), rounded up to pages, plus the 8 KiB that the loader allocated for itself at 0x7f29a55fd000.
+
+## The libraries and the special areas
+
+libc and the loader have the same pattern as my program: a read-only part with the headers, the code, the constants, a page made read-only after relocation, the writable data, and an anonymous line for the zeroed data. The `puts` marker, 0x7f29a548ee00, is in the `r-xp` line of libc.
+
+Then the special areas:
+
+- `[stack]` contains `local`, at 0x7ffc507fa9c4. Its top is at 0x7ffc507fd000, and [the part about the initial stack](/blog/what-is-on-the-stack-when-a-process-starts-argv-envp-and-auxv) showed what the kernel wrote in the last bytes below it. Here it is 136 KiB, and it grows down when the program needs more.
+- `[vvar]` and `[vdso]` are pages that the kernel adds to every process. The vDSO is a small library in memory (its address is `AT_SYSINFO_EHDR` in the auxiliary vector), and `[vvar]` holds data that it reads. A later part measures why they exist.
+- `[vsyscall]` is at a fixed address near the top of the address space, and its permissions are only `--x`. It is an old mechanism kept for compatibility. The kernel documentation of the `vsyscall=` parameter says that the default is `xonly`: calls into this page are trapped and emulated, and the page "is not readable".
+
+## The same program, twice
+
+With address randomization, the addresses change at every run:
+
+```text
+$ ./maps | grep -E 'main|r--p 00000000 .* maps$|heap'   (run 1)
+main 0x558681f6f0e0, counter 0x558681f72068, small 0x558694515010, large 0x7fb4680fd010, local 0x7ffded435ed4, puts 0x7fb468283e00
+558681f6e000-558681f6f000 r--p 00000000 103:02 1969203                   maps
+558694515000-558694536000 rw-p 00000000 00:00 0                          [heap]
+$ ./maps | grep -E 'main|r--p 00000000 .* maps$|heap'   (run 2)
+main 0x565248d930e0, counter 0x565248d96068, small 0x565284603010, large 0x7fc14c60d010, local 0x7fff21667e74, puts 0x7fc14c793e00
+565248d92000-565248d93000 r--p 00000000 103:02 1969203                   maps
+565284603000-565284624000 rw-p 00000000 00:00 0                          [heap]
+```
+
+The program, the heap, the libraries and the stack each moved, independently. But inside each area the offsets stay the same: `main` ends in `0e0` in both runs, `counter` in `068`, `puts` in `e00`. I liked this detail. The kernel moves whole mappings, page by page, never the content inside them. This is why one leaked address of libc is enough to know where all of libc is.
+
+With `setarch -R`, randomization is off for one command:
+
+```text
+$ setarch x86_64 -R ./maps | grep -E 'main|r--p 00000000 .* maps$|heap'   (run 1)
+main 0x5555555550e0, counter 0x555555558068, small 0x555555559010, large 0x7ffff7c9a010, local 0x7fffffffcf44, puts 0x7ffff7e20e00
+555555554000-555555555000 r--p 00000000 103:02 1969203                   maps
+555555559000-55555557a000 rw-p 00000000 00:00 0                          [heap]
+$ setarch x86_64 -R ./maps | grep -E 'main|r--p 00000000 .* maps$|heap'   (run 2)
+main 0x5555555550e0, counter 0x555555558068, small 0x555555559010, large 0x7ffff7c9a010, local 0x7fffffffcf44, puts 0x7ffff7e20e00
+555555554000-555555555000 r--p 00000000 103:02 1969203                   maps
+555555559000-55555557a000 rw-p 00000000 00:00 0                          [heap]
+```
+
+Identical runs. These are the addresses that gdb showed in the earlier parts, because gdb uses the same personality flag. One more detail: without randomization the heap starts at 0x555555559000, directly after the program. With randomization there was a big random gap between them.
+
+And with `-no-pie`, the program is not position independent anymore, so it cannot move at all:
+
+```text
+$ ./maps_nopie | head -n 7
+main 0x4010e0, counter 0x404068, small 0x38d07010, large 0x7f65586ec010, local 0x7ffec5a1c844, puts 0x7f6558872e00
+00400000-00401000 r--p 00000000 103:02 1969204                           maps_nopie
+00401000-00402000 r-xp 00001000 103:02 1969204                           maps_nopie
+00402000-00403000 r--p 00002000 103:02 1969204                           maps_nopie
+00403000-00404000 r--p 00002000 103:02 1969204                           maps_nopie
+00404000-00405000 rw-p 00003000 103:02 1969204                           maps_nopie
+38d07000-38d28000 rw-p 00000000 00:00 0                                  [heap]
+```
+
+0x400000, the classic base address of x86-64 executables. Only the program is fixed: the heap at 0x38d07000 and the libraries are still randomized.
+
+## One line in detail
+
+The maps file says where a mapping is. `/proc/self/smaps` has the same lines, each followed by its numbers. Here is the code of libc in my process:
+
+```text
+7efcd6a84000-7efcd6bf5000 r-xp 00024000 103:02 11023609                  /usr/lib/libc.so.6
+Size:               1476 kB
+KernelPageSize:        4 kB
+MMUPageSize:           4 kB
+Rss:                1068 kB
+Pss:                   3 kB
+Pss_Dirty:             0 kB
+Shared_Clean:       1068 kB
+Shared_Dirty:          0 kB
+Private_Clean:         0 kB
+Private_Dirty:         0 kB
+...
+VmFlags: rd ex mr mw me sd 
+```
+
+The mapping is 1,476 kB, but only 1,068 kB of it is resident and mapped in this process (`Rss`). The pages that are not in Rss are not mapped yet, the next part is about this. `Pss` is 3 kB: these pages are shared with many other processes, and this process pays only its share, as in the part about static linking. And `VmFlags` gives the same permissions in more detail: `rd` readable, `ex` executable, `mr mw me` "may read, may write, may execute" (what `mprotect` could still allow), and `sd` for "soft dirty", a flag for memory tracking.
+
+## A Rust program
+
+The map of a Rust program has the same structure, and two differences. Here is the middle of it:
+
+```text
+7f5810970000-7f5810971000 rw-p 0002b000 103:02 11051877                  /usr/lib/libgcc_s.so.1
+7f5810971000-7f5810973000 rw-p 00000000 00:00 0 
+7f581099e000-7f581099f000 ---p 00000000 00:00 0 
+7f581099f000-7f58109a1000 rw-p 00000000 00:00 0 
+7f58109a1000-7f58109a2000 r--p 00000000 103:02 11020445                  /usr/lib/ld-linux-x86-64.so.2
+```
+
+The first difference is `libgcc_s.so.1`, the second library of every Rust program here. The second is the two small anonymous lines: a page with no permissions at all (`---p`) and 8 KiB of `rw-p` just above it. This is the alternate signal stack that std creates before `main`: in the first part, strace showed an `mmap` of 12 KiB and an `mprotect` of its first page to `PROT_NONE`. A page that nobody can read or write is a guard: if the signal handler uses too much stack, it touches this page and crashes immediately, instead of overwriting other memory. Guard pages are the subject of a later part about stack overflows.
+
+## Reading a map, in order
+
+After this part, my order to read a map is simple. First the file of each line, and for the anonymous lines I need strace or gdb, because neighbours can merge. Then the permissions: `r-x` is code, an `r--` line just before the `rw-` line of the same file, with the same offset, is data that the loader relocated and then protected, and `---` is a guard. The offset gives the segment in `readelf -l`, and the last three hex digits of an address stay the same between runs, so I can find one function again. For the cost in memory the map is not enough, I read `Rss` and `Pss` in `smaps`.
+
+## Sources
+
+- proc_pid_maps(5), the meaning of each field: https://man7.org/linux/man-pages/man5/proc_pid_maps.5.html
+- proc_pid_smaps(5): https://man7.org/linux/man-pages/man5/proc_pid_smaps.5.html
+- The kernel documentation of /proc, smaps fields and VmFlags: https://docs.kernel.org/filesystems/proc.html
+- The kernel parameters, `vsyscall=`: https://docs.kernel.org/admin-guide/kernel-parameters.html
+- The programs and the saved outputs of this part: https://github.com/mehdiakiki/mehdi-cz/tree/main/experiments/from-source-to-process/p12

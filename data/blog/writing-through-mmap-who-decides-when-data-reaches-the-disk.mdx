@@ -1,0 +1,124 @@
+---
+title: "Writing Through mmap: Who Decides When Data Reaches the Disk"
+date: "2026-10-17T06:35:00+01:00"
+lastmod: "2026-10-17T06:35:00+01:00"
+tags: ["what survives a crash", "linux", "rust", "databases", "memory management"]
+draft: false
+reviewed: true
+reviewedHash: "0dc394c1029e26400896df893d9666e502fc51cc7d6689a180e91ecbc39bc8f4"
+cluster: "reliable-data-integrations"
+campaign: "editorial"
+summary: "I changed 64 MiB of a file without one write call, through a shared memory mapping. The pages became dirty like in the first part, kill -9 kept them, msync or fsync made them durable, and a truncated file killed my program with SIGBUS. The kernel decides the rest."
+---
+
+A program can change a file without calling write at all:
+
+```text
+== strace -f -e trace=write,pwrite64,writev,msync,fsync,fdatasync,mmap: mmapwrite sync, 16 MiB, msync
+mmap(NULL, 16777216, PROT_READ|PROT_WRITE, MAP_SHARED, 3, 0) = 0x7f682ae00000
+msync(0x7f682ae00000, 16777216, MS_SYNC) = 0
+write, pwrite64 and writev calls on the file (descriptor 3): 0
+write calls on standard output (descriptor 1): 3
+```
+
+The program mapped 16 MiB of a file into its memory, filled every page with normal stores, and called msync once. Zero write calls on the file. (The three writes on standard output are its own messages.) So the whole series until now, which watched write and fsync, would see nothing here. This part looks at what the kernel does with data that arrives this way, and who decides when it goes to the disk.
+
+## Stores instead of write calls
+
+The program is in Rust, with my own `extern "C"` declarations for `mmap`, `msync` and `munmap`, because the standard library does not have them. It creates a file of 64 MiB, maps it with `MAP_SHARED` (changes go to the file, not to a private copy), and writes every 4 KiB page through a pointer:
+
+```rust
+    fn fill(&self) {
+        for index in 0..self.len / PAGE {
+            let page = unsafe { std::slice::from_raw_parts_mut(self.ptr.add(index * PAGE), PAGE) };
+            page.fill(0x6d);
+            page[..8].copy_from_slice(&(index as u64).to_le_bytes());
+        }
+    }
+```
+
+Then it waits one second and it looks also at the counters of [the first part](/blog/your-data-is-not-on-disk-when-write-returns):
+
+```text
+none: 64 MiB file, MAP_SHARED, every page written through memory in 62.9 ms, 15873 minor and 513 major page faults
+  Dirty grew by 65344 kB, file dirty pages after the stores: 16384
+  no sync, one second of sleep: 1000.2 ms, file dirty pages after it: 16384, disk: 456 KiB written, 0 flushes
+```
+
+The result is the same as with write. Dirty grew by about 64 MiB, and `cachestat` says that all 16,384 pages of the file are dirty. One second later they are still dirty, and the disk received almost nothing. The pages of a shared file mapping are the pages of the page cache, the same ones that write fills.
+
+How does the kernel know about stores, if there is no system call? This was not obvious for me at first. Through page faults: the first store to a page that is not mapped yet stops the program, the kernel prepares the page and marks it, and the program continues.
+
+The program counted 15,873 minor and 513 major page faults during the stores, together 16,386, so about one per page. A fault is "major" when the page is not in the page cache at all: in the kernel source of `filemap_fault`, the comment "No page in the page cache at all" comes just before the major fault is counted. Then the kernel prepares also the pages around this one, its readahead, and the faults on them are only minor. The readahead of this disk is 128 KiB (the first line of the output file says it), so 32 pages, and 16,384 pages divided by 32 gives 512, near the 513 major faults. But the file is new and has no block on the disk yet, so nothing is read here; "major" is only how the kernel counts these faults.
+
+## kill -9 keeps it
+
+If the pages are in the page cache, a process crash should not lose them. Same test as in the first part: write 64 MiB through the mapping, no msync, no fsync, and kill:
+
+```text
+== 64 MiB written through a MAP_SHARED mapping, no msync and no fsync, then kill -9
+64 MiB written through the mapping, no msync, no fsync, waiting to be killed
+exit status after kill -9: 137
+file size 67108864 bytes, pages with wrong content: 0
+```
+
+Every page correct. Good. The process died, and the memory that it wrote into belongs to the kernel, which keeps it and writes it back later. For a process crash, a store into a shared mapping is as safe as a write.
+
+## Who decides when
+
+Without any call, the kernel decides, with the same writeback rules as for write: old dirty data at the next flusher wake-up, or earlier when it wants to. The program has two ways to ask for durability. The first is msync:
+
+```text
+msync: 64 MiB file, MAP_SHARED, every page written through memory in 45.9 ms, 15873 minor and 513 major page faults
+  Dirty grew by 64380 kB, file dirty pages after the stores: 16384
+  msync(MS_SYNC): 22.7 ms, file dirty pages after it: 0, disk: 65924 KiB written, 1 flushes
+```
+
+The msync(2) man page says what it is for: it "flushes changes made to the in-core copy of a file that was mapped into memory using mmap(2) back to the filesystem. Without use of this call, there is no guarantee that changes are written back before munmap(2) is called." With `MS_SYNC` it "requests an update and waits for it to complete". After it, zero dirty pages, about 64 MiB written to the disk, and one flush.
+
+The second way is a normal fsync on the file descriptor:
+
+```text
+fsync: 64 MiB file, MAP_SHARED, every page written through memory in 48.8 ms, 15873 minor and 513 major page faults
+  Dirty grew by 65664 kB, file dirty pages after the stores: 16384
+  fsync(fd): 31.9 ms, file dirty pages after it: 0, disk: 65812 KiB written, 1 flushes
+```
+
+The same result. OK, so both calls work. On Linux, fsync writes the dirty pages of the file, and it does not care if they became dirty through write or through a mapping, because they are the same pages. I would still use msync in code that writes through a mapping: it is the call that the man page documents for this, and it says what the code means.
+
+So with a mapping, the answer to "when does the data reach the disk" is: when the kernel decides, or when you call msync or fsync. Never because the store instruction finished. That is the same rule as for write, only without a system call that you can see in a trace.
+
+## The file can disappear under the mapping
+
+A mapping has also one danger that write does not have. The program maps 8 KiB of a file, writes to the second page, then truncates the file to 4 KiB, and writes to the second page again:
+
+```text
+== map 8 KiB of a file, truncate the file to 4 KiB, write to the second page
+wrote to the second page of an 8 KiB mapping: ok
+file truncated to 4096 bytes, writing to the second page again
+exit status: 135, which is 128 + 7, and signal 7 is SIGBUS
+```
+
+The second store killed the process. The mmap(2) man page lists the signal: "SIGBUS Attempted access to a page of the buffer that lies beyond the end of the mapped file." With write, a problem with the file is an error code that the program can handle. With a mapping, it is a signal in the middle of a normal assignment, and the program never sees a return value. Here my own program truncated the file, but any other process that can truncate it can do the same.
+
+## What databases decided
+
+For a database, writing through a mapping is tempting: no copies, no buffer pool, the kernel manages the memory. LMDB is built on a memory map, and its header file (`lmdb.h` of version 0.9.33 is installed on my laptop) explains its default carefully: the map "is read-only by default as this provides total immunity to corruption. Using read-write mode offers much higher write performance, but adds the possibility for stray application writes thru pointers to silently corrupt the database." With a read-only map, LMDB writes its pages with system calls. The flag `MDB_WRITEMAP` changes this to a writable map, and the documentation repeats the price: it "loses protection from application bugs like wild pointer writes and other bad updates into the database."
+
+In 2022, Andrew Crotty, Viktor Leis and Andy Pavlo published "Are You Sure You Want to Use MMAP in Your Database Management System?" at CIDR. Their project page summarizes it: "There are, however, severe correctness and performance issues with MMAP that are not immediately apparent", and their conclusion is that "MMAP is not a suitable replacement for a traditional buffer pool."
+
+I can add one reason from this series, as my own reasoning. My store of [part 9](/blog/write-ahead-logging-from-scratch) decides the order: first the log record is durable, then the data changes. With a writable mapping, the kernel can write any dirty page at any moment, and [part 1](/blog/your-data-is-not-on-disk-when-write-returns) showed that it sometimes does it much earlier than 30 seconds. So a changed data page can reach the disk before the log record that explains it. A database that writes through a mapping must work against the kernel to keep the order that write-ahead logging needs.
+
+## My conclusion
+
+Writing through mmap is not less durable than write. It is the same page cache, the same dirty pages, the same writeback, and msync or fsync make it durable. What changes is who controls the moment: with write, nothing goes to the kernel before you call it, and with a mapping, the kernel can take a page whenever it wants. For reading a big file, mmap is a good tool. For writing data that must follow an order, I prefer write and pwrite, where the order is visible in the code and in strace.
+
+The program is `mmapwrite.rs` in the [fixture](https://github.com/mehdiakiki/mehdi-cz/tree/main/experiments/what-survives-a-crash). The outputs are [p17-sync.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/what-survives-a-crash/results/p17-sync.txt), [p17-strace.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/what-survives-a-crash/results/p17-strace.txt), [p17-kill.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/what-survives-a-crash/results/p17-kill.txt), [p17-sigbus.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/what-survives-a-crash/results/p17-sigbus.txt) and [p17-lmdb.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/what-survives-a-crash/results/p17-lmdb.txt).
+
+## Further reading
+
+- [mmap(2), Linux manual page](https://man7.org/linux/man-pages/man2/mmap.2.html)
+- [msync(2), Linux manual page](https://man7.org/linux/man-pages/man2/msync.2.html)
+- [mm/filemap.c in Linux 6.6, with `filemap_fault`](https://elixir.bootlin.com/linux/v6.6/source/mm/filemap.c)
+- [LMDB, the project page](https://symas.com/lmdb), and its header `lmdb.h` (version 0.9.33)
+- [Crotty, Leis and Pavlo, "Are You Sure You Want to Use MMAP in Your Database Management System?", CIDR 2022, project page](https://db.cs.cmu.edu/mmap-cidr2022/)

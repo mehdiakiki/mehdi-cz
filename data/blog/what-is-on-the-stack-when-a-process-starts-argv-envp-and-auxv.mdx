@@ -1,0 +1,154 @@
+---
+title: "What Is on the Stack When a Process Starts: argv, envp and auxv"
+date: "2026-09-30T12:30:00+01:00"
+lastmod: "2026-09-30T12:30:00+01:00"
+tags: ["from source to process", "linux", "c", "rust", "memory layout"]
+draft: false
+reviewed: true
+reviewedHash: "d680dcc4b1dc8f2dd87d6f4398bbdca8a382587f06745fc92a281996a402559b"
+cluster: "rust-under-the-hood"
+campaign: "editorial"
+summary: "Before the first instruction, the kernel writes argc, argv, envp and 22 pairs of numbers for the loader at the top of the stack. I read them from a C program, compared them with LD_SHOW_AUXV, and saw 4,000 bytes of environment move every local variable of main."
+---
+
+In [the first part of this series](/blog/what-happens-when-you-run-a-program-from-execve-to-main), the loader started with almost nothing: my program and itself in memory, a stack, and no open file for my program. Still, it found my program headers, mapped libc for it and jumped to my `_start`. How did it know where my program is?
+
+The answer is on the stack. Before the first instruction, the kernel writes some values there for the process, and one part of them is a list made for the loader, the auxiliary vector. I made a small C program that reads this whole area, starting from what `main` receives.
+
+The idea of the program is simple. `main` gets `argc`, `argv` and `envp`. The `envp` array ends with a NULL pointer, and the auxiliary vector starts just after it: pairs of (type, value) until a pair with type `AT_NULL`. The program walks this, gives each type its name from `elf.h`, and prints the addresses of everything. I ran it with an almost empty environment, so the output stays short:
+
+```text
+$ env -i A=1 B=two ./auxv one
+the initial stack, from low to high addresses:
+  0x7ffc0abcf640  argc = 2
+  0x7ffc0abcf648  argv[0] .. argv[1], then NULL
+  0x7ffc0abcf660  envp[0] .. envp[1], then NULL
+  0x7ffc0abcf678  auxv, pairs of (type, value):
+        AT_SYSINFO_EHDR        0x7ffc0abdd000
+        AT_MINSIGSTKSZ         0xe30
+        AT_HWCAP               0xbfebfbff
+        AT_PAGESZ              0x1000
+        AT_CLKTCK              0x64
+        AT_PHDR                0x560329c5f040
+        AT_PHENT               0x38
+        AT_PHNUM               0xe
+        AT_BASE                0x7f014b931000
+        AT_FLAGS               0x0
+        AT_ENTRY               0x560329c60440
+        AT_UID                 0x3e8
+        AT_EUID                0x3e8
+        AT_GID                 0x3e8
+        AT_EGID                0x3e8
+        AT_SECURE              0x0
+        AT_RANDOM              0x7ffc0abcf7e9
+        AT_HWCAP2              0x2
+        AT_EXECFN              0x7ffc0abd0ff1  "./auxv"
+        AT_PLATFORM            0x7ffc0abcf7f9  "x86_64"
+        AT_RSEQ_FEATURE_SIZE   0x1c
+        AT_RSEQ_ALIGN          0x20
+        AT_NULL                0x0
+```
+
+Let me read it from the top. `argc` is the first value, at the lowest address: this is where the stack pointer was when the process started. Then the `argv` array, 2 pointers and a NULL, so 24 bytes: 0x...640 + 8 = 0x...648, and 0x...648 + 24 = 0x...660, where `envp` starts. The same for `envp`: two pointers, a NULL, and at 0x...678 the auxiliary vector. Everything is packed one after the other, 8 bytes per word.
+
+## The 22 pairs
+
+The auxiliary vector has 22 pairs before `AT_NULL`. Some are for the loader, some for libc, some describe the machine. The getauxval(3) man page describes them.
+
+For the loader, the most important ones:
+
+- `AT_PHDR` is "the address of the program headers of the executable": 0x560329c5f040, that is the load address of my program plus 0x40, where the program headers start in the file (the second part of this series showed this offset in `readelf -h`). `AT_PHENT` is 0x38 = 56 bytes per header, and `AT_PHNUM` is 0xe = 14 headers. With these three values, the loader can read the segments of my program without opening the file.
+- `AT_ENTRY` is the entry point of my program. 0x560329c60440 is the same base plus 0x1440, and `readelf -h auxv` says `Entry point address: 0x1440`. At the end of its work, the loader jumps there.
+- `AT_BASE` is the address where the kernel put the loader itself.
+
+So this is how the loader of the first part knew everything about my program: the kernel told it, here, on the stack.
+
+About the process: `AT_UID`, `AT_EUID`, `AT_GID` and `AT_EGID` are all 0x3e8, my user 1000, and `AT_SECURE` is 0. This is the flag of the secure-execution mode from [the part about LD_PRELOAD](/blog/how-ld-preload-replaces-a-function-without-recompiling): with a set-user-ID program it would be 1, and the loader would restrict `LD_PRELOAD`.
+
+About the machine: `AT_PAGESZ` is 4096 (the same value as `getauxval(AT_PAGESZ)`, which the program printed too), `AT_CLKTCK` is 100 ticks per second for times(2), `AT_HWCAP` and `AT_HWCAP2` are bit masks of processor features, and `AT_PLATFORM` points to the string "x86_64". `AT_MINSIGSTKSZ` is 0xe30, 3,632 bytes: the kernel documentation for x86 says it is "the minimum stack size required by the kernel to deliver a signal to user-space". The Rust standard library reads this value when it sizes the alternate signal stack that the first part saw in strace. The two `AT_RSEQ_` values belong to the `rseq` registration of the first part.
+
+Two pointers point outside the stack and the program: `AT_SYSINFO_EHDR`, the address of the vDSO, a small library that the kernel puts in every process (a later part measures why it exists), and `AT_BASE`, the loader. And `AT_RANDOM` points to 16 random bytes that the kernel wrote on the stack, ready before any library could ask the kernel for randomness.
+
+glibc can print the same list itself, with `LD_SHOW_AUXV=1`. For `/bin/true`:
+
+```text
+$ env -i LD_SHOW_AUXV=1 /bin/true
+AT_SYSINFO_EHDR:      0x7ffcdfbb2000
+AT_MINSIGSTKSZ:       3632
+AT_HWCAP:             0xbfebfbff
+AT_PAGESZ:            4096
+...
+AT_EXECFN:            /bin/true
+AT_PLATFORM:          x86_64
+AT_RSEQ_FEATURE_SIZE: 28
+AT_RSEQ_ALIGN:        32
+```
+
+The same 22 entries in the same order. So my walk from `envp` found the real vector. In a real program I would use `getauxval` instead of walking the stack myself, my walk is only to see the layout.
+
+## The strings live at the very top
+
+The arrays contain only pointers. The program printed also where the bytes are:
+
+```text
+the strings and bytes they point to:
+  0x7ffc0abd0fdc  argv[0] = "./auxv"
+  0x7ffc0abd0fe7  "A=1"
+  0x7ffc0abd0feb  "B=two"
+  0x7ffc0abcf7e9  AT_RANDOM, 16 random bytes
+  0x7ffc0abd0ff1  AT_EXECFN = "./auxv"
+  0x7ffc0abcf7f9  AT_PLATFORM = "x86_64"
+a local variable of main: 0x7ffc0abcf4e4
+getauxval(AT_PAGESZ) = 4096
+the [stack] line of /proc/self/maps: 7ffc0abb0000-7ffc0abd1000 rw-p 00000000 00:00 0                          [stack]
+```
+
+The stack mapping ends at 0x7ffc0abd1000. The path in `AT_EXECFN` is at 0x7ffc0abd0ff1, only 15 bytes below the end. Just under it are the environment strings, and under them the argument strings, one after the other with their terminating zero: "./auxv" at 0x...fdc is 6 characters plus the zero, and "A=1" starts 11 bytes later because the argument "one" is between them. The random bytes and the platform string are lower, a little above the pointer arrays. And the local variable of `main` is lower again, at 0x7ffc0abcf4e4: the frames of `_start`, `__libc_start_main` and `main` are built below everything the kernel wrote.
+
+So the picture of a new stack, from the top: the file name, the strings of the environment and the arguments, the platform string and the random bytes, then the auxiliary vector, `envp`, `argv` and `argc`. Then the stack grows down from there for the whole life of the process.
+
+## More environment, everything moves
+
+If the strings are at the top and everything else is below them, then a bigger environment must push everything down. I ran the program twice with address randomization turned off (`setarch -R`), once with one small variable and once with an extra variable of 4,000 characters:
+
+```text
+$ setarch x86_64 -R env -i A=1 ./auxv | grep -E 'argc =|local|stack'
+the initial stack, from low to high addresses:
+  0x7fffffffee30  argc = 1
+a local variable of main: 0x7fffffffecd4
+the [stack] line of /proc/self/maps: 7ffffffde000-7ffffffff000 rw-p 00000000 00:00 0                          [stack]
+$ setarch x86_64 -R env -i A=1 BIG=(4000 times x) ./auxv | grep -E 'argc =|local|stack'
+the initial stack, from low to high addresses:
+  0x7fffffffde80  argc = 1
+a local variable of main: 0x7fffffffdd24
+the [stack] line of /proc/self/maps: 7ffffffde000-7ffffffff000 rw-p 00000000 00:00 0                          [stack]
+```
+
+The mapping is the same, but `argc` moved from 0x7fffffffee30 to 0x7fffffffde80, and the local variable of `main` from 0x7fffffffecd4 to 0x7fffffffdd24. Both moved by 0xfb0, that is 4,016 bytes: the 4,005 bytes of the new string, 8 bytes for one more pointer in `envp`, and some alignment. It is logical, but I did not think about it before. The address of every variable on the stack depends on something as far away as the length of an environment variable. A program that uses the address of a local variable (for a hash, for an alignment) can behave differently only because the environment changed.
+
+## How Rust gets argv
+
+In C, `main` receives `argv`. A Rust `main` has no parameters, so how does `std::env::args()` work? [The part about code before main](/blog/the-code-that-runs-before-main-start-constructors-and-init-array) showed it: on glibc, std has a function in `.init_array`, and glibc calls it with `argc`, `argv` and `envp`. std only stores the two pointers. The strings are copied later, when the program asks for them:
+
+```text
+$ env -i ./args_rs
+std::env::args() first: "./args_rs" at 0x5626dfa7fd70
+AT_EXECFN:              "./args_rs" at 0x7ffda458cfee
+a local of main:        0x7ffda458c8bf
+5626dfa7f000-5626dfaa0000 rw-p 00000000 00:00 0                          [heap]
+7ffda456c000-7ffda458d000 rw-p 00000000 00:00 0                          [stack]
+```
+
+The `String` from `std::env::args()` is at 0x5626dfa7fd70, inside the `[heap]` mapping. The original bytes are still at the top of the stack: `AT_EXECFN`, read with `getauxval` through an `extern "C"` declaration, is at 0x7ffda458cfee, 18 bytes below the end of `[stack]`. In the std 1.98 source, `args()` builds a vector of new strings from the saved pointers, so each call to `std::env::args()` allocates. For a program that reads its arguments once, this is nothing. It only explains why the Rust strings and the C strings live in different places.
+
+## The environment is part of the input
+
+So the kernel prepares everything before the first instruction: `argc`, `argv`, `envp`, and the auxiliary vector, from which the loader learns about the program. In your own code, `getauxval` is the clean way to read these values, and the strings of the arguments and of the environment are normal writable memory at the top of the stack. For me the interesting result is the last experiment: 4,000 characters in the environment moved every local variable of `main` by 4,016 bytes. So if a program depends on the address of a local variable, even by accident, its environment is part of its input.
+
+## Further reading
+
+- getauxval(3), the meaning of the `AT_` entries: https://man7.org/linux/man-pages/man3/getauxval.3.html
+- Linux kernel documentation, x86-specific auxiliary vector entries (`AT_MINSIGSTKSZ`): https://docs.kernel.org/arch/x86/elf_auxvec.html
+- ld.so(8), `LD_SHOW_AUXV`: https://man7.org/linux/man-pages/man8/ld.so.8.html
+- Rust 1.98.0, `std::sys::args`: https://github.com/rust-lang/rust/blob/1.98.0/library/std/src/sys/args/unix.rs
+- The programs and the saved outputs of this part: https://github.com/mehdiakiki/mehdi-cz/tree/main/experiments/from-source-to-process/p11
