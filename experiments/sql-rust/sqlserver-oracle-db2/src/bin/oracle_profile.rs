@@ -37,6 +37,8 @@ fn exercise(conn: &oracle::Connection, table: &str) -> AnyResult<()> {
         &[&"changed", &id],
     )?;
     conn.rollback()?;
+    let writer_row = conn.query_row(&format!("SELECT note FROM {table} WHERE id = :1"), &[&id])?;
+    assert_eq!(writer_row.get::<_, Option<String>>(0)?, None);
     let row = observer.query_row(&format!("SELECT note FROM {table} WHERE id = :1"), &[&id])?;
     assert_eq!(row.get::<_, Option<String>>(0)?, None);
     println!("committed insert visible; rolled-back note unchanged");
