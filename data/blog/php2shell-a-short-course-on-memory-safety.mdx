@@ -1,0 +1,153 @@
+---
+title: "The PHP2Shell Bug: A Short Course on Memory Safety"
+date: "2026-10-25T10:00:00+01:00"
+tags: ["security", "php", "memory-safety", "rust", "c"]
+draft: false
+reviewed: true
+reviewedHash: "61d5c8e20f72ed8f991cfbdc8eb7ef8b2a3fd1108536fec13a5851296214a818"
+summary: "PHP2Shell is two memory bugs in PHP's C core, CVE-2026-109618 and CVE-2026-109619. This short course explains what the bugs are, why no login is needed and why they can fire before your code runs, what to update today, and why the same use-after-free is a compile error in safe Rust."
+---
+
+On October 21, 2026, the PHP project shipped an emergency security release. The fix closed two bugs that the community now calls PHP2Shell. Both bugs let an attacker run code on your server with no login at all. The official names are CVE-2026-109618 and CVE-2026-109619.
+
+If you run PHP and you read only one line today, read this one. Update PHP to 8.5.12, 8.4.27, 8.3.36, or 8.2.35, and then restart your workers. After that, come back and read the rest.
+
+This article is a short course. We go step by step. First, what the two bugs really are. Then, why the attack surface is so wide. Then, what to do today. And last, the part I find most interesting: why these are memory bugs, and why the same mistake cannot happen in safe Rust.
+
+## Lesson 1: what the two bugs are
+
+Both bugs are about memory. Not about your code, not about SQL, not about passwords. They are about the C memory inside PHP itself.
+
+PHP is written in C. C gives you raw memory and trusts you to use it correctly. Most of the time this works. Sometimes it does not.
+
+CVE-2026-109618 starts when PHP runs out of memory. When this happens, PHP has to stop the current work and recover. The problem is that this recovery does not clean up in the right order. It tears down memory that is still in use, and then later code uses that memory anyway. So the program keeps working with memory that is already broken.
+
+CVE-2026-109619 is about reuse between requests. A PHP worker process does not start fresh for every request. It stays alive and handles many requests, one after another. This is good for speed. But it means the state must be cleaned between requests. In this bug, some state from one request is not cleaned. It survives into the next request. And that old state can point at memory that was already given back. So the next request reads memory that now belongs to nobody.
+
+Both bugs have the same shape. Code uses memory that is already gone: memory that was freed or torn down, and then touched again. In C, that memory still holds old bytes. The program keeps going as if the bytes are real. From there, a careful attacker can push the program into running their own code. I will not show that final step. The shape is what matters for this course.
+
+## Lesson 2: why the attack surface is so wide
+
+Three things make PHP2Shell worse than a normal bug.
+
+First, no login is needed. The bug is in how PHP handles a request, not in your application. So the attacker does not need an account, a password, or a valid form. A plain web request is enough to reach the code path.
+
+Second, it can fire before your code runs. This is the scary part. With mod_php, which is PHP running inside Apache, the request reaches the PHP core before your application has its turn. Your login checks, your rules written in PHP, your careful input validation: none of them have run yet. So you cannot fix this bug by writing better PHP. The bug sits under your PHP.
+
+Third, it is almost everywhere. The PHP team listed many ways of running PHP as affected: PHP-FPM, Apache with mod_php, php-cgi, FrankenPHP, and LiteSpeed. The reason is simple. The bug is in PHP's C core, and every one of these runtimes embeds that same core. FrankenPHP, for example, is written in Go, which is a memory-safe language. But it still runs the PHP C engine inside. So it is still affected. The wrapper language does not matter here. The core does.
+
+How many servers is that? By one count, researchers at Palo Alto Networks found about 22.6 million PHP servers reachable from the internet that could be affected. Other counts are lower, because they measure in different ways. But the number is large any way you count it. PHP runs a very large part of the web, so a bug in its core is a bug for a large part of the web.
+
+## Lesson 3: what to do today
+
+The fix is an update. These are the fixed versions:
+
+- PHP 8.5: update to 8.5.12
+- PHP 8.4: update to 8.4.27
+- PHP 8.3: update to 8.3.36
+- PHP 8.2: update to 8.2.35
+
+Anything below these numbers, inside each branch, is affected.
+
+Then restart. Remember the second bug: workers stay alive between requests. An old worker is still a vulnerable worker, even after the new files are on disk. You must restart PHP-FPM, or Apache, or whatever runs your PHP, so the new code is actually loaded.
+
+What if you run an older PHP? PHP 5.4 up to 8.1 are end of life, so they do not get normal updates. For the three most recent of these, 7.4, 8.0, and 8.1, the PHP team did publish source-only patches that you can build yourself. Many Linux distributions also shipped a backport in their own packages, so check your distribution first. For branches older than 7.4 there is no official fix. The honest answer there is that you must move to a supported branch. There is no safe way to stay on them.
+
+Can a firewall save you while you patch? A little. Some vendors published a temporary rule for their web firewall that blocks the known bad requests. This can buy you a few hours. But a firewall rule only guesses the shape of the attack, while the update removes the bug. So treat the firewall as a bandage, not as the fix.
+
+One word about panic. The reports do not fully agree on how far the attacks have gone. Several firms, watchTowr, Amazon, and Cloudflare among them, saw attack attempts, and some of these came before the patch was public. But as of the latest reports, no break-in was confirmed, and watchTowr said many of the attempts it saw do not even work. The United States agency CISA still told everyone to patch now. When it is this close, the move is simple: patch now, do not wait for the reports to agree. The PHP team rates both bugs 9.2 out of 10 on the CVSS 4.0 scale, which means critical.
+
+## Lesson 4: the real lesson
+
+Now the interesting part. Why did this happen, and could it happen in another language?
+
+Both bugs are the same old story. A program reads memory that it should not read. Memory that was freed, or memory that was never set. C lets you do this. The C compiler does not stop you. The mistake only shows up later, at run time, and only if some tool is watching.
+
+Let me make a small experiment to show the shape. Two tiny programs, the same mistake, two languages.
+
+Here is the C version. It pretends to hold the state of one request, frees it, and then reads it again by mistake:
+
+```c
+// A small picture of the PHP2Shell shape: memory from one request is read
+// again after it was given back. This file only demonstrates the bug class.
+// It is not an exploit and it does nothing to PHP.
+// Build and run: gcc -fsanitize=address -g use_after_free.c -o uaf && ./uaf
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+// Pretend this holds the state of one web request.
+struct request {
+  char user[16];
+};
+
+int main(void) {
+  struct request *first = malloc(sizeof *first);
+  strcpy(first->user, "alice");
+  free(first);
+
+  // A later step reuses the old pointer by mistake. This is the bug.
+  printf("user still reads as: %s\n", first->user);
+  return 0;
+}
+```
+
+The C compiler accepts this without a word. It builds, and it runs. To catch the mistake I had to add a special tool at build time, the AddressSanitizer. Only then does the program complain, and only when the bad line actually runs:
+
+```text
+==...==ERROR: AddressSanitizer: heap-use-after-free ...
+READ of size 2 ...
+    #3 ... in main use_after_free.c:20
+freed by thread T0 here:
+    #1 ... in main use_after_free.c:17
+previously allocated by thread T0 here:
+    #1 ... in main use_after_free.c:15
+```
+
+Read the three line numbers from the bottom up. Line 15 allocated the memory. Line 17 freed it. Line 20 read it anyway. That is a use after free. It is the same shape as CVE-2026-109619.
+
+Now the same mistake in safe Rust:
+
+```rust
+// A use-after-free written in safe Rust.
+// Build with: rustc use_after_free.rs
+struct Request {
+  user: String,
+}
+
+fn main() {
+  let first = Request { user: String::from("alice") };
+  drop(first);
+
+  // A later step uses the value after it is gone. This is the bug.
+  println!("user still reads as: {}", first.user);
+}
+```
+
+Rust does not build this. The compiler stops at the mistake and refuses:
+
+```text
+error[E0382]: borrow of moved value: `first`
+ 8 |   let first = Request { user: String::from("alice") };
+   |       ----- move occurs because `first` has type `Request` ...
+ 9 |   drop(first);
+   |        ----- value moved here
+12 |   println!("user still reads as: {}", first.user);
+   |                                       ^^^^^^^^^^ value borrowed here after move
+```
+
+This is the whole point. In C, the use after free is a surprise at run time. You find it with a sanitizer, a fuzzer, or a security advisory. In safe Rust, the use after free is a compile error. Every developer sees it, on every build, before the code ever ships. The compiler knows the value is gone, so it will not let you touch it. I did not need a sanitizer. I did not even need to run it. The program simply does not exist until the mistake is fixed.
+
+Both outputs above are real. The two files and the run script are in the repository under `experiments/php2shell-memory-safety`. On my laptop, gcc 15.2.1 and rustc 1.99.1 produced exactly these messages.
+
+## The honest part
+
+No tool is magic, so let me be honest.
+
+Rust is not a shield against every bug. Rust has an `unsafe` keyword. Inside `unsafe`, you can do the same dangerous things as C, and the compiler trusts you again. Rust also talks to C through FFI, and across that border the checks stop. And Rust does nothing about logic bugs. A wrong password check is still wrong in any language.
+
+PHP is also not going to disappear, and it should not. It is written in C for real reasons: speed, long history, and a huge amount of code that already works. Nobody rewrites the PHP core in a weekend.
+
+So the lesson is not "rewrite everything in Rust." The lesson is smaller and more useful. Know which mistakes your language lets you make. C lets you read dead memory, so C code that faces the internet needs guards that the language does not give for free: fuzzing, sanitizers during testing, and fast patching when a bug like this appears. A language like safe Rust moves this one class of bug from run time to compile time. That is the move from "maybe a security advisory next year" to "an error on my screen right now."
+
+To end the course. PHP2Shell is two memory bugs in PHP's C core. They need no login, they can fire before your code runs, and they touch almost every way of running PHP. Update to 8.5.12, 8.4.27, 8.3.36, or 8.2.35, and restart your workers. And remember the shape, because it is older than PHP and it will come back in the next C program too: never trust memory that is gone.
