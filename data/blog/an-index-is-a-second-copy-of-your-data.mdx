@@ -1,0 +1,266 @@
+---
+title: "An Index Is a Second Copy of Your Data"
+date: "2026-07-02T15:25:00+01:00"
+lastmod: "2026-07-02T15:25:00+01:00"
+tags: ["inside a database index", "databases", "sqlite", "indexing", "data structures"]
+draft: false
+reviewed: true
+reviewedHash: "77a53880942f8214cafb51614ee6271cad923995f5871561a0ba81b64881c2b8"
+campaign: "editorial"
+summary: "I added one index to a SQLite table of one million users and read the file page by page. The index is a second sorted copy of the emails, each one with the rowid of its row, and when I broke one entry the database returned a row that does not exist."
+---
+
+I made a table of one million users in SQLite, and then I added one index on the email column. Before the index, the database file had 67,457,024 bytes. After it, 102,371,328 bytes. One line of SQL, and the file is almost 52% bigger.
+
+So an index is not a setting, or a flag on a column that says "be fast here". It is data. We write `CREATE INDEX` when a query is slow, the query becomes fast, and we never look at what was created. Right? I wanted to look. So I made an experiment: I read the file page by page, I threw the index away and built it again, and at the end I broke one entry on purpose, to see what the database answers when its copy is wrong.
+
+This is the first part of a series about indexes, and its map is at the end.
+
+## The table
+
+The data comes from a small Python program with a fixed random seed, so every run creates the same rows. One million users:
+
+```sql
+CREATE TABLE users (
+    id INTEGER PRIMARY KEY,
+    email TEXT NOT NULL,
+    country TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    status TEXT NOT NULL
+)
+```
+
+The emails look like `liam.novak5008@example.net`, and about one in ten has capital letters, like `Adam.Ali1087@example.net`. The rows are inserted in id order, and `created_at` grows with the id, like in a real table where new users arrive at the end. Everything runs on my laptop (Linux, ext4, an NVMe SSD) with the `sqlite3` shell 3.51.2 and Python 3.14, whose `sqlite3` module uses the same SQLite 3.51.2.
+
+SQLite keeps the whole database in one file, cut in pages of the same size:
+
+```text
+PRAGMA page_size;
+page_size
+---------
+4096     
+PRAGMA page_count;
+page_count
+----------
+16469     
+```
+
+16,469 pages of 4096 bytes. One page is the schema, and the other 16,468 pages are the table.
+
+## What CREATE INDEX wrote
+
+Then the index:
+
+```text
+CREATE INDEX users_email ON users(email);
+Run Time: real 0.606890 user 0.513565 sys 0.089766
+```
+
+0.6 seconds, one run (this number moves between runs, and it is not the subject here). To see what changed in the file, I used `dbstat`. It is a virtual table that reads the file and returns one row per page, or one row per b-tree with `aggregate = TRUE`:
+
+```text
+name           pages  payload   unused
+-------------  -----  --------  ------
+sqlite_schema  1      249       3730  
+users          16468  60708820  481144
+users_email    8524   31665537  146483
+```
+
+`payload` is the useful bytes stored in the pages, and `unused` is the empty space left inside them.
+
+Look at the `users` line first. It is exactly the same as before the index: 16,468 pages, 60,708,820 bytes of payload. Creating the index did not touch the table. Everything new is in a separate structure, `users_email`, with its own 8,524 pages and 31.7 MB of payload.
+
+Here is the part that was not obvious for me. The index has one column of five, but it is more than half of the table. The email is the biggest column, OK, but this is not the full answer. There is one more thing in every entry. Let me show it.
+
+## The first entry, byte by byte
+
+A b-tree is a tree of pages. The leaf pages hold the entries in sorted order, and the pages above them (interior pages) hold keys that say which child page to follow. With 4096-byte pages one interior page can point to hundreds of children, so the tree stays flat:
+
+```text
+name         pagetype  pages  cells    depth
+-----------  --------  -----  -------  -----
+users        internal  42     16425    2    
+users        leaf      16426  1000000  3    
+users_email  internal  81     8442     2    
+users_email  leaf      8443   991558   3    
+```
+
+Both trees have only 3 levels for one million rows: a root page, one level of interior pages, and the leaves.
+
+I wanted to see one entry with my own eyes. So I made a small decoder in Python: it opens the database file as normal bytes and follows the file format documented on sqlite.org. It starts at the root page of the index and always takes the first child, until a leaf:
+
+```text
+index users_email, from the root page to the first leaf:
+  page  16470  interior index    79 cells
+  page  16575  interior index   102 cells
+  page  16471  leaf index       123 cells
+first cell of page 16471, 31 bytes:
+  1e 03 3d 03 41 64 61 6d 2e 41 6c 69 31 30 38 37
+  40 65 78 61 6d 70 6c 65 2e 6e 65 74 0e c0 14
+  payload length 30
+  record header: 3 bytes, serial types [61, 3]
+     61 = text of 24 bytes     'Adam.Ali1087@example.net'
+      3 = 24-bit integer       966676
+```
+
+31 bytes. Let me read them slowly, because this is the whole idea of the series.
+
+- `1e` is 30, the length of the payload that follows.
+- `03` says that the record header has 3 bytes: this byte and two more. Each of the two describes one value.
+- `3d` is 61. In the SQLite record format an odd number from 13 means text, and the length is (61 - 13) / 2 = 24 bytes.
+- `03` means an integer stored in 3 bytes.
+- Then come the 24 bytes of text: `41 64 61 6d` is "Adam", and so on until `6e 65 74`, "net".
+- And the last 3 bytes, `0e c0 14`, are the integer 966676.
+
+So one index entry is the email and, after it, the number 966676: the rowid of the row. Every row of a normal SQLite table has a 64-bit integer key called the rowid, and in my table `id INTEGER PRIMARY KEY` is the rowid itself, with another name. So the entry says: "the email `Adam.Ali1087@example.net` is in the row 966676". That is the one more thing. The index stores a copy of the column, sorted, and next to each value the address of its row.
+
+Nothing else is in the entry: no country, no status, no date.
+
+Why is `Adam.Ali1087` first, and not an email with a small "a"? The index compares bytes (the default collation, called BINARY), and capital letters have smaller codes: "A" is `41`, "a" is `61`. So the capitalized emails come first, and the end of the index looks like this:
+
+```text
+SELECT email, rowid FROM users INDEXED BY users_email ORDER BY email DESC LIMIT 3;
+email                id    
+-------------------  ------
+zyilmaz@example.org  153579
+zyilmaz@example.net  72198 
+zyilmaz@example.com  116338
+```
+
+(The header says `id`, because for this table `id` and `rowid` are the same column.) The emails are sorted and the rowids next to them are not: the index follows the order of the emails, and the table the order of the ids.
+
+## The table is a b-tree too
+
+The rowid 966676 is where the second lookup goes. The table is also a b-tree, but its key is the rowid. My decoder starts at the root page of the table and, at each interior page, takes the child whose key range contains 966676:
+
+```text
+table users, from the root page to the leaf that holds rowid 966676:
+  page      2  interior table    40 cells
+  page  15763  interior table   411 cells
+  page  15920  leaf table        61 cells
+the cell of rowid 966676 on page 15920, 63 bytes:
+  3b bb 80 14 06 00 3d 11 33 1d 41 64 61 6d 2e 41
+  6c 69 31 30 38 37 40 65 78 61 6d 70 6c 65 2e 6e
+  65 74 55 53 32 30 32 35 2d 31 31 2d 32 34 20 30
+  33 3a 32 31 3a 35 31 69 6e 61 63 74 69 76 65
+  payload length 59, rowid 966676
+  record header: 6 bytes, serial types [0, 61, 17, 51, 29]
+      0 = NULL                 None
+     61 = text of 24 bytes     'Adam.Ali1087@example.net'
+     17 = text of 2 bytes      'US'
+     51 = text of 19 bytes     '2025-11-24 03:21:51'
+     29 = text of 8 bytes      'inactive'
+```
+
+Again three pages. The cell starts with `3b`, the payload length 59. Then `bb 80 14` is the rowid, written as a varint: each byte gives 7 bits, and its high bit says that one more byte follows. The three groups of 7 bits are 0x3b, 0x00 and 0x14, and together they make 966676. Then the record: a 6-byte header with five serial types, and the five values.
+
+The first value is NULL. Strange at first: the id column is NULL in the stored row? But it is logical. The id is the rowid, and the rowid is already the key of the cell, so SQLite does not store it a second time. The file format documentation says that such a column "appears in the record as a NULL value". When you read `id`, SQLite gives you the key.
+
+So now we have the full picture of a query like `WHERE email = ?`. First a descent in the index, 3 pages, to find the email and its rowid. Then a descent in the table, 3 more pages, to find the row. Without the index, the only way is to read all 16,426 leaf pages of the table and compare every email. The next part measures this difference.
+
+One more detail in the counts above, and I liked it. In the table, the 16,425 cells of the interior pages are only page numbers and rowids that guide the search, and all the rows are in the leaves. In the index, 991,558 entries in the leaves plus 8,442 in the interior pages make exactly 1,000,000. So in an index b-tree the interior pages hold real entries, and each entry is stored only once.
+
+## Drop it, and build it again
+
+If the index is only a copy, I can throw it away, compute it again from the table, and get the same thing. My script reads all the entries in index order and computes a SHA-256 digest of the (email, rowid) pairs. Then it drops the index, creates it again, and computes the digest again:
+
+```text
+index entries: 1000000 entries, digest fd4b0cc909372d95
+DROP INDEX users_email;
+  page_count 24993, freelist_count 8524
+CREATE INDEX users_email ON users(email);
+  page_count 24993, freelist_count 0
+index entries: 1000000 entries, digest fd4b0cc909372d95
+PRAGMA integrity_check: [('ok',)]
+```
+
+The same digest. Good, that is what I wanted to see. The index has no information of its own: everything in it was computed from the table. This is what "derived data" means in this series. A table is the source of truth. An index is derived from it, the database keeps it in sync on every write, and you can always build it again.
+
+Look also at the page counts. After `DROP INDEX` the file has still 24,993 pages, and 8,524 of them are on the freelist, that is the list of empty pages that SQLite keeps for later. The file did not become smaller, and the new `CREATE INDEX` took these pages back. A later part is about free pages.
+
+## When the copy is wrong
+
+SQLite works hard so that the table and its indexes never disagree. Every INSERT, UPDATE and DELETE changes the table and all its indexes in the same transaction. But I was curious what the database would answer if the copy would be wrong. So I made a copy of the file, and in the first index entry I replaced the 3 bytes of the rowid: 966676 became 966677. I did not change one byte of the table.
+
+```text
+index entry ('Adam.Ali1087@example.net', 966676) on page 24574; its rowid is 3 bytes at file offset 100655101
+wrote 966677 over it, the table is not changed
+sqlite> SELECT id, email FROM users WHERE email = 'Adam.Ali1087@example.net';
+  plan: SEARCH users USING COVERING INDEX users_email (email=?)
+  (966677, 'Adam.Ali1087@example.net')
+sqlite> SELECT * FROM users WHERE email = 'Adam.Ali1087@example.net';
+  plan: SEARCH users USING INDEX users_email (email=?)
+  (966677, 'Adam.Ali1087@example.net', 'IN', '2025-11-24 03:22:10', 'inactive')
+sqlite> SELECT * FROM users NOT INDEXED WHERE email = 'Adam.Ali1087@example.net';
+  plan: SCAN users
+  (966676, 'Adam.Ali1087@example.net', 'US', '2025-11-24 03:21:51', 'inactive')
+sqlite> SELECT * FROM users WHERE id = 966677;
+  plan: SEARCH users USING INTEGER PRIMARY KEY (rowid=?)
+  (966677, 'nmoreau4283@example.net', 'IN', '2025-11-24 03:22:10', 'inactive')
+```
+
+(The page is not 16471 anymore: the rebuild took the free pages in another order.)
+
+The first query asks only for the id and the email. Both are in the index entry, so SQLite did not read the table at all ("COVERING INDEX"). It answered 966677: a wrong id, without any error.
+
+The second query asks for all columns. SQLite found the entry in the index, went to the row 966677, and returned... a mix. The email comes from the index entry, and the country, the date and the status come from row 966677, which belongs to another user, `nmoreau4283@example.net` from India (see the last query). This row does not exist anywhere in the database. I expected a wrong row, or no row, but not a mix of two users.
+
+The third query forbids the index with `NOT INDEXED`. SQLite reads the whole table, and the answer is correct: 966676, from the US.
+
+So the same question gives a different answer depending on the plan, and nothing tells you that something is wrong. In a real database this should never happen. In fact it shows what the index is for SQLite: a copy that it trusts completely.
+
+There is a tool to compare the copy with the source:
+
+```text
+PRAGMA integrity_check:
+  row 966676 missing from index users_email
+REINDEX users_email;
+PRAGMA integrity_check: [('ok',)]
+sqlite> SELECT * FROM users WHERE email = 'Adam.Ali1087@example.net';
+  plan: SEARCH users USING INDEX users_email (email=?)
+  (966676, 'Adam.Ali1087@example.net', 'US', '2025-11-24 03:21:51', 'inactive')
+```
+
+`PRAGMA integrity_check` takes every row of the table and checks that each index has the matching entry. Row 966676 has no entry anymore, and it says so. (`PRAGMA quick_check` is faster, but the documentation says it "does not verify that index content matches table content", so it would not see this.) The repair is the same idea as the drop and create before: `REINDEX` deletes the index and builds it again from the table.
+
+## Without the rowid
+
+SQLite has another kind of table, `WITHOUT ROWID`. Then there is no rowid and no table b-tree keyed by it: the whole row is stored in one b-tree sorted by the primary key. I made one measurement, with the same rows and the email as the primary key:
+
+```text
+name           pages  payload 
+-------------  -----  --------
+sqlite_schema  1      453     
+users          16468  60708820
+users_email    8524   31665537
+users_wr       18487  63675925
+```
+
+One b-tree of 18,487 pages, against 16,468 plus 8,524 pages for the normal table and its index. A search by email is now one descent, `SEARCH users_wr USING PRIMARY KEY (email=?)`. But this tree has 4 levels and not 3, because its interior pages hold whole rows, and fewer of them fit in a page. And any other index on this table would store the primary key, so the email, instead of a small rowid. The documentation recommends `WITHOUT ROWID` mostly for tables with a non-integer or composite primary key and small rows.
+
+## The same idea in PostgreSQL and MySQL
+
+I measured only SQLite, but the documentation of PostgreSQL and MySQL describes the same idea.
+
+In PostgreSQL the rows of a table are in a separate area called the heap, and the PostgreSQL 18 documentation says: "All indexes in PostgreSQL are secondary indexes, meaning that each index is stored separately from the table's main data area". Even the primary key is a separate copy there. And an index entry points to the row with a TID, "a block number and an item number within that block", so the physical place of the row in the heap.
+
+In MySQL with InnoDB it is closer to `WITHOUT ROWID`. The table itself is stored in the primary key index (InnoDB calls it the clustered index), and "each record in a secondary index contains the primary key columns for the row, as well as the columns specified for the secondary index". So a secondary index is a sorted copy of its columns, and the pointer back to the row is the primary key value.
+
+Three databases, three kinds of pointer, and the same rule: an index you create is a second copy, and the database must keep it equal to the table.
+
+## The map of this series
+
+Everything in this series comes from this one fact. In the next part I read `EXPLAIN QUERY PLAN` and the bytecode of a query, to see the two lookups from the side of the database, and I time them. Then I measure what an index costs on every insert, because the copy must be written too. Three parts are about using the copy well: the order of the columns in a composite index, a covering index that answers without the table (we saw one above, by accident), and the cases where SQLite does not use an index you made. Then the planner statistics, which are one more piece of derived data that can become stale. Then partial and expression indexes, which copy only a part of the rows or a computed value. Then what deleted rows leave in the file, and VACUUM. And the last part leaves the database: a search index kept in sync without one shared transaction.
+
+All the parts are on the [series page](/blog/tags/inside-a-database-index/page/1). The programs, the data generator and a `run.sh` that runs everything are in the [fixture of this series](https://github.com/mehdiakiki/mehdi-cz/tree/main/experiments/inside-a-database-index), and the exact output quoted here is in [p01-second-copy.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/inside-a-database-index/results/p01-second-copy.txt). If you run it, the times will be a bit different. The pages, the bytes and the digests must be the same.
+
+## Sources
+
+- SQLite, [Database File Format](https://sqlite.org/fileformat2.html).
+- SQLite, [ROWIDs and the INTEGER PRIMARY KEY](https://sqlite.org/lang_createtable.html#rowid).
+- SQLite, [The DBSTAT Virtual Table](https://sqlite.org/dbstat.html).
+- SQLite, [Query Planning](https://sqlite.org/queryplanner.html).
+- SQLite, [PRAGMA integrity_check and quick_check](https://sqlite.org/pragma.html#pragma_integrity_check), and [REINDEX](https://sqlite.org/lang_reindex.html).
+- SQLite, [Clustered Indexes and the WITHOUT ROWID Optimization](https://sqlite.org/withoutrowid.html).
+- PostgreSQL 18, [Index-Only Scans and Covering Indexes](https://www.postgresql.org/docs/18/indexes-index-only-scans.html) and [Index Access Method Interface Definition](https://www.postgresql.org/docs/18/indexam.html).
+- MySQL 8.4, [Clustered and Secondary Indexes](https://dev.mysql.com/doc/refman/8.4/en/innodb-index-types.html).

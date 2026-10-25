@@ -1,0 +1,133 @@
+---
+title: "Partial and Expression Indexes: Index Only What You Query"
+date: "2026-08-06T20:00:00+01:00"
+lastmod: "2026-08-06T20:00:00+01:00"
+tags: ["inside a database index", "databases", "sqlite", "indexing", "json"]
+draft: false
+reviewed: true
+reviewedHash: "02ba2624e69dc0b3414454225df95dca793a43fde9b8d5ceb193fd1224b7251a"
+campaign: "editorial"
+summary: "A partial index of the 2% active users took 138 pages instead of 9,096 and answered as fast. But SQLite uses it only when the query says the condition in the same way, or binds the same value, and an index on json_extract() is ignored by the ->> operator, which returns the same value."
+---
+
+An index does not have to copy every row. In [the first part](/blog/an-index-is-a-second-copy-of-your-data) the index was a sorted copy of one column for all one million users. But if the application only ever asks for the active users, why keep a copy of the other 98%?
+
+SQLite can index only a part of the rows (a partial index), or a computed value instead of a column (an expression index). Both are smaller or more precise copies. And both have the same weakness: SQLite must recognize, from the text of your query, that the index fits. I made a few tests to see how strict this recognition is.
+
+## Only the active rows
+
+The query is "the active users created after a date". Only 2% of the users are active (19,784 of one million). I made two indexes for it:
+
+```text
+-- CREATE INDEX users_status_created ON users(status, created_at)
+-- CREATE INDEX users_active_created ON users(created_at) WHERE status = 'active'
+    users: 16468 pages
+    users_status_created: 9096 pages
+    users_active_created: 138 pages
+```
+
+The first one is a normal composite index, with status first, as [part 4](/blog/why-column-order-matters-in-a-composite-index) recommends. The second has a WHERE clause: only the rows with `status = 'active'` get an entry. 138 pages instead of 9,096, so 66 times smaller. And the query is not slower:
+
+```text
+users_status_created: SEARCH users USING INDEX users_status_created (status=? AND created_at>?)
+    545 rows, median 221.5 us (min 216.6 us, max 280.2 us, 15 runs)
+users_active_created: SEARCH users USING INDEX users_active_created (created_at>?)
+    545 rows, median 214.5 us (min 211.2 us, max 269.8 us, 15 runs)
+```
+
+Same 545 rows, same time. The plan of the partial index mentions only `created_at>?`, because inside this index every entry is already active.
+
+## The query must say it the same way
+
+Now the strict part. The SQLite documentation says that the query can use a partial index only if its WHERE clause implies the WHERE clause of the index, and that "the terms in W and X must match exactly" (in the documentation, W is the WHERE clause of the query and X the one of the index). SQLite "does not do algebra". I tested several ways to say "active", with `INDEXED BY` to force the index:
+
+```text
+    WHERE status = 'active' AND created_at > '2025-12-01'
+        SEARCH users USING COVERING INDEX users_active_created (created_at>?)
+    WHERE created_at > '2025-12-01'
+        error: no query solution
+    WHERE status IN ('active') AND created_at > '2025-12-01'
+        error: no query solution
+    WHERE status = 'active' COLLATE NOCASE AND created_at > '2025-12-01'
+        error: no query solution
+    WHERE status NOT IN ('inactive', 'suspended') AND created_at > '2025-12-01'
+        error: no query solution
+```
+
+`no query solution` is what SQLite says when `INDEXED BY` asks for an index that it cannot use. The second line is logical: without the status, the query also wants inactive users, and they are not in the index. The `COLLATE NOCASE` line is logical too: it also matches 'Active' or 'ACTIVE', and such rows would not be in the index. But two lines are less obvious. `status IN ('active')` means exactly `status = 'active'`, and with the three statuses of my data, `NOT IN ('inactive', 'suspended')` means it too. SQLite does not see this. In fact the parser rewrites `IN ('active')` as `status = +'active'` (I checked it in the source, [parse.y](https://sqlite.org/src/file?name=src/parse.y&ci=version-3.51.2) of version 3.51.2), and this small `+` is already a different term. Only the same term, written the same way, works.
+
+What about a bound parameter, `status = ?` with the value 'active'? With `INDEXED BY` it also fails: the statement is compiled before any value is bound, so at that moment nothing proves that the value will be 'active'. Without `INDEXED BY`, the planner gets the value:
+
+```text
+bound parameter ('active', '2025-12-01'): SEARCH users USING INDEX users_active_created (created_at>?)
+    median 256.6 us (min 245.9 us, max 315.1 us, 15 runs)
+bound parameter ('suspended', '2025-12-01'): SCAN users
+    median 44.36 ms (min 43.14 ms, max 68.03 ms, 15 runs)
+```
+
+So in SQLite 3.51.2 a bound value can use a partial index, because the statement is compiled again with the value. I did not expect this, because the PostgreSQL 18 documentation says the opposite for PostgreSQL: "Matching takes place at query planning time, not at run time. As a result, parameterized query clauses do not work with a partial index." The safest way in both databases is to write the condition of the index as a literal in the query, `status = 'active'`, and to bind only the other values.
+
+## An index on an expression
+
+An expression index stores a computed value. [Part 6](/blog/when-the-database-ignores-your-index) used `lower(email)` to make a case-insensitive lookup fast. Here I tested how close the query must be to the expression:
+
+```text
+    WHERE lower(email) = 'adam.ali1087@example.net'
+        SEARCH users USING COVERING INDEX users_email_lower (<expr>=?)
+    WHERE LOWER( users.email ) = 'adam.ali1087@example.net'
+        SEARCH users USING COVERING INDEX users_email_lower (<expr>=?)
+    WHERE lower(email) = lower('Adam.Ali1087@example.net')
+        SEARCH users USING COVERING INDEX users_email_lower (<expr>=?)
+    WHERE lower(trim(email)) = 'adam.ali1087@example.net'
+        SCAN users
+    WHERE email = 'adam.ali1087@example.net' COLLATE NOCASE
+        SCAN users
+    WHERE lower(email) LIKE 'adam.ali1%'
+        SCAN users USING COVERING INDEX users_email_lower
+    WHERE lower(email) GLOB 'adam.ali1*'
+        SEARCH users USING COVERING INDEX users_email_lower (<expr>>? AND <expr><?)
+```
+
+Upper case, spaces and the table name do not matter. The documentation says it: SQLite "requires that the expressions be the same, except for minor syntactic differences such as white-space changes". The other side of the comparison can be anything, also another call to `lower()`. But one more function around the column, like `trim()`, and it is a different expression. `COLLATE NOCASE` gives the same answer as `lower()` for ASCII emails, but it is a different thing for the planner. And LIKE on the expression reads the whole index, for the reason of part 6: LIKE is case-insensitive and the index compares bytes. GLOB, which is case-sensitive, can seek in it.
+
+## The JSON near-miss
+
+This is the case I think people meet in real code. Many tables have a JSON column now, and SQLite has two ways to read a field: the function `json_extract(profile, '$.plan')` and, since 3.38.0, the operator `profile ->> '$.plan'`. I added a column `profile` with a JSON object like `{"plan":"team"}` and an index on the function:
+
+```text
+-- CREATE INDEX users_plan ON users(json_extract(profile, '$.plan'))
+    WHERE json_extract(profile, '$.plan') = 'team'
+        SEARCH users USING COVERING INDEX users_plan (<expr>=?), count 20000, median 483.5 us (min 453.6 us, max 555.5 us, 15 runs)
+    WHERE profile ->> '$.plan' = 'team'
+        SCAN users, count 20000, median 99.67 ms (min 93.60 ms, max 144.85 ms, 15 runs)
+    WHERE json_extract(profile, '$."plan"') = 'team'
+        SCAN users, count 20000, median 106.59 ms (min 100.40 ms, max 126.85 ms, 15 runs)
+```
+
+The JSON documentation says that for a string, a number or null, the two forms return the same SQL value. Same rows, 20,000 of them. So it is the same expression, right? Not for the planner: `->>` is another expression, and the query takes 99.67 ms instead of 483.5 µs: 200 times slower, without any error. Even the same path written with quotes, `'$."plan"'`, is a different expression. So a team that indexes `json_extract()` must write `json_extract()` everywhere, in exactly the same form. Or index the form that the code really uses.
+
+## What they cost on writes
+
+Last, the write side. I inserted 100,000 new users in one transaction into the full table, with one of these indexes, 3 runs each:
+
+```text
+no extra index: median 62.87 ms (min 59.61 ms, max 63.52 ms, 3 runs), wchar 6767688, load average 2.21 2.98 3.33
+full (status, created_at): median 133.67 ms (min 125.91 ms, max 196.05 ms, 3 runs), wchar 11191520, load average 2.84 3.10 3.37
+partial (created_at) WHERE status = 'active': median 68.05 ms (min 65.69 ms, max 69.00 ms, 3 runs), wchar 6878328, load average 2.84 3.10 3.37
+expression lower(email): median 1.07 s (min 573.79 ms, max 1.25 s, 3 runs), wchar 510879116, load average 3.49 3.23 3.41
+```
+
+The partial index is almost free: 98% of the new rows are not active, so they never touch it, and the 2% that do are added at its end, because `created_at` grows. The full index doubles the time. The expression index on `lower(email)` is the expensive one, for the reason that [part 3](/blog/what-an-index-costs-on-every-insert) measured: lowercase emails are random, so every new entry goes to a random page, and SQLite passed 510 MB to `write()` for 100,000 rows. PostgreSQL's documentation warns about another part of this cost: "Index expressions are relatively expensive to maintain, because the derived expression(s) must be computed for each row insertion".
+
+## Index only what you query
+
+I like partial indexes more after this experiment. When the application really queries a small, fixed subset (active users, unpaid orders, jobs that are not done yet, etc.), a partial index is a small copy of exactly that subset, cheap to write and fast to read. An expression index is the right tool when the query really uses the expression. In both cases the price is the same rule: the query must repeat the condition or the expression exactly as the index wrote it, so it belongs in one place in the code, not copied by hand into ten queries. And check the plan, because when the match fails, nothing tells you except the word SCAN.
+
+The full output is in [p08-partial-expression.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/inside-a-database-index/results/p08-partial-expression.txt).
+
+## Further reading
+
+- SQLite, [Partial Indexes](https://sqlite.org/partialindex.html).
+- SQLite, [Indexes On Expressions](https://sqlite.org/expridx.html).
+- SQLite, [JSON Functions And Operators](https://sqlite.org/json1.html), section about the `->` and `->>` operators.
+- PostgreSQL 18, [Partial Indexes](https://www.postgresql.org/docs/18/indexes-partial.html) and [Indexes on Expressions](https://www.postgresql.org/docs/18/indexes-expressional.html).

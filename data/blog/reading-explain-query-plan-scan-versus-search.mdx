@@ -1,0 +1,215 @@
+---
+title: "Reading EXPLAIN QUERY PLAN: SCAN Versus SEARCH"
+date: "2026-07-03T17:10:00+01:00"
+lastmod: "2026-07-03T17:10:00+01:00"
+tags: ["inside a database index", "databases", "sqlite", "query plans", "performance"]
+draft: false
+reviewed: true
+reviewedHash: "f8719781278b280098aa3b9c6e997ca02af670636570c0d764acbbb7f79aff9a"
+campaign: "editorial"
+summary: "SQLite says SCAN or SEARCH before it runs a query. I measured what the two words mean on one million rows: 16,469 pages against 7, and about 34 ms against 6 microseconds when the file is cached. With a cold cache the gap is much smaller."
+---
+
+Before SQLite runs a query, it can tell you how it is going to run it. Here is a lookup by email, in a table of one million users, without any index:
+
+```text
+SELECT * FROM users WHERE email = 'Adam.Ali1087@example.net';
+QUERY PLAN
+`--SCAN users
+```
+
+And the same query after `CREATE INDEX users_email ON users(email)`:
+
+```text
+QUERY PLAN
+`--SEARCH users USING INDEX users_email (email=?)
+```
+
+Most of us read these lines like a traffic light: SCAN is red, SEARCH is green. I wanted to know what the two words mean in numbers: pages, instructions, time. And when the red one is not so red.
+
+The table is the one from [the first part of this series](/blog/an-index-is-a-second-copy-of-your-data): one million generated users, a 64 MiB file on an NVMe SSD, SQLite 3.51.2.
+
+## What SCAN costs
+
+The `sqlite3` shell has a mode `.stats on` that prints counters after each statement. It prints a lot, so my script keeps only the lines I need:
+
+```text
+SELECT * FROM users WHERE email = 'Adam.Ali1087@example.net';
+QUERY PLAN
+`--SCAN users
+966676|Adam.Ali1087@example.net|US|2025-11-24 03:21:51|inactive
+Page cache hits:                     2
+Page cache misses:                   16467
+Fullscan Steps:                      999999
+Sort Operations:                     0
+Virtual Machine Steps:               3000014
+Run Time: real 0.110373 user 0.080100 sys 0.029535
+```
+
+`SCAN users` means: read the table from the first row to the last one, in rowid order.
+
+Hits plus misses is the number of pages the query touched: 2 + 16,467 = 16,469, every page of the file. A hit is a page that was already in SQLite's own cache, a miss is a page that SQLite had to ask from the operating system. Almost all are misses. Why? The reason is not the disk. This is the first scan in this shell, so these pages were never in SQLite's own cache, and they cannot stay there: `PRAGMA cache_size` says -2000 on this build, that is 2000 KiB, so about 500 pages, and the table has 16,468 pages. The next scan in the same shell had again 16,467 misses: when a scan arrives at the end of the table, the beginning is already gone from the cache.
+
+`Fullscan Steps` counts the moves to the next row: one million rows, one million minus one moves. `Virtual Machine Steps` needs a word more. SQLite compiles each statement into a small program of bytecode, and this counter is the number of instructions that ran. Three million, so 3 per row. I show these 3 below.
+
+This single run took 110 ms, and single runs move a lot on this laptop. So I measured also in Python, 15 runs: median 34.07 ms, between 32.85 and 55.78 ms. To find one row, SQLite compared one million emails.
+
+## What SEARCH costs
+
+The same statement with the index:
+
+```text
+SELECT * FROM users WHERE email = 'Adam.Ali1087@example.net';
+QUERY PLAN
+`--SEARCH users USING INDEX users_email (email=?)
+966676|Adam.Ali1087@example.net|US|2025-11-24 03:21:51|inactive
+Page cache hits:                     4
+Page cache misses:                   3
+Fullscan Steps:                      0
+Sort Operations:                     0
+Virtual Machine Steps:               18
+Run Time: real 0.000038 user 0.000000 sys 0.000039
+```
+
+7 pages. One of them is page 1, the first page of the file, which SQLite reads at the start of every statement. The other 6 are exactly the two descents from part 1: 3 pages in the index to find the email and its rowid, and 3 pages in the table to find the row. (I made a small test to be sure about page 1: a lookup by rowid, `WHERE id = 966676`, touches 4 pages, so page 1 and the 3 levels of the table.) In Python, 15 runs of 1000 queries: median 5.6 µs per query, and this includes the time Python needs to call SQLite and build the result tuple.
+
+So 34 ms against 6 µs, about six thousand times less, for the same answer.
+
+In the plan line, `SEARCH` means that only a part of the rows is visited, and `USING INDEX users_email` names the index that drives the loop. The parentheses list the WHERE terms that the index uses to jump to the right place (the `?` means "a value", not my value). Other conditions are not in the parentheses: `WHERE email = ... AND country = 'US'` gives the same `(email=?)`, and the country is checked on each row after the jump.
+
+## The bytecode
+
+`EXPLAIN` without `QUERY PLAN` prints the program itself. Here is the indexed version, without the first and last lines, which only start the transaction:
+
+```text
+addr  opcode         p1    p2    p3    p4             p5  comment      
+----  -------------  ----  ----  ----  -------------  --  -------------
+...
+1     OpenRead       0     2     0     5              0   root=2 iDb=0; users
+2     OpenRead       1     16470 0     k(2,,)         2   root=16470 iDb=0; users_email
+3     String8        0     1     0     Adam.Ali1087@example.net 0   r[1]='Adam.Ali1087@example.net'
+4     SeekGE         1     14    1     1              0   key=r[1]
+5       IdxGT          1     14    1     1              0   key=r[1]
+6       DeferredSeek   1     0     0                    0   Move 0 to 1.rowid if needed
+7       IdxRowid       1     2     0                    0   r[2]=rowid; users.rowid
+8       Column         1     0     3                    0   r[3]= cursor 1 column 0
+9       Column         0     2     4                    0   r[4]= cursor 0 column 2
+10      Column         0     3     5                    0   r[5]= cursor 0 column 3
+11      Column         0     4     6                    0   r[6]= cursor 0 column 4
+12      ResultRow      2     5     0                    0   output=r[2..6]
+13    Next           1     5     1                    0   
+14    Halt           0     0     0                    0   
+...
+```
+
+Slowly:
+
+- Lines 1 and 2 open two cursors: cursor 0 on root page 2, the table, and cursor 1 on root page 16470, the index, whose keys have two parts (`k(2,,)`: the email and the rowid).
+- Line 4, `SeekGE`, moves the index cursor to the first entry greater than or equal to the email in `r[1]`. This one instruction is the whole descent from the root to the leaf.
+- Line 5, `IdxGT`, is the exit of the loop: if the current entry is greater, so it is another email, jump to the end.
+- Line 6, `DeferredSeek`, says "move the table cursor to the rowid of this entry, but only when somebody reads from the table". Nothing happens yet.
+- Line 7 takes the rowid from the index entry: that is the `id` column.
+- Line 8 reads the email, and look where: cursor 1, the index, not the table.
+- Lines 9 to 11 read country, created_at and status from cursor 0. The first of them makes the deferred seek happen: the second descent.
+- Line 12 returns the row, and line 13 goes to the next index entry and back to line 5.
+
+Line 8 explains something strange from part 1. When I broke one index entry there, a query returned the email of one user with the country and the date of another user. Look at line 8 again: when SQLite compiled the query, it saw that the email is also in the index entry, so it reads it from cursor 1 and not from the table. Normally the two copies are equal, and this only saves work. With my broken entry, the email came from the index, and the other columns from the wrong row. I liked to find it in the bytecode itself.
+
+I tried also to count the instructions by hand. My first count was 18, like the counter, but the two numbers agreed only by chance. Line 2 opens the index for an equality search (the 2 in the `p5` column), and for this case the documentation of `SeekGE` says: "The IdxGT opcode will be skipped if this opcode succeeds". So line 5 runs only after `Next`, and the program has 17 steps, not 18. And the counter above says 18 because of `.eqp on`: the shell first runs the same statement in plan mode to print the plan, and these steps are counted too, one for each line of the plan. Without `.eqp`, in a separate run, the counter agrees:
+
+```text
+SELECT * FROM users WHERE email = 'Adam.Ali1087@example.net';
+966676|Adam.Ali1087@example.net|US|2025-11-24 03:21:51|inactive
+VM-steps: 17
+```
+
+The scan version is a loop of three instructions, repeated for each row:
+
+```text
+2     Rewind         0     12    0                    0   
+3       Column         0     1     1                    0   r[1]= cursor 0 column 1
+4       Ne             2     11    1     BINARY-8       82  if r[1]!=r[2] goto 11
+...
+11    Next           0     3     0                    1   
+```
+
+Read the email of the current row, compare it with my value, go to the next row. Three instructions, one million times, plus 13 around the loop: 3,000,013 without `.eqp`, and one more step for the plan line in the counter above.
+
+## Warm and cold
+
+All the times above are with a warm cache: the file was in the kernel page cache, that is the memory where Linux keeps file data that was used recently. So a miss in SQLite's small cache was only a copy from memory to memory.
+
+For the cold case, my script calls `posix_fadvise` with `POSIX_FADV_DONTNEED` on the database file before each run. It asks the kernel to drop the cached pages of this one file (my own file, so no root is needed, and `fincore` reports 0 bytes cached). Then it runs the query once:
+
+```text
+email lookup, cold (0 bytes cached before each run): median 57.94 ms (min 55.65 ms, max 67.37 ms, 7 runs)
+...
+email lookup, cold (0 bytes cached before each run): median 569.1 us (min 437.7 us, max 4.98 ms, 7 runs)
+```
+
+The first line is the scan, the second is the search with the index.
+
+The cold scan took 58 ms instead of 34 ms. Only about 24 ms more, to read 64 MiB from the SSD. A scan reads the file in order, the kernel reads ahead, and this SSD is fast for sequential reads. And most of the work was there already with a warm cache: 3 million instructions, and 16,467 reads from the kernel page cache (in the single run above, 0.03 s of the time was in the kernel).
+
+The cold search went from 6 µs to 569 µs, about one hundred times slower. In fact its pages are in different places of the file, and each one is a separate small read from the SSD. So with a cold cache the index is "only" about a hundred times faster than the scan.
+
+## A range, and an ORDER BY
+
+A range of one day on `created_at` (905 rows) gives the same picture: `SCAN users` and a median of 39.43 ms without an index. With an index on `created_at`, a count becomes:
+
+```text
+SELECT count(*) FROM users WHERE created_at BETWEEN '2025-03-01 00:00:00' AND '2025-03-01 23:59:59';
+QUERY PLAN
+`--SEARCH users USING COVERING INDEX users_created (created_at>? AND created_at<?)
+905
+```
+
+Two small things here. `COVERING INDEX`: a count needs nothing from the table, so the table is never read (10 pages in total). And the plan writes `>` and `<`, but BETWEEN includes both ends. This was not obvious for me at first: the plan only says which sides are limited, and `created_at > ... AND created_at < ...` prints the same line. The bytecode tells the truth, with `SeekGE` (greater or equal) at the start and `IdxGT` (stop when greater) at the end.
+
+Now the ORDER BY: the three newest users, without an index on `created_at`:
+
+```text
+SELECT id, email FROM users ORDER BY created_at DESC LIMIT 3;
+QUERY PLAN
+|--SCAN users
+`--USE TEMP B-TREE FOR ORDER BY
+```
+
+`USE TEMP B-TREE FOR ORDER BY` means a temporary b-tree that sorts the rows. The bytecode shows that it is clever: because of the LIMIT, the temporary b-tree never holds more than 3 rows. For each row, SQLite looks at the oldest of the three, and if the new row is newer, it deletes that one and inserts the new row. But my rows come in `created_at` order, so every row is newer and every row does the delete and the insert: 11 instructions per row, 11,000,014 in the counter, and a median of 155.64 ms. To return 3 rows.
+
+With the index:
+
+```text
+QUERY PLAN
+`--SCAN users USING INDEX users_created
+1000000|sara.silva1373@example.net
+999999|mwagner387@example.org
+999998|sofia.romano486@example.com
+Page cache hits:                     7
+Page cache misses:                   4
+Fullscan Steps:                      2
+Sort Operations:                     0
+Virtual Machine Steps:               27
+```
+
+The word is still SCAN, but it is a scan of the index from its end, and the LIMIT stops it after 3 rows: 2 steps, 11 pages, 27 instructions, no sort, a median of 5.8 µs. So SCAN does not mean "this query reads everything". It means "this loop could visit every row".
+
+## How I read a plan now
+
+- `SCAN t` without `USING`: a loop over the whole table. Fine for small tables, and a LIMIT can stop it early.
+- `SEARCH t USING INDEX i (a=?)`: a jump into the index. The parentheses list the terms used for the jump, and the other terms are checked row by row.
+- `USING COVERING INDEX`: the table is not read at all.
+- `USE TEMP B-TREE`: a sort step. With a LIMIT it stays small, but all the input rows still pass through it.
+- When in doubt, `.stats on` counts the pages.
+
+Other databases use other words for the same ideas. PostgreSQL's EXPLAIN prints plan nodes like `Seq Scan` and `Index Scan`, and `EXPLAIN ANALYZE` runs the query and adds the real times. In MySQL, `type: ALL` is a full table scan, `Using index` means the table is not read, and `Using filesort` is an extra sort. I did not run them, but the questions are the same.
+
+The full output, with all the timings and the load of the machine, is in [p02-scan-versus-search.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/inside-a-database-index/results/p02-scan-versus-search.txt), and the step counts without `.eqp` are in [p02-vm-steps.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/inside-a-database-index/results/p02-vm-steps.txt).
+
+## References
+
+- SQLite, [EXPLAIN QUERY PLAN](https://sqlite.org/eqp.html). The page also says that the format is for interactive debugging and can change between releases.
+- SQLite, [The SQLite Bytecode Engine](https://sqlite.org/opcode.html): SeekGE, IdxGT, DeferredSeek, IdxRowid.
+- SQLite, [PRAGMA cache_size](https://sqlite.org/pragma.html#pragma_cache_size).
+- PostgreSQL 18, [Using EXPLAIN](https://www.postgresql.org/docs/18/using-explain.html).
+- MySQL 8.4, [EXPLAIN Output Format](https://dev.mysql.com/doc/refman/8.4/en/explain-output.html).

@@ -1,0 +1,121 @@
+---
+title: "Keeping a Derived Index in Sync Outside the Database"
+date: "2026-08-19T12:45:00+01:00"
+lastmod: "2026-08-19T12:45:00+01:00"
+tags: ["inside a database index", "databases", "sqlite", "full-text search", "data synchronization"]
+draft: false
+reviewed: true
+reviewedHash: "4a32f131f08f86e4f843c9b72357be7ef05e9c6c3ef567f5aec4736ac3d99b6a"
+campaign: "editorial"
+summary: "I killed a program 200 times while it wrote documents and their search entries in two transactions: 104 documents became invisible to search, without any error. One transaction, or triggers, gave zero. When the copy lives in another system, only an outbox and reconciliation are left."
+---
+
+In all the parts of this series until now, SQLite kept the index in sync for me. Every INSERT, UPDATE and DELETE changed the table and its indexes in the same transaction, and in [the first part](/blog/an-index-is-a-second-copy-of-your-data) I had to break the file by hand to see them disagree.
+
+In this last part the index is maintained by my code. It is a full-text search index, so a derived copy of the documents again, but nothing forces it to follow the table. So I made an experiment to see how it goes wrong, how often, and how you can notice it.
+
+## A search index that the database does not maintain
+
+The documents are in a normal table. The search index is an FTS5 table in "external content" mode: it stores only the index, and it reads the text from the table `docs` when it needs it.
+
+```python
+    "CREATE TABLE docs (id INTEGER PRIMARY KEY, title TEXT NOT NULL, body TEXT NOT NULL)",
+    "CREATE VIRTUAL TABLE docs_fts USING fts5(title, body, content='docs', content_rowid='id')",
+```
+
+The FTS5 documentation is honest about this mode: "It is still the responsibility of the user to ensure that the contents of an external content FTS5 table are kept up to date with the content table." So it is my job. I tested three ways to do it, with the same writer program. It inserts documents in a loop, and each document has a unique word in its body (`tok` and its id), so later I can check exactly which documents the search can find.
+
+## Two transactions, and kill -9
+
+The first way is the one that looks normal in application code: save the document, then update the search index. With `autocommit=True` in Python, each `execute` here is its own transaction:
+
+```python
+            con.execute("INSERT INTO docs VALUES (?, ?, ?)", (i, title, body))
+            con.execute("INSERT INTO docs_fts (rowid, title, body) VALUES (?, ?, ?)",
+                        (i, title, body))
+```
+
+Then a second program starts the writer, waits until it says "ready", waits a random time between 0 and 50 ms, and kills it with SIGKILL, which a process cannot catch or delay. 200 times, always continuing in the same database file. I did not choose the moment of each kill, the random delay did:
+
+```text
+== mode two: 200 kills with SIGKILL in 15.7 s
+    after the kills: 1178 documents, 104 not found in the search index, integrity-check: error: database disk image is malformed
+```
+
+104 documents out of 1,178 are in the table but not in the search index. About half of the kills (104 of 200 in this run) arrived between the two commits. The documents are saved. In an application, the user would have a confirmation, and nobody would ever find these documents with a search. No error was raised anywhere. The number changes from run to run, because it depends on where the kills land.
+
+SQLite did nothing wrong here. Each transaction was atomic: when a kill arrived in the middle of a transaction, the next process rolled it back from the journal. But the document and its search entry were two transactions, and a crash between them is a normal crash.
+
+## How to notice, and how to repair
+
+The last part of the line above is the FTS5 integrity check, `INSERT INTO docs_fts(docs_fts, rank) VALUES ('integrity-check', 1)`. With the rank 1, it compares the index with the content table, and on any difference "the command fails with an SQLITE_CORRUPT_VTAB error". The message of this error is the scary "database disk image is malformed", but the file is fine: this is how FTS5 says "my index does not match the table".
+
+The repair is the same idea as `REINDEX` in part 1. The documents are the truth, the index is derived from them, so throw it away and build it again:
+
+```text
+    rebuild: 5.61 ms
+    after rebuild: 1178 documents, 0 not found in the search index, integrity-check: ok
+```
+
+`rebuild` "first deletes the entire full-text index, then rebuilds it based on the contents of the table or content table". 5.61 ms for 1,178 documents. On a big table it costs much more, but it is always possible, because nothing in the index is original data.
+
+## One transaction, or let the database do it
+
+The second way puts both inserts in one transaction, `BEGIN`, the two inserts, `COMMIT`. The third way uses the triggers from the FTS5 documentation, so the application inserts only the document:
+
+```python
+    """CREATE TRIGGER docs_ai AFTER INSERT ON docs BEGIN
+  INSERT INTO docs_fts(rowid, title, body) VALUES (new.id, new.title, new.body);
+END""",
+```
+
+(The documentation has also the triggers for DELETE and UPDATE, and my fixture creates all three.) The same 200 kills:
+
+```text
+== mode one: 200 kills with SIGKILL in 15.4 s
+    after the kills: 2264 documents, 0 not found in the search index, integrity-check: ok
+== mode trigger: 200 kills with SIGKILL in 15.7 s
+    after the kills: 2298 documents, 0 not found in the search index, integrity-check: ok
+```
+
+Zero, in both. A kill inside the transaction rolls back the document and its entry together. This is what SQLite does for its own indexes, and now it does it for mine. The trigger version is better in one way: every code path that writes to `docs` gets the search update, also the ones written next year by somebody who never heard of the search index. And both of these ways wrote almost twice as many documents as the first one in the same time, because they make one commit per document instead of two.
+
+## A trigger is only as good as the path
+
+Triggers protect only the writes that go through them. To see the failure, I dropped the UPDATE trigger, like a quick fix or a bulk tool might do, and changed one document:
+
+```text
+    -- an UPDATE that does not go through the triggers
+    DROP TRIGGER docs_au
+    UPDATE docs SET body = 'replaced text tok1' WHERE id = 1
+    search for 'commit' still returns: [(1, 'replaced text tok1')]
+    integrity-check: error: database disk image is malformed
+    after rebuild, search for 'commit' returns: [], integrity-check: ok
+```
+
+The search for "commit", a word of the old body, still finds document 1, and the body it shows does not contain this word anymore. The index has the old words, and the external content mode reads the new text from the table. The documentation warns that in this situation results "may become unintuitive and appear inconsistent", and this is exactly how it looks. Again the integrity check found it, and `rebuild` fixed it.
+
+## When the copy is in another system
+
+Now the general case. A search server, a cache, a second database, a data warehouse, etc.: the derived copy lives in a system that does not share a transaction with yours. Then the second and the third way do not exist anymore. What is left? Only the first one, the one that lost 104 documents.
+
+This is the dual-write problem from the article on [the outbox pattern](/blog/outbox-pattern), and changing the order does not save you. If I would write the search entry first, the kills would leave the opposite problem: search results for documents that do not exist. The outbox pattern moves the boundary instead. In the same local transaction as the document, you write a small row that says "index document 42". A separate process reads these rows, sends them to the search system, and marks them done. In fact a crash can make it send one twice, but not zero times, so the update on the other side must be safe to apply twice.
+
+And because a copy in another system will drift anyway (a bug, a failed retry, a manual fix), you also need the outside version of `integrity-check` and `rebuild`: compare the copy with the source, and repair the difference. That is [reconciliation](/blog/reconciliation-cross-system-sync), and the article on this site puts it like this: "You make them agree by comparing them."
+
+PostgreSQL has the same split, from its documentation. When the text search vector is stored in a separate column, "it is necessary to create a trigger to update the tsvector column when the document content columns change", like my third way, and the PostgreSQL 18 documentation adds that this method "has been obsoleted by the use of stored generated columns", where the database computes the derived column itself.
+
+## Looking back at the series
+
+An index is usually explained as the thing that makes queries fast. After these ten experiments I see it more as a promise: two copies of the same data agree. Almost every number in this series was a price of this promise. The 4 GB that SQLite passed to `write()` for one index on emails (part 3). The planner that chose a slow index, because its statistics, one more copy, were stale (part 7). The half-empty pages that a delete left in the index (part 9). And here, 104 documents that nobody can find, after 200 kills and not one error.
+
+Inside one SQLite transaction, the database keeps this promise for me. Outside of it, my code must keep it, and I know only one proof: compare the copy with the source, from time to time.
+
+The writer and the killer are in the [fixture of the series](https://github.com/mehdiakiki/mehdi-cz/tree/main/experiments/inside-a-database-index), and the full output is in [p10-derived-search-index.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/inside-a-database-index/results/p10-derived-search-index.txt).
+
+## Sources
+
+- SQLite, [FTS5](https://sqlite.org/fts5.html): external content tables, the example triggers, the `rebuild` and `integrity-check` commands.
+- SQLite, [Atomic Commit In SQLite](https://sqlite.org/atomiccommit.html): what happens to a transaction interrupted by a crash.
+- PostgreSQL 18, [Additional Features: Triggers for Automatic Updates](https://www.postgresql.org/docs/18/textsearch-features.html).
+- On this site: [The Outbox Pattern](/blog/outbox-pattern) and [How to Keep Two Systems in Sync](/blog/reconciliation-cross-system-sync).
