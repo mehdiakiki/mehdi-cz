@@ -18,7 +18,10 @@ fn main() -> Result<()> {
     let c = Connection::open_in_memory()?;
     duck_version(&c)?;
     let totals = report(&c, good.to_str().ok_or("non-UTF8 temporary path")?)?;
-    assert_eq!(totals, vec![("ops".to_owned(), 300), ("support".to_owned(), 50)]);
+    assert_eq!(
+        totals,
+        vec![("ops".to_owned(), 300), ("support".to_owned(), 50)]
+    );
     assert!(report(&c, bad.to_str().ok_or("non-UTF8 temporary path")?).is_err());
     println!("typed totals={totals:?}; invalid numeric CSV rejected");
     Ok(())

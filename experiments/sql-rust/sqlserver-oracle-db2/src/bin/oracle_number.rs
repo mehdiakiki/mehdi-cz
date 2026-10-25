@@ -15,8 +15,12 @@ fn main() -> AnyResult<()> {
         let exact: String = row.get(1)?;
         assert_eq!(exact, input);
         let integer = exact_integer(&exact)?;
-        assert_eq!(narrowed.is_ok(), i64::try_from(integer).is_ok());
-        println!("exact={exact}, fits_i64={}", narrowed.is_ok());
+        let expected_i64 = i64::try_from(integer).ok();
+        match expected_i64 {
+            Some(expected) => assert_eq!(narrowed?, expected),
+            None => assert!(narrowed.is_err()),
+        }
+        println!("exact={exact}, fits_i64={}", expected_i64.is_some());
     }
     Ok(())
 }

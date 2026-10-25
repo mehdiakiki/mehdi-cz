@@ -3,12 +3,25 @@ use sql_rust_engines_b::{connect, Result};
 // article-example:start
 async fn compare(variable: &str) -> Result<()> {
     let mut c = connect(variable).await?;
-    sqlx::query("DROP TABLE IF EXISTS b_json").execute(&mut c).await?;
-    sqlx::query("CREATE TABLE b_json(id INT PRIMARY KEY, payload JSON NOT NULL) ENGINE=InnoDB").execute(&mut c).await?;
+    sqlx::query("DROP TABLE IF EXISTS b_json")
+        .execute(&mut c)
+        .await?;
+    sqlx::query("CREATE TABLE b_json(id INT PRIMARY KEY, payload JSON NOT NULL) ENGINE=InnoDB")
+        .execute(&mut c)
+        .await?;
     let original = r#"{ "a":1, "a":2, "note":"é" }"#;
-    sqlx::query("INSERT INTO b_json VALUES(1,?)").bind(original).execute(&mut c).await?;
-    let stored: String = sqlx::query_scalar("SELECT CAST(payload AS CHAR) FROM b_json WHERE id=1").fetch_one(&mut c).await?;
-    let selected: String = sqlx::query_scalar("SELECT JSON_UNQUOTE(JSON_EXTRACT(payload,'$.a')) FROM b_json WHERE id=1").fetch_one(&mut c).await?;
+    sqlx::query("INSERT INTO b_json VALUES(1,?)")
+        .bind(original)
+        .execute(&mut c)
+        .await?;
+    let stored: String = sqlx::query_scalar("SELECT CAST(payload AS CHAR) FROM b_json WHERE id=1")
+        .fetch_one(&mut c)
+        .await?;
+    let selected: String = sqlx::query_scalar(
+        "SELECT JSON_UNQUOTE(JSON_EXTRACT(payload,'$.a')) FROM b_json WHERE id=1",
+    )
+    .fetch_one(&mut c)
+    .await?;
     if variable == "MARIADB_URL" {
         assert_eq!(stored, original);
         assert_eq!(selected, "1");
@@ -16,12 +29,26 @@ async fn compare(variable: &str) -> Result<()> {
         assert_ne!(stored, original);
         assert_eq!(selected, "2");
     }
-    sqlx::query("INSERT INTO b_json VALUES(2,?)").bind(r#"{"n":null}"#).execute(&mut c).await?;
-    let explicit: Option<String> = sqlx::query_scalar("SELECT JSON_TYPE(JSON_EXTRACT(payload,'$.n')) FROM b_json WHERE id=2").fetch_one(&mut c).await?;
-    let missing: Option<String> = sqlx::query_scalar("SELECT JSON_TYPE(JSON_EXTRACT(payload,'$.absent')) FROM b_json WHERE id=2").fetch_one(&mut c).await?;
+    sqlx::query("INSERT INTO b_json VALUES(2,?)")
+        .bind(r#"{"n":null}"#)
+        .execute(&mut c)
+        .await?;
+    let explicit: Option<String> =
+        sqlx::query_scalar("SELECT JSON_TYPE(JSON_EXTRACT(payload,'$.n')) FROM b_json WHERE id=2")
+            .fetch_one(&mut c)
+            .await?;
+    let missing: Option<String> = sqlx::query_scalar(
+        "SELECT JSON_TYPE(JSON_EXTRACT(payload,'$.absent')) FROM b_json WHERE id=2",
+    )
+    .fetch_one(&mut c)
+    .await?;
     assert_eq!(explicit.as_deref(), Some("NULL"));
     assert_eq!(missing, None);
-    assert!(sqlx::query("INSERT INTO b_json VALUES(3,?)").bind("not json").execute(&mut c).await.is_err());
+    assert!(sqlx::query("INSERT INTO b_json VALUES(3,?)")
+        .bind("not json")
+        .execute(&mut c)
+        .await
+        .is_err());
     println!("{variable}: stored={stored}; selected a={selected}; null and missing checked");
     Ok(())
 }

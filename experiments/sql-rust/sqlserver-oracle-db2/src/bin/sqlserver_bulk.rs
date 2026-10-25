@@ -1,11 +1,18 @@
 use sql_rust_enterprise_examples::{
     fixture_name, fixture_permission, invalid, sqlserver, validate_batch, AnyResult, SqlClient,
 };
-use tiberius::IntoRow;
+use tiberius::{IntoRow, SqlBulkCopyOption};
 // article-example: bulk
 async fn send_batch(client: &mut SqlClient, table: &str, rows: &[(i32, i32)]) -> AnyResult<()> {
     validate_batch(rows)?;
-    let mut request = client.bulk_insert(table).await?;
+    let mut request = client
+        .bulk_insert_with_options(
+            table,
+            &["id", "quantity"],
+            SqlBulkCopyOption::CheckConstraints.into(),
+            &[],
+        )
+        .await?;
     for &(id, quantity) in rows {
         request.send((id, quantity).into_row()).await?;
     }
@@ -53,13 +60,20 @@ async fn exercise(client: &mut SqlClient, table: &str) -> AnyResult<()> {
     failing
         .execute("SET XACT_ABORT ON; BEGIN TRANSACTION", &[])
         .await?;
-    let error = failing
-        .execute(
-            format!("INSERT INTO {table} VALUES (@P1,@P2)"),
-            &[&4i32, &-1i32],
-        )
-        .await
-        .expect_err("database CHECK must reject negative quantity");
+    let rejected = async {
+        let mut request = failing
+            .bulk_insert_with_options(
+                table,
+                &["id", "quantity"],
+                SqlBulkCopyOption::CheckConstraints.into(),
+                &[],
+            )
+            .await?;
+        request.send((4i32, -1i32).into_row()).await?;
+        request.finalize().await
+    }
+    .await;
+    let error = rejected.expect_err("bulk CHECK must reject negative quantity");
     assert_eq!(error.code(), Some(547));
     drop(failing);
     assert_eq!(count(&mut observer, table).await?, 3);
