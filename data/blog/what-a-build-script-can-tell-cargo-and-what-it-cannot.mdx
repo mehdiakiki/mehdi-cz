@@ -1,0 +1,281 @@
+---
+title: "What a Build Script Can Tell Cargo, and What It Cannot"
+date: "2026-11-06T16:20:00+01:00"
+lastmod: "2026-11-06T16:20:00+01:00"
+tags: ["rust", "cargo", "build scripts", "build systems", "build cache"]
+draft: false
+reviewed: true
+reviewedHash: "5c0a6cbd7dc65ba17c179af5dc14066ea430494b6958cfca956c63f03868c60b"
+cluster: "rust-under-the-hood"
+campaign: "editorial"
+summary: "A build script talks to Cargo with lines on standard output, and every line has its own receiver. I made a small workspace on Cargo 1.99.1 to follow each line, and to see what happens when the script reads a file that it did not declare."
+---
+
+Eleven test programs in my [Rust Failure Atlas](/rust-failure-atlas) have a `build.rs`. In most of them, the problem is not the work that the script does, like compiling C. It is the exchange between the script and Cargo: a cfg that rustc does not accept, a `DEP_` variable that does not arrive, a `rustc-env` value that is gone when the binary starts alone, an environment variable that Cargo does not watch.
+
+The usual picture of `build.rs` is a small program that runs before the build and configures it. It runs first and prints instructions, so it can change the build, right? Only partly. A build script prints lines on standard output, Cargo reads the lines it knows, and every line goes to its own receiver, often a smaller one than the name of the line suggests. So I made a small workspace and followed each line to its receiver.
+
+## The setup
+
+Everything runs with Cargo 1.99.1 and rustc 1.99.1 on x86_64 Linux, with GCC 15.2.1 as `cc`. The main pair is `answer-sys`, a package with `links = "answer"` whose build script compiles one C function into a static library, and `app`, a binary that depends on it. Smaller packages test one question each. The workspace is in [`experiments/rust-atlas/build-script-contract`](https://github.com/mehdiakiki/mehdi-cz/tree/main/experiments/rust-atlas/build-script-contract), and `run.sh` runs it in a temporary directory, so below `WS` is that directory and `HASH` replaces Cargo's hashes.
+
+The build script compiles the C function `int answer(void) { return 42; }` with `cc -c -fPIC`, packs it with `ar crs` into `libanswer.a` in `OUT_DIR`, and prints:
+
+```rust
+println!("cargo::rustc-link-search=native={}", out_dir.display());
+println!("cargo::rustc-link-lib=static=answer");
+println!("cargo::rustc-link-arg=-Wl,--defsym=link_arg_from_answer_sys=0x2a");
+println!("cargo::rustc-check-cfg=cfg(answer_version, values(\"1\", \"2\"))");
+println!("cargo::rustc-cfg=answer_version=\"{NATIVE_VERSION}\"");
+println!("cargo::rustc-env=ANSWER_CC={cc}");
+println!("cargo::metadata=version={NATIVE_VERSION}");
+println!("cargo::warning=compiled native/answer.c with {cc}");
+```
+
+`NATIVE_VERSION` is the constant `"2"`. The `rustc-link-arg` line is a marker: it asks the linker to define a symbol, so I can look for it with `nm`. The build script of `app` prints its own marker, `link_arg_from_app`, its own cfg and its own `rustc-env`.
+
+## Who received each line
+
+With `-v`, Cargo prints every rustc command. These are the flags from build scripts, plus the `--extern` between the two crates. For the `answer_sys` library:
+
+```text
+-L native=WS/target/debug/build/answer-sys-HASH/out
+-l static=answer
+-C link-arg=-Wl,--defsym=link_arg_from_answer_sys=0x2a
+--cfg 'answer_version="2"'
+--check-cfg 'cfg(answer_version, values("1", "2"))'
+```
+
+For `app`:
+
+```text
+--extern answer_sys=WS/target/debug/deps/libanswer_sys-HASH.rlib
+-L native=WS/target/debug/build/answer-sys-HASH/out
+-C link-arg=-Wl,--defsym=link_arg_from_app=0x2a
+--cfg 'dep_answer_version="2"'
+--check-cfg 'cfg(dep_answer_version, values("1", "2"))'
+```
+
+Trimmed: both commands have also the two default `--check-cfg` flags that Cargo adds to every crate.
+
+From the lines of `answer-sys`, only the search path reached `app`. The cfg, the `-l` and the link argument stayed in `answer-sys`, and this was not obvious for me: Cargo even gave the link argument to the library, where nothing is linked. The `-l` goes [to the library target](https://doc.rust-lang.org/cargo/reference/build-scripts.html#rustc-link-lib) of the package, says the Cargo book, and `app` does not need it, because `ar t` on the rlib lists `answer.o` next to the Rust object.
+
+The binary shows the same picture from the inside:
+
+```text
+answer() from C = 42
+in answer-sys, env!("ANSWER_CC") = cc
+in answer-sys, cfg!(answer_version = "2") = true
+in app, cfg!(answer_version = "2") = false
+in app, cfg!(dep_answer_version = "2") = true
+in app, option_env!("ANSWER_CC") = None
+in app, option_env!("DEP_ANSWER_VERSION") = None
+```
+
+In fact rustc for `app` does not even know the name `answer_version`. The build of `app` warns:
+
+```text
+warning: unexpected `cfg` condition name: `answer_version`
+ --> app/src/main.rs:8:64
+```
+
+A few lines later it says `help: there is a config with a similar name and value` and proposes `dep_answer_version`, the cfg that the build script of `app` made itself. Quite a smart help. `answer-sys` has no such warning, because its script declared the name with `rustc-check-cfg`, and [this atlas case](/rust/failures/build-script-custom-cfg-needs-rustc-check-cfg) shows what happens without it. And in the final binary, `nm` finds one marker, the one of `app`:
+
+```text
+000000000000002a A link_arg_from_app
+```
+
+So this is the map I got. The last column says what my run showed, the rest is from the Cargo book:
+
+| Line | Who receives it | My run |
+| --- | --- | --- |
+| `rerun-if-changed`, `rerun-if-env-changed` | Cargo, to decide if the script runs again | yes |
+| `rustc-cfg`, `rustc-check-cfg` | rustc, only for the same package | yes |
+| `rustc-env` | rustc, only for the same package, and the program under `cargo run` or `cargo test` | yes, except `cargo test` |
+| `rustc-link-lib` | rustc, for the library of the same package, or all its targets if it has no library | the library part |
+| `rustc-link-search` | rustc for the same package and for `app` that depends on it, and for a path in `OUT_DIR` also the dynamic library search path of the program that Cargo starts | the rustc part |
+| `rustc-link-arg` | the linker, for the binaries, tests, examples, benches and cdylib of the same package | the binary part |
+| `metadata` | the build scripts of direct dependents, as `DEP_<LINKS>_<KEY>` | yes |
+| `warning`, `error` | the terminal, warnings only for path dependencies unless `-vv` or the build fails, and `error` also fails the build | yes, for path dependencies |
+
+## Metadata crosses one edge, to a build script
+
+So how does `app` learn anything about `answer-sys`? Through `links`. `answer-sys` printed `cargo::metadata=version=2`, and the build script of `app` received a variable whose name Cargo builds from the `links` value and the key:
+
+```text
+warning: app@0.1.0: DEP_ANSWER_VERSION=2
+```
+
+The Rust code of `app` does not receive it, `option_env!("DEP_ANSWER_VERSION")` was `None` above. So the build script of `app` translates it into its own `cargo::rustc-cfg=dep_answer_version="2"`. This is the [conditional compilation example](https://doc.rust-lang.org/cargo/reference/build-script-examples.html#conditional-compilation) of the Cargo book, where `openssl-sys` publishes the OpenSSL version number and the build script of `openssl` turns it into cfgs like `ossl111`.
+
+The Cargo book says that "metadata is only passed to immediate dependents, not transitive dependents", and [this atlas case](/rust/failures/cargo-dep-metadata-does-not-cross-transitive-dependencies) shows a third crate that does not receive it. And `links` is a claim of ownership: Cargo allows [one package per `links` value](/rust/failures/cargo-links-conflict-native-library) in a graph.
+
+## What a build script cannot do
+
+### Enable a feature or add a dependency
+
+`fake-feature` has an optional dependency, `helper`, behind a feature `extra`. Its build script prints `cargo::rustc-cfg=feature="extra"`, and rustc did receive the cfg:
+
+```text
+--check-cfg 'cfg(feature, values("extra"))'
+--cfg 'feature="extra"'
+```
+
+The first line is from Cargo, it lists the features of `Cargo.toml`, so check-cfg does not catch the fake either. And rustc included the code under `#[cfg(feature = "extra")]`. But `helper` never came. There is no `--extern helper`, Cargo did not compile `helper` at all, and the build fails:
+
+```text
+error[E0433]: cannot find module or crate `helper` in this scope
+ --> fake-feature/src/lib.rs:3:5
+```
+
+With `--features extra` on the command line, Cargo compiles `helper` and the same package builds. Cargo decides the features and the dependency graph before any build script runs. The [Cargo book](https://doc.rust-lang.org/cargo/reference/build-scripts.html#rustc-cfg) says it clearly: `rustc-cfg` "cannot be used to enable an optional dependency, or enable other Cargo features". How Cargo really chooses features is in [Cargo Feature Unification Across Workspaces, Host Tools, and Targets](/blog/cargo-feature-unification-across-workspaces-host-tools-and-targets).
+
+There is no instruction for features either. `echo-line` is a tiny package whose build script prints one line that I give in an environment variable, so I can test lines one by one:
+
+```text
+error: invalid output in build script of `echo-line v0.1.0 (WS/echo-line)`: `cargo::feature=extra`
+Unknown key: `feature`.
+```
+
+### Give a cfg or an environment variable to another crate, or set compiler options
+
+The first part showed it for cfgs and `rustc-env`. For other compiler options it is even more closed: the script cannot set them even for its own package. `rustc-flags` sounds like a general door to rustc, but:
+
+```text
+error: only `-l` and `-L` flags are allowed in build script of `echo-line v0.1.0 (WS/echo-line)`: `-C opt-level=3`
+```
+
+So a script can give cfgs and link flags, and in my run only the search path left its package. Optimization and debug info come from the profiles, and target features from `-C target-feature` in `RUSTFLAGS` or `.cargo/config.toml`. All of them belong to the user who runs the build. Cargo even ignores the profiles in the `Cargo.toml` of a dependency.
+
+### Give a value to the program at run time
+
+`rustc-env` sets a variable for rustc while it compiles the package, and `env!` copies the value into the binary. The name sounds like a normal environment variable, so it is tempting to read it with `std::env::var`. Here is the same binary started in two ways, trimmed to the `APP_LABEL` lines:
+
+```text
+== cargo run -p app
+in app, env!("APP_LABEL") = set by app/build.rs
+in app, std::env::var("APP_LABEL") = Ok("set by app/build.rs")
+
+== target/debug/app, started directly
+in app, env!("APP_LABEL") = set by app/build.rs
+in app, std::env::var("APP_LABEL") = Err(NotPresent)
+```
+
+Under `cargo run` the variable exists at run time, because Cargo sets it also when it starts the program. The Cargo book calls this usage discouraged, since it "ties the executable to Cargo's execution environment". Started directly, the same binary keeps the copy from `env!`, and `std::env::var` finds nothing. The atlas has [a longer version of this case](/rust/failures/cargo-rustc-env-is-not-a-portable-runtime-environment-variable).
+
+## Two colons, and the old single colon
+
+The `cargo::` form with two colons exists since Rust 1.77, and Cargo checks the `rust-version` of the package that prints it. In `old-msrv`, a package with `rust-version = "1.76"`:
+
+```text
+error: the `cargo::` syntax for build script output instructions was added in Rust 1.77.0, but the minimum supported Rust version of `old-msrv v0.1.0 (WS/old-msrv)` is 1.76.
+Switch to the old `cargo:rustc-cfg=fast` syntax (note the single colon).
+```
+
+With `cargo:rustc-cfg=fast` it builds. autocfg 1.5.1, which I tested in [What Breaks When Rust Reaches 1.100](/blog/what-breaks-when-rust-reaches-1-100), still prints its lines with one colon, like `cargo:rustc-cfg=...`. They come out of the build script of the package that uses autocfg, so a `cargo::` line would be checked against the `rust-version` of that package, not against the `rust-version = "1.0"` of autocfg.
+
+I tested also the `feature` line from before with one colon, `cargo:feature=extra`. The build finished with exit status 0, and nothing in the output mentions the line. The Cargo book says why: with the old form, "unsupported directives are assumed to be metadata keys". So a typo becomes silent metadata, and here not even that, because `echo-line` has no `links` and so no `DEP_` name. With two colons it is an error.
+
+The Cargo book gives two more minimum versions: `rustc-check-cfg` is respected since 1.80 and `error` since 1.84. With `CC=no-such-cc`, the `cargo::error` line of `answer-sys` fails the build, although the script itself returns normally:
+
+```text
+error: answer-sys@0.1.0: could not start no-such-cc: No such file or directory (os error 2)
+error: build script logged errors
+```
+
+## The host is not the target
+
+A build script runs on the host, so `cfg!` inside `build.rs` describes the host. The Cargo book [says this](https://doc.rust-lang.org/cargo/reference/build-scripts.html#inputs-to-the-build-script), and so does [the article about reruns](/blog/why-cargo-build-scripts-rerun-and-how-to-make-them-predictable), but I wanted to see what a wrong script gives. `where-it-runs` is a `no_std` library whose build script prints `cfg!` next to the `CARGO_CFG_TARGET_*` values. I ran `cargo check` for `thumbv7em-none-eabi`, a 32-bit ARM target without an operating system:
+
+```text
+warning: where-it-runs@0.1.0: HOST=x86_64-unknown-linux-gnu TARGET=thumbv7em-none-eabi
+warning: where-it-runs@0.1.0: cfg!(target_os = "linux") = true, CARGO_CFG_TARGET_OS = none
+warning: where-it-runs@0.1.0: cfg!(target_arch = "x86_64") = true, CARGO_CFG_TARGET_ARCH = arm
+warning: where-it-runs@0.1.0: cfg!(target_pointer_width = "64") = true, CARGO_CFG_TARGET_POINTER_WIDTH = 32
+```
+
+For the host build the two sides agree, so a wrong script looks correct there. Then the script makes one decision in the two ways:
+
+```rust
+if cfg!(target_pointer_width = "64") {
+    println!("cargo::rustc-cfg=ptr64_by_cfg_macro");
+}
+if env::var("CARGO_CFG_TARGET_POINTER_WIDTH").as_deref() == Ok("64") {
+    println!("cargo::rustc-cfg=ptr64_by_cargo_cfg");
+}
+```
+
+For `thumbv7em-none-eabi`, rustc received, trimmed to the target and the cfg:
+
+```text
+--target thumbv7em-none-eabi
+--cfg ptr64_by_cfg_macro
+```
+
+So a target with 32-bit pointers was checked with a cfg that says 64-bit pointers, and `cargo check` finished with exit status 0. In a script that compiles C, the same confusion between host and target gives [an object file for the wrong machine](/rust/failures/native-dependency-built-for-host), and [this atlas case](/rust/failures/cargo-build-script-target-is-a-runtime-environment-variable) shows why `TARGET` must be read with `std::env::var` and not with `env!`. The differences between targets outside the build script are in [the article about a Rust program that behaves differently on another target](/blog/why-does-my-rust-program-behave-differently-on-another-target).
+
+## An input that nobody declared
+
+The rules of the two `rerun-if` lines are in [Why Cargo Build Scripts Rerun and How to Make Them Predictable](/blog/why-cargo-build-scripts-rerun-and-how-to-make-them-predictable), and how to read the dirty reasons is in [Why Did Cargo Rebuild This Crate?](/blog/why-did-cargo-rebuild-this-crate-fingerprints-and-dirty-reasons). [The diagnostic tree](/blog/why-is-my-rust-build-slow-a-diagnostic-tree) has a branch for a script that runs too often. Here I wanted the opposite: a script that should run again and does not.
+
+`undeclared-input` reads `../shared/greeting.txt`, a file outside its package, and the variable `GREETING_STYLE`. It writes a constant into `OUT_DIR`, and the binary prints it. `declared-input` is the same script with two more lines:
+
+```rust
+println!("cargo::rerun-if-changed=../shared/greeting.txt");
+println!("cargo::rerun-if-env-changed=GREETING_STYLE");
+```
+
+The first build of both prints `hello`. Then I changed the file to `bonjour`, and after that I set `GREETING_STYLE=loud`. Here is `cargo build -v` and the program each time:
+
+```text
+== shared/greeting.txt now says bonjour
+       Fresh undeclared-input v0.1.0 (WS/undeclared-input)
+undeclared-input prints: hello
+       Dirty declared-input v0.1.0 (WS/declared-input): the file `declared-input/../shared/greeting.txt` has changed (...)
+declared-input prints: bonjour
+
+== GREETING_STYLE=loud
+       Fresh undeclared-input v0.1.0 (WS/undeclared-input)
+undeclared-input prints: hello
+       Dirty declared-input v0.1.0 (WS/declared-input): the env variable GREETING_STYLE changed
+declared-input prints: BONJOUR
+```
+
+Trimmed: the timestamps after `has changed`. So Cargo said `Fresh`, the program printed the old value, and there was no warning. Cargo did its job here: it compared everything it knew, and it knew nothing about these two inputs.
+
+Then I touched `undeclared-input/src/main.rs`, without changing its content:
+
+```text
+== GREETING_STYLE=loud, after touch undeclared-input/src/main.rs
+       Dirty undeclared-input v0.1.0 (WS/undeclared-input): the precalculated components changed
+undeclared-input prints: BONJOUR
+```
+
+Now it is correct, and this is the strange part. A script without any `rerun-if` line gets the default rule of the Cargo book: Cargo runs it again when a file in the package changes. In the Cargo source, this fingerprint is [the modification time of the newest file in the package](https://github.com/rust-lang/cargo/blob/5f94df4789f005f9a352888e8355ffc645b7ed0e/src/compiler/fingerprint/mod.rs#L263-L274), and Cargo calls it precalculated. `greeting.txt` is outside the package and an environment variable is not a file, so neither of them counts. But any edit inside the package runs the script again, and the old value is fixed by accident.
+
+So the result depends on which file somebody edited last. The [atlas case for the environment variable](/rust/failures/build-script-environment-inputs-need-rerun-if-env-changed) has the same stale constant without this accident: its script declares only `build.rs`, so an edit inside the package does not run it again.
+
+## The patches, and why they are not enough
+
+Two patches look fine on one machine. `RUSTFLAGS="--cfg ..."` gives a cfg to every crate, also to the crates that never asked, and the value lives in a shell or a CI file that the users of the package do not have. Every new value of `RUSTFLAGS` also compiles all the crates one more time, as I measured in [the fingerprints article](/blog/why-did-cargo-rebuild-this-crate-fingerprints-and-dirty-reasons). And `cargo clean` in CI makes CI always correct, while the stale builds stay on the developer machines.
+
+## What I do now
+
+1. Every file and every outside environment variable that the script reads gets a `rerun-if-changed` or `rerun-if-env-changed` line. The variables that Cargo gives to the script, like `TARGET` or `OUT_DIR`, do not need one. In `answer-sys` this means `native/answer.c`, `CC` and `AR`.
+2. A value for another crate goes through `links` and `metadata`, and the build script on the other side turns it into its own cfg.
+3. A value for the program at run time does not come from the build script. `env!` is for values fixed at build time, like a version.
+4. I use the `cargo::` form when the MSRV is 1.77 or newer, so that a line with an unknown key is an error and not silent metadata.
+
+## The tradeoffs
+
+The metadata stops after one edge. A wrapper crate that must pass a value further has to do it on purpose, with its own `links` and its own metadata.
+
+A declared list has a cost too. After the first `rerun-if` line Cargo stops scanning the package, so a forgotten input is never fixed by accident, like in the atlas case above. A test with two builds in the same `target` finds it, a clean build does not.
+
+And my `answer-sys` works for native builds, not for cross builds. It calls `cc` directly to avoid dependencies and does not give it the target. A real sys crate should use the [`cc` crate](https://docs.rs/cc/latest/cc/), which takes `TARGET` and `HOST` from Cargo and can detect a cross build.
+
+## The rule under it
+
+For the build system, a build step depends on the inputs it declares and on nothing else, and its outputs go only to the receivers that the build system knows. Cargo checked the inputs it knew for `undeclared-input`, found no change, and gave back `hello` after the file said `bonjour`, until an unrelated file changed. On the output side it was the same: the cfg of `answer-sys` stayed in `answer-sys`, the metadata reached one build script, and an unknown line was an error, or with the old form, nothing.
+
+The rule is older than Cargo. [Bazel can run an action in a sandbox](https://bazel.build/docs/sandboxing) whose working directory has only the declared inputs, so a relative path like `../shared/greeting.txt` would fail there. Its documentation describes also the same stale build: when an undeclared input changes, "Bazel still believes that the build is up-to-date". Cargo has no such sandbox, it trusts the script. So when I write a build step now, in Cargo or anywhere else, I write two lists: what the step reads, and who receives what it produces. A read that is missing from the first list gives a stale result one day.
