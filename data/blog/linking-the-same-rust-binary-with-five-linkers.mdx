@@ -1,0 +1,206 @@
+---
+title: "Linking the Same Rust Binary With Five Linkers"
+date: "2026-10-31T15:55:00+01:00"
+lastmod: "2026-10-31T15:55:00+01:00"
+tags: ["rust", "cargo", "linker", "build-performance", "benchmarking", "linux"]
+draft: false
+reviewed: true
+reviewedHash: "936dad15599af748ff73929eb975a6d2288c9a745e56fd895ea951e070cde9a8"
+cluster: "rust-under-the-hood"
+campaign: "editorial"
+summary: "mold 3.0 is the first Rust version of mold. I linked the same ripgrep object files with it, mold 2, GNU ld, gold, LLD and wild. With one thread, LLD, mold and wild were equal, the Rust mold was a bit slower with 16, and all outputs were the same program."
+---
+
+On October 5, mold 3.0.0 came out. mold is a linker, that is the program that joins the object files of a build into one executable, and 3.0.0 is its first version in Rust (2.42.1, from September 11, was the last in C++). The [release notes](https://github.com/rui314/mold/releases/tag/v3.0.0) promise the same options, the same output except for some bug fixes, and "linking performance remains on par with 2.42.1".
+
+A rewrite is a risk for speed, so I wanted to check it on my laptop, next to LLD (Rust's default on x86_64 Linux since [Rust 1.90](https://blog.rust-lang.org/2025/09/18/Rust-1.90.0/)), wild (also in Rust, 0.11.0 on October 24) and GNU ld. I linked the same ripgrep 15.2.0 object files with all of them. How long does it take? And is the result really the same program?
+
+## The Link Command That rustc Runs
+
+rustc does not start the linker itself: it starts `cc`, and `cc` starts the linker. So I built ripgrep with Rust 1.99.1 and gave rustc a small script as its linker, which saves its arguments and runs the real `cc`. The dev build (debug info, no optimization) passed 335 arguments. Some of them (DIR is my home directory):
+
+```text
+-m64
+out/target/debug/deps/rustcyRJSy2/symbols.o
+out/target/debug/deps/rg-69b18cf19b82bfc1.00j9n6ofilw91cx1ryhraie5l.12uwurf.rcgu.o
+...
+out/target/debug/deps/libgrep-1d40bc265aa683e0.rlib
+...
+-lc
+...
+-BDIR/.rustup/toolchains/1.99.1-x86_64-unknown-linux-gnu/lib/rustlib/x86_64-unknown-linux-gnu/bin/gcc-ld
+-fuse-ld=lld
+...
+-pie
+-Wl,-z,relro,-z,now
+-nodefaultlibs
+```
+
+The 257 `.rcgu.o` files are the rg crate itself, cut into codegen units that rustc compiles in parallel. Then come 52 `.rlib` archives, 33 for the dependencies and 19 for the standard library. The `-B` and `-fuse-ld=lld` lines choose the linker: `cc` looks first in a directory of the Rust toolchain, where `ld.lld` starts `rust-lld`, the LLD that comes with Rust (23.1.1 here).
+
+With `-C save-temps`, rustc keeps the object files that it normally deletes, so I could run the link alone and change only these lines. My first check: linking again with rust-lld gave a file byte-identical to cargo's `rg`. Good, that is what I wanted to see.
+
+## Seven Linker Versions on the Same Files
+
+I used five linkers, two of them in two versions: GNU ld 2.46 (bfd), gold 1.16 ([deprecated since binutils 2.44](https://sourceware.org/pipermail/binutils/2025-February/139195.html), but still shipped in even releases like 2.46), LLD 21.1.8 from my distribution and 23.1.1 from Rust, mold 2.42.1 and 3.0.0, and wild 0.11.0.
+
+The timing has one warm-up round, then 20 rounds where every linker runs once in a rotating order ([interleaving](/blog/compare-two-versions-by-interleaving-the-runs) protects against slow changes of the machine), after deleting the old output. Here is the dev link, a binary of about 53 MB:
+
+```text
+default threads
+linker             median       min-max    cpu   max rss outputs
+gnu-ld-2.46        0.744s  0.678-1.346s  0.74s   213 MiB       1
+gold-1.16          0.596s  0.528-1.030s  0.59s   353 MiB       1
+lld-21.1.8         0.290s  0.246-0.349s  1.03s   299 MiB       1
+rust-lld-23.1.1    0.248s  0.237-0.284s  1.12s   273 MiB       1
+mold-3.0.0         0.191s  0.124-0.226s  1.89s   342 MiB       1
+mold-2.42.1        0.176s  0.106-0.199s  1.79s   322 MiB       1
+wild-0.11.0        0.137s  0.056-0.154s  1.23s   238 MiB       1
+read from storage during these runs: 1 of 140 runs, at most 4 KiB
+```
+
+`median` and `min-max` are wall time, `cpu` is user plus system time of all processes, `max rss` is peak memory (it counts also the mapped pages of input and output files), and `outputs` is 1 when all 20 runs wrote the same bytes.
+
+wild was the fastest, which surprised me a bit: the mold README says mold links "1.9x faster than wild at the median". But that median is over programs of 0.15 to 9.55 GiB, on a 64-core Threadripper and 16 cores of an M1 Ultra, with linker builds from August, and on the M1 Ultra wild already wins two links.
+
+These runs were not pinned, like in a real build, but the pinned runs below spread just as much: other programs were running (1-minute load about 1.8, 5-minute about 2.5), and the swap was full. Only one run read from storage (4 KiB), so the inputs stayed in memory. So I trust only big differences, and the order holds round by round (wild beat mold 2.42.1 in 19 of 20 rounds).
+
+## Why mold Looked Like It Used 20 MiB
+
+Before I measured, I read `mold --help`. For `--fork` it says "Spawn a child process (default)", and wild has the same default. So my harness records two views of each run: what a normal benchmark script gets (the resource usage of the children it waited for), and the same with the processes that live longer than `cc`:
+
+```text
+what a parent that waits for cc sees, against all processes (medians)
+linker               cpu   seen   max rss     seen    wall last exit late
+...
+mold-3.0.0         1.89s  0.02s   342 MiB   20 MiB  0.191s    0.195s    1
+mold-2.42.1        1.79s  0.02s   322 MiB   20 MiB  0.176s    0.179s    1
+wild-0.11.0        1.23s  0.02s   238 MiB   20 MiB  0.137s    0.154s    1
+```
+
+Look at the `seen` columns: a normal script would say that mold uses 20 MiB and 0.02 seconds of CPU, the small processes that `cc` waits for. The real numbers are 342 MiB and 1.89 seconds.
+
+Why? mold forks at the start, and the child does the link. When the output file is complete, the parent exits and `cc` returns, while the child cleans up alone. No process between my script and mold waits for it, so its resource usage is lost. My harness makes itself a subreaper with [`prctl(PR_SET_CHILD_SUBREAPER)`](https://man7.org/linux/man-pages/man2/PR_SET_CHILD_SUBREAPER.2const.html): when a process under it loses its parent, the kernel gives it to my harness, not to init. `late` counts this orphan, and `last exit` shows that it ends 3 to 4 ms (mold) or 17 ms (wild) after `cc`.
+
+Later I found that the [mold manual](https://github.com/rui314/mold/blob/main/docs/mold.md) warns about exactly this: `--fork` "also hides the resource usage statistics reported by time(1)". Honestly, for a user it is good design. But if you compare linkers with `time`, two of them get wrong CPU and memory numbers, and `time` does not tell you.
+
+## One Thread Each
+
+LLD, mold and wild start a thread for each of the 16 CPUs, while GNU ld and gold use one. So is the difference in the algorithm, or in the threads? I ran every linker again with one thread, pinned with `taskset` to a performance core (unpinned, it can land on a [slower efficiency core](/blog/the-benchmark-ran-on-an-efficiency-core)):
+
+```text
+one thread, pinned to CPU 2 (a performance core)
+linker             median       min-max    cpu   max rss outputs
+gnu-ld-2.46        0.693s  0.626-0.800s  0.69s   213 MiB       1
+gold-1.16          0.537s  0.456-0.611s  0.54s   354 MiB       1
+lld-21.1.8         0.266s  0.197-0.281s  0.27s   283 MiB       1
+rust-lld-23.1.1    0.255s  0.189-0.285s  0.25s   263 MiB       1
+mold-3.0.0         0.247s  0.184-0.265s  0.25s   249 MiB       1
+mold-2.42.1        0.256s  0.191-0.288s  0.26s   241 MiB       1
+wild-0.11.0        0.248s  0.177-0.261s  0.25s   224 MiB       1
+read from storage during these runs: 0 of 140 runs, at most 0 KiB
+```
+
+This one surprised me. With one thread, LLD, mold and wild take the same quarter of a second, so their difference in the first table comes from the threads. rust-lld gets almost nothing from them (0.248 against 0.255 seconds) for 1.12 seconds of CPU instead of 0.25. mold becomes 1.3 to 1.5 times faster for about seven times more CPU, wild 1.8 times faster for five times more (the pinned core helps too: alone, it made GNU ld 7% faster). And each linker wrote the same bytes with one thread as with 16.
+
+Every linker does the same job: read the sections, resolve the symbols, patch the addresses (the [relocations](/blog/relocations-the-holes-the-compiler-leaves-for-the-linker)), write the file. A simple model: link time is the time with one thread, divided by the speedup from the threads. The first part is the same for the three modern linkers, the second is not, and the CPU bill grows faster than the speed.
+
+## mold 3 Against mold 2
+
+In the first table, mold 3.0.0 is 15 ms slower than mold 2.42.1, but the ranges overlap. So I made a separate test of 40 pairs, with the order changing every pair:
+
+```text
+...
+mold-3.0.0 minus mold-2.42.1, per pair: median +0.0371s, middle half +0.0177s to +0.0533s
+mold-3.0.0 was slower in 35 of 40 pairs
+```
+
+So with 16 threads the Rust version is slower here, by 15 to 37 ms depending on the test, and with one thread it is as fast. Where does the time go? mold's `--perf` prints the time of each pass; I ran it ten times per version:
+
+```text
+pass                               mold-2.42.1  mold-3.0.0  difference
+('-' means that this version has no pass with this name)
+all                                     0.152s      0.179s     +0.027s
+  read_input_files                      0.037s      0.040s     +0.003s
+  before_copy                           0.059s      0.078s     +0.019s
+    resolve_symbols                     0.010s      0.019s     +0.009s
+...
+    scan_relocations                    0.014s      0.008s     -0.006s
+    compute_section_sizes               0.001s      0.019s     +0.018s
+      split_contents                         -      0.006s           -
+      resolve_contents                       -      0.010s           -
+...
+  copy                                  0.046s      0.049s     +0.003s
+...
+```
+
+The biggest change is `compute_section_sizes`, from 1 to 19 ms. Its two new steps cut string sections like `.debug_str` (here 14 MB, not loaded into memory) into strings and keep each string only once: the linker merges these sections. In mold 2.42.1, `main.cc` says "Non-allocated merged sections are independent of symbol and relocation processing. Resolve them while the remaining foreground passes run." In 3.0.0, `compute_section_sizes` says "Merged sections without SHF_ALLOC are resolved here." So mold 2 did this work at the same time as the other passes, and mold 3 does it while they wait. That is my reading of the sources (the release notes say nothing), and if it is right, it explains up to 18 ms of the difference.
+
+For a developer, 37 ms is nothing. But "on par" is a bit optimistic for this program on this machine.
+
+## Is It the Same Program?
+
+The bytes differ for every linker, so I compared what the programs do: four searches over the ripgrep source tree (sorted, parallel, without a match, with a broken regex). All seven gave the same output and exit codes (0, 1 and 2), and `addr2line` found `rg::main` at `crates/core/main.rs:43` in each one.
+
+The two mold versions are much closer: 47 of 51 sections have the same address, size and bytes. The other four are the version string in `.comment`, the build ID (a hash of the content), and the symbol table with its strings, where mold 2 has four symbols more:
+
+```text
+symbols only in the mold 2.42.1 output: __start_EHDR __start_PHDR __stop_EHDR __stop_PHDR
+```
+
+These are exactly the symbols that the release notes call "meaningless" and that mold 3 no longer creates. I liked that. For this program, "the same output except for the bug fixes" is true, apart from the version string and the build ID.
+
+Between linker families, the layout differs: GNU ld and gold put the code before the read-only data, the others after it. mold's file is 2.4 MB bigger than LLD's because of local symbols like `bcmp$got` for its 13,187 GOT entries (the address table from [the PLT and GOT article](/blog/how-a-call-to-printf-finds-printf-the-plt-and-the-got)). They take about 2.45 MB of the symbol table, which is not loaded. None of this changes what the program does.
+
+## How Much of a Rebuild Is the Link
+
+A faster linker gives a faster rebuild. Right? I timed the real loop too: touch `crates/core/main.rs`, rebuild with cargo, 20 rounds, four settings in turn:
+
+```text
+setting                median        min-max   linker named in .comment
+rust-lld (default)      1.77s   1.21-2.18s   Linker: LLD 23.1.1
+gnu-ld                  2.47s   1.87-2.86s   no linker name in .comment (GNU ld)
+mold-3.0.0              1.89s   1.18-2.44s   mold 3.0.0
+wild-0.11.0             1.53s   1.20-2.08s   Linker: Wild 0.11.0 non-git-build
+```
+
+GNU ld is the only clear difference, 0.7 seconds more per rebuild, and since Rust 1.90 it is no longer the default on x86_64 Linux. Compared to rust-lld, mold and wild should save 57 and 111 ms of link time, but a cargo rebuild moves by almost a second here, so this test cannot see it. The rest of the 1.8 seconds is cargo and rustc.
+
+## What I Would Do in a Rust Project
+
+First, check what you already use:
+
+```sh
+readelf -p .comment target/debug/your-binary
+```
+
+If it says `Linker: LLD`, you have the big step already. For a program of this size I would stop here.
+
+If links are a big part of your rebuilds, try mold or wild. The mold README gives this for `.cargo/config.toml`:
+
+```toml
+[target.'cfg(target_os = "linux")']
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+```
+
+rustc adds its own `-fuse-ld=lld`, so I checked with a hello world that this still works:
+
+```text
+rustc -C link-arg=-fuse-ld=mold: link line has fuse-ld=lld fuse-ld=mold; .comment names mold 3.0.0
+```
+
+Both options are there, and `cc` takes the last one. For wild, `-fuse-ld=wild` needs gcc 16.1 or clang ([Using Wild](https://github.com/wild-linker/wild/blob/main/USAGE.md)), so with my gcc 15 I used `-C linker-features=-lld` (it stops rustc from choosing rust-lld) and a `-B` directory with an `ld` link to wild.
+
+Then the costs. A parallel linker is fast because it takes many cores: mold used 1.89 seconds of CPU where GNU ld needs 0.74, and on a CI machine with parallel jobs, these cores come from the other jobs. Compatibility can matter more: mold 3.x still wants to close gaps with GNU ld in linker scripts, and wild says it is close to linking the Linux kernel. mold 3.0 is less than four weeks old as a Rust program, and wild is not at 1.0.
+
+So measure your own rebuild first. If the link is a small part of it, [the diagnostic tree](/blog/why-is-my-rust-build-slow-a-diagnostic-tree) is a better start than a new linker. More about Rust builds is in [Rust under the hood](/blog/topics/rust-under-the-hood).
+
+Scripts and raw results are in [`experiments/five-linkers`](https://github.com/mehdiakiki/mehdi-cz/tree/main/experiments/five-linkers). The numbers move between runs; the files keep the ones I quote.
+
+## Sources
+
+- mold: release notes [3.0.0](https://github.com/rui314/mold/releases/tag/v3.0.0) (October 5, 2026) and [2.42.1](https://github.com/rui314/mold/releases/tag/v2.42.1) (September 11, 2026), [README](https://github.com/rui314/mold), [manual](https://github.com/rui314/mold/blob/main/docs/mold.md), [2.42.1 `src/main.cc`](https://github.com/rui314/mold/blob/v2.42.1/src/main.cc), [3.0.0 `src/passes.rs`](https://github.com/rui314/mold/blob/v3.0.0/src/passes.rs)
+- [Announcing Rust 1.90.0](https://blog.rust-lang.org/2025/09/18/Rust-1.90.0/) (September 18, 2025) and [Faster linking times with 1.90.0 stable on Linux using the LLD linker](https://blog.rust-lang.org/2025/09/01/rust-lld-on-1.90.0-stable/) (September 1, 2025)
+- wild: [0.11.0 release notes](https://github.com/wild-linker/wild/releases/tag/0.11.0) (October 24, 2026) and [Using Wild](https://github.com/wild-linker/wild/blob/main/USAGE.md)
+- GNU Binutils [2.44](https://sourceware.org/pipermail/binutils/2025-February/139195.html) (February 2, 2025) and [2.46](https://sourceware.org/pipermail/binutils/2026-February/148149.html) (February 8, 2026) announcements
+- [PR_SET_CHILD_SUBREAPER](https://man7.org/linux/man-pages/man2/PR_SET_CHILD_SUBREAPER.2const.html) manual page

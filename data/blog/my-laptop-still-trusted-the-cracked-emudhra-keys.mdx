@@ -1,0 +1,167 @@
+---
+title: "My Laptop Still Trusted the Cracked eMudhra Keys"
+date: "2026-10-26T15:40:00+01:00"
+lastmod: "2026-10-26T15:40:00+01:00"
+tags: ["security", "tls", "networking", "linux", "rust"]
+draft: false
+reviewed: true
+reviewedHash: "c9390ae95b0b14139c4f8220c7efb7470bddef87036e0b3467455dde228c4356"
+cluster: "reliable-data-integrations"
+campaign: "editorial"
+summary: "Eight eMudhra CA keys had a private value below 256, so my laptop found all of them in a fraction of a second. Then I looked at what still trusted the root above them. The browsers were fixed in hours. curl, Python and the system store were not."
+---
+
+Last week a certificate authority called eMudhra had a very bad problem. Eight of its intermediate CA keys were made so badly that anyone can compute the private key from the public one. On a laptop, in milliseconds. The researcher Scott Helme wrote it up as "Eight Bits of Trust", and Mozilla opened a public bug and sent a notice to the people who run trust stores.
+
+Here is the reason. A P-384 private key should be a random 384-bit number. These eight keys were 47 zero bytes and then one last byte. So the private key was a number below 256.
+
+When I read this, I wanted to see it on the real certificates. Then a second question came, really for us engineers. The browsers blocked it in a few hours. But what about everything else on my machine, curl, my scripts, the small services, the old containers? So on Sunday I made a small experiment.
+
+## Eight small numbers
+
+A public key on an elliptic curve is one point. You take a fixed point `G`, the same for everybody, and add it to itself `d` times. The result is the public key, and `d` is the private key. When `d` is a random 384-bit number, going back from the point to `d` is the hard problem that keeps TLS safe. Nobody can do it.
+
+But if `d` is below 256, there is nothing to break. You just try: `1` times `G`, `2` times `G`, and so on, comparing each result with the public key. At most 255 tries.
+
+I wanted the real certificates. There are sixteen, because each of the eight keys appears twice: once in an eMudhra certificate, once in a certificate cross-signed by Sectigo, with the same public key. I downloaded all sixteen from crt.sh by their SHA-256 fingerprint and checked every fingerprint against the list in the notice. My small Rust program reads the public key from each one and tries `d = 1` to `255`. As a control I also gave it the real `emSign ECC Root CA - G3` root certificate's public key, which is a normal one.
+
+The search is this small, with the `p384` crate:
+
+```rust
+let generator = ProjectivePoint::generator();
+let mut k = 1u32;
+while k <= max_k {
+    let candidate = (generator * scalar_from_small(k)).to_affine();
+    if candidate.to_encoded_point(true) == target_compressed {
+        found = Some(k);
+        break;
+    }
+    k += 1;
+}
+```
+
+Part of the output (I cut lines, the full file is in the fixture):
+
+```text
+EM-DV-TLS-CA-G3B/emSign found d=156 tries=156 time_us=80937.3
+EM-DV-TLS-CA-G3B/Sectigo found d=156 tries=156 time_us=60765.8
+...
+EM-OV-TLS-CA-G3C/emSign found d=4 tries=4 time_us=1518.6
+EM-OV-TLS-CA-G3C/Sectigo found d=4 tries=4 time_us=1552.9
+emSign-ECC-Root-CA-G3-real/anchor none tries=255 time_us=175309.6
+```
+
+Each line has the CA name, which issuer the certificate came from, the recovered `d`, the number of tries, and the time in microseconds. The first two lines are the same CA, once from eMudhra and once from the Sectigo cross-signed certificate: different certificate, same public key, so both fall at `d=156`. The number of tries is just `d`. So `EM OV TLS CA - G3C`, with `d=4`, took four tries and about 1.5 milliseconds.
+
+The times move a lot, the laptop was busy. One guess costs a few tenths of a millisecond, so trying all 255 is about a tenth to a quarter of a second. The last line is the control: the real root's public key, same curve, same program, 255 tries, and `none`. There is no way back from a real key. The eight others were just small numbers.
+
+## The chain my laptop trusts
+
+So the keys are out, and you cannot run the elliptic curve backwards to make a cracked key safe again. For a program that does not check revocation, the only fix is to stop trusting the CA above these keys. But "above" is not one step, and here I had to correct myself. The six TLS intermediates are signed by `emSign Root TLS CA - G3` (the two code-signing ones by `emSign Root CS CA - G3`). `emSign Root TLS CA - G3` is not in my store. It is signed, in turn, by `emSign ECC Root CA - G3`, which is in my store as a trust anchor.
+
+The link is a cross-certificate: one CA's certificate signed by another CA, so a chain can reach a root the client already trusts. The notice listed three possible roots, Sectigo's `AAA Certificate Services`, `emSign Root TLS CA - G3`, and `emSign ECC Root CA - G3`; on my laptop only the last one is in the store. So I asked openssl directly, with a real compromised intermediate:
+
+```text
+verify against the system store WITHOUT the cross-certificate:
+  error 20 at 0 depth lookup: unable to get local issuer certificate
+...
+verify WITH the cross-certificate (emSign Root TLS CA - G3 signed by the anchor) as the bridge:
+  certs/real/98B896625C0C230ADEEC3EB2CF6AAD5001ECF9156A68644E82374CE5833BC25B.pem: OK
+...
+revocation with eMudhra's own CRL (committed snapshot certs/roottlscag3.crl.pem):
+  error 23 at 0 depth lookup: certificate revoked
+```
+
+Without the cross-certificate it fails, because `emSign Root TLS CA - G3` is missing. The cross-certificate is not in my store either, and it does not need to be: a server sends its intermediates in the handshake, so an attacker would just send this one too. Give it to openssl and the chain is `OK`, all the way to `emSign ECC Root CA - G3`. This is a real certificate, not my test one. The last line, with eMudhra's own CRL, says `certificate revoked`, so the revocation is real too.
+
+Chrome pushed a blocklist (a CRLSet) the evening it was reported, Firefox blocked the intermediates through OneCRL a few hours later, and on October 20 Mozilla shipped an NSS update that removes the root. Chrome removes it in Root Store version 43, which reaches devices on October 27. The browsers get these pushed lists; other programs do not. So I went through the others, read only.
+
+| What | the trust list it reads | emSign ECC Root CA - G3 |
+| --- | --- | --- |
+| curl, Python `ssl` | system store | trusted |
+| Python `certifi` (this distro) | a link to the system store | trusted |
+| Java | system cacerts | trusted |
+| Go | system store | trusted |
+| Rust `rustls-native-certs` | system store | trusted |
+| Node 26.12.1 (default) | its own list, from NSS 3.131.1 | removed |
+| Rust `webpki-roots` 1.0.11 | its own list | removed |
+
+The first group reads the operating system trust store, and on my laptop that store still has the root. Even `certifi`, the bundle that Python's `requests` and `pip` usually carry, is not a separate copy here: the package replaces its file with a link to the system bundle, and `cmp` says they are byte-for-byte the same.
+
+```text
+  certifi where=/usr/lib/python3.14/site-packages/certifi/cacert.pem
+    realpath=/etc/ca-certificates/extracted/tls-ca-bundle.pem
+    cmp: byte-for-byte identical to the system bundle
+  go system roots: go accept: the system roots trust the chain to the anchor
+...
+  node default roots: total=118 G3=0
+  node --use-system-ca: total=988 G3=6
+  rust webpki-roots total=118 emsign_subjects=1 has_target=false
+```
+
+My last package sync was Wednesday, and the newest `ca-certificates-mozilla` on offer was built in August, before any of this. So the whole first group still trusts the root. The second group ships its own copy, and these copies were already updated: `webpki-roots` 1.0.10 (October 19) removed the root, and Node 26.12.1 (October 21) took it from NSS 3.131.1. That is the real split. Not old copies against new, but one shared store that lags, against small copies that moved. One trap: `node --use-system-ca` reads the system store too, which turns 118 entries into 988 and brings the cracked one back. It is not the fix here.
+
+A plain bundle also has one lever per root: keep it or drop it. It cannot say "trust this root, except this one intermediate". The finer lever is revocation, and the trust list is what [a TLS handshake](/blog/what-a-tls-handshake-costs) checks the server chain against.
+
+## Nobody asked if it was revoked
+
+The revocation is real: eMudhra revoked the certificates on October 18, Sectigo on October 19, and openssl just confirmed it against eMudhra's own CRL. But a client has to look, and most do not. To see it, I made a tiny copy on 127.0.0.1: a test root, a test intermediate whose private key is the number 7 (the same problem), and I told curl, Python and Node to trust only my test root. When a client [opens the connection](/blog/what-happens-when-your-program-calls-connect):
+
+```text
+[default settings]
+  curl   accept  http=200 verify=0
+  python accept
+  node accept true
+```
+
+All three accept a valid chain to the trusted root. When I turn revocation on and give them the lists, they refuse:
+
+```text
+[same clients, revocation turned on]
+...
+    curl   http=000 verify=23
+  python reject verify_code=23 certificate revoked
+  node reject CERT_REVOKED
+```
+
+curl says `verify=23`, the same "certificate revoked" I got for the real one, and Python says it too. But look at the work. I had to turn it on (`--crlfile`, a flag, the `crl` option), and give a CRL for every CA in the chain, not just one. And the real list is not always there: the bug reports that a plain `curl` got HTTP 403 from eMudhra's CRL URL on October 25. Go is worse: it has no switch. Its documentation puts a WARNING on verification, it "doesn't do any revocation checking", and a Go program that wants it must write the check itself, for example in a `VerifyConnection` callback.
+
+## They did not stay unused
+
+Here is the part that changed the story for me. eMudhra says it never issued a certificate from these eight CAs. But other people did. The bug ([comment 44](https://bugzilla.mozilla.org/show_bug.cgi?id=2083449#c44)) counts 107,107 certificates signed with six of the eight keys, logged to two public Certificate Transparency logs between October 20 and 21. 106,050 of them are proof-of-concept certificates whose only name is `google.com`. So these keys are not only easy to find, they were already used in the open. And all but two of these certificates have no revocation address at all. A client that checks revocation only for the server certificate, a common setup, finds nothing to check. Only a check of every CA in the chain, a pushed blocklist, or a removed root stops them.
+
+The break itself was found by scanning CCADB, the database of CA certificates, not the log ([comment 2](https://bugzilla.mozilla.org/show_bug.cgi?id=2083449#c2)). What the log does: Chrome accepts a certificate only if it was submitted to a log, so a secret forged one fails in Chrome. curl, Python and Node do not check the log at all. And the log stops nobody from adding a certificate, which is exactly what those 107,107 are.
+
+## What to check, and what it costs
+
+On a system like mine you can check with `trust list` and, on Arch-like systems, block the root yourself without waiting for the package:
+
+```sh
+trust extract --format=pem-bundle \
+  --filter='pkcs11:id=%7C%5D%02%84%13%D4%CC%8A%9B%81%CE%17%1C%2E%29%1E%9C%48%63%42;type=cert' \
+  emsign-ecc-root-ca-g3.pem
+sudo cp emsign-ecc-root-ca-g3.pem /etc/ca-certificates/trust-source/blocklist/
+sudo update-ca-trust
+trust list --filter=blocklist
+```
+
+I did not change my own store for this article; every check above was read only. And blocking the root does not reach everything. A `certifi` installed with pip is its own real copy (the release 2026.10.18 dropped these roots), pip has a vendored copy, and an older Node, a binary built with `webpki-roots` 1.0.9, a container image, a JDK with its own `cacerts`, or a process already running each keep their old trust until you update or restart them. If you ship Rust binaries, rebuild them with `webpki-roots` 1.0.10 or newer. For the rest: update `ca-certificates` when your distribution ships the removal, and take Node 26.12.1 or newer. I keep notes like this under [reliable data integrations](/blog/topics/reliable-data-integrations).
+
+No fix here is free. eMudhra estimates about 30,000 honest certificates under this root that still need migration ([comment 19](https://bugzilla.mozilla.org/show_bug.cgi?id=2083449#c19)), so removing it breaks real sites. Revocation has its own costs: the list can be unreachable, and then you fail open (the check did nothing) or fail closed (an outage). And the logs find abuse after it happens, they do not prevent it.
+
+The browsers blocked it in a few hours. The other part, the curl in a cron job, the old container, the Go service that reads the system store and never checks revocation, is slower and quieter. It is the part we have to check ourselves.
+
+The program and the saved output are in [experiments/emudhra-ca-keys](https://github.com/mehdiakiki/mehdi-cz/tree/main/experiments/emudhra-ca-keys), and `run.sh` makes it again.
+
+## Sources
+
+- Scott Helme, "Eight Bits of Trust: eMudhra's CA keys cracked in milliseconds": https://scotthelme.co.uk/eight-bits-of-trust-emudhras-ca-keys-cracked-in-milliseconds/
+- Mozilla bug 2083449 and the notice to trust store operators (attachment 9664786): https://bugzilla.mozilla.org/attachment.cgi?id=9664786
+- Google, The Keyword, on the eMudhra intermediates (October 20, 2026): https://blog.google/security/protecting-chrome-and-android-users-from-compromised-emudhra-intermediate-ca-certificates/
+- CSO Online, "Google, Mozilla revoke eMudhra intermediates after private key compromise": https://www.csoonline.com/article/4238338/google-mozilla-revoke-emudhra-intermediates-after-private-key-compromise.html
+- eMudhra, "eMudhra to Exit global SSL/TLS Certificate Business" (October 22, 2026): https://emudhra.com/en/press-release/emudhra-to-exit-global-ssl-tls-certificate-business
+- Node.js 26.12.1 release notes (October 21, 2026, root certificates from NSS 3.131.1): https://nodejs.org/en/blog/release/v26.12.1
+- NSS 3.131.1 release notes: https://firefox-source-docs.mozilla.org/security/nss/releases/nss_3_131_1.html
+- webpki-roots releases: https://github.com/rustls/webpki-roots/releases
+- Go documentation, `crypto/x509` (revocation checking and the system trust store on Linux): https://pkg.go.dev/crypto/x509
+- Node.js command-line options (`--use-system-ca`): https://nodejs.org/api/cli.html

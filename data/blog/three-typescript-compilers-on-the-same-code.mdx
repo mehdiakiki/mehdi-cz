@@ -1,0 +1,254 @@
+---
+title: "Three TypeScript Compilers on the Same Code"
+date: "2026-10-30T15:50:00+01:00"
+lastmod: "2026-10-30T15:50:00+01:00"
+tags: ["typescript", "performance", "developer-tools", "rust", "go"]
+draft: false
+reviewed: true
+reviewedHash: "da34b7e7f5132ab596ef32146a5f01ceb165498ac6aac6b1f05d58d16db7e5d9"
+campaign: "editorial"
+summary: "I type checked my Next.js site with tsc 6, TypeScript 7 in Go and the new Rust port tsrs. None of them accepted my tsconfig at first, all found the same 17 errors, and on my laptop tsrs lost 30% of its time waiting for the kernel."
+---
+
+My site is a Next.js app with 94 `.ts` and `.tsx` files, and every `next build` type checks all of it with the project's own `tsc`. The types [disappear when the code runs](/blog/two-ways-to-make-a-type-disappear-erasure-and-monomorphization), so only the type checker can use them.
+
+On July 8, Microsoft released [TypeScript 7.0](https://devblogs.microsoft.com/typescript/announcing-typescript-7-0/), a port of the compiler to Go, "a 10x faster native port" with speedups "between 8x and 12x on full builds". [TypeScript 6.0](https://devblogs.microsoft.com/typescript/announcing-typescript-6-0/), in March, was meant to be the last release on the old JavaScript codebase. On October 20, Cloudflare [introduced tsrs](https://blog.cloudflare.com/typescript-rust-port/), a port to Rust by Max Schwenk that Cloudflare and VoidZero now develop with him, "up to 8x faster" than TypeScript 7.0, with about 70% less memory "when using the same number of type check workers".
+
+So I wanted to know two things, on my own code: how much faster is each one, and is it still the same type checker?
+
+## Four compilers and one snapshot
+
+I made a snapshot of the site at one commit, with the types that contentlayer and `next typegen` generate during the build.
+
+I installed the compilers with npm, each in its own folder: `typescript@6.0.3`, `typescript@7.0.2` and `tsrs@0.18.0-ts7.1.0-dev.20260929`. (My `package.json` still says 5.9.3.) The tsrs version looked strange to me, so I asked it:
+
+```text
+Version 7.1.0-dev.20260930.4 (tsrs 0.18.0-ts7.1.0-dev.20260929, microsoft/TypeScript@b85298b6a81f)
+```
+
+So tsrs follows a 7.1 development version, commit `b85298b6`. The npm nightly with this version comes from the [next commit](https://github.com/microsoft/TypeScript/commit/9adc871ff47f79b3e99ff2b1cbe9efb140d76af8), which only changes two CI files, so I added it as a fourth compiler: if tsrs and this nightly disagree, it is the port.
+
+Every run uses the command line of `next build` in Next.js 16.3:
+
+```sh
+tsc -p tsconfig.json --noEmit --declarationMap false --emitDeclarationOnly false --tsBuildInfoFile FILE
+```
+
+## None of them accepted my tsconfig
+
+tsc 6 refused to check anything:
+
+```text
+out/subject/tsconfig.json(22,5): error TS5101: Option 'baseUrl' is deprecated and will stop functioning in TypeScript 7.0. Specify compilerOption '"ignoreDeprecations": "6.0"' to silence this error.
+  Visit https://aka.ms/ts6 for migration information.
+```
+
+My tsconfig has `"baseUrl": "."`. TypeScript 6.0 deprecated this option, and 7.0 removed it. TypeScript 7.0, the 7.1 nightly and tsrs printed the same five errors:
+
+```text
+out/subject/tsconfig.json(22,5): error TS5102: Option 'baseUrl' has been removed. Please remove it from your configuration.
+  Use '"paths": {"*": ["./*"]}' instead.
+out/subject/tsconfig.json(25,9): error TS5090: Non-relative paths are not allowed. Did you forget a leading './'?
+...
+```
+
+With `"ignoreDeprecations": "6.0"`, tsc 6 was happy, and the three others still refused. So I removed `baseUrl` and added `./` to my four paths, like `"@/components/*": ["components/*"]`. Now all four compilers found 96 errors, and 51 of them were imports:
+
+```text
+out/subject/app/(site)/about/page.tsx(6,33): error TS2307: Cannot find module 'app/seo' or its corresponding type declarations.
+out/subject/app/(site)/blog/[...slug]/page.tsx(26,72): error TS2307: Cannot find module 'lib/publication.mjs' or its corresponding type declarations.
+...
+```
+
+My code imports `app/seo` and `lib/...` without `@/` and without `./`. This works only because `baseUrl` is also a root for module lookup. The 6.0 announcement says that projects which really use `baseUrl` like this are "extremely rare". Well, mine is one of them. The fix is the catch-all mapping that the TS5102 message suggests:
+
+```json
+"paths": {
+  "@/components/*": ["./components/*"],
+  "@/data/*": ["./data/*"],
+  "@/layouts/*": ["./layouts/*"],
+  "@/css/*": ["./css/*"],
+  "contentlayer/generated": ["./.contentlayer/generated"],
+  "*": ["./*"]
+}
+```
+
+With it, all four compilers checked the site with zero errors, and I kept this config (in the snapshot only) for everything after.
+
+## What the compiler really reads
+
+I wanted to know also the size of the work, so I grouped the files that tsc 6 lists with `--listFiles`:
+
+```text
+group                           files     lines     MiB
+site .ts and .tsx                  94     10786     0.4
+site .d.ts and .d.mts              22       480     0.0
+site .js, .mjs and .cjs            75     36994     1.4
+site JSON                          12      2977     0.1
+next typegen output                 4       571     0.0
+contentlayer documents           1240    129497    42.4
+contentlayer _index.json            3    129503    42.7
+other contentlayer files            6      1426     0.2
+TypeScript lib files               89     59040     2.8
+declarations in node_modules     1203    205989     7.8
+total                            2748    577263    98.0
+```
+
+This one surprised me. My own TypeScript is 10,786 lines, and the compiler reads 577,263. 87% of the bytes are JSON from contentlayer: one file for each page of content, and three `_index.json` files with all of them again. Removing them from `include` failed with TS6307, because two scripts import the generated `index.mjs`. (I did not try to keep only the three index files.)
+
+## Same answers?
+
+So I made a second snapshot with 17 mistakes in 7 files: wrong types, misspelled names, a missing and an extra property, values that are possibly `undefined`, a forgotten `await` on Next.js `params`, a JSDoc error, etc.
+
+All four compilers found the same 17 errors, at the same line and column, in the same order. And tsrs printed exactly the same 17 messages as the 7.1 nightly, byte for byte. I ran tsrs and TypeScript 7.0 five more times, and with several numbers of checkers, from single-threaded to 16 (a checker is a worker that type checks its own share of the files). The output never changed. Good, that is what I wanted to see.
+
+Between tsc 6 and TypeScript 7, four messages were different. One line of the first, from tsc 6 and then TypeScript 7:
+
+```text
+    Type '"blog"' is not assignable to type '"article" | "website" | "book" | "profile" | "music.song" | "music.album" | "music.playlist" | "music.radio_station" | "video.movie" | "video.episode" | "video.tv_show" | "video.other" | undefined'.
+    Type '"blog"' is not assignable to type '"article" | "book" | "music.album" | "music.playlist" | "music.radio_station" | "music.song" | "profile" | "video.episode" | "video.movie" | "video.other" | "video.tv_show" | "website" | undefined'.
+```
+
+The same union, in another order. As the 6.0 announcement explains, tsc 6 sorts a union by the order in which it met each type, and TypeScript 7, which checks in parallel, by the content of the types. Here this gives alphabetical order. With the flag `--stableTypeOrdering`, tsc 6 printed three of the four messages exactly like TypeScript 7.
+
+The fourth is a real difference, from tsc 6 and then from all three new compilers:
+
+```text
+out/subject-errors/lib/rust-failure-atlas.ts(15,43): error TS2344: Type '{ title: string; slug: string; }' does not satisfy the constraint 'Publishable'.
+  Property 'date' is missing in type '{ title: string; slug: string; }' but required in type 'Publishable'.
+out/subject-errors/lib/rust-failure-atlas.ts(15,43): error TS2741: Property 'date' is missing in type '{ title: string; slug: string; }' but required in type 'Publishable'.
+```
+
+Same mistake, same position, but another error code. Both find the error, but a test that compares error codes will see a change.
+
+## How fast they were
+
+I measured it like in my [series about benchmarks that lie](/blog/the-benchmark-that-measured-nothing): one warm-up run, then 11 rounds where every variant runs once, in a [rotating order](/blog/compare-two-versions-by-interleaving-the-runs), and I look at the median and the range. Each run starts without build info, that is the file where an incremental build keeps the results of the last run (I pass `/dev/null` as this file). From [timing.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/typescript-compilers/results/timing.txt), with some lines cut:
+
+```text
+variant                wall median  wall min-max cpu median cpu/wall RSS median   RSS min-max
+tsc6                       7295 ms   6484-8484     13670 ms     1.87   1486 MiB   1482-1494  
+tsc7                       1505 ms   1432-1742      7000 ms     4.65   1085 MiB   1031-1093  
+...
+tsc7.1                     1530 ms   1318-1646      5953 ms     3.89    857 MiB    843-927   
+tsrs                       1020 ms    936-1148      3046 ms     2.99    937 MiB    905-949   
+...
+tsrs-checkers4             1063 ms    868-1306      3102 ms     2.92    924 MiB    899-937   
+tsc6+incremental           3086 ms   2547-3411      6516 ms     2.11   1025 MiB   1022-1031  
+tsc7+incremental            711 ms    558-748       4108 ms     5.78    635 MiB    624-658   
+tsrs+incremental            356 ms    314-489       1821 ms     5.11    643 MiB    621-655   
+```
+
+"wall" is the time I wait, "cpu" the CPU time of all threads together (so "cpu/wall" says how many cores were busy on average), and "RSS" the most memory used at one moment.
+
+TypeScript 7 is about 4.8 times faster than tsc 6 here (4.5 in another session): a full check goes from 7.3 to 1.5 seconds. Very good, but not 10x. With 4 checkers, like TypeScript 7, tsrs is only 1.4 times faster, not 8x, and uses 15% less memory, not 70%.
+
+Why so far from the claims? My first idea was the size of my project, but the sources disagree. In the TypeScript 7 table, tldraw needs 1.46 seconds with TypeScript 7, like my site, and it got 7.7x. On the [tsrs benchmark page](https://github.com/oxc-project/tsrs/blob/v0.18.0/bench/RESULTS.md), webpack needs 1.46 seconds with TypeScript 7.0.2 and 0.29 with tsrs and 4 checkers, on a 16-vCPU server. So the reason is in my project or on my laptop. Part of it was the laptop, as I found later.
+
+The load was under 2.0 at the start of each timing session, and no run of a separate session had a major page fault ([faults.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/typescript-compilers/results/faults.txt)): nothing came back from the full swap.
+
+## Threads on a laptop with two kinds of cores
+
+TypeScript 7 uses 4 checkers by default, and the [tsrs rule](https://github.com/oxc-project/tsrs/blob/v0.18.0/docs/USAGE.md) gives 4 for a project of my size too: the `tsrs` and `tsrs-checkers4` lines below are almost the same. My laptop has 4 performance cores (two threads each) and 8 slower efficiency cores. With `--checkers 1`, the parsing still runs in parallel, and `--singleThreaded` turns off all of it ([timing-threads.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/typescript-compilers/results/timing-threads.txt)):
+
+```text
+variant                wall median  wall min-max cpu median cpu/wall RSS median   RSS min-max
+tsc7-single                2296 ms   1991-2715      3163 ms     1.38    790 MiB    782-812   
+tsc7-checkers1             1876 ms   1646-2072      5662 ms     3.02    843 MiB    814-859   
+tsc7-checkers2             1714 ms   1634-1937      6395 ms     3.73    929 MiB    909-984   
+tsc7                       1593 ms   1458-1669      6985 ms     4.39   1071 MiB   1028-1100  
+tsc7-checkers8             1513 ms   1413-1661      9041 ms     5.97   1259 MiB   1222-1289  
+tsc7-checkers16            1571 ms   1432-1840     13036 ms     8.30   1657 MiB   1638-1712  
+tsrs-single                 827 ms    620-1339       916 ms     1.11    616 MiB    604-624   
+tsrs-checkers1              830 ms    702-1064      2242 ms     2.70    729 MiB    695-760   
+tsrs-checkers2              882 ms    708-1092      2554 ms     2.89    790 MiB    781-808   
+tsrs-checkers4             1063 ms   1027-1303      3048 ms     2.87    921 MiB    912-926   
+tsrs-checkers8             1458 ms   1264-1831      3629 ms     2.49   1061 MiB   1043-1066  
+tsrs-checkers16            1203 ms   1036-1669      3679 ms     3.06   1025 MiB   1015-1038  
+tsrs                       1057 ms    969-1321      3040 ms     2.88    943 MiB    933-951   
+```
+
+TypeScript 7 gets faster up to 4 or 8 checkers, then it stops, and with 16 checkers it needs 1,657 MiB instead of 1,071. tsrs did not like more threads at all: single-threaded and with 1 checker it was the fastest (827 and 830 ms), but with a very wide range, from 620 to 1,339 ms. Strange.
+
+So I pinned the runs with `taskset` to CPUs 0-7 (performance) or 8-15 (efficiency), with 15 rounds ([timing-cores.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/typescript-compilers/results/timing-cores.txt)):
+
+```text
+variant                wall median  wall min-max cpu median cpu/wall RSS median   RSS min-max
+tsc6                       7204 ms   6438-7994     13558 ms     1.88   1487 MiB   1484-1491  
+tsc6-pcores                6590 ms   6074-7236     12461 ms     1.89   1489 MiB   1483-1493  
+tsc7                       1594 ms   1465-1750      7148 ms     4.48   1067 MiB   1023-1087  
+tsc7-pcores                1490 ms   1410-1719      5366 ms     3.60   1076 MiB   1044-1086  
+tsc7-ecores                2123 ms   1938-2219      7103 ms     3.35   1073 MiB   1037-1096  
+tsrs-checkers4             1135 ms    946-1418      3120 ms     2.75    920 MiB    908-939   
+tsrs-checkers4-pcores       976 ms    785-1051      2279 ms     2.34    872 MiB    846-891   
+tsrs-checkers4-ecores      1337 ms   1263-1427      2954 ms     2.21    870 MiB    843-895   
+tsrs-single                 798 ms    718-899        915 ms     1.15    614 MiB    602-624   
+tsrs-single-pcores          689 ms    660-779        737 ms     1.07    599 MiB    591-611   
+tsrs-single-ecores         1046 ms   1015-1146      1118 ms     1.07    601 MiB    594-619   
+```
+
+Pinned, single-threaded tsrs is stable: 689 ms on a performance core, 1,046 ms on an efficiency core. But even the unpinned runs were calmer in this session (718 to 899 ms), so the cores do not explain all of the first range. And the 8 efficiency cores did not make any compiler faster: the medians were even 7 to 14% lower without them (the ranges overlap).
+
+The TypeScript 7 announcement says that the checkers "may end up duplicating some common work, but given the same input files, they will always divide them identically". So the files are split before the work starts, and the check ends with the last checker. More checkers means more repeated work and memory, and more chances that one runs on a slow core. TypeScript 7 still won (2.3 seconds single-threaded, 1.6 with 4 checkers). tsrs did not, and the kernel shows one more reason.
+
+## What the kernel was doing
+
+tsrs spent about 40% of its CPU time in the kernel, TypeScript 7 about 18%. So I read the counters of `/proc/vmstat` before and after each run ([vmstat.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/typescript-compilers/results/vmstat.txt)):
+
+```text
+variant                       sys      compact_stall       compact_fail allocstall_movable    thp_fault_alloc thp_fault_fallback
+tsc7-thp-default          1411 ms                  0                  0                  0                148                301
+tsc7-thp-off               894 ms                  0                  0                  0                  6                  0
+tsrs-thp-default          1482 ms                680                680                241                179                328
+tsrs-thp-off               713 ms                  0                  0                  0                  3                  0
+tsrs-single-thp-default    420 ms                266                266                 91                179                120
+tsrs-single-thp-off        208 ms                  0                  0                  0                  9                  0
+```
+
+(The counters are system-wide.) `compact_stall` counts how many times a program waited while the kernel moved memory around to build a huge page, that is one 2 MiB page instead of 512 small ones, and `allocstall_movable` the waits while it freed memory. tsrs asks for huge pages with `madvise` (61 times in one run, TypeScript 7 once). My laptop has little free memory, and during a tsrs run the kernel tried 680 times and failed every time (`compact_fail`). TypeScript 7 caused no stall, but still got 148 huge pages: with my kernel's `defrag` setting, `madvise`, only memory marked with `madvise` waits ([kernel documentation](https://docs.kernel.org/admin-guide/mm/transhuge.html)).
+
+tsrs builds its allocator so that mimalloc turns huge pages off for the whole process at start ([prim.c](https://github.com/microsoft/mimalloc/blob/v3.5.2/src/prim/unix/prim.c#L265-L276)). Then tsrs turns them back on for its arena ([allocator.rs](https://github.com/oxc-project/tsrs/blob/v0.18.0/crates/tsrs_core/src/allocator.rs#L3-L17)): its authors measured it 3% to 25% slower without them on their servers ([notes](https://github.com/oxc-project/tsrs/blob/v0.18.0/notes/mem-no-thp.md?plain=1#L190-L197)). It skips this when `MIMALLOC_ALLOW_THP` is set, so `MIMALLOC_ALLOW_THP=0` keeps them off ([timing-thp.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/typescript-compilers/results/timing-thp.txt)):
+
+```text
+variant                wall median  wall min-max cpu median cpu/wall RSS median   RSS min-max
+tsc7-thp-default           1647 ms   1563-1737      7094 ms     4.31   1073 MiB   1014-1088  
+tsc7-thp-off               1598 ms   1421-1636      6363 ms     3.98   1070 MiB   1009-1081  
+tsrs-thp-default           1134 ms   1007-1316      3228 ms     2.85    869 MiB    854-879   
+tsrs-thp-off                795 ms    715-945       2557 ms     3.22    740 MiB    739-740   
+tsrs-single-thp-default      997 ms    858-1105      1112 ms     1.12    603 MiB    596-605   
+tsrs-single-thp-off         790 ms    687-947        829 ms     1.05    525 MiB    524-527   
+```
+
+Without huge pages, tsrs took 795 ms instead of 1,134, with 740 MiB instead of 869, and single-threaded was not faster any more. That is twice as fast as TypeScript 7 in the same session. Still not 8x, but now I see where 30% of the time went. This is my laptop, not a rule: on the tsrs servers, huge pages made it faster. Here the swap was full, the 680 tries failed, and tsrs waited for each one.
+
+## What I would use
+
+For my build, TypeScript 7 is the easy choice. It found the same errors as tsc 6, and the [Next.js documentation](https://nextjs.org/docs/app/api-reference/config/typescript) says that installing `typescript@^7` is enough. The real work is the tsconfig migration (Next.js reads `paths` too, so a full build must pass first). In the editor I would wait: my tsconfig loads the `next` plugin, and the 7.0 post recommends TypeScript 7 "in scenarios where language server plugins are not required".
+
+tsrs was the fastest, and it gave exactly the answers of the nightly it follows. But it is an experimental 0.x release, and its [README](https://github.com/oxc-project/tsrs) warns: "Known checker-order issues can make errors appear or disappear between runs". It also follows 7.1, not 7.0, and the two already differ: in one of my messages, and on 8 of the 17 projects of the tsrs benchmark page. So I would use it as a fast first check, and keep TypeScript 7 as the gate in CI.
+
+tsc 6 stays installed too: TypeScript 7.0 "does not ship with an API", and typescript-eslint still needs one, through `@typescript/typescript6`.
+
+On your own project, compare the answers first:
+
+```sh
+npx -p typescript@6 tsc -p . --noEmit --pretty false > ts6.txt
+npx -p typescript@7 tsc -p . --noEmit --pretty false > ts7.txt
+npx -p tsrs tsrs -p . --noEmit --pretty false > tsrs.txt
+diff ts6.txt ts7.txt
+diff ts7.txt tsrs.txt
+```
+
+Then time them with interleaved runs, without build info. If one spends much time in the kernel, look at `compact_stall` in `/proc/vmstat` first. And on a laptop with two kinds of cores, try `--singleThreaded` and `taskset`: the default is not always the fastest.
+
+## Sources
+
+- Microsoft, [Announcing TypeScript 7.0](https://devblogs.microsoft.com/typescript/announcing-typescript-7-0/), July 8, 2026.
+- Microsoft, [Announcing TypeScript 6.0](https://devblogs.microsoft.com/typescript/announcing-typescript-6-0/), March 23, 2026.
+- Cloudflare, [Introducing tsrs: a Port of TypeScript to Rust](https://blog.cloudflare.com/typescript-rust-port/), October 20, 2026.
+- The [tsrs README](https://github.com/oxc-project/tsrs), and at version 0.18.0 its [usage documentation](https://github.com/oxc-project/tsrs/blob/v0.18.0/docs/USAGE.md), [benchmark results](https://github.com/oxc-project/tsrs/blob/v0.18.0/bench/RESULTS.md), [allocator.rs](https://github.com/oxc-project/tsrs/blob/v0.18.0/crates/tsrs_core/src/allocator.rs#L3-L17) and [notes on huge pages](https://github.com/oxc-project/tsrs/blob/v0.18.0/notes/mem-no-thp.md?plain=1#L190-L197).
+- mimalloc 3.5.2, [prim.c](https://github.com/microsoft/mimalloc/blob/v3.5.2/src/prim/unix/prim.c#L265-L276).
+- Linux kernel documentation, [Transparent Hugepage Support](https://docs.kernel.org/admin-guide/mm/transhuge.html).
+- microsoft/TypeScript [commit 9adc871](https://github.com/microsoft/TypeScript/commit/9adc871ff47f79b3e99ff2b1cbe9efb140d76af8).
+- Next.js documentation, [TypeScript](https://nextjs.org/docs/app/api-reference/config/typescript).
+- The experiment: [experiments/typescript-compilers](https://github.com/mehdiakiki/mehdi-cz/tree/main/experiments/typescript-compilers).

@@ -71,9 +71,10 @@ test("series retain their reading order while omitting future and unapproved par
   assert.equal(editorialSeriesForPost("unrelated"), undefined);
 });
 
-test("every scheduled article belongs to exactly one ten-part reader series", () => {
+test("all sixty editorial articles have one reader series and the daily series retain ten parts", () => {
   const slugs = editorialSeries.flatMap((series) => series.parts);
-  assert.equal(slugs.length, 30);
-  assert.equal(new Set(slugs).size, 30);
-  assert.ok(editorialSeries.every((series) => series.parts.length === 10));
+  assert.equal(slugs.length, 60);
+  assert.equal(new Set(slugs).size, 60);
+  assert.ok(editorialSeries.filter((series) => series.slug !== "sql-databases-from-rust").every((series) => series.parts.length === 10));
+  assert.equal(editorialSeries.find((series) => series.slug === "sql-databases-from-rust").parts.length, 30);
 });

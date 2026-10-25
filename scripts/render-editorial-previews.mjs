@@ -16,10 +16,7 @@ const records = [];
 const sqlSeries = JSON.parse(
   await readFile("docs/editorial/sql-rust-proposed-series-2026-10-25.json", "utf8")
 );
-const reviewSeries = [
-  ...editorialSeries,
-  { parts: sqlSeries.articles.map((article) => article.slug) },
-];
+const reviewSeries = editorialSeries;
 await mkdir(output, { recursive: true });
 
 for (const series of reviewSeries) {
@@ -109,16 +106,16 @@ await writeFile(
           null,
           React.createElement("meta", { charSet: "utf-8" }),
           React.createElement("meta", { name: "robots", content: "noindex, nofollow" }),
-          React.createElement("title", null, "SQL and Rust: thirty drafts for review")
+          React.createElement("title", null, "SQL and Rust: thirty published articles")
         ),
         React.createElement(
           "body",
           null,
-          React.createElement("h1", null, "SQL and Rust: thirty drafts for review"),
+          React.createElement("h1", null, "SQL and Rust: thirty published articles"),
           React.createElement(
             "p",
             null,
-            "Private review copies. These articles remain drafts pending publication approval."
+            "Private review copies of the thirty articles approved for immediate publication."
           ),
           React.createElement(
             "ol",
@@ -153,6 +150,28 @@ assert.equal(articleSchemas.length, 1, "A production article must emit one Artic
 assert.equal(articleSchemas[0].url, articleUrl);
 assert.equal(articleSchemas[0]["@id"], `${articleUrl}#article`);
 assert.ok(articleSchemas[0].author.length > 0);
+const sqlHubHtml = await readFile(".next/server/app/blog/series/sql-databases-from-rust.html", "utf8");
+const blogIndexHtml = await readFile(".next/server/app/blog.html", "utf8");
+assert.ok(blogIndexHtml.includes('href="/blog/series/sql-databases-from-rust"'));
+for (const article of sqlSeries.articles) {
+  const post = bySlug.get(article.slug);
+  const url = `https://www.mehdi.cz/blog/${article.slug}`;
+  const html = await readFile(`.next/server/app/blog/${article.slug}.html`, "utf8");
+  assert.ok(sqlHubHtml.includes(`href="/blog/${article.slug}"`), article.slug);
+  assert.ok(publicArticleHref(allBlogs, article.slug, now), article.slug);
+  assert.doesNotMatch(html, /<meta\b[^>]*name="robots"[^>]*content="[^"]*noindex/i, article.slug);
+  assert.deepEqual([...html.matchAll(canonicalPattern)].map((match) => match[1]), [url]);
+  const entities = [...html.matchAll(schemaPattern)].flatMap((match) => {
+    const value = JSON.parse(match[1]);
+    return Array.isArray(value) ? value : [value];
+  }).filter((value) => value["@type"] === "Article");
+  assert.equal(entities.length, 1, article.slug);
+  assert.equal(entities[0].headline, post.title);
+  assert.equal(entities[0].description, post.summary);
+  assert.equal(entities[0].url, url);
+  assert.equal(Date.parse(entities[0].datePublished), Date.parse(post.date));
+  assert.equal(Date.parse(entities[0].dateModified), Date.parse(post.lastmod));
+}
 console.log(
-  `Rendered ${records.length} series review copies, checked article links, and verified production canonical and Article metadata.`
+  `Rendered ${records.length} series review copies, checked article links, and verified all thirty released SQL pages, their hub, canonical URLs and Article metadata.`
 );

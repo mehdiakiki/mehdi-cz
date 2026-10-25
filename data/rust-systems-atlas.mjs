@@ -45,6 +45,10 @@ export const rustSystemsAtlasEditorialSections = {
   "reuse-compiled-aho-corasick-searchers-rust": "types-memory-unsafe",
   "test-streaming-algorithms-every-chunk-boundary": "types-memory-unsafe",
   "what-breaks-when-rust-reaches-1-100": "release-compatibility",
+  "how-rust-1-99-0-returned-16-for-false": "release-compatibility",
+  "defining-c-variadic-functions-in-rust-1-99": "ffi-targets",
+  "why-does-my-rust-program-behave-differently-on-another-target": "ffi-targets",
+  "what-a-build-script-can-tell-cargo-and-what-it-cannot": "cargo-build-linking",
   "what-happens-when-you-run-a-program-from-execve-to-main": "ffi-targets",
   "what-is-inside-an-executable-file-elf-headers-segments-and-sections": "cargo-build-linking",
   "where-variables-live-in-a-binary-text-rodata-data-and-bss": "types-memory-unsafe",
@@ -65,6 +69,8 @@ export const rustSystemsAtlasEditorialSections = {
   "how-a-stack-overflow-is-detected-guard-pages-and-signals": "types-memory-unsafe",
   "how-each-thread-gets-its-own-copy-of-a-variable-thread-local-storage": "async-concurrency",
   "what-happens-when-a-process-exits": "types-memory-unsafe",
+  "how-safe-rust-read-a-dead-value-issue-164250": "types-memory-unsafe",
+  "linking-the-same-rust-binary-with-five-linkers": "cargo-build-linking",
 };
 
 export const rustSystemsAtlasSections = [
