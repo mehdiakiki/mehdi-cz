@@ -1,0 +1,158 @@
+---
+title: "What a TLS Handshake Costs"
+date: "2026-08-11T10:25:00+01:00"
+lastmod: "2026-08-11T10:25:00+01:00"
+tags: ["following a tcp connection", "networking", "security", "tls", "python"]
+draft: false
+reviewed: true
+reviewedHash: "35fefa6b8ac4494ca1f2716cfb17ca86417b2331d19c21d79fa71434a8e4b41d"
+cluster: "reliable-data-integrations"
+campaign: "editorial"
+summary: "On loopback a TCP connect costs tens of microseconds and a TLS 1.3 handshake costs about one to three milliseconds. I counted the records, the bytes and the CPU on both sides, compared an RSA and an ECDSA certificate, measured resumption, and found 42 ms that were not TLS at all."
+---
+
+How much does TLS add to a connection? I expected some cost, but I did not know its size or its shape. So I made a TLS server and its client with Python's `ssl` module, on 127.0.0.1, and measured three things for each new connection: the time, the bytes, and the CPU on each side.
+
+The short answer from my laptop: a TCP connect over loopback took between 12 and 71 microseconds (median of 300, in six batches), and a full TLS 1.3 handshake on top of it took between 0.8 and 2.9 milliseconds. In each run, the full handshake took more than 20 times the plain connect, and up to 200 times. The rest of this part is about where these milliseconds go.
+
+## The setup
+
+I made two self-signed certificates for `localhost` and 127.0.0.1 with `openssl req`, one with an RSA key of 2048 bits and one with an ECDSA key on the P-256 curve. The server is a Python program in its own process, so its CPU time is separate from the client's. To see what was negotiated, I connected to it once with `openssl s_client`:
+
+```text
+Peer signature type: rsa_pss_rsae_sha256
+Negotiated TLS1.3 group: X25519MLKEM768
+SSL handshake has read 2453 bytes and written 1620 bytes
+Verification: OK
+New, TLSv1.3, Cipher is TLS_AES_256_GCM_SHA384
+Protocol: TLSv1.3
+```
+
+TLS 1.3, the cipher `TLS_AES_256_GCM_SHA384`, and a signature `rsa_pss_rsae_sha256` from the RSA certificate. The interesting line is the group, the key exchange: `X25519MLKEM768`. This is what OpenSSL 3.6.1 chose by default on my laptop, with no option from me. It is a hybrid: the classic X25519 key exchange together with ML-KEM-768, the post-quantum key encapsulation that NIST standardized in FIPS 203.
+
+It has a cost in bytes. The same `s_client` with `-groups X25519` only:
+
+```text
+Peer Temp Key: X25519, 253 bits
+SSL handshake has read 1387 bytes and written 386 bytes
+```
+
+The client wrote 386 bytes instead of 1620, and read 1387 instead of 2453. So the hybrid group adds more than 2 KB to every handshake, also to the resumed ones. On loopback it costs nothing, but it is good to know it for the day when you look at a capture.
+
+## The handshake, record by record
+
+Python's `ssl` uses plain `read()` and `write()` calls on the socket, and it reads one TLS record at a time. So `strace -xx` gives me every byte, and a small parser in the fixture cuts it into records. Here is one full handshake with the RSA certificate, then one resumed handshake with the session ticket from the first:
+
+```text
+== a new TCP connection
+  client -> server  handshake          record of  1509 bytes
+  server -> client  handshake          record of  1210 bytes
+  server -> client  change_cipher_spec record of     1 bytes
+  server -> client  application_data   record of    23 bytes
+  server -> client  application_data   record of   839 bytes
+  server -> client  application_data   record of   281 bytes
+  server -> client  application_data   record of    69 bytes
+  client -> server  change_cipher_spec record of     1 bytes
+  client -> server  application_data   record of    69 bytes
+  server -> client  application_data   record of   250 bytes
+  server -> client  application_data   record of   250 bytes
+  server -> client  application_data   record of    18 bytes
+  client -> server  application_data   record of    18 bytes
+```
+
+RFC 8446 describes this flow in its figure 1. Since TLS 1.3 encrypts everything after the ServerHello, I cannot read the messages, but their order and their sizes match:
+
+1. The ClientHello, 1509 bytes. It is big because it already contains the key share of the client: with the hybrid group, the public key of ML-KEM-768 and the one of X25519.
+2. The ServerHello, 1210 bytes, with the key share of the server. After it, both sides can compute the keys, and everything else is encrypted (the records say `application_data`, but they carry handshake messages).
+3. A `change_cipher_spec` record of 1 byte. It means nothing in TLS 1.3. Appendix D.4 of RFC 8446 explains it: "The server sends a dummy change_cipher_spec record immediately after its first handshake message", so that old middleboxes on the network accept the connection. The client sends one too.
+4. EncryptedExtensions, 23 bytes.
+5. The Certificate, 839 bytes. My certificate is 809 bytes in DER, and the 30 bytes more are the length fields of the message and the encryption overhead of the record (a 16-byte tag and one byte of type).
+6. CertificateVerify, 281 bytes: the RSA signature of 256 bytes, which proves that the server has the private key.
+7. Finished, 69 bytes, from the server, and then the client's own Finished.
+
+After this, the server sent two NewSessionTicket messages of 250 bytes (tickets for a future resumption), and then my two test bytes, one in each direction, 18 bytes each when encrypted.
+
+Count the trips: the client speaks, the server answers with everything, and the client can send its data with its Finished. So a full TLS 1.3 handshake is one round trip, after the round trip of the TCP handshake. On loopback both are free. On a network with 50 ms of round trip, a new HTTPS connection waits about 100 ms before the first byte of the request can leave.
+
+With the ECDSA certificate, the same flow is smaller: the Certificate record is 443 bytes and the CertificateVerify 97 bytes, because a P-256 key and signature are much smaller than RSA ones.
+
+And the resumed handshake:
+
+```text
+== a new TCP connection
+  client -> server  handshake          record of  1780 bytes
+  server -> client  handshake          record of  1216 bytes
+  server -> client  change_cipher_spec record of     1 bytes
+  server -> client  application_data   record of    23 bytes
+  server -> client  application_data   record of    69 bytes
+  client -> server  change_cipher_spec record of     1 bytes
+  client -> server  application_data   record of    69 bytes
+  server -> client  application_data   record of   250 bytes
+  server -> client  application_data   record of    18 bytes
+  client -> server  application_data   record of    18 bytes
+```
+
+The Certificate and the CertificateVerify are gone: the server proves who it is with the key from the ticket. But the ClientHello is bigger (1780 bytes, it carries the ticket), and the ServerHello is still 1216 bytes, because a new key exchange still happens. RFC 8446 allows a resumption with a shared key only, but says that the shared keys "can be used with (EC)DHE key exchange in order to provide forward secrecy", and this is what OpenSSL did here.
+
+## Where the time goes
+
+Now the timing. The client makes 300 plain TCP connections, 300 full handshakes and 300 resumed handshakes, first to the server with the RSA certificate, then to the one with ECDSA, and I did three runs. For each kind I measured the handshake (the `wrap_socket()` call), and the CPU time of both processes, divided by the number of connections. The ranges over the three runs:
+
+| | handshake median | client CPU per connection | server CPU per connection |
+| --- | --- | --- | --- |
+| RSA, full | 2.4 to 2.9 ms | 1.1 to 1.4 ms | 1.6 to 2.4 ms |
+| RSA, resumed | 1.3 to 1.4 ms | 1.0 ms | 0.8 ms |
+| ECDSA, full | 0.8 to 1.5 ms | 0.9 to 1.2 ms | 0.6 to 0.8 ms |
+| ECDSA, resumed | 1.1 to 1.4 ms | 0.8 to 1.0 ms | 0.6 to 0.9 ms |
+
+The spread is big, and I know one reason. The CPU governor is `powersave`, and the program printed the current frequencies: between 400 and 4658 MHz during these runs. So the absolute numbers move, and I trust the comparisons more than the values.
+
+To know the cost of the pure cryptography, I ran `openssl speed` for one second each:
+
+```text
+                              sign    verify    sign/s verify/s
+ 256 bits ecdsa (nistp256)   0.0000s   0.0001s  64583.8  18695.0
+...
+                               keygen     signs    verify keygens/s    sign/s  verify/s
+                    rsa2048 0.034516s 0.000426s 0.000012s      29.0    2347.0   80145.0
+                              op      op/s
+ 253 bits ecdh (X25519)   0.0000s  35602.0
+                               keygen    encaps    decaps keygens/s  encaps/s  decaps/s
+             X25519MLKEM768 0.000061s 0.000075s 0.000062s   16271.7   13339.0   16061.0
+```
+
+An RSA-2048 signature costs 0.43 ms (2347 per second), an ECDSA P-256 signature about 0.015 ms (64584 per second), and each operation of the hybrid key exchange is under 0.1 ms. So in a full handshake with RSA, the signature on the server is the biggest single piece of cryptography. I think it explains most of why the server with RSA used two to three and a half times more CPU than the server with ECDSA. Not all of it: 0.43 ms is less than the 0.8 to 1.5 ms of difference that I measured, and the CPU frequency moved a lot between the runs.
+
+Resumption helps exactly there. With RSA, a resumed handshake cost the server 0.8 ms instead of 1.6 to 2.4 ms, and it was twice faster. With ECDSA there was almost nothing to save: the full handshake was already cheap, and in one run of three the resumed one was even slower.
+
+And the rest? Even the cheapest cases used about 1.5 ms of CPU for the two sides together, while the cryptography itself is a few tenths of a millisecond. I think the rest is everything around it: the Python objects, the OpenSSL state for each connection, the parsing and the verification of the certificate on the client, the key schedule. I did not try to split it more.
+
+## 42 milliseconds that were not TLS
+
+My first version of this experiment was much slower than these tables, and the reason was not TLS. After the handshake, the server sends 1 byte, and the client waits for it:
+
+```text
+== the server sends 1 byte right after the handshake, without TCP_NODELAY on the server
+  50 connections: handshake median 4.57 ms, then the first byte after 42.34 ms (median), load average 1.41 1.49 2.21
+== the same, the server sets TCP_NODELAY
+  50 connections: handshake median 3.91 ms, then the first byte after 0.32 ms (median), load average 1.41 1.49 2.21
+```
+
+Again about 40 ms, like in [part 3 about Nagle and delayed ACK](/blog/why-a-small-write-can-wait-40-milliseconds-nagle-and-delayed-ack). The record list above shows why. Just after the handshake, the server writes its two session tickets. Then it writes my 1 byte, a small segment, while the tickets are not acknowledged yet, so Nagle keeps it. The client reads the tickets, has nothing to send, and delays its ACK. 40 ms later the timer fires, and the byte comes.
+
+This happens when the server speaks first after the handshake. In a protocol where the client sends a request first, like HTTP, the request carries the ACK of the tickets, so I do not expect the stall there, but I did not measure it. For the measurements of this article, the servers set `TCP_NODELAY`.
+
+## What I keep from this
+
+TLS itself is not slow. What is expensive is a new TLS connection. On loopback, where the network costs nothing, it is pure CPU: between 1.5 and 3.7 ms per new connection for the two sides together, where a plain TCP connection used less than 0.2 ms. On a real network it adds one more round trip, and this is often the bigger cost. And both are paid again for every new connection.
+
+So my opinion: the certificate type is worth a look on a busy server (ECDSA was much cheaper than RSA for the server here), resumption is worth it with RSA, and when it is possible, it is better to not make a new handshake at all. The last part of this series measures what keeping a connection open saves.
+
+The outputs are [p09-certs.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/following-a-tcp-connection/results/p09-certs.txt), [p09-sclient.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/following-a-tcp-connection/results/p09-sclient.txt), [p09-records.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/following-a-tcp-connection/results/p09-records.txt), [p09-cost.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/following-a-tcp-connection/results/p09-cost.txt), [p09-speed.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/following-a-tcp-connection/results/p09-speed.txt) and [p09-firstbyte.txt](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/following-a-tcp-connection/results/p09-firstbyte.txt). The program is `p09_tls.py` in the [fixture of the series](https://github.com/mehdiakiki/mehdi-cz/tree/main/experiments/following-a-tcp-connection), whose first part is [what happens when a program calls connect()](/blog/what-happens-when-your-program-calls-connect).
+
+## Further reading
+
+- [RFC 8446, The Transport Layer Security (TLS) Protocol Version 1.3](https://www.rfc-editor.org/rfc/rfc8446.html#section-2), section 2 and appendix D.4
+- [FIPS 203, Module-Lattice-Based Key-Encapsulation Mechanism Standard](https://csrc.nist.gov/pubs/fips/203/final), NIST, 2024
+- [openssl-s_client(1)](https://docs.openssl.org/3.6/man1/openssl-s_client/) and [openssl-speed(1)](https://docs.openssl.org/3.6/man1/openssl-speed/), OpenSSL 3.6 documentation
+- [ssl, Python 3.14 documentation](https://docs.python.org/3.14/library/ssl.html), for `SSLSocket.session` and `session_reused`
