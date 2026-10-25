@@ -1,0 +1,109 @@
+---
+title: "A Rust tool for an existing Db2 database"
+date: "2026-10-24T13:00:00Z"
+lastmod: "2026-10-25"
+tags: ["rust", "sql", "db2", "odbc", "data-integration"]
+draft: false
+reviewed: true
+reviewedHash: "40a3b0656326933f935f15c2233d02cedd21a98d618e291209bbf7eb54e8911b"
+cluster: "reliable-data-integrations"
+campaign: "editorial"
+summary: "Connect a bounded Rust export tool to Db2 LUW with a real IBM ODBC driver, then check the server version, null values and truncated fields."
+---
+
+A warehouse already has its orders in Db2. The requested change is a small export that another service can read every morning. Replacing the database would turn this into a different project. A Rust command that reads a few columns may be enough.
+
+The first obstacle can arrive before the query. The program compiles, the database is reachable, and the connection still fails because the machine has an ODBC driver manager but no IBM driver. Those are separate pieces. After that is fixed, there are other questions: did the program reach the expected server, can it distinguish NULL from text, and will a long field be silently cut short?
+
+This example takes those questions in order. It targets **Db2 for Linux, UNIX and Windows**, usually called Db2 LUW. A similar name on Db2 for z/OS or IBM i does not establish the same connection setup, permissions or SQL behavior.
+
+## Install the IBM driver as well as unixODBC
+
+The Rust dependency is pinned to `odbc-api = 29.2.0`. On Linux, it calls an ODBC driver manager such as unixODBC. The driver manager loads the registered IBM driver, which connects to Db2. Installing a development package for unixODBC can satisfy compilation without installing the IBM software that the connection needs. The [odbc-api guide](https://docs.rs/odbc-api/latest/odbc_api/guide/index.html) describes this driver-manager boundary.
+
+Ask whoever maintains the existing application which IBM driver package and version it uses. Record that version with the operating system, driver-manager version and server service level. A DSN that works in an administrator's shell may be missing from the service account's configuration. A driver registered for a different architecture is another possible mismatch. Checking these facts is faster than rewriting the query after every connection error.
+
+The example reads `DB2_DSN`, `DB2_USER` and `DB2_PASSWORD` from its environment. The DSN and TLS settings live in the IBM driver configuration. IBM documents [`SSLServerCertificate`](https://www.ibm.com/docs/en/db2/11.5.x?topic=cck-sslservercertificate) for trusting a certificate. Check hostname validation separately: the driver's [`SSLClientHostnameValidation` setting](https://www.ibm.com/docs/en/db2/12.1.x?topic=keywords-sslclienthostnamevalidation) controls that check. Defaults depend on the installed client version, so inspect its configuration rather than assuming that a successful TLS connection verified the intended hostname.
+
+## Check the server, a bound value and a null
+
+The query binds an integer and returns it beside a NULL and a small text value. There is no business table to create, update or clean up. This keeps the first investigation away from production data while exercising the driver and result buffers.
+
+Before that query, the program asks the server for its service level. `DB2_EXPECT_SERVICE_LEVEL` is mandatory: it must match the returned value exactly after trimming. Obtain that expected value from the owner of the test database, rather than setting it automatically from whatever server answered. IBM defines `SERVICE_LEVEL` in its [instance-information documentation](https://www.ibm.com/docs/en/db2/11.1?topic=views-env-inst-info-current-instance-information). Access to the underlying administrative function may need an explicit grant; a refusal there is not evidence that ordinary application queries are broken.
+
+This is the main function from [db2_profile.rs](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/sql-rust/sqlserver-oracle-db2/src/bin/db2_profile.rs). Its imports and pinned dependencies are in the same project.
+
+```rust
+fn main() -> AnyResult<()> {
+    let environment = Environment::new()?;
+    let mut connection = environment.connect(
+        &std::env::var("DB2_DSN")?,
+        &std::env::var("DB2_USER")?,
+        &std::env::var("DB2_PASSWORD")?,
+        ConnectionOptions::default(),
+    )?;
+    {
+        let mut cursor = connection
+            .execute(
+                "SELECT SERVICE_LEVEL FROM TABLE(SYSPROC.ENV_GET_INST_INFO()) AS info",
+                (),
+                Some(5),
+            )?
+            .ok_or_else(|| invalid("no server version cursor"))?;
+        let mut row = cursor
+            .next_row()?
+            .ok_or_else(|| invalid("no server version row"))?;
+        let mut bytes = Vec::new();
+        if !row.get_text(1, &mut bytes)? {
+            return Err(invalid("null Db2 service level").into());
+        }
+        let version = std::str::from_utf8(&bytes)?.trim();
+        if version != std::env::var("DB2_EXPECT_SERVICE_LEVEL")? {
+            return Err(invalid("Db2 service level differs from the declared fixture pin").into());
+        }
+        println!("Db2 service level={version}");
+    }
+    let id = 42i32;
+    let mut cursor = connection
+        .execute(
+            "VALUES (CAST(? AS INTEGER), CAST(NULL AS VARCHAR(40)), CAST('ready' AS VARCHAR(40)))",
+            &id,
+            Some(5),
+        )?
+        .ok_or_else(|| invalid("expected a result cursor"))?;
+    let buffers = TextRowSet::for_cursor(4, &mut cursor, Some(64))?;
+    let mut cursor = cursor.bind_buffer(buffers)?;
+    let mut rows = 0;
+    while let Some(batch) = cursor.fetch_with_truncation_check(true)? {
+        for index in 0..batch.num_rows() {
+            let actual_id =
+                std::str::from_utf8(batch.at(0, index).ok_or_else(|| invalid("null id"))?)?;
+            assert_eq!(actual_id, "42");
+            assert_eq!(batch.at(1, index), None);
+            assert_eq!(batch.at(2, index), Some(&b"ready"[..]));
+            rows += 1;
+        }
+    }
+    assert_eq!(rows, 1);
+    println!("one bound row; NULL distinct from text; no truncation");
+    Ok(())
+}
+```
+
+The assertions expect exactly one row: the text `42`, a database NULL, and `ready`. The DSN and IBM driver still determine which server answers and how its text reaches Rust. Run the probe under the export's service account, where driver registration and trust files may differ from an administrator's shell.
+
+## Reject truncated fields
+
+A text buffer needs a size. Here each column has a maximum of 64 bytes in a batch of four rows. Those are deliberately small fixture limits, not recommended sizes for every Db2 schema. `fetch_with_truncation_check(true)` rejects truncation reported by the driver instead of accepting a shortened value. The [buffered cursor API](https://docs.rs/odbc-api/latest/odbc_api/struct.BlockCursor.html) documents this check.
+
+For a real orders export, decide what each field can contain before choosing limits. A description column may need a separate path from an order code. Increasing every field to several megabytes can make one batch consume an unreasonable amount of memory. Fetching fewer rows at once may be the better choice for wide records. A rejected export with an identifiable oversized field is easier to repair than a CSV that looks complete but has lost part of an address.
+
+NULL also needs its own representation. In the buffered rows, `None` means a database NULL; it must not become the literal word `NULL`, an empty string or a missing column by accident. The example asserts that distinction separately from the returned text. At the lower cursor level, column numbering starts at one, while the rowset access here starts at zero. That is why the service-level lookup uses `get_text(1, ...)` and the first buffered value uses `at(0, index)`. The [cursor-row documentation](https://docs.rs/odbc-api/latest/odbc_api/struct.CursorRow.html) explains the lower-level convention.
+
+## The first successful export still needs a second sample
+
+Everything returned by this fixture is ASCII. Calling `from_utf8` on those bytes checks the fixture's expected representation; it does not prove that every customer name is encoded as UTF-8 by the installed driver. Add accented names, characters outside the basic multilingual plane, empty text and the longest permitted fields to a real schema test. Compare the resulting bytes with the expected export encoding. A replacement character in the output is a failed comparison, even if the row count is right.
+
+The five-second value passed to `execute` is a query timeout request through ODBC. It is not a deadline for loading the driver, opening the connection, fetching an entire export and writing its output. Schedule the tool with an overall job deadline as well, and preserve database diagnostics without printing credentials or the full contents of a failed row.
+
+Once this small probe passes, try a bounded read from the actual orders table using a read-only account. Select named columns, keep their null rules, and compare a few known order IDs with the existing application. Agree on a stable ordering and a restart position before adding pagination. A useful next check interrupts a small export after a known order, restarts it, and compares the combined IDs with the expected list. That reveals missed and repeated orders before the tool starts producing files that other services rely on.

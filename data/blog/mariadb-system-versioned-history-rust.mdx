@@ -1,0 +1,93 @@
+---
+title: "Read Old MariaDB Row Versions From Rust"
+date: "2026-10-24T13:00:00Z"
+lastmod: "2026-10-25"
+tags: ["rust", "mariadb", "history"]
+draft: false
+reviewed: true
+reviewedHash: "32acbf57f70a4b7d69fe83369f50e8548bda5b0aebd0f97937710f92da096807"
+cluster: "reliable-data-integrations"
+campaign: "editorial"
+summary: "Use a system-versioned table to read values after update and deletion, while keeping business time, access and backups explicit."
+---
+
+A support request asks what a record said before someone changed it. The current row cannot answer that question. An updated timestamp says when something happened, but it does not recover the previous title or explain which value was visible before the change.
+
+MariaDB system-versioned tables can retain earlier row versions automatically. That makes them useful for investigating changes without writing a separate history insert for every ordinary update. Those rows can recover an old value. They do not identify who changed it or replace a backup, and a privileged administrator can affect what remains.
+
+The small example here follows one document title. It starts as draft, changes to approved and is then deleted. The current table ends empty. The historical query below is expected to recover both titles in the next recorded engine run. This is a constructed support case.
+
+## Query the versions after deleting the current row
+
+The fixture creates an InnoDB table with system versioning enabled. It uses MariaDB 11.4.13 and SQLx 0.9.0. MariaDB's [system-versioned table documentation](https://mariadb.com/docs/server/reference/sql-structure/temporal-tables/system-versioned-tables) describes the table option, generated system periods and historical query syntax.
+
+```rust
+async fn history(c: &mut sqlx::MySqlConnection) -> Result<()> {
+    sqlx::query("INSERT INTO b_history(id,title) VALUES(1,'draft')")
+        .execute(&mut *c)
+        .await?;
+    sqlx::query("UPDATE b_history SET title='approved' WHERE id=1")
+        .execute(&mut *c)
+        .await?;
+    let current: String = sqlx::query_scalar("SELECT title FROM b_history WHERE id=1")
+        .fetch_one(&mut *c)
+        .await?;
+    assert_eq!(current, "approved");
+    sqlx::query("DELETE FROM b_history WHERE id=1")
+        .execute(&mut *c)
+        .await?;
+    let current_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM b_history WHERE id=1")
+        .fetch_one(&mut *c)
+        .await?;
+    assert_eq!(current_count, 0);
+    let rows = sqlx::query("SELECT title, CAST(ROW_START AS CHAR) AS started, CAST(ROW_END AS CHAR) AS ended FROM b_history FOR SYSTEM_TIME ALL WHERE id=1 ORDER BY ROW_START")
+        .fetch_all(&mut *c).await?;
+    let mut titles = Vec::new();
+    for row in rows {
+        let title: String = row.try_get("title")?;
+        let start: String = row.try_get("started")?;
+        let end: String = row.try_get("ended")?;
+        println!("historical value={title}, system interval=[{start},{end})");
+        titles.push(title);
+    }
+    titles.sort();
+    assert_eq!(titles, vec!["approved".to_owned(), "draft".to_owned()]);
+    Ok(())
+}
+```
+
+The source is [mariadb_history.rs](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/sql-rust/mysql-mariadb-duckdb/src/bin/mariadb_history.rs). Setup is separate from this function and uses a disposable schema. The query requests all system-time versions, with the same identifier filter that a normal record lookup would need.
+
+The assertions check current state and historical state independently. Immediately after the update, the current title must be approved. After deletion, the current count must be zero. The historical titles must still contain draft and approved. When run, the binary prints the server's period values for inspection. No timestamps here are presented as observed output.
+
+Sorting the titles for the assertion avoids making a timing comparison the central test. The fixture does not sleep to manufacture a visible delay between changes. It checks that the versions exist. A product that depends on a particular point-in-time boundary should add queries around that boundary using recorded period values and the required transaction semantics.
+
+## System time is not the customer's effective date
+
+Suppose an employee's new address is entered on Monday, but it became effective last Thursday. The database recorded the update on Monday. That does not make Monday the business start date of the address.
+
+MariaDB also has [application-time periods](https://mariadb.com/docs/server/reference/sql-structure/temporal-tables/application-time-periods) for values whose validity is defined by the application. System time and business validity answer different questions. If a product needs both, model both instead of overloading one timestamp.
+
+The same distinction applies to a delayed import. A row loaded today may describe an event from last month. Historical versions can show when the database learned the value, while an event or effective-time field describes what the value is about. A report must say which of those timelines it uses.
+
+## Who changed it is another field
+
+The versioned title does not explain the actor, the request or the reason for the change. If support needs that explanation, store it deliberately. A request identity and actor reference can connect the row change to a business operation, but those fields also need trustworthy write paths.
+
+An administrator with powerful database privileges can affect what history remains. This feature should not be described as an immutable security audit. Access controls, operational logging and independent retention may be needed for that purpose. The right design depends on the evidence the organization actually needs, not on the presence of a history query.
+
+Historical reads need ordinary application authorization too. A current-record endpoint that filters by tenant does not make an unrestricted history query safe. Apply the tenant and record scope to historical queries, and decide which users may see prior values. Deleting a current value does not mean its earlier sensitive contents have disappeared.
+
+## Back up the history you intend to keep
+
+A backup procedure must include the historical rows if those rows matter. The [mariadb-dump documentation](https://mariadb.com/docs/server/clients-and-utilities/backup-restore-and-import-clients/mariadb-dump) describes `--dump-history`, also available as `-H`. For the pinned MariaDB release, include that option in a logical dump procedure that must preserve history and rehearse its restoration. A dump containing only current rows would pass a current-state smoke check after the example's deletion while losing the very records we wanted to retain.
+
+A useful restore test repeats both views of the data: the current table remains empty and the historical query returns the two old titles. Keep that test with the backup procedure, because the application fixture alone cannot validate a separate operational command.
+
+History also consumes space. Choose how long earlier values must remain queryable and name the job and owner that remove them. Check whether backups retain those values for longer. After a cleanup rehearsal, query a record just inside and just outside the chosen retention window; a written duration alone will not remove a row.
+
+Schema changes deserve the same attention. Historical rows are still queried through a schema. Renaming, converting or removing a column can affect what an old value means or how it can be read. Rehearse the migrations that matter to your reports rather than assuming versioning preserves every earlier schema as a separate object.
+
+A history screen should label its dates clearly. “Recorded by the database” and “effective for the customer” are different labels for different fields. Giving both an unqualified “date” heading invites support to answer the wrong question even when the query is correct.
+
+For the support screen, begin with one document that was updated and then deleted. The current lookup should say it is absent, while an authorized history view can show draft and approved with clearly labelled system dates. Restore the backup into a separate schema and repeat both lookups before relying on that screen during an incident.

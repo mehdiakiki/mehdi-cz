@@ -1,0 +1,82 @@
+---
+title: "Adding Rust to a System That Already Uses SQL Server"
+date: "2026-10-24T13:00:00Z"
+lastmod: "2026-10-25"
+tags: ["rust", "sql-server", "tiberius", "database-integration"]
+draft: false
+reviewed: true
+reviewedHash: "1b8e3a15e3242d4c5fdded586c77a06827c6b2c58508afa424c47ad4ed5f95a6"
+cluster: "reliable-data-integrations"
+campaign: "editorial"
+summary: "Connect Tiberius with verified TLS, bind one value, and handle a nullable result before moving existing SQL Server work into Rust."
+---
+
+A team is replacing one reporting endpoint with Rust. The accounts will stay in SQL Server. The old endpoint returns an account identifier and an optional note, so those are the first two fields to compare.
+
+Suppose the prototype connects on a developer's machine, but the certificate check fails in the deployment image. Someone gets past that by accepting any certificate, then turns a null note into an empty string.
+
+The demo now runs, but it accepts an unverified server and changes what a missing note means. Resolve those two problems before adding the rest of the endpoint.
+
+## Keep certificate verification in the first example
+
+The example pins Tiberius 0.13.0 and enables its Rustls TLS backend. Tokio 1.54.1 supplies the socket, and tokio-util 0.7.20 adapts the socket traits expected by the driver. The [Tiberius connection documentation](https://docs.rs/tiberius/latest/tiberius/) describes that adapter. The example opens one connection; it has no pool.
+
+The shared connection function builds its configuration from separate host, port, database, username, and password settings. It explicitly requires encryption. It leaves certificate checking enabled, optionally adding a trusted CA file for the organization's database certificates. The configured hostname must agree with the certificate presented by the server.
+
+There is no call to `trust_cert`. That method disables certificate validation, as the [configuration reference](https://docs.rs/tiberius/latest/tiberius/struct.Config.html) explains. If the deployment cannot find its CA, repair the trust configuration and test the real hostname. A successful encrypted connection to an unverified peer is not the same result.
+
+Keep credentials out of the connection log. The fixture prints the server version after connecting, not its password or full configuration. Use a dedicated account with only the permissions the endpoint needs. The SQL authentication used here is one authentication choice; it does not prescribe replacing the organization's existing integrated identity arrangements.
+
+## Bind the account identifier and preserve the null
+
+The main query is deliberately independent of a business table. It echoes one bound integer and returns a nullable text column. That isolates connection and decoding from permissions on the existing application schema. This function is copied from `sqlserver_profile.rs`; its connection helper and bounded entry point are checked in alongside it.
+
+```rust
+async fn run() -> AnyResult<()> {
+    let mut client = sqlserver().await?;
+    let account_id = 42i32;
+    let row = client
+        .query(
+            "SELECT CAST(@P1 AS int) AS account_id, CAST(NULL AS nvarchar(40)) AS note",
+            &[&account_id],
+        )
+        .await?
+        .into_row()
+        .await?
+        .ok_or_else(|| invalid("expected one row"))?;
+    let actual: i32 = row
+        .try_get("account_id")?
+        .ok_or_else(|| invalid("account_id is null"))?;
+    let note: Option<&str> = row.try_get("note")?;
+    assert_eq!(actual, account_id);
+    assert_eq!(note, None);
+    println!("bound account_id={actual}, note={note:?}");
+    Ok(())
+}
+```
+
+`@P1` is a value parameter. The account identifier does not become part of the query text. In the real endpoint, add its table and predicate after this check works. Do not replace a table name with a value parameter and expect it to become an identifier; object selection needs a trusted query or an explicit allowed mapping.
+
+The identifier uses a fallible typed lookup. A missing row, a null identifier, and a decoding error are different failures. The optional note stays optional. Only the caller that owns the response contract should decide whether a missing note becomes a missing JSON field, a JSON null, or a display label.
+
+The expected identifier is 42 and the expected note is absent. The query checks those two values without depending on an application table. It cannot tell you whether the account has permission to read the real accounts table, or whether that table declares its identifier as `int`. Test those separately when adding the actual query.
+
+## Put the real endpoint beside the small probe
+
+Next, choose one existing query and a few representative rows. Include a null note, a populated note, and an identifier that does not exist. Record the expected response using the old endpoint or an agreed contract, not by copying whatever the new Rust function returns.
+
+Also inspect the database types. SQL Server `int` and `bigint` have different ranges. A text column may use Unicode or a code page, and an optional column can remain nullable even when most current rows contain text. The [driver's type mapping](https://docs.rs/tiberius/latest/tiberius/trait.FromSql.html) is a starting point for choosing Rust types, not a replacement for the actual schema.
+
+The first release can keep the old write path. A read-only Rust endpoint is easier to compare because it does not create a second owner for transactions or retries. If it later writes, make the commit boundary and failure behavior explicit before adding an automatic retry around the whole handler.
+
+One connection handles a request at a time. If a query is cancelled partway through its protocol exchange, discard that client rather than returning it to a pool as though it were clean. This follows the [client's cancellation guidance](https://docs.rs/tiberius/latest/tiberius/struct.Client.html). A request deadline is useful only when the connection lifecycle handles that cancellation too.
+
+## Check the image that will run the endpoint
+
+Declare the exact SQL Server product version in `SQLSERVER_EXPECT_VERSION`; the helper rejects a different value. Record the engine build and compatibility level, the client lockfile, and the certificate trust setup. “SQL Server 2022” alone leaves many patch levels and database settings unspecified. Use the same deployment image and service account for this check that will run the endpoint, so a CA file available only in an administrator's shell cannot hide the original problem.
+
+The example's README lists the environment settings and CI commands. A twenty-second deadline covers connecting and running the probe, with no reconnect loop. If it expires, the client is dropped. Retrying a request later should start with a new connection and keep the original error available for diagnosis.
+
+If connection succeeds but the query fails, separate login access from object permissions. Check the selected database and schema before adding broader grants. If decoding fails, inspect the declared column type and whether the value is null. Printing a secret connection string will not answer either question.
+
+Before moving traffic, send the same known account identifiers to both endpoints. Include one populated note, one null note, and one account that does not exist. Compare the actual fields and missing-row behavior. HTTP 200 from both endpoints would be a weak comparison if one has quietly changed a missing note into an empty string.

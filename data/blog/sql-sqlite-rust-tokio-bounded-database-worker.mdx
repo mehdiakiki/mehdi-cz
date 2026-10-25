@@ -1,0 +1,86 @@
+---
+title: "Run rusqlite on a Worker Thread with a Bounded Tokio Queue"
+date: "2026-10-24T13:00:00Z"
+lastmod: "2026-10-25"
+tags: ["sql", "sqlite", "rust", "tokio", "concurrency"]
+draft: false
+reviewed: true
+reviewedHash: "156cf0a6d3c460bb35f10f82104dcba9aca52a00d0b45de523b9903e78c2dae0"
+cluster: "reliable-data-integrations"
+campaign: "editorial"
+summary: "Give one thread a SQLite connection, limit its request queue, and check that Tokio can run another task while a submitted write remains pending."
+---
+
+A service uses Tokio for HTTP work and rusqlite for a local database. Most requests finish quickly. When a database write waits for a lock, an unrelated task also stops making progress.
+
+An async function can still execute synchronous work on a runtime thread. Calling rusqlite from that function does not turn SQLite's wait into an async suspension. On a current-thread runtime, the difference is especially easy to see: work that never yields can hold up every other task using that thread.
+
+One practical arrangement is a dedicated database worker. It owns a connection, performs its synchronous calls on a separate thread, and sends results back. The queue feeding it must be bounded too, or the service has simply moved the congestion into an unbounded collection of pending jobs.
+
+## Give one thread ownership of the connection
+
+The example's worker creates its rusqlite connection inside a standard Rust thread. It receives a small job enum: insert a fixed note or return the current row count. Each job carries a one-shot reply channel.
+
+The connection never moves between concurrent operations. The worker takes one job, performs the database call, and replies before taking the next. This is useful for a small write-oriented store because SQLite already serializes writes to the same database.
+
+That does not mean every SQLite application needs exactly one connection or one worker. Read-heavy workloads and larger services have other options. This example chooses a simple ownership model so queueing, blocking, and shutdown are visible before adding parallel readers.
+
+rusqlite documents the connection as a [synchronous SQLite interface](https://docs.rs/rusqlite/latest/rusqlite/struct.Connection.html). Tokio's [blocking-work guidance](https://docs.rs/tokio/1.48.0/tokio/task/fn.spawn_blocking.html) explains why synchronous operations that take time should not run directly in an ordinary async task. A persistent worker is an alternative to starting a separate blocking task for each database request.
+
+## Make the database wait for a known reason
+
+The full source is [sqlite_worker.rs](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/sql-rust/postgres-sqlite/src/bin/sqlite_worker.rs). Before submitting work, the test opens another connection and holds an immediate write transaction. The worker's insert therefore has a real SQLite writer to wait for.
+
+The main path then starts the worker and checks an unrelated Tokio task:
+
+```rust
+let (send, receive) = mpsc::channel(2);
+let database_thread = worker(path, receive);
+let (entered, started) = oneshot::channel();
+let (reply, saved) = oneshot::channel();
+send.send(Job::Insert { entered, reply }).await?;
+tokio::time::timeout(Duration::from_secs(1), started).await??;
+let heartbeat = tokio::spawn(async { "other Rust task ran" });
+assert_eq!(
+    tokio::time::timeout(Duration::from_secs(1), heartbeat).await??,
+    "other Rust task ran"
+);
+```
+
+The worker signals just before calling SQLite. The external connection still holds the writer lock, so the submitted insert cannot finish yet. On the current-thread Tokio runtime, the heartbeat checks that another async task can run while that request is pending. The signal does not mark the exact instant SQLite entered a lock wait.
+
+The one-second timeout makes a stalled heartbeat fail the test. It is not the service’s response-time target. In the application, set the queue wait and database wait from the same request budget so moving work to a thread does not merely move the long delay.
+
+The database worker also has a finite busy timeout. A broken test must not leave an indefinite lock wait behind. The fixture contains a few rows and one deliberate conflict, rather than a load generator or a resource-exhaustion case.
+
+## Bound waiting jobs, not only active calls
+
+While the insert is blocked, the example fills the queue's two slots with count requests. A third `try_send` must return the full-queue result. That checks actual admission behavior rather than merely constructing a channel with a small number in its configuration.
+
+Tokio's [bounded channel documentation](https://docs.rs/tokio/1.48.0/tokio/sync/mpsc/index.html) explains the distinction between waiting for capacity and rejecting a send immediately. An HTTP handler needs to choose the appropriate behavior for its deadline and product response.
+
+Waiting for space can be reasonable if the request still has time to complete. Returning a useful busy response can be better when the queue already consumes the budget. An unbounded queue hides the decision until memory use or response time becomes unacceptable.
+
+Queue length alone is not a byte limit. A queue of two jobs can still hold two enormous documents. Keep the job representation small, validate input size before admission, and choose whether large payloads belong in separate bounded storage.
+
+The worker's insert uses a fixed short title, and each count response is one integer. That keeps the demonstration's memory small. It does not establish a safe payload budget for an arbitrary application message type.
+
+## Cancellation does not undo a started write
+
+Dropping a reply receiver means the caller no longer wants the result. It does not necessarily stop the worker's SQLite statement. In the example, the worker deliberately ignores a failed reply send after the database operation has already completed.
+
+Keep that behavior in mind when an HTTP request times out. A client retry may arrive while its earlier write is still queued or already committed. Give business operations a suitable identity or another deduplication rule when repeating them would create an unwanted effect.
+
+Likewise, a timeout around an await does not prove the synchronous query stopped. Tokio documents that a started blocking task cannot simply be aborted like an async task. A dedicated thread also needs an explicit policy for database cancellation and shutdown; returning a timeout to the browser is only one event.
+
+Do not interrupt a shared connection casually without deciding which operation owns it. The one-worker design makes that ownership easier to identify, but it does not choose the application's cancellation semantics for you.
+
+## Finish the work before shutting down the worker
+
+The test releases the external write lock, expects the insert to save one note, and expects both queued counts to return one. It then drops the sender and joins the database thread after the submitted work has replied.
+
+Both count replies must return one, after the insert replies successfully. That checks the order seen by queued jobs: they run after the saved note, rather than racing a different connection. Once the sender is dropped and the queue drains, the worker can exit.
+
+For a real service, stop admitting requests, decide how long queued jobs may drain, and record unfinished operations if the process must exit. The database may preserve committed rows while the service loses the reply, so a restart needs to consider both stored state and pending callers.
+
+If the progress check passes but the service's queue is usually full, inspect write duration and admitted load before adding workers. Another thread does not give the SQLite file a second writer. Keep the queue rejection visible to callers while investigating the wait.

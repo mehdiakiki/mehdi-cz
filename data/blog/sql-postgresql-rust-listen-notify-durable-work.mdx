@@ -1,0 +1,77 @@
+---
+title: "Recover Pending Rust Jobs After a PostgreSQL Listener Reconnects"
+date: "2026-10-24T13:00:00Z"
+lastmod: "2026-10-25"
+tags: ["sql", "postgresql", "rust", "background-jobs"]
+draft: false
+reviewed: true
+reviewedHash: "90ef21cd783089d8d033b1488d252614c4927d7e6e786b170ed64f35c93623a8"
+cluster: "reliable-data-integrations"
+campaign: "editorial"
+summary: "Disconnect a SQLx listener, create work while it is absent, and recover from a durable table after listening again. Notifications remain a wake-up signal."
+---
+
+A background worker waits for a PostgreSQL notification before checking for work. Its connection drops. A producer commits a new job while the worker is away. After reconnecting, the worker waits again, and the job sits untouched.
+
+The producer did send a notification. The mistake was treating that notification as stored work the worker could replay later. PostgreSQL sends notifications to sessions listening at the relevant time; a newly listening session does not receive a history of everything it missed.
+
+Keep the durable fact in a table. Use the notification to reduce the delay before the worker looks at that table. A reconnect, missed wake-up, or repeated wake-up should then change when work is noticed, rather than whether it exists.
+
+## Commit the row and the wake-up together
+
+The producer in the example opens one SQLx transaction, inserts a pending work row, calls `pg_notify`, and commits. It sends a small payload saying that work changed. The pending row contains the actual identity and state.
+
+PostgreSQL's [NOTIFY reference](https://www.postgresql.org/docs/18/sql-notify.html) explains transaction timing: notifications issued in a transaction are delivered only if that transaction commits. An application should not expect a listener to react while the producing transaction is still open.
+
+Keeping insertion and notification together avoids committing a row and then failing in a separate call that should send its wake-up. A listener that was disconnected can still miss the event. When it returns, it finds the row through the pending-work query.
+
+Keep secrets out of notification payloads. Notifications are not a private per-user message channel. A job identifier or generic wake-up is enough when the worker can perform its ordinary authorized database read afterward.
+
+## Listen before the recovery scan
+
+The complete source is [pg_notify.rs](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/sql-rust/postgres-sqlite/src/bin/pg_notify.rs). It first verifies a live notification for one job. Then it drops the old listener, commits another job, and creates a new listener:
+
+```rust
+let mut reconnected = PgListener::connect(&url).await?;
+reconnected.listen(channel).await?;
+let recovered = pending(pool).await?;
+assert_eq!(recovered, vec![2]);
+let old_event = tokio::time::timeout(Duration::from_millis(100), reconnected.recv()).await;
+assert!(old_event.is_err());
+```
+
+The pending scan finds the committed job even though the new listener has no historical event for it. The short receive timeout is a bounded absence check in this controlled example. It is not a latency target for a production queue.
+
+The order matters. Establish listening first, then inspect current durable state. If the worker scans before it begins listening, a producer can commit in the gap and leave the worker waiting for an event it missed.
+
+The [LISTEN documentation](https://www.postgresql.org/docs/18/sql-listen.html) describes this startup race and the listen-then-inspect sequence. Notifications that overlap the initial scan may refer to work the worker has already seen. That is fine if repeating the scan is safe.
+
+## Reconnection is not recovery by itself
+
+SQLx's [PgListener API](https://docs.rs/sqlx/0.8.6/sqlx/postgres/struct.PgListener.html) can reconnect and restore subscriptions. It also documents that transient notifications received during a lost connection are not returned later. Restoring a socket and restoring application progress are different tasks.
+
+The example creates a new listener after job two commits. That gives it no subscription during the commit, which is the particular gap being tested. It is a controlled absence, rather than a test of SQLx reconnecting after a physical network failure.
+
+After the recovery scan, the test publishes a third job and expects a new live event. Another scan returns jobs two and three. That positive check matters: a listener that never receives anything would otherwise look successful in a test concerned only with missing historical events.
+
+Do not assume one event means one job. PostgreSQL can combine repeated notifications with the same channel and payload within a transaction. A producer could insert several jobs and emit one wake-up. The worker must scan the pending rows instead of processing just the number of events it received.
+
+## A table of pending rows is not yet a complete queue
+
+This example has one consumer and performs no external effect. Several workers need an atomic way to claim work so they do not all process the same row. A lease or another claim protocol may also need to recover after a worker stops while holding a job.
+
+Do not delete a pending row before the effect succeeds merely to make the next scan empty. That turns a crash between deletion and the effect into lost work. Keeping a done flag in the demonstration makes the state easy to inspect, but a real effect still needs its own delivery and retry design.
+
+If the effect can happen twice, give it a stable identity and an appropriate deduplication rule. A database transaction cannot roll back an email or an accepted request to another service. Exactly where the worker records completion matters when the process crashes after the effect and before that record.
+
+Those questions belong to the work protocol, not to the notification channel. Adding a richer payload does not answer them.
+
+## Keep a periodic way to notice pending work
+
+A worker can scan on startup, after a wake-up, after detecting a reconnect, and at a bounded idle interval. The periodic scan provides another route to notice work if a wake-up path is broken. Choose the interval from the product's acceptable delay and database load.
+
+Avoid a tight polling loop with an empty query. Also avoid an infinite wait that assumes an event is the only evidence of work. Record the oldest pending age so the system can notice a worker that remains connected but has stopped making progress.
+
+For a real integration test, create a known job while the listener is absent, restore listening, and check that the worker completes that same durable job. Keep the test's effect harmless. The source here stops at table state and notification delivery, so it doesn't claim a complete production queue implementation.
+
+The recovery path should be understandable without the notification payload: connect, listen, inspect pending rows, and act through the normal claim protocol. If that scan can find the work on its own, a late notification no longer decides whether the job will ever run.

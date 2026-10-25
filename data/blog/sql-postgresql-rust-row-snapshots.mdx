@@ -1,0 +1,86 @@
+---
+title: "Why Two PostgreSQL Reads in Rust Can See Different Row Versions"
+date: "2026-10-24T13:00:00Z"
+lastmod: "2026-10-25"
+tags: ["sql", "postgresql", "rust", "transactions"]
+draft: false
+reviewed: true
+reviewedHash: "13bfc6b1f6352cdb62e54d17c560b8ba816ed8489353b708b9b2406d5403cf30"
+cluster: "reliable-data-integrations"
+campaign: "editorial"
+summary: "Coordinate two SQLx connections to compare Read Committed and Repeatable Read, then choose the snapshot boundary a request actually needs."
+---
+
+A request reads ten available items. It performs another query and reads nine. Both reads happened inside the same Rust function, using the same database connection. The second value looks suspicious until you ask which transaction isolation level the connection used.
+
+In PostgreSQL's default Read Committed mode, an ordinary select sees committed data as of that statement's start. Another transaction can commit between two selects. Sharing a connection or a function does not make the two statements share one frozen view.
+
+That behavior is often useful. A second query can see work that finished recently. It becomes a problem when application code quietly assumes several reads describe the same moment. A total and its detail rows, for example, may disagree even though each query returned a valid result.
+
+## Make the other commit explicit
+
+The example uses SQLx 0.8.6 and two PostgreSQL connections. One connection reads. The other commits a stock change between the reader's statements. There are no sleeps to make a race more likely: the Rust program awaits each step in the order it wants to inspect.
+
+The source is [pg_snapshots.rs](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/sql-rust/postgres-sqlite/src/bin/pg_snapshots.rs). Its Read Committed case is:
+
+```rust
+let mut tx = reader.begin().await?;
+sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+    .execute(&mut *tx)
+    .await?;
+let first: i32 = sqlx::query_scalar("SELECT available FROM stock WHERE id = 1")
+    .fetch_one(&mut *tx)
+    .await?;
+sqlx::query("UPDATE stock SET available = 9 WHERE id = 1")
+    .execute(&mut *writer)
+    .await?;
+let second: i32 = sqlx::query_scalar("SELECT available FROM stock WHERE id = 1")
+    .fetch_one(&mut *tx)
+    .await?;
+tx.commit().await?;
+assert_eq!((first, second), (10, 9));
+```
+
+The writer's update runs outside an explicit transaction block, so that successful statement commits before the awaited call returns. The reader's transaction stays open throughout. Its two ordinary selects still use different statement snapshots.
+
+PostgreSQL's [transaction isolation documentation](https://www.postgresql.org/docs/18/transaction-iso.html#XACT-READ-COMMITTED) describes the guarantee. Read Committed prevents a normal select from seeing an uncommitted change; it does not promise that a later statement sees exactly what an earlier statement saw.
+
+This is a database visibility test. It doesn't model an HTTP cache, a read replica, or another service returning stale data. Those are other reasons two screens can disagree. Reproduce the query sequence on the same primary before attributing every changing result to transaction isolation.
+
+## Move the boundary to the whole read operation
+
+The second case resets the counter and begins a Repeatable Read transaction. The reader selects ten, the writer commits eight, and the reader selects again. Both reads inside the reader's transaction must return ten. After it commits, a fresh query sees eight.
+
+Under Repeatable Read, ordinary queries share the view established by the transaction’s first query or data-changing statement. Calling begin in Rust does not by itself take that snapshot. The [SET TRANSACTION reference](https://www.postgresql.org/docs/18/sql-set-transaction.html) explains when the level can be selected.
+
+Set the level before issuing the reads that depend on it. A helper that quietly queries a setting or loads a row before the caller chooses isolation can make the intended order difficult to follow. Keep transaction creation, isolation selection, and the first application read close together.
+
+The transaction can still see its own writes. Calling its view a frozen copy of everything would be misleading. The useful promise for this example concerns other transactions' commits during the reader's operation.
+
+## One request may need only one statement
+
+Before changing the isolation level, ask why the request uses two queries. A query that returns the total and details together can remove a gap between separate statement snapshots. It may also reduce network round trips.
+
+That is not always the right shape. A large export may need several queries, and an application may deliberately refresh data between steps. Start with the result the user should receive. “The same numbers every time” and “the latest numbers at each step” are different requirements.
+
+Suppose a report shows an order total beside its lines. If the total comes from one statement and the lines from another, a concurrent edit can create an apparent arithmetic error. A shared snapshot may be appropriate for the report. An editing screen that refreshes the order after a save may prefer a fresh view.
+
+Write that choice beside the request's database boundary. It helps a later developer understand whether combining queries or changing isolation would preserve the feature's meaning.
+
+## Protect the rule when the request also writes
+
+Repeatable Read does not make every read-then-write business rule safe. Another request may make a related change after the snapshot was taken. Depending on the operation, PostgreSQL may reject a conflicting write, or the application may need a stronger design to protect a rule spanning several rows.
+
+For a stock reservation, a conditional update can be clearer than reading availability and later trusting that old value. For a rule involving several rows, examine constraints, locking, or Serializable transactions. Choose the mechanism around the rule, rather than promoting every transaction to the strongest setting by habit.
+
+Keep retry behavior in that design. PostgreSQL can reject a transaction using stronger isolation so the application can restart it. Retrying only the last statement is not enough when the decision came from earlier reads. The earlier reads belong to the attempt too.
+
+If a report later becomes a reservation endpoint, revisit that write rule before reusing its read transaction. The <ArticleLink slug="sql-postgresql-rust-retry-whole-transaction">whole-transaction retry example</ArticleLink> shows a competing commit between a read and a write. Its retry repeats the decision from fresh data, instead of carrying a value from the earlier attempt.
+
+## Save the sequence when the bug appears
+
+For a real investigation, record which connection and transaction issued each statement, the chosen isolation level, and when the other commit completed. Keep sensitive values out of the shared record. A list saying only “read, update, read” is missing the boundary that explains the result.
+
+Also check that a transaction really stayed on one acquired connection. A pool is a source of connections, not a transaction shared by every request that uses the pool. SQLx's transaction object makes the executor passed to each query visible in this example.
+
+The order report can show a coherent order as it existed at the start of its snapshot. A later refresh can show a newer coherent version. If that is the intended behavior, keep the total and detail reads inside that boundary; the time between the two Rust calls should not decide which version each sees.

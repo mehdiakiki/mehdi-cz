@@ -13,14 +13,21 @@ const output = "/tmp/editorial-evidence/previews";
 const now = new Date();
 const bySlug = new Map(allBlogs.map((post) => [post.slug, post]));
 const records = [];
+const sqlSeries = JSON.parse(
+  await readFile("docs/editorial/sql-rust-proposed-series-2026-10-25.json", "utf8")
+);
+const reviewSeries = editorialSeries;
 await mkdir(output, { recursive: true });
 
-for (const series of editorialSeries) {
+for (const series of reviewSeries) {
   for (const slug of series.parts) {
     const post = bySlug.get(slug);
     assert.ok(post, `Missing compiled article: ${slug}`);
     if (post.draft === true || post.reviewed === false) {
       assert.equal(publicArticleHref(allBlogs, slug, now), null);
+      await assert.rejects(readFile(`.next/server/app/blog/${slug}.html`, "utf8"), {
+        code: "ENOENT",
+      });
     }
     const contextualLinks = [];
     function ArticleLink({ slug: target, children }) {
@@ -55,7 +62,12 @@ for (const series of editorialSeries) {
             null,
             React.createElement("meta", { charSet: "utf-8" }),
             React.createElement("title", null, post.title),
-            React.createElement("meta", { name: "robots", content: "noindex, nofollow" })
+            React.createElement("meta", { name: "robots", content: "noindex, nofollow" }),
+            React.createElement(
+              "style",
+              null,
+              "body{max-width:74ch;margin:2rem auto;padding:0 1rem;font:18px/1.65 system-ui}pre{overflow:auto;padding:1rem;background:#f3f4f6;font-size:.85em}h1,h2,h3{line-height:1.2}a{color:#174ea6}"
+            )
           ),
           React.createElement(
             "body",
@@ -77,10 +89,49 @@ for (const series of editorialSeries) {
     });
   }
 }
-assert.equal(records.length, 30);
+assert.equal(records.length, 30 + sqlSeries.articles.length);
 await writeFile(
   path.join(output, "index.json"),
   JSON.stringify({ generatedAt: now.toISOString(), articles: records }, null, 2) + "\n"
+);
+await writeFile(
+  path.join(output, "sql-rust-index.html"),
+  "<!doctype html>" +
+    renderToStaticMarkup(
+      React.createElement(
+        "html",
+        { lang: "en" },
+        React.createElement(
+          "head",
+          null,
+          React.createElement("meta", { charSet: "utf-8" }),
+          React.createElement("meta", { name: "robots", content: "noindex, nofollow" }),
+          React.createElement("title", null, "SQL and Rust: thirty published articles")
+        ),
+        React.createElement(
+          "body",
+          null,
+          React.createElement("h1", null, "SQL and Rust: thirty published articles"),
+          React.createElement(
+            "p",
+            null,
+            "Private review copies of the thirty articles approved for immediate publication."
+          ),
+          React.createElement(
+            "ol",
+            null,
+            ...sqlSeries.articles.map((article) =>
+              React.createElement(
+                "li",
+                { key: article.slug },
+                React.createElement("a", { href: `${article.slug}.html` }, article.title),
+                ` (${article.database})`
+              )
+            )
+          )
+        )
+      )
+    )
 );
 // Exercise the changed metadata on an actual production article, not the
 // standalone MDX copies above. This existing route is also a build regression target.
@@ -99,6 +150,36 @@ assert.equal(articleSchemas.length, 1, "A production article must emit one Artic
 assert.equal(articleSchemas[0].url, articleUrl);
 assert.equal(articleSchemas[0]["@id"], `${articleUrl}#article`);
 assert.ok(articleSchemas[0].author.length > 0);
+const sqlHubHtml = await readFile(
+  ".next/server/app/blog/series/sql-databases-from-rust.html",
+  "utf8"
+);
+const blogIndexHtml = await readFile(".next/server/app/blog.html", "utf8");
+assert.ok(blogIndexHtml.includes('href="/blog/series/sql-databases-from-rust"'));
+for (const article of sqlSeries.articles) {
+  const post = bySlug.get(article.slug);
+  const url = `https://www.mehdi.cz/blog/${article.slug}`;
+  const html = await readFile(`.next/server/app/blog/${article.slug}.html`, "utf8");
+  assert.ok(sqlHubHtml.includes(`href="/blog/${article.slug}"`), article.slug);
+  assert.ok(publicArticleHref(allBlogs, article.slug, now), article.slug);
+  assert.doesNotMatch(html, /<meta\b[^>]*name="robots"[^>]*content="[^"]*noindex/i, article.slug);
+  assert.deepEqual(
+    [...html.matchAll(canonicalPattern)].map((match) => match[1]),
+    [url]
+  );
+  const entities = [...html.matchAll(schemaPattern)]
+    .flatMap((match) => {
+      const value = JSON.parse(match[1]);
+      return Array.isArray(value) ? value : [value];
+    })
+    .filter((value) => value["@type"] === "Article");
+  assert.equal(entities.length, 1, article.slug);
+  assert.equal(entities[0].headline, post.title);
+  assert.equal(entities[0].description, post.summary);
+  assert.equal(entities[0].url, url);
+  assert.equal(Date.parse(entities[0].datePublished), Date.parse(post.date));
+  assert.equal(Date.parse(entities[0].dateModified), Date.parse(post.lastmod));
+}
 console.log(
-  `Rendered ${records.length} series review copies, checked article links, and verified production canonical and Article metadata.`
+  `Rendered ${records.length} series review copies, checked article links, and verified all thirty released SQL pages, their hub, canonical URLs and Article metadata.`
 );

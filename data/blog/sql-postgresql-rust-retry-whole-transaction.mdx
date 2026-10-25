@@ -1,0 +1,88 @@
+---
+title: "Retry the Whole PostgreSQL Transaction from Rust"
+date: "2026-10-24T13:00:00Z"
+lastmod: "2026-10-25"
+tags: ["sql", "postgresql", "rust", "retries"]
+draft: false
+reviewed: true
+reviewedHash: "834672b430057ae72316bda0bd59391bbec43e53e37f651be77b62b424ab2dbc"
+cluster: "reliable-data-integrations"
+campaign: "editorial"
+summary: "Force a serialization conflict with two SQLx connections and check that a bounded retry opens a new transaction and repeats the reads that chose the write."
+---
+
+A transaction reads a counter at zero and plans to write one. Before it writes, another connection increments the counter and commits. PostgreSQL rejects the first transaction with a serialization failure.
+
+The tempting repair is to run its update again. But that update was chosen using the old zero. Reusing the decision would throw away the work that the other transaction just committed. The retry needs a new transaction and a new read.
+
+Each attempt owns the read, the calculation, the write and the commit. The loop starts that whole attempt again, with a limit on how many times it can try. Keeping those steps together makes it harder to reuse the old zero by accident.
+
+## Arrange one conflict without a timing contest
+
+The example in [pg_retry.rs](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/sql-rust/postgres-sqlite/src/bin/pg_retry.rs) starts a Serializable transaction and reads one counter row. On the first attempt, a harness step uses another pooled connection to commit an increment. Only after that commit does the first transaction try its write.
+
+That order creates the conflict deliberately. The test does not start a large load and hope that one request fails. It expects the rejected attempt to have read zero, the next attempt to read one, and the final stored value to be two.
+
+The harness step is not production retry logic. It exists to put a real competing commit between the attempt's read and write. Remove that intervention in an application; keep the surrounding transaction boundary and error classification.
+
+PostgreSQL documents serialization failures under SQLSTATE `40001` in its [failure-handling guidance](https://www.postgresql.org/docs/18/mvcc-serialization-failure-handling.html). Here PostgreSQL cannot accept both operations as if they had run one after the other, so it rejects an attempt. The application must be prepared for that result.
+
+## Classify the error after ending the attempt
+
+The example's `attempt` function begins a transaction, selects Serializable isolation before reading, performs the operation, and commits. If the body returns an error, it explicitly rolls the transaction back before returning that error to the retry loop.
+
+Its wrapper is small enough to inspect:
+
+```rust
+async fn increment_with_retry(
+    pool: &PgPool,
+    reads: &mut Vec<i32>,
+) -> std::result::Result<usize, sqlx::Error> {
+    for number in 0..3 {
+        match attempt(pool, number == 0, reads).await {
+            Ok(()) => return Ok(number + 1),
+            Err(error) if code(&error).as_deref() == Some("40001") && number < 2 => {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("each final attempt returns")
+}
+```
+
+The boolean passed to `attempt` enables that first-attempt harness intervention. The `reads` vector records what each attempt observed so the test can check a fresh read happened. Neither is a requirement for the service function you eventually ship.
+
+Only `40001` enters this retry path. A malformed query or a persistent constraint violation should not be retried merely because it came from the database. PostgreSQL's [error-code reference](https://www.postgresql.org/docs/18/errcodes-appendix.html) provides stable categories for that decision; matching translated message text is a fragile substitute.
+
+Deadlocks and some uniqueness conflicts can also need application-specific handling. They are not all equivalent to this example. Decide what the operation means before expanding a list of supposedly transient errors.
+
+## Check the read, not just the final count
+
+The example asserts exactly two attempts and a read sequence of zero followed by one. It then queries the database through another operation and checks the final value is two.
+
+A final-value assertion alone can miss a broken demonstration. If the harness accidentally stopped creating a conflict, a program might still store some plausible number. The attempt count and read history establish the particular retry behavior being taught.
+
+The ten-millisecond pause is a fixture setting. For a busy service, choose a bounded delay and consider jitter so requests that fail together do not all try again together. Backoff still cannot guarantee that an attempt will succeed.
+
+For a real request, combine an attempt limit with an overall deadline. A fixed maximum of three attempts can still take too long if each attempt spends most of the request budget waiting for a connection or lock. The fixture also applies connection and server statement limits to keep failures bounded in CI.
+
+## Keep other effects out of the repeated body
+
+Imagine adding an email call immediately after the transaction reads the counter. The first attempt sends the email, loses its database transaction, then sends it again on the retry. PostgreSQL cannot roll the first email back.
+
+Performing the email after commit avoids repeating it inside a failed attempt, but introduces another question: what if the process dies after commit and before sending? If delivery must survive that gap, record a durable delivery job or outbox entry in the same transaction and let a separate worker handle it with a retry-safe identity.
+
+The same reasoning applies to payment calls, file uploads, and events published outside the database. They need their own delivery and deduplication decisions. Calling an HTTP API from inside a transaction does not make that API part of PostgreSQL's rollback.
+
+Keep values derived from the reads inside the attempt as well. A price, permission decision, or chosen row ID calculated once before entering the loop may become stale across retries. Repeating SQL while reusing those earlier decisions is only a partial restart.
+
+## Treat an unknown commit outcome separately
+
+A received serialization failure tells the application why that attempt did not complete successfully. A dropped connection during commit can be less clear: the server may have committed even though the client did not receive the result.
+
+Do not add every network error to this loop and assume another increment is harmless. A business request with a stable operation key can let the service look up an earlier result or reject a duplicate. That is a different guarantee from retrying a known-aborted transaction.
+
+For an incident record, keep the operation identity, error code, attempt number, and final result. Avoid full SQL parameters when they contain customer data. Those few fields can distinguish one successful retry from three failures and a deadline.
+
+When adapting this code, look for calculations still sitting outside attempt: a chosen row, a price or a decision based on permission data. If one depends on database state that can change, decide whether it must be repeated too. A new transaction does not refresh a value that the Rust caller keeps passing back in.

@@ -1,0 +1,91 @@
+---
+title: "PostgreSQL HOT Updates: Check When a Rust Write Avoids New Index Entries"
+date: "2026-10-24T13:00:00Z"
+lastmod: "2026-10-25"
+tags: ["sql", "postgresql", "rust", "indexes"]
+draft: false
+reviewed: true
+reviewedHash: "588add2124950cc3738930065c9d9cef2359d5e24d14627786a729f161c2c32f"
+cluster: "reliable-data-integrations"
+campaign: "editorial"
+summary: "Compare non-indexed and indexed updates using PostgreSQL's current-transaction HOT counters, without turning a tiny fixture into a performance claim."
+---
+
+A service increments a visit counter on a row that also has a primary key and a searchable label. The request changes neither key. Does PostgreSQL still need to add entries to those indexes for every increment?
+
+Sometimes it can avoid new index entries through a heap-only tuple update, usually called HOT. PostgreSQL normally stores a new row version for an update. HOT lets that new version share an existing route from the index, provided the required columns and page space allow it.
+
+Two conditions matter for the B-tree indexes used here: the update must leave indexed columns unchanged, and the new row version must fit on the relevant heap page. We can construct a small example that gives those conditions a fair chance, then ask the server which updates it counted as HOT.
+
+## Leave the indexed values alone first
+
+The Rust program creates one row with an integer primary key, a label with a B-tree index, a visit counter, and a short padding string. It creates the table with a fillfactor of fifty to leave room for updates. Ten statements increment only the visit counter. An eleventh statement changes the indexed label.
+
+PostgreSQL's [HOT documentation](https://www.postgresql.org/docs/18/storage-hot.html) describes the index and page-space conditions. It also distinguishes ordinary indexes from summarizing indexes such as BRIN. This example uses B-trees, so it does not try to demonstrate the summarizing-index exception.
+
+The same documentation explains why HOT can avoid new ordinary index entries for a new row version. The existing index entry can lead to the relevant versions on the heap page. That is a storage mechanism, not a reason for the application to assume that every update is cheap.
+
+The test starts with one row on a fresh page, so there is already plenty of room. The low fillfactor makes the intended setup explicit; this example does not show that changing fillfactor caused an improvement. A useful fillfactor comparison needs enough rows to fill pages under each setting.
+
+## Ask the current transaction, not a lagging total
+
+The source is [pg_hot.rs](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/sql-rust/postgres-sqlite/src/bin/pg_hot.rs). It reads `pg_stat_xact_user_tables` twice inside the same explicit transaction:
+
+```rust
+for _ in 0..10 {
+    sqlx::query("UPDATE hot_rows SET visits = visits + 1 WHERE id = 1")
+        .execute(&mut *tx)
+        .await?;
+}
+let before: (i64, i64) = sqlx::query_as(
+    "SELECT n_tup_upd, n_tup_hot_upd
+    FROM pg_stat_xact_user_tables WHERE relid = 'hot_rows'::regclass",
+)
+.fetch_one(&mut *tx)
+.await?;
+sqlx::query("UPDATE hot_rows SET label = 'second' WHERE id = 1")
+    .execute(&mut *tx)
+    .await?;
+let after: (i64, i64) = sqlx::query_as(
+    "SELECT n_tup_upd, n_tup_hot_upd
+    FROM pg_stat_xact_user_tables WHERE relid = 'hot_rows'::regclass",
+)
+.fetch_one(&mut *tx)
+.await?;
+assert_eq!(before, (10, 10));
+assert_eq!(after, (11, 10));
+```
+
+The pair contains all updates and HOT updates for this transaction. The expected first pair says all ten counter changes qualified in the controlled layout. The second says the label change added one update without adding a HOT update.
+
+The assertions require those pairs for this one-row layout. The program also reads the final counter and label, checking that the intended values were stored. It prints the pairs from the actual run so the observation can be kept with the table definition.
+
+The [statistics documentation](https://www.postgresql.org/docs/18/monitoring-stats.html) distinguishes current-transaction views from cumulative statistics. Using the transaction view avoids waiting for a cumulative counter flush or accidentally reusing a cumulative statistics snapshot. If you investigate with cumulative views instead, account for their reporting and snapshot rules explicitly.
+
+## Free page space is part of the experiment
+
+The low fillfactor is deliberate. PostgreSQL's [table storage parameters](https://www.postgresql.org/docs/18/sql-createtable.html#SQL-CREATETABLE-STORAGE-PARAMETERS) explain how it leaves space on pages for later updates. The setting changes a tradeoff: leaving room can help updates, while storing fewer initial rows on each page can make the table occupy more pages.
+
+Fifty is a convenient fixture setting, not a general tuning recommendation. The row is short and the test performs only ten updates. A table with wide rows, different update sizes, and concurrent activity may have a very different amount of usable space.
+
+Changing a fillfactor also should not be described as a magic command that instantly rearranges every existing row. Decide how a storage change will take effect on the actual table and what maintenance it requires. Test that operational plan separately from editing the table option.
+
+For a production comparison, keep the row shape, indexes, update frequency, and maintenance state with the observation. Otherwise an apparent improvement may come from testing newly loaded data against an old, heavily updated table.
+
+## Check the indexes you actually maintain
+
+An application developer may think a field is unindexed because it is not the primary key. Check all relevant index definitions. A secondary index, an expression using that field, or another indexed dependency can change the update's eligibility.
+
+Do not remove a useful index solely to increase the HOT ratio. Reads may depend on it, and the product's total cost includes those reads. The practical question is whether the index earns its maintenance cost for the queries the service actually serves.
+
+Likewise, adding an index to make one dashboard fast can affect a frequently updated row. Review the write path when reviewing that index. Keeping the visit counter in a different table may sometimes be worth considering, but that introduces another read or join and another data relationship to maintain.
+
+The example changes a label that has one ordinary index. That makes the comparison easy to explain. It does not claim every indexed update has the same physical cost or that every non-indexed update will be HOT.
+
+## Measure the saved work before claiming a faster service
+
+A higher HOT count is evidence about update classification. It is not an elapsed-time result. The example does not compare transaction latency, WAL bytes, table growth, vacuum work, or the read workload needed to find the row.
+
+If a real service spends significant time updating these rows, compare the before and after behavior under representative concurrency. Keep error rates and read latency beside write measurements. A storage change that makes one update cheaper may still make the overall feature worse.
+
+An index added for a new visits dashboard can change this write path too. Review that index alongside the counter update, then compare HOT counts and the dashboard query under the proposed schema. Keep the table layout and counter interval with the result, so the next engineer can tell which writes the counts describe.

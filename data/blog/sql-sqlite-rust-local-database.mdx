@@ -1,0 +1,74 @@
+---
+title: "SQLite from Rust: Save Local Data Without a Database Server"
+date: "2026-10-24T13:00:00Z"
+lastmod: "2026-10-25"
+tags: ["sql", "sqlite", "rust", "data-storage"]
+draft: false
+reviewed: true
+reviewedHash: "64a1189961abc8738b684c5604d030bd92145756a4327dc199132d0f202ecbf6"
+cluster: "reliable-data-integrations"
+campaign: "editorial"
+summary: "Build a small local notes store with rusqlite, a versioned schema, bound values, transactions, and a check that committed data survives reopening."
+---
+
+A desktop notes app remembers everything until you close it. The next launch opens an empty screen. Keeping the notes in a Rust collection was enough for the first interface demo, but now the product needs a place to keep them.
+
+SQLite is a useful fit for that change. The application opens a database file and calls the library directly. There is no separate database service to install, authenticate against, or keep running. That removes one operational job, although the application still owns the file, schema changes, backups, and failures.
+
+The example stores a title and a completion flag using rusqlite 0.41.0 with a pinned bundled SQLite dependency. It commits one note, rolls back another, then reopens the same file. That gives us a specific answer to the empty-screen problem: which note did the app actually save?
+
+## Start with a real file
+
+An in-memory connection is convenient for a unit test. It cannot show that a note will still exist after the process ends. The example creates a temporary directory, puts a database file inside it, and opens that same path again after dropping the first connection.
+
+The temporary directory keeps the demonstration disposable. A shipped application needs a stable location under its own data directory. Choosing a relative filename without checking the working directory can produce two perfectly valid databases in different places. That often looks like lost data: the program saved a note, then reopened another file.
+
+Record the resolved location somewhere useful for support, without exposing private note contents. Decide who may read the directory. A local database is not encrypted merely because it lives outside a server. Other software running with the user's filesystem permissions may be able to read or replace it.
+
+SQLite's [description of suitable uses](https://www.sqlite.org/whentouse.html) discusses application storage and the limits of sharing a database directly between machines. The local-file design works best when the application can control the environment around that file. Putting it on an arbitrary shared network drive changes the problem.
+
+## Give the first schema a version
+
+The example's migration reads `PRAGMA user_version` inside a transaction. Version zero creates the notes table and changes the marker to one. Version one leaves the schema alone. An unexpected version returns an error rather than guessing that the file is compatible.
+
+The table requires a title and limits the completion flag to zero or one. The Rust program also understands that rule, but a database check protects writes from another code path or a future version of the app. It is useful to have the file reject a value that the screen cannot display honestly.
+
+The version marker is an integer the application manages. SQLite does not check whether version one really has the table expected by release one; its [PRAGMA reference](https://www.sqlite.org/pragma.html#pragma_user_version) leaves that meaning to the application. Update the schema and marker in the same migration transaction so a failed change does not leave them out of step.
+
+For later releases, keep each migration and its expected starting version. Test opening a file produced by a supported older release. Also decide what an older binary should do with a newer file. Refusing it with a useful message is often better than writing under assumptions that no longer hold.
+
+## Commit the note and its state together
+
+The checked-in source is [sqlite_local.rs](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/sql-rust/postgres-sqlite/src/bin/sqlite_local.rs). After migration, its main write is:
+
+```rust
+let tx = connection.transaction()?;
+tx.execute(
+    "INSERT INTO notes (title) VALUES (?1)",
+    ["Sam's travel notes"],
+)?;
+tx.execute("UPDATE notes SET done = 1 WHERE id = ?1", [1])?;
+tx.commit()?;
+```
+
+The title is a bound value. Its apostrophe does not become part of the SQL grammar. Binding is also easier to review than a custom escaping function that every caller must remember to use. The table and column names remain application code; placeholders are for values, not arbitrary identifiers.
+
+The two changes share a transaction. The example is intentionally a new, empty database, so the inserted row has ID one. A real insert path should obtain the inserted identifier rather than assuming that the next ID will be one. That distinction matters when a snippet moves out of its disposable setup.
+
+rusqlite's [connection and transaction API](https://docs.rs/rusqlite/latest/rusqlite/) provides these operations. They are synchronous calls. In a small command-line program that may be exactly what you want. An async service must arrange where this blocking work runs; wrapping the call in an async function does not change its behavior.
+
+## Close it, reopen it, and inspect the outcome
+
+The test commits the first note, opens another transaction, inserts a second note, and rolls that transaction back. It then closes the connection and reopens the same file. The expected contents are one note, the original title, and a completion value of one.
+
+It also attempts to store a completion value of two. The table must reject that write. Together these checks cover persistence across connection lifetime, explicit rollback, and the stored constraint. A test that only checked the return value from the first insert would cover much less.
+
+Closing a connection is not a power-loss experiment. This example does not simulate a full disk, a torn storage write, or a crash at every commit boundary. Keep those limits separate when describing the result. It establishes the ordinary reopen contract for this program, not every possible failure of a user's machine.
+
+## The file needs a recovery plan too
+
+Before users rely on the app, decide how to back up and restore its database. Copying a database file while writes are in progress needs coordination. SQLite's [online backup API](https://www.sqlite.org/backup.html) exists for taking a consistent copy while a database is in use. The fact that the data fits in one file does not make every filesystem copy a valid backup procedure.
+
+A restore check should reopen the saved copy with the application and verify a few meaningful records. Keep it separate from the original working directory so the test cannot accidentally read the live file. A backup that has never been opened is still an assumption.
+
+A later launch that cannot find the saved file should make that situation visible. Opening a new empty file can look exactly like a successful launch with lost notes. Keep first-run setup distinct from opening an existing store, and show the resolved location in support diagnostics. A schema-version refusal should be equally clear: the app found the file but cannot safely write its format.

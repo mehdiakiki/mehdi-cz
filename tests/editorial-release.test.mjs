@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
-import { editorialSeries } from "../data/editorial-series.mjs";
+import { editorialSeries as allEditorialSeries } from "../data/editorial-series.mjs";
 import { heldArticleSlugs } from "../data/publication-hold.mjs";
 import { hasValidReviewHash } from "../lib/content-review.mjs";
 import {
@@ -16,6 +16,10 @@ import {
 
 const approval = JSON.parse(
   await readFile(new URL("../docs/editorial/release-2026-10-25.json", import.meta.url), "utf8")
+);
+const approvedSlugs = new Set(approval.articles.map((article) => article.slug));
+const editorialSeries = allEditorialSeries.filter((series) =>
+  series.parts.every((slug) => approvedSlugs.has(slug))
 );
 const posts = await Promise.all(
   approval.articles.map(async ({ slug }) => {

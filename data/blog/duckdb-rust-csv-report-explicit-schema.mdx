@@ -1,0 +1,60 @@
+---
+title: "A CSV Report in Rust Without Adding a Database Server"
+date: "2026-10-24T13:00:00Z"
+lastmod: "2026-10-25"
+tags: ["rust", "duckdb", "csv"]
+draft: false
+reviewed: true
+reviewedHash: "7d9dd83239e9ff35cec5d3d9672cc3bcfbc9a19a9a941bd54458f226d15f3311"
+cluster: "reliable-data-integrations"
+campaign: "editorial"
+summary: "Embed DuckDB for a small report, give the CSV an explicit schema, and reject a bad amount instead of silently changing the report."
+---
+
+A weekly expense report arrives as a CSV file. The task is modest: group the amounts by team and return two columns. Adding a service, an account and another network connection feels like a large answer to a file on disk.
+
+DuckDB can run inside a Rust process and query the file directly. That makes it a useful option for a report command, an import tool or an application that needs local analytical queries. It changes where the database runs, though. The application now owns its memory use, file access and failure handling alongside the query.
+
+The example below keeps the report small enough to inspect by hand. Three expenses belong to two teams. Amounts are integer cents, and the expected totals are computed from those known rows. There is a second input with an invalid amount, because a report that returns numbers is not necessarily a report that accepted the right data.
+
+## Give the file a schema before summing it
+
+The report function receives a path and returns typed Rust rows. The path is a query parameter. The schema says exactly which columns to read and which type each column has.
+
+```rust
+fn report(c: &Connection, path: &str) -> duckdb::Result<Vec<(String, i64)>> {
+    let mut query = c.prepare("SELECT team, CAST(SUM(cents) AS BIGINT) AS total_cents FROM read_csv(?, header=true, columns={'team':'VARCHAR','cents':'BIGINT'}) GROUP BY team ORDER BY team")?;
+    let rows = query.query_map(params![path], |row| Ok((row.get(0)?, row.get(1)?)))?;
+    rows.collect()
+}
+```
+
+The complete source is [duckdb_report.rs](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/sql-rust/mysql-mariadb-duckdb/src/bin/duckdb_report.rs). It creates a temporary CSV containing two operations expenses of 100 and 200 cents and one support expense of 50 cents. The assertions require the two sorted team totals to be 300 and 50. These are expected assertions for the engine run; this draft does not report a completed run or a performance comparison.
+
+DuckDB's [CSV documentation](https://duckdb.org/docs/2.0/data/csv/overview) describes explicit column types as well as automatic detection. Detection is handy when exploring an unfamiliar file. For a repeatable report, a declared schema gives a changed or malformed value somewhere clear to fail.
+
+The bad file contains `oops` where the cents value should be numeric. The fixture requires the same report function to reject it. Using a count-only query for that check would be weaker: a query can avoid reading values it does not need. We exercise the sum because it actually needs the amount column.
+
+Integer cents keep this toy report's arithmetic straightforward. They do not solve every monetary calculation. Exchange rates, fractional tax rules and currencies with different minor units need a deliberate representation and rounding policy. The explicit cast of the sum back to BIGINT also makes the Rust boundary visible. A total outside that type's range should fail rather than arrive as an unnoticed truncation.
+
+## The library has an engine version too
+
+This fixture pins the Rust crate to `duckdb` 1.20000.0 and verifies that the linked engine reports v2.0.0. The crate's numbering is easy to misread as an old 1.x engine release. Check the [Rust client documentation](https://duckdb.org/docs/2.0/clients/rust/overview) and the wrapper's release metadata when choosing a pin.
+
+The configured CI setup sets `DUCKDB_DOWNLOAD_LIB=1` to fetch the matching prebuilt shared library; the manifest alone does not select that download. The deployment also needs that native library where its loader can find it. Check that the packaged command starts and reports the intended engine version. A successful Rust compile does not check that deployment step.
+
+The connection is in memory, while the input is a file. Closing the connection discards that database state. The CSV remains a separate input until the temporary directory is removed. If the application needs a persistent database file or durable report outputs, choose their locations and replacement rules explicitly.
+
+## Where this fits in a service
+
+The Rust API used here is synchronous. In an asynchronous web application, a large report should not occupy a runtime worker that is also expected to make progress on unrelated requests. Use a bounded blocking-work arrangement or a separate worker process, and cap the number of simultaneous reports. Merely putting an async function around this call does not change the engine's execution model.
+
+DuckDB documents its [concurrency model](https://duckdb.org/docs/2.0/connect/concurrency). In this report, the connection reads a CSV and keeps database state in its own process. Sharing one writable database file among independent application processes would need a separate design. The <ArticleLink slug="mysql-rust-stock-reservation-transaction">InnoDB stock reservation</ArticleLink> has a transaction and contention problem; this report has a scan and aggregation problem. Both use SQL, but they do not need the same deployment design.
+
+File access also belongs in the design. This fixture chooses its own temporary path. A hosted reporting endpoint should not accept arbitrary filesystem paths from a request. Select inputs through application-owned identifiers and permissions, then pass the resolved path to the query. A parameter prevents the path from becoming SQL syntax; it does not decide whether the caller is allowed to read that file.
+
+The ordering clause also matters at the Rust boundary. Without it, the report should not promise a particular team order. If a UI needs a stable order for comparison or export, make that part of the query contract and keep the corresponding assertion.
+
+Before using real exports, add cases for missing teams, empty amounts, duplicate records and a changed header. Decide whether missing data should reject the report, produce a separate rejection list or be allowed under a documented rule. Silently treating an unreadable amount as zero can make a report look pleasantly complete while changing its meaning.
+
+For larger files, inspect the plan and give the process a memory and scratch budget. The follow-up on <ArticleLink slug="duckdb-memory-limit-scratch-rust">DuckDB memory limits and scratch space</ArticleLink> checks those settings without assuming that every configured query spills. When the next export changes, keep the failing input row with a safe diagnostic: the amount could not be read, so no finished report was produced. Decide whether the user must repair the file or download a rejection list. Turning that amount into zero would hide the problem from both people.

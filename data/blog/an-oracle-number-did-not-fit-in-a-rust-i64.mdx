@@ -1,0 +1,95 @@
+---
+title: "An Oracle NUMBER Did Not Fit in a Rust i64"
+date: "2026-10-24T13:00:00Z"
+lastmod: "2026-10-25"
+tags: ["rust", "oracle", "numeric-precision", "data-contracts"]
+draft: false
+reviewed: true
+reviewedHash: "f7431fab65807caf632fce0780eff711d3ebf65f5b6ee67c81b9f78d628368ed"
+cluster: "reliable-data-integrations"
+campaign: "editorial"
+summary: "Check Oracle NUMBER conversion at the i64 boundary and retain large integral values exactly without an f64 detour."
+---
+
+Suppose a Rust report reads identifiers into `i64`. Most rows work. One imported identifier is larger, and the fetch fails even though Oracle accepted the value.
+
+Before widening every field, inspect the column. Oracle `NUMBER` does not mean Rust `i64`. It can describe values outside that integer range, and some declarations allow fractional values too. Check the field's actual precision, scale, and what the application does with it.
+
+This example keeps the problem narrow: integral values in `NUMBER(38,0)`. It checks the largest positive `i64`, the next integer, and a thirty-eight-digit integer. There is no conversion through floating point, and no assumption that every Oracle number can fit in the replacement Rust type.
+
+## Read the declaration before choosing the destination
+
+A signed `i64` stops at 9,223,372,036,854,775,807. The next positive integer is perfectly ordinary decimal text, but it is outside that Rust type. A database field that permits thirty-eight integral decimal digits has a wider range.
+
+Precision and scale matter separately. For example, `NUMBER(12,2)` allows twelve significant decimal digits, with two places after the decimal point. It is not the same field as `NUMBER(12,0)`. If the column stores money, decide which decimal representation and rounding rules the application must preserve before choosing a Rust type.
+
+Oracle's [data-type reference](https://docs.oracle.com/en/database/oracle/oracle-database/26/sqlrf/Data-Types.html) defines the available `NUMBER` precision and scale. Inspect the deployed declaration rather than choosing a Rust type from the column's name. A column named identifier may have been populated by several different systems over many years.
+
+For the three selected values, the expected results are:
+
+| Decimal value                          | Read as `i64`        | Keep as exact decimal text |
+| -------------------------------------- | -------------------- | -------------------------- |
+| 9223372036854775807                    | Fits                 | Unchanged                  |
+| 9223372036854775808                    | Conversion must fail | Unchanged                  |
+| 99999999999999999999999999999999999999 | Conversion must fail | Unchanged                  |
+
+A failed narrowing conversion is useful. It prevents the report from quietly returning a different identifier. Do not replace that failure with a default zero and call the import complete.
+
+## Read the narrow result and the exact result together
+
+The program pins `oracle` 0.6.3. It binds decimal text, asks Oracle to cast it to the explicit integral declaration, and retrieves both the numeric value and a deliberate character representation. This is the checked-in `oracle_number.rs` example:
+
+```rust
+fn main() -> AnyResult<()> {
+    let conn = oracle_connection()?;
+    for input in [
+        "9223372036854775807",
+        "9223372036854775808",
+        "99999999999999999999999999999999999999",
+    ] {
+        let row = conn.query_row(
+            "SELECT CAST(:1 AS NUMBER(38,0)), TO_CHAR(CAST(:1 AS NUMBER(38,0)), 'TM9', 'NLS_NUMERIC_CHARACTERS=''.,''') FROM dual",
+            &[&input],
+        )?;
+        let narrowed: oracle::Result<i64> = row.get(0);
+        let exact: String = row.get(1)?;
+        assert_eq!(exact, input);
+        let integer = exact_integer(&exact)?;
+        let expected_i64 = i64::try_from(integer).ok();
+        match expected_i64 {
+            Some(expected) => assert_eq!(narrowed?, expected),
+            None => assert!(narrowed.is_err()),
+        }
+        println!("exact={exact}, fits_i64={}", expected_i64.is_some());
+    }
+    Ok(())
+}
+```
+
+The first read tries `i64`. The second keeps the full value. The assertions compare that exact result with the supplied decimal text. A value that fits must also decode to the expected integer; values outside the range must fail the narrow read.
+
+`TO_CHAR` here uses the `TM9` format and explicit numeric characters. It is not a claim that an arbitrary session's default numeric formatting is a wire format. Oracle's [number-format conversion reference](https://docs.oracle.com/en/database/oracle/oracle-database/26/sqlrf/TO_CHAR-number.html) explains where session defaults otherwise enter the result.
+
+The three integers need at most thirty-eight digits. Oracle's [`TM9` format](https://docs.oracle.com/en/database/oracle/oracle-database/26/sqlrf/Format-Models.html) switches to scientific notation only when the output would exceed 64 characters, so these values should remain ordinary decimal digits. An unconstrained `NUMBER` or a fractional value needs a separate formatting and parsing decision. The helper here rejects fractions and exponents rather than guessing what they mean.
+
+## Keep the value exact until its meaning is settled
+
+For these integral values, a Rust `i128` can hold every signed value with up to thirty-eight decimal digits. The helper accepts digits with an optional leading minus sign, then uses a checked conversion if a caller still requires `i64`. Its Rust tests cover the boundary and reject fractions, exponents, and other unsupported forms.
+
+The parser tests do not call Oracle. The query above is needed to check whether OCI decodes each selected number as expected. If a Client upgrade changes that behavior, the failure should identify either the numeric decode or the exact text comparison, rather than disappear inside a general parsing error.
+
+If the value is an identifier rather than a quantity, validated decimal text may be the clearer application type. The program need not add or divide identifiers simply because their database storage type is numeric. Preserve the agreed leading-zero policy too; a numeric column cannot remember formatting that was discarded when the value was stored.
+
+If the field is an amount, use an exact decimal type with a supported range and explicit scale policy. Check the Rust driver's supported conversions for that type. Do not assume a decimal crate with one precision limit can represent every `NUMBER` declaration.
+
+An `f64` detour is especially unhelpful for a large identifier. Converting it to a float before formatting it back can discard integer precision. At that point, displaying a longer string does not restore the original digits. The problem is the representation chosen between the database and the response.
+
+## Stop silent loss at the report boundary
+
+Consider the next consumer too. A JSON client might read a numeric token into a floating-point number even when the Rust service kept an exact integer internally. An API that sends large identifiers as strings should make that choice part of its schema, so the consumer does not undo the repair.
+
+For a report file, compare the whole emitted identifier with the expected value, not only the Rust object's type. Include the first out-of-range case in the regression data. A column that has contained only small values for years can still permit a larger value tomorrow.
+
+The <ArticleLink slug="adding-rust-to-a-system-that-already-uses-oracle">shared Oracle connection helper</ArticleLink> checks the declared exact server version and requires Client 18.1 or later because it sets a call timeout. Record the Client build with the three returned values. A Rust lockfile does not pin those native libraries, and a parser test cannot tell you which library the deployment loaded.
+
+If narrowing fails in the real report, keep the original value with a clear error or route it through the agreed wider representation. Include the complete account number in the expected report data. A test that only checks whether the export succeeded would miss a changed final digit.

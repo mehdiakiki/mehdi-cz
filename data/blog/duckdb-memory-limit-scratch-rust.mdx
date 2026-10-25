@@ -1,0 +1,99 @@
+---
+title: "DuckDB Memory Limits: Check Completion, Scratch Use and Failure Separately"
+date: "2026-10-24T13:00:00Z"
+lastmod: "2026-10-25"
+tags: ["rust", "duckdb", "memory"]
+draft: false
+reviewed: true
+reviewedHash: "dd45e87b8ee2dc65c9dd9a521af4ca8fc52b173000a337358c6b49bf072b9dfb"
+cluster: "reliable-data-integrations"
+campaign: "editorial"
+summary: "Run a bounded Rust sorting query with explicit memory and scratch budgets, and report observed spill instead of assuming it."
+---
+
+Suppose a report fails with an out-of-memory error. You give it a temporary directory and the next run completes. The directory may have helped, but completion alone does not tell you whether DuckDB used it. Keep the input and query fixed, then inspect the run's profile.
+
+Record the memory setting, scratch allowance and measured scratch use for each run. First require a baseline that returns the right answer. Otherwise a program that reports memory errors every time could appear to pass without ever sorting its rows.
+
+The fixture here sorts a fixed range of 250,000 identifiers by a generated hash string. It reads every result and checks the row count and sum. There is no user-provided query and no unbounded input generator. The input size stays fixed while the resource settings change.
+
+## Require one known result first
+
+The binary runs three fresh in-memory connections. The baseline has a 128 MB engine memory limit and no scratch allowance, and must complete. The second case lowers the memory limit to 32 MB and allows 64 MB of scratch. The third has a 1 MB memory limit and no scratch allowance.
+
+Only the baseline is required to complete. The constrained cases can either return the checked result or produce a recognized engine out-of-memory error. Other errors fail the fixture. That distinction keeps a malformed query, an invalid configuration setting or a missing native library from masquerading as the expected resource limit.
+
+```rust
+fn case(root: &Path, name: &str, memory: &str, scratch: &str, must_complete: bool) -> Result<()> {
+    let c = Connection::open_in_memory()?;
+    duck_version(&c)?;
+    let temp = root.join(format!("scratch-{name}"));
+    let profile = root.join(format!("profile-{name}.json"));
+    std::fs::create_dir(&temp)?;
+    c.execute_batch(&format!("SET threads=1; SET max_execution_time=15000; SET memory_limit='{memory}'; SET max_temp_directory_size='{scratch}'; SET temp_directory={}; SET enable_profiling='json'; SET profiling_output={};", literal(&temp), literal(&profile)))?;
+    let outcome = consume(&c);
+    c.execute_batch("PRAGMA disable_profiling")?;
+    match outcome {
+        Ok((count, sum)) => {
+            assert_eq!(count, 250000);
+            assert_eq!(sum, (0..250000_i64).sum::<i64>());
+            println!("{name}: completed, rows={count}, memory={memory}, scratch cap={scratch}");
+        }
+        Err(error) => {
+            let message = error.to_string();
+            if must_complete || !message.to_ascii_lowercase().contains("out of memory") {
+                return Err(error.into());
+            }
+            println!("{name}: bounded engine memory rejection: {message}");
+        }
+    }
+    if profile.is_file() {
+        let json: serde_json::Value = serde_json::from_slice(&std::fs::read(&profile)?)?;
+        match temp_peak(&json) {
+            Some(0) => {
+                println!("{name}: profile reports zero peak scratch bytes; spill not observed")
+            }
+            Some(bytes) => println!("{name}: observed peak scratch bytes={bytes}"),
+            None => println!(
+                "{name}: profile schema has no recognized scratch metric; spill unverified"
+            ),
+        }
+        println!("{name}: actual profile={json}");
+    } else {
+        println!("{name}: no profile file; spill unverified");
+    }
+    Ok(())
+}
+```
+
+The complete source is [duckdb_memory.rs](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/sql-rust/mysql-mariadb-duckdb/src/bin/duckdb_memory.rs), using Rust wrapper 1.20000.0 and DuckDB v2.0.0. The `consume` function iterates the sorted result without building an additional Rust vector. That avoids one application allocation pattern; it does not promise that the client API or the engine streams every internal result without materialization.
+
+The sorting query has a fifteen-second engine limit and one execution thread. Memory and scratch settings are fixed in the fixture. Keep an overall job deadline too: loading the native library and starting the program happen before these SQL settings apply. None of these settings is an operating-system memory cap.
+
+## A configured directory is not a spill observation
+
+DuckDB's [configuration reference](https://duckdb.org/docs/2.0/configuration/overview) documents the memory limit, temporary directory and maximum temporary-directory size. We set all three explicitly instead of relying on defaults that may be unsuitable for the process's environment.
+
+The fixture enables JSON profiling and gives each case a separate output path. The setup selects JSON profiling before assigning the output file, matching the [documented profiling example](https://duckdb.org/docs/2.0/dev/metrics). Each connection and path is new, so a failed query cannot accidentally inherit the previous query's profile file.
+
+When a profile exists, the binary looks for the peak scratch metric. DuckDB's [metrics documentation](https://duckdb.org/docs/2.0/dev/metrics) names it `system.peak_temp_dir_size`. The small reader recognizes that name and a few JSON layout variants, and prints the actual profile for inspection. If it cannot recognize the metric, it reports that spill is unverified. It does not substitute zero for missing evidence.
+
+A reported zero means this run did not observe scratch use through that metric. A positive value records temporary storage use for that case. If the query failed, its profile only describes work before that failure; it does not prove that scratch space allowed the report to finish. Neither number predicts another dataset. The 32 MB case is allowed to fit without spilling, and the 1 MB case is allowed to complete if the pinned engine can execute it within those settings. The article does not claim a result before the recorded run exists.
+
+## The process can use more memory than the engine limit
+
+An embedded database shares a process with the application. Rust objects, input buffers, native allocations and returned results all contribute to the process footprint. An engine memory setting should not be described as a hard cap on the whole executable.
+
+DuckDB's [out-of-memory guidance](https://duckdb.org/docs/2.0/guides/troubleshooting/oom_errors) discusses engine allocation failures and process termination. A database error returned to Rust is different from the operating system killing the process. The fixture handles the former. It does not deliberately provoke the latter or claim that a returned error proves the host cannot run out of memory.
+
+In a deployed report worker, give the process an appropriate outer memory limit and leave headroom for the application. Bound report concurrency too. Four queries that are individually reasonable can still compete for the same process and scratch disk. The right number comes from the workload and deployment budget, not from copying this fixture's one-thread setting.
+
+Scratch storage needs a location with known capacity and permissions. It may contain data derived from the query, so do not casually point it at a shared public directory. Decide how abandoned job files are cleaned up, and make disk-full behavior visible to the caller. The temporary directories here are owned and removed by the fixture; a long-running service needs an operational policy.
+
+## Keep the failure useful to the caller
+
+When a report reaches its budget, return an error that distinguishes a resource rejection from invalid input or an unavailable dependency. Keep the detailed engine message in appropriate diagnostics, and avoid endlessly retrying the identical report under identical limits.
+
+Reducing projected columns, narrowing the interval or splitting a report may solve the actual problem more effectively than raising every limit. The <ArticleLink slug="duckdb-parquet-projection-filter-plan-rust">Parquet plan example</ArticleLink> shows how to inspect whether the query is asking for unnecessary data.
+
+If the 32 MB case completes with zero peak scratch bytes, this run has not demonstrated spilling. If it completes with a positive peak, save that profile with the checked result and settings. If it still returns out of memory, reduce the query's demand or change its budget deliberately. These remain possible outcomes until the recorded run supplies the profile; choosing a directory alone settles none of them.
