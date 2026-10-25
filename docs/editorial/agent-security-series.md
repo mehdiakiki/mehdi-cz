@@ -1,6 +1,6 @@
 # Agent security series
 
-The approved length and search revisions are now implemented; see the [implementation record](article-length-seo-implementation-2026-10-24.md) for verification and remaining release work. The earlier review paragraphs below describe previous passes.
+The author approved this series for daily publication on October 25, 2026. All ten sources now have `draft: false`, `reviewed: true`, and exact content review hashes. The [daily calendar](daily-publication-calendar.md) and [approval record](release-2026-10-25.json) record the active schedule.
 
 Ten additional articles about how agent containment fails and how to reduce the
 damage. Requested October 24, 2026. The writing uses the same plain, practical
@@ -30,16 +30,12 @@ shells, cloud operations, or privileged host escape payloads. A guard inside the
 agent's own process is not an OS sandbox. Each article must explain that limit
 where it affects the example.
 
-Code is stored under `experiments/agent-security/`. It is authored for later
+Code is stored under `experiments/agent-security/`. Its bounded checks passed
 GitHub CI verification; no demonstration has been run locally. Real CVE payloads
 are not being reproduced. Kernel/runtime patching and network enforcement need
 checks in the actual deployed environment in addition to these small examples.
 
-The [single daily calendar](daily-publication-calendar.md) starts October 24.
-It includes the earlier ten CI drafts, ten engineering drafts, and these ten
-security drafts. This series occupies November 13–22 at 13:00 UTC, one per day.
-All articles remain explicitly drafted and unreviewed until the existing review
-and release gates are completed. A date is not evidence of release approval.
+This series occupies November 14–23 at 13:00 UTC in the approved [daily calendar](daily-publication-calendar.md), after the ten CI and ten engineering articles. The author approved removal of the draft and review holds on October 25. Date-stamped research claims retain their stated observation dates; they are not claims of fresh incident verification on a future publication day.
 
 ## Research notes and claim limits
 

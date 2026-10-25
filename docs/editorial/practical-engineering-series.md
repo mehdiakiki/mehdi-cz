@@ -1,6 +1,6 @@
-# Practical engineering article drafts
+# Practical engineering series
 
-The approved length and search revisions are now implemented; see the [implementation record](article-length-seo-implementation-2026-10-24.md) for verification and remaining release work. The earlier review paragraphs below describe previous passes.
+The author approved this series for daily publication on October 25, 2026. All ten sources now have `draft: false`, `reviewed: true`, and exact content review hashes. The [daily calendar](daily-publication-calendar.md) and [approval record](release-2026-10-25.json) record the active schedule.
 
 Ten new drafts based on the themes the author accepted on October 24, 2026.
 These are separate from the earlier CI and coding-agent series.
@@ -15,14 +15,9 @@ Each article should give readers a concrete problem, a small example, the next
 thing to inspect or change, and a way to judge the result. Avoid repeated
 disclaimers, slogans, and identical introductions or endings.
 
-All ten retain `draft: true` and `reviewed: false`. Their dates now occupy
-November 3–12 in the [single daily calendar](daily-publication-calendar.md),
-after the earlier ten CI drafts. The calendar starts today, October 24, and
-includes all thirty held articles. Dates do not remove the review and publication
-holds. No publication or technical review hash is being approved. Later commits
-must use only the author's configured Git identity.
+These ten articles occupy November 4–13 at 13:00 UTC, after the CI series. The shared thirty-article calendar starts October 25 and ends November 23. Commits use only the author's configured Git identity.
 
-| Draft | What the reader should be able to do |
+| Article | What the reader should be able to do |
 | --- | --- |
 | [Deno Is Joining Cloudflare: What Existing Apps Need to Move](../../data/blog/deno-joining-cloudflare-what-happens-to-your-app.mdx) | Separate runtime dependencies from hosting dependencies and plan a migration. |
 | [AI Agent Sandbox Permissions: A Deno Sandbox Checklist](../../data/blog/what-can-an-ai-agent-reach-from-its-sandbox.mdx) | Check network access, credentials, and files before allowing generated code to run. |
