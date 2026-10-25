@@ -1,0 +1,90 @@
+---
+title: "Isolate Agent Job State with Scoped Leases and Generations"
+date: "2026-11-22T13:00:00Z"
+tags: ["ai", "security", "agent-security", "python", "multi-tenancy"]
+draft: false
+reviewed: true
+reviewedHash: "941fb6ede7e469417d34666d81ce37b3910d6ecbe8dff05cab69eea1bd50287d"
+cluster: "reliable-ai-systems"
+campaign: "editorial"
+summary: "Keep same-owner jobs separate, reject stale references when an ID is reused, and remove expired application state through an operator-owned cleanup path."
+---
+
+The first job writes `result.txt`. The second job starts on the same worker and asks for a file with the same name.
+
+If the storage helper uses a shared folder or a cache keyed only by filename, the second job may receive the first result. The agent doesn't need to escape anything. The application has carried data across the boundary for it.
+
+It is easy to notice this with two different customers. It is also worth checking two jobs from the same account. Sharing an owner doesn't mean every new task should automatically inherit every old task's inputs and outputs.
+
+This example protects an application state service, using strings stored under result names. It does not isolate arbitrary filesystem access. The <ArticleLink slug="sandboxing-model-generated-code-is-a-systems-problem">sandbox overview</ArticleLink> explains how worker reuse can also carry files, processes, and credentials into later jobs.
+
+## Let the server choose the current job
+
+A tempting API accepts `actor`, `jobId`, and `filename`, then checks whether the actor owns that job. This can be a valid account-level file browser. It is too broad for a tool meant to serve only the current agent job.
+
+Instead, authenticated middleware should supply the current job context. The model asks for a named result within that context. It doesn't choose another job by adding an identifier to its tool arguments.
+
+Our small Python example uses a context with an owner, job ID, and generation: a fresh random value for each job registration. Reusing a human-readable job ID then doesn't make old references valid again.
+
+```python
+@dataclass(frozen=True)
+class Context:
+    actor: str
+    job_id: str
+    generation: str
+
+def _authorize(self, context: Context) -> None:
+    lease = self._leases.get(context.job_id)
+    if (
+        not lease or lease.owner != context.actor
+        or lease.generation != context.generation
+        or self._clock() >= lease.expires_at
+    ):
+        raise PermissionError("job unavailable")
+
+def read(self, context: Context, name: str) -> str:
+    self._authorize(context)
+    return self._data[(context.job_id, context.generation, name)]
+```
+
+These are excerpts from the [complete Python state service](https://github.com/mehdiakiki/mehdi-cz/blob/aa3ea07386d828fda077d626020d6ca7565aa5e0/experiments/agent-security/job_state.py). The full file includes the imports, lease record, registration, writes, and operator cleanup.
+
+`Context` is constructed by trusted application code. Deserializing it from model-produced JSON would let the caller claim the authority the check is supposed to verify. The generation comes from Python's [secrets module](https://docs.python.org/3/library/secrets.html), not from a counter selected by the agent.
+
+## Check reuse, not only different owners
+
+The demonstration creates two Alice-owned jobs and writes a dummy result into the first. Reading that name from the second finds no value. It also checks that a different owner is denied.
+
+Then it destroys the first job, registers the same job ID again, and tries the old context. The changed generation should reject that reference. Finally, an injected clock advances to the expiry time and checks that access stops.
+
+The checks concern reads through this state service. A shared filesystem or another cache can still expose the same data through a different path. The job context needs to reach every service that handles private state.
+
+An authorization denial also doesn't erase data. An expired context cannot call `destroy`, because that method checks the same lease. Giving an expired agent extra authority to solve cleanup would reopen access after the lease ended.
+
+## Give expiry cleanup to the operator
+
+The service has a separate `collect_expired` method. It reads the operator's clock, visits expired lease records, and removes their stored generation. It is a lifecycle method, not an agent tool. Before deleting a generation, the helper checks that the current lease still has that generation. A stale cleanup request must not delete a replacement job just because it reused the same name.
+
+The demonstration keeps one live job while two other leases expire. Before collection, it expects three lease records and two stored values: the expired result and the live result. Access to the expired result is denied, but the counts have not changed. Operator collection then removes two leases and one value. The live result remains readable. A second collection removes nothing.
+
+Those observations distinguish denial from deletion and make a retry safe to inspect. This implementation runs in one process without concurrent mutations. A persistent service needs an atomic expiry-and-generation check with the deletion, using its database's transaction or conditional-write mechanism. Copying a list of IDs into a later cleanup task without their generations would lose the protection.
+
+## Apply the same scope to caches and artifacts
+
+Fixing the state table while leaving a shared result cache keyed by prompt text can reintroduce the leak elsewhere. Include the relevant tenant and job scope in keys for private data. Where cross-job reuse is intentional, decide exactly which content is safe to share. <ArticleLink slug="caching-ai-results-requires-an-identity-and-freshness-model">Cache identity and freshness</ArticleLink> covers that separate reuse decision.
+
+Artifact downloads need the same authorization as tool reads. An unpredictable URL is not a complete policy for who may retrieve a private result. Check the authenticated caller or use a deliberately scoped, expiring download capability.
+
+Also inspect temporary directories, browser profiles, mounted volumes, tool transcripts, package credentials, and environment variables when workers are reused. Resetting the conversation does not reset these resources.
+
+Keep saved reports in an account store with access checks. Keep scratch files in temporary job storage. Give each a deletion rule, and make the retention choice visible where users need it. The next job shouldn't inherit private scratch data just because the account chose to save one report.
+
+## Some shared state is below your application
+
+[OpenAI's October 23 research report](https://openai.com/index/securing-our-frontier-model-training-environment/) describes cross-task communication using shared CPU-cache timing. In most of those communication tests, researchers suggested channels or supplied an encoding protocol. Our state service does not prevent that different mechanism. <ArticleLink slug="sometimes-the-escape-is-in-the-runtime">Maintaining the isolation runtime</ArticleLink> concerns the lower layer.
+
+Keep the two investigations separate. Application storage needs explicit scope and cleanup. Jobs with stricter isolation requirements may also need stronger separation between the environments running them and a review of shared hardware resources.
+
+For the ordinary worker pool, begin with a practical handoff check: finish one job containing a dummy private marker, start the next job, and inspect what it can retrieve through every supported interface. Repeat with the same account and a different account.
+
+If the marker appears, follow the real storage path. A new job ID in the UI means little if the file helper, cache, or download endpoint still points at yesterday's workspace.

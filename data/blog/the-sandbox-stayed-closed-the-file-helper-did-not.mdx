@@ -1,0 +1,98 @@
+---
+title: "Prevent Path Traversal in Host Tools for AI Agents"
+date: "2026-11-14T13:00:00Z"
+tags: ["ai", "security", "agent-security", "sandboxing", "python"]
+draft: false
+reviewed: true
+reviewedHash: "b96b8e70e4c54240c03fcb2747179d31a2ed4d6dbc7e8cac4b8de85170b684bd"
+cluster: "reliable-ai-systems"
+campaign: "editorial"
+summary: "An agent can write outside its job through a privileged file helper. Let trusted code choose destinations and authorize report downloads."
+---
+
+An agent writes a file outside its workspace. The first explanation is often “it escaped the sandbox.” But which process actually wrote the file?
+
+If a trusted host tool accepted the destination and performed the write, the VM may have stayed isolated. The application carried the agent's request across the boundary for it.
+
+This is a useful place to start an agent security review. Read the code that moves data into and out of the sandbox, not only the code running inside it.
+
+Here we follow one report from a tool call to a download. The <ArticleLink slug="sandboxing-model-generated-code-is-a-systems-problem">sandbox execution overview</ArticleLink> covers the wider system: isolation, network access, resources, and cleanup.
+
+## A real example from the framework layer
+
+Microsoft's [May 2026 Semantic Kernel report](https://www.microsoft.com/en-us/security/blog/2026/05/07/prompts-become-shells-rce-vulnerabilities-ai-agent-frameworks/) tracks the .NET download flaw as CVE-2026-25592. The model could choose where the host saved a downloaded file. A file produced inside the sandbox could therefore be written to a dangerous host location. The fix removed the helper's model exposure and added path restrictions. This is separate from the Python expression-evaluation flaw discussed in the same report.
+
+That is a host-side tool flaw. It doesn't require the generated program to discover a hypervisor vulnerability.
+
+For an application audit, list tools that can read, write, upload, download, start a process, or change sandbox settings. For each one, ask whose permissions perform the operation. The tool name may say “download report”; the implementation may have authority to overwrite much more.
+
+The same trace matters for a tool that starts a process. <ArticleLink slug="a-filename-became-a-shell-command">Keeping filenames out of shell commands</ArticleLink> follows the point where a value becomes an instruction to another privileged program.
+
+## Show the mistake with a harmless file
+
+The [complete Python example](https://github.com/mehdiakiki/mehdi-cz/blob/aa3ea07386d828fda077d626020d6ca7565aa5e0/experiments/agent-security/host_helper.py) uses a temporary parent directory. Its vulnerable helper is intentionally small:
+
+```python
+def unsafe_download(job_dir, requested_name, body):
+    destination = job_dir / requested_name
+    destination.write_bytes(body)
+    return destination
+```
+
+A requested name of `../outside-job.txt` reaches a dummy file beside the job directory. The demonstration doesn't target a real host file. It shows why joining a trusted directory and an untrusted path doesn't itself enforce a boundary.
+
+An absolute path is another problem: in Python's path handling, it can replace the earlier path component. Rejecting one string such as `../` is not a complete solution.
+
+The trusted Python process writes the file. Putting the file-generating program in a stronger VM wouldn't remove this tool's authority. Follow the request all the way to the process that opens the destination.
+
+## Let the host choose where reports go
+
+If the user only needs a downloadable report, the model doesn't need a host path argument. Give the trusted service a job ID, check ownership, and select an output directory from its own record.
+
+For a host-owned directory that agent code cannot modify, the replacement uses:
+
+```python
+def save_report(trusted_output_dir, body):
+    if len(body) > 64 * 1024:
+        raise ValueError("report too large")
+    destination = trusted_output_dir / (secrets.token_hex(16) + ".txt")
+    with destination.open("xb") as output:
+        output.write(body)
+    return destination
+```
+
+The host chooses the filename. Exclusive creation refuses an existing target instead of overwriting it. The output size is bounded. The complete example imports `secrets` and creates its own temporary directories.
+
+The directory condition matters. If untrusted code can replace parent directories or plant links there, the design needs stronger filesystem controls. <ArticleLink slug="the-safe-path-changed-before-it-was-opened">Opening files through a directory capability</ArticleLink> covers a narrower way to grant filesystem access. Don't turn this short helper into a claim that arbitrary paths are now safe.
+
+The [Python file-opening reference](https://docs.python.org/3/library/functions.html#open) documents exclusive creation. It protects this creation step; it doesn't authenticate the caller or validate the report's content.
+
+## Keep the returned artifact untrusted
+
+Check the file's format before serving it. A report containing HTML isn't automatically safe to render inside your application's origin. A text attachment is a simpler starting point for this example.
+
+Use an application download endpoint that checks the user and job. The random filename is useful for avoiding collisions, not a replacement for authorization. A copied URL should not grant another user access to a private report.
+
+Also decide whether repeated calls create several files and how those files expire. An agent that retries a successful export shouldn't create unlimited stored output.
+
+Return an artifact identifier to the agent rather than the host's storage path. The application can use that identifier to locate the report after checking access. That keeps an internal filesystem detail out of the next tool call and gives the download service one place to enforce retention and ownership.
+
+The complete example includes a small `Reports` service. Its trusted job record holds the owner, output directory, and expiry time. The application obtains `actor` from authentication, then follows this flow:
+
+```python
+artifact_id = service.create(actor, "job-a", report_bytes)
+# Later, after authenticating the download request:
+download_bytes = service.download(actor, artifact_id)
+```
+
+Creation checks the job before writing. Download resolves the artifact back to that job and checks again. Copying Alice's artifact identifier into Bob's request therefore doesn't bypass the owner check. Advancing the example clock to the job's expiry denies a later download, even though the bytes still exist. Deleting retained reports is a separate storage task; an access denial hasn't removed them.
+
+## Verify the denied operation too
+
+The example first attempts the dummy traversal. Then it calls the replacement helper and asserts that the report path stays under the trusted output directory. Its service checks also cover an allowed owner download, another account's creation and download attempts, an oversized report, and an expired job. The oversized case checks that no extra file appeared.
+
+For the real application, add negative cases at the tool boundary: another user's job, an expired job, an oversized report, and an attempt to supply an unsupported destination field. Run them against the actual wrapper that reaches storage.
+
+Check the application's response too. A denied write should return a clear error, without retrying through another helper that accepts the same unrestricted path.
+
+When a future report says an agent “escaped,” trace the operation from model output to the process that changed the host. If the application supplied the missing privilege, that is where the first repair belongs.

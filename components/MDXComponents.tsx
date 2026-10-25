@@ -6,6 +6,7 @@ import Image from "./Image";
 import CustomLink from "./Link";
 import TableWrapper from "./TableWrapper";
 import Pre from "./Pre";
+import ArticleLink from "./ArticleLink";
 
 // Custom image component for MDX with optimizations
 const MDXImage = (props: any) => {
@@ -37,6 +38,7 @@ const AccessibleBlogNewsletterForm = (props: ComponentProps<typeof BlogNewslette
 );
 
 export const components: MDXComponents = {
+  ArticleLink,
   Image: MDXImage,
   img: MDXImage, // Also handle regular img tags
   TOCInline,

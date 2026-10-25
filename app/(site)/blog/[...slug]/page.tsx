@@ -12,6 +12,7 @@ import siteMetadata from "@/data/siteMetadata";
 import { notFound } from "next/navigation";
 import Link from "@/components/Link";
 import OpportunitiesCard from "@/components/OpportunitiesCard";
+import EditorialSeriesNav from "@/components/EditorialSeriesNav";
 import { ArticleJsonLd, BreadcrumbJsonLd } from "@/components/JsonLd";
 import { authorityOpportunities } from "@/data/authority-opportunities.mjs";
 import { getContentCluster } from "@/data/content-clusters.mjs";
@@ -72,6 +73,7 @@ export async function generateMetadata({
   return {
     title: post.title,
     description: post.summary,
+    alternates: { canonical: post.canonicalUrl || `/${post.path}` },
     openGraph: {
       title: post.title,
       description: post.summary,
@@ -80,7 +82,7 @@ export async function generateMetadata({
       type: "article",
       publishedTime: publishedAt,
       modifiedTime: modifiedAt,
-      url: "./",
+      url: `/${post.path}`,
       images: ogImages,
       authors: authors.length > 0 ? authors : [siteMetadata.author],
     },
@@ -148,26 +150,11 @@ export default async function Page({ params }: { params: Promise<{ slug: string[
   });
   const mainContent = coreContent(post);
   const requiredStyles = articleStyleRequirements(post.body.code);
-  const jsonLd = { ...post.structuredData };
-  jsonLd["author"] = authorDetails.map((author) => {
-    return {
-      "@type": "Person",
-      name: author.name,
-    };
-  });
-  if (note) {
-    jsonLd["isPartOf"] = {
-      "@type": "CollectionPage",
-      name: "Engineering Notes",
-      url: `${siteMetadata.siteUrl}/notes`,
-    };
-  } else if (cluster) {
-    jsonLd["isPartOf"] = {
-      "@type": "CollectionPage",
-      name: cluster.title,
-      url: `${siteMetadata.siteUrl}/blog/topics/${cluster.slug}`,
-    };
-  }
+  const collection = note
+    ? { name: "Engineering Notes", url: `${siteMetadata.siteUrl}/notes` }
+    : cluster
+      ? { name: cluster.title, url: `${siteMetadata.siteUrl}/blog/topics/${cluster.slug}` }
+      : undefined;
 
   const Layout = layouts[post.layout || defaultLayout];
 
@@ -200,12 +187,10 @@ export default async function Page({ params }: { params: Promise<{ slug: string[
         url={`${siteMetadata.siteUrl}/${post.path}`}
         tags={post.tags || []}
         images={post.images ? (typeof post.images === "string" ? [post.images] : post.images) : []}
+        authors={authorDetails.map((author) => ({ name: author.name, url: siteMetadata.siteUrl }))}
+        collection={collection}
       />
       <BreadcrumbJsonLd items={breadcrumbItems} />
-      <script
-        type="application/ld+json"
-        dangerouslySetInnerHTML={{ __html: JSON.stringify(jsonLd) }}
-      />
       <Layout content={mainContent} authorDetails={authorDetails} next={next} prev={prev}>
         {status !== "published" && (
           <aside className="mb-8 rounded-md border border-amber-300 bg-amber-50 px-5 py-4 text-sm leading-6 text-amber-950 dark:border-amber-800 dark:bg-amber-950/30 dark:text-amber-100">
@@ -260,6 +245,7 @@ export default async function Page({ params }: { params: Promise<{ slug: string[
           )}
         </p>
         <MDXLayoutRenderer code={post.body.code} components={components} toc={post.toc} />
+        {!note && <EditorialSeriesNav slug={post.slug} />}
         {!note && (
           <OpportunitiesCard
             clusterSlug={cluster?.slug}

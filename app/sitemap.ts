@@ -4,6 +4,7 @@ import { slug } from "github-slugger";
 import siteMetadata from "@/data/siteMetadata";
 import { contentClusters } from "@/data/content-clusters.mjs";
 import { writingThemeOf, writingThemes } from "@/data/writing-tiers.mjs";
+import { availableEditorialSeries, publishedSeriesParts } from "lib/editorial-navigation.mjs";
 import {
   isRustFailureAtlasLaunched,
   rustFailureAreas,
@@ -28,6 +29,17 @@ export default function sitemap(): MetadataRoute.Sitemap {
     return latest === undefined ? undefined : new Date(latest);
   };
   const latestBlogModification = latestModified(publishedWriting);
+  const editorialSeriesRoutes: MetadataRoute.Sitemap = availableEditorialSeries(publishedBlogs).map(
+    (series) => {
+      const lastModified = latestModified(publishedSeriesParts(series, publishedBlogs));
+      return {
+        url: `${siteUrl}/blog/series/${series.slug}`,
+        ...(lastModified ? { lastModified } : {}),
+        changeFrequency: "weekly",
+        priority: 0.7,
+      };
+    }
+  );
   const latestNotesModification = latestModified(publishedNotes);
   const latestRustModification = latestModified([
     ...publishedWriting.filter((post) => post.cluster === "rust-under-the-hood"),
@@ -229,6 +241,7 @@ export default function sitemap(): MetadataRoute.Sitemap {
   return [
     ...staticPages,
     ...themeRoutes,
+    ...editorialSeriesRoutes,
     ...clusterRoutes,
     ...rustFailureRoutes,
     ...blogRoutes,
