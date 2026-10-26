@@ -33,7 +33,11 @@ for (const article of manifest.articles) {
   assert.equal(data.draft, false);
   assert.equal(data.reviewed, true);
   assert.equal(data.reviewedHash, articleReviewHash(source), article.slug);
-  const post = { ...parsePublicationFrontmatter(source), slug: article.slug, path: `/blog/${article.slug}` };
+  const post = {
+    ...parsePublicationFrontmatter(source),
+    slug: article.slug,
+    path: `/blog/${article.slug}`,
+  };
   posts.push(post);
   assert.equal(post.date, article.publish_at);
   const boundary = new Date(post.date).getTime();
@@ -67,19 +71,36 @@ for (const article of manifest.articles) {
 
 // Exercise the same due-path detector used by the hourly deployment workflow.
 const days = new Map();
-for (const post of posts) days.set(post.date.slice(0, 10), (days.get(post.date.slice(0, 10)) || 0) + 1);
-assert.deepEqual([...days], [
-  ["2026-10-26", 2], ["2026-10-27", 1], ["2026-10-28", 1],
-  ["2026-10-29", 1], ["2026-10-30", 1], ["2026-10-31", 1], ["2026-11-01", 1],
-]);
+for (const post of posts)
+  days.set(post.date.slice(0, 10), (days.get(post.date.slice(0, 10)) || 0) + 1);
+assert.deepEqual(
+  [...days],
+  [
+    ["2026-10-26", 2],
+    ["2026-10-27", 1],
+    ["2026-10-28", 1],
+    ["2026-10-29", 1],
+    ["2026-10-30", 1],
+    ["2026-10-31", 1],
+    ["2026-11-01", 1],
+  ]
+);
 const live = [];
 for (const post of posts) {
   const xml = `<urlset>${live.map((path) => `<url><loc>https://www.mehdi.cz${path}</loc></url>`).join("")}</urlset>`;
   const boundary = new Date(post.date).getTime();
   assert.deepEqual(missingDuePublications(posts, xml, new Date(boundary - 1)), []);
-  assert.deepEqual(missingDuePublications(posts, xml, new Date(boundary)).map((item) => item.slug), [post.slug]);
+  assert.deepEqual(
+    missingDuePublications(posts, xml, new Date(boundary)).map((item) => item.slug),
+    [post.slug]
+  );
   live.push(post.path);
-  const updated = xml.replace("</urlset>", `<url><loc>https://www.mehdi.cz${post.path}</loc></url></urlset>`);
+  const updated = xml.replace(
+    "</urlset>",
+    `<url><loc>https://www.mehdi.cz${post.path}</loc></url></urlset>`
+  );
   assert.deepEqual(missingDuePublications(posts, updated, new Date(boundary)), []);
 }
-console.log("Checked all eight publication boundaries: not due, due and missing, then present in the sitemap.");
+console.log(
+  "Checked all eight publication boundaries: not due, due and missing, then present in the sitemap."
+);

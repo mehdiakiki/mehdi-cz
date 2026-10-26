@@ -19,10 +19,7 @@ pub async fn create_invoice(
             } else {
                 "invalid_json"
             };
-            return (
-                error.status(),
-                Json(json!({"error": {"code": code}})),
-            );
+            return (error.status(), Json(json!({"error": {"code": code}})));
         }
     };
     if invoice.quantity == 0 {

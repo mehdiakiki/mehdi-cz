@@ -15,9 +15,11 @@ async fn expansion_accepts_old_writes_but_the_constraint_ends_that_compatibility
     old_insert(&pool, 2, "Old writer").await.unwrap();
     new_insert(&pool, 3, "New writer").await.unwrap();
     assert_eq!(new_update(&pool, 3, "Updated by new").await.unwrap(), 1);
-    let updated: (String, String) = sqlx::query_as(
-        "SELECT full_name, display_name FROM profiles WHERE id = 3"
-    ).fetch_one(&pool).await.unwrap();
+    let updated: (String, String) =
+        sqlx::query_as("SELECT full_name, display_name FROM profiles WHERE id = 3")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(updated, ("Updated by new".into(), "Updated by new".into()));
     backfill_range(&pool, 1, 3).await.unwrap();
     // An old writer can still change the authoritative column after a backfill.

@@ -27,7 +27,8 @@ pub async fn renew(pool: &PgPool, job: i64, epoch: i64) -> Result<bool, sqlx::Er
     .bind(epoch)
     .execute(pool)
     .await?
-    .rows_affected() == 1)
+    .rows_affected()
+        == 1)
 }
 // article:end renew
 

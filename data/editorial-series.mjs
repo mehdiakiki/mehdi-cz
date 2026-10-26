@@ -103,8 +103,10 @@ export const editorialSeries = [
   {
     slug: "rust-backend-in-practice",
     title: "Rust backend problems in practice",
-    description: "Follow failed requests, shutdowns, traces, migrations, sessions, uploads and job leases through small Rust examples.",
-    introduction: "Each article starts with a backend problem and checks a repair against an executable example. Read the problem you have now, then follow the related Rust and database articles when you need more detail.",
+    description:
+      "Follow failed requests, shutdowns, traces, migrations, sessions, uploads and job leases through small Rust examples.",
+    introduction:
+      "Each article starts with a backend problem and checks a repair against an executable example. Read the problem you have now, then follow the related Rust and database articles when you need more detail.",
     parts: [
       "axum-json-rejection-handler-never-ran",
       "axum-middleware-order-timeout-boundary",

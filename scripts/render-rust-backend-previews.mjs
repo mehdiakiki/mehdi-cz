@@ -43,7 +43,11 @@ function document(title, content) {
         element(
           "body",
           null,
-          element("p", null, "Private review copy; public visibility follows the approved release calendar."),
+          element(
+            "p",
+            null,
+            "Private review copy; public visibility follows the approved release calendar."
+          ),
           content
         )
       )
@@ -57,14 +61,23 @@ for (const article of manifest.articles) {
   assert.equal(post.draft, false);
   assert.equal(post.reviewed, true);
   const due = publicationStatus(post, now) === "published";
-  assert.equal(publicArticleHref(allBlogs, article.slug, now), due ? `/blog/${article.slug}` : null);
-  assert.equal(search.includes(article.slug), due, `Incorrect public search visibility: ${article.slug}`);
+  assert.equal(
+    publicArticleHref(allBlogs, article.slug, now),
+    due ? `/blog/${article.slug}` : null
+  );
+  assert.equal(
+    search.includes(article.slug),
+    due,
+    `Incorrect public search visibility: ${article.slug}`
+  );
   if (due) {
     const route = await readFile(`.next/server/app/blog/${article.slug}.html`, "utf8");
     assert.ok(route.includes(post.title.replaceAll("&", "&amp;")), article.slug);
     publicRoutes += 1;
   } else {
-    await assert.rejects(readFile(`.next/server/app/blog/${article.slug}.html`), { code: "ENOENT" });
+    await assert.rejects(readFile(`.next/server/app/blog/${article.slug}.html`), {
+      code: "ENOENT",
+    });
   }
   const body = renderToStaticMarkup(element(MDXLayoutRenderer, { code: post.body.code }));
   assert.ok(body.includes("<h2"), article.slug);

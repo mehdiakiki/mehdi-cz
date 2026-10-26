@@ -93,10 +93,14 @@ async fn oversized_json_keeps_the_endpoint_error_format() {
     // article:end bodylimit
     let body = format!(r#"{{"quantity":2,"padding":"{}"}}"#, "x".repeat(100));
     let response = app
-        .oneshot(Request::post("/invoices")
-            .header("content-type", "application/json")
-            .body(Body::from(body)).unwrap())
-        .await.unwrap();
+        .oneshot(
+            Request::post("/invoices")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
     assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     assert_eq!(response.headers()["content-type"], "application/json");
     let bytes = response.into_body().collect().await.unwrap().to_bytes();

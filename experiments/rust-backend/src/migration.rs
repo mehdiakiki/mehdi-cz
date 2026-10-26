@@ -22,12 +22,14 @@ pub async fn new_insert(pool: &PgPool, id: i32, name: &str) -> Result<(), sqlx::
 
 // article:start dualupdate
 pub async fn new_update(pool: &PgPool, id: i32, name: &str) -> Result<u64, sqlx::Error> {
-    Ok(sqlx::query("UPDATE profiles SET full_name = $2, display_name = $2 WHERE id = $1")
-        .bind(id)
-        .bind(name)
-        .execute(pool)
-        .await?
-        .rows_affected())
+    Ok(
+        sqlx::query("UPDATE profiles SET full_name = $2, display_name = $2 WHERE id = $1")
+            .bind(id)
+            .bind(name)
+            .execute(pool)
+            .await?
+            .rows_affected(),
+    )
 }
 // article:end dualupdate
 

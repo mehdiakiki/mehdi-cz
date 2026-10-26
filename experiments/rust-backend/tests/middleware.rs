@@ -36,9 +36,12 @@ async fn service_builder_runs_the_first_added_layer_first() {
         let start = tokio::time::Instant::now();
         let response = builder_router()
             .oneshot(request.body(Body::empty()).unwrap())
-            .await.unwrap();
+            .await
+            .unwrap();
         assert_eq!(response.status(), 504);
         assert_eq!(start.elapsed().as_millis(), 10);
     }
-    println!("ServiceBuilder: first layer is the outer deadline; accepted/rejected=504 at virtual_ms=10");
+    println!(
+        "ServiceBuilder: first layer is the outer deadline; accepted/rejected=504 at virtual_ms=10"
+    );
 }
