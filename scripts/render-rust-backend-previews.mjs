@@ -85,10 +85,13 @@ const index = element(
   element(
     "ol",
     null,
-    ...records.map((record) => element(
-      "li", { key: record.slug },
-      element("a", { href: `${record.slug}.html` }, record.title)
-    ))
+    ...records.map((record) =>
+      element(
+        "li",
+        { key: record.slug },
+        element("a", { href: `${record.slug}.html` }, record.title)
+      )
+    )
   )
 );
 await writeFile(`${output}/index.html`, document(manifest.series_name, index));

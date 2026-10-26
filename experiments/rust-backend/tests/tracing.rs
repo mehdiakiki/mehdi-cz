@@ -1,4 +1,5 @@
 use axum::{body::Body, extract::State, http::Request, routing::get, Router};
+use http_body_util::BodyExt;
 use rust_backend_labs::{database, discard};
 use sqlx::PgPool;
 use std::sync::{Arc, Mutex};
@@ -97,6 +98,8 @@ fn a_spawned_database_lookup_needs_its_request_span() {
                     .await
                     .unwrap();
                 assert_eq!(response.status(), 200);
+                let body = response.into_body().collect().await.unwrap().to_bytes();
+                assert_eq!(&body[..], b"42");
             }
             discard(pool, "backend_tracing").await;
         });

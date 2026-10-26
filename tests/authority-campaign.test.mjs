@@ -24,7 +24,10 @@ const sqlRustSeries = JSON.parse(
 );
 
 const rustBackendSeries = JSON.parse(
-  readFileSync(new URL("../docs/editorial/rust-backend-eight-2026-10-26.json", import.meta.url), "utf8")
+  readFileSync(
+    new URL("../docs/editorial/rust-backend-eight-2026-10-26.json", import.meta.url),
+    "utf8"
+  )
 );
 
 test("markdown word count ignores fenced code and inline markup", () => {
