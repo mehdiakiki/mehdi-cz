@@ -16,6 +16,9 @@ const records = [];
 const sqlSeries = JSON.parse(
   await readFile("docs/editorial/sql-rust-proposed-series-2026-10-25.json", "utf8")
 );
+const backendSeries = JSON.parse(
+  await readFile("docs/editorial/rust-backend-eight-2026-10-26.json", "utf8")
+);
 const reviewSeries = editorialSeries;
 await mkdir(output, { recursive: true });
 
@@ -89,7 +92,7 @@ for (const series of reviewSeries) {
     });
   }
 }
-assert.equal(records.length, 30 + sqlSeries.articles.length);
+assert.equal(records.length, 30 + sqlSeries.articles.length + backendSeries.articles.length);
 await writeFile(
   path.join(output, "index.json"),
   JSON.stringify({ generatedAt: now.toISOString(), articles: records }, null, 2) + "\n"
