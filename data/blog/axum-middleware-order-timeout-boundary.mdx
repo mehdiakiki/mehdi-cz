@@ -1,0 +1,93 @@
+---
+title: "Axum Middleware Order Changes What Your Timeout Covers"
+date: "2026-10-26T10:00:00Z"
+tags: ["rust", "axum", "tower", "timeouts"]
+draft: true
+reviewed: false
+cluster: "rust-under-the-hood"
+campaign: "editorial"
+summary: "Use a controlled authentication delay to see how Axum layer order changes a timeout boundary. Check both authorized and rejected requests."
+---
+
+A request takes twenty milliseconds to check its identity. The handler itself returns immediately. There is a ten millisecond timeout in the application.
+
+Should the response be a success or a timeout?
+
+You need to know where the timer sits. Seeing a timeout layer in the source is not enough to answer the question.
+
+This article uses a deliberately slow authentication stand-in and a tiny report endpoint. There is no external identity provider. The delay exists so we can see the boundary clearly. Do not copy the fixture's bearer string as an authentication system.
+
+## Draw the outside before reading the chain
+
+With successive calls to `Router::layer`, a later layer wraps the earlier router. Axum explains this in its [middleware ordering guide](https://docs.rs/axum/0.8.9/axum/middleware/index.html#ordering).
+
+Here are the two arrangements used in the lab:
+
+```rust
+pub fn router(auth_is_outside: bool) -> Router {
+    let app = Router::new().route("/report", get(|| async { "report" }));
+    if auth_is_outside {
+        app.layer(middleware::from_fn(deadline))
+            .layer(middleware::from_fn(slow_auth))
+    } else {
+        app.layer(middleware::from_fn(slow_auth))
+            .layer(middleware::from_fn(deadline))
+    }
+}
+```
+
+In the first arrangement the request enters authentication, then enters the deadline, then reaches the report. Time spent in authentication is outside this deadline.
+
+In the second it enters the deadline first. The timer includes authentication and the report handler.
+
+That is the whole difference. Both chains contain authentication. Reordering these layers does not give an unauthorized request permission to run the report. It changes which response can win when the identity lookup is slow.
+
+Write that request path next to the configuration during review. Names such as `auth_layer` and `timeout_layer` do not show whether the intended budget surrounds both operations.
+
+## A timeout with a visible response
+
+The example uses Axum middleware built on Tower's layer mechanism. The deadline implementation is short:
+
+```rust
+pub async fn deadline(request: Request, next: Next) -> Response {
+    match tokio::time::timeout(Duration::from_millis(10), next.run(request)).await {
+        Ok(response) => response,
+        Err(_) => axum::http::StatusCode::GATEWAY_TIMEOUT.into_response(),
+    }
+}
+```
+
+The ten millisecond value belongs to the experiment. It is intentionally shorter than the fake authentication check. It is not a recommended production deadline.
+
+The middleware converts an elapsed timer into a 504 response. That is a policy chosen for this service. A deployment may use another documented response, depending on what timed out and what sits in front of the application. Keep that decision explicit so an SDK does not turn every timeout into an automatic retry of a write.
+
+This timer also ends when `next.run` returns a response. A streaming body can continue afterwards. If the requirement is a deadline for the complete body, this function does not establish it. Measure and limit that stage separately.
+
+## Let a virtual clock settle the argument
+
+The test runs with Tokio's paused clock. The authentication stand-in waits for twenty virtual milliseconds. It then accepts one fixed fixture credential or rejects the request. The report adds no delay.
+
+| Outside layer | Credential | Status | Virtual time |
+| --- | --- | ---: | ---: |
+| Authentication | accepted | 200 | 20 ms |
+| Deadline | accepted | 504 | 10 ms |
+| Authentication | rejected | 401 | 20 ms |
+| Deadline | rejected | 504 | 10 ms |
+
+Both status and elapsed virtual time are asserted in `tests/middleware.rs` in [the lab](https://github.com/mehdiakiki/mehdi-cz/tree/editorial/rust-backend-eight-drafts-2026-10-26/experiments/rust-backend). This is an ordering experiment, not a latency benchmark. There is no claim that an identity lookup normally takes twenty milliseconds.
+
+The rejected-request rows are useful. A team may expect every invalid credential to produce 401, then wonder why slow identity checks produce 504. The outer deadline can expire before authentication has a result to return.
+
+The accepted-request rows show a second mistake. A ten millisecond handler timeout can coexist with a twenty millisecond request. The service has bounded one part of the request while leaving another part outside that bound.
+
+## Choose the promise, then choose the order
+
+For a total request admission budget, put the relevant work inside the outer deadline. Authentication clients may also need their own smaller timeout so one dependency does not consume everything.
+
+For a handler-only budget, say so in the configuration and the measurements. Record authentication time separately. The [Tokio runtime article](/blog/tokio-main-deep-dive) explains where asynchronous work is polled, but the runtime does not decide which application stages your timer surrounds.
+
+Queueing creates another boundary. If a request waits before reaching this router, neither arrangement includes that earlier wait. A proxy, a concurrency gate, or a database pool can each add time in a different place.
+
+Finally, dropping a timed-out future is not a rollback protocol. A database transaction may need an observed outcome, and a remote service may already have accepted a request. Keep this ordering test separate from the question of whether it is safe to repeat the operation.
+
+Before adding more layers, keep these four requests in CI. They are small enough to explain to the next engineer, and they make the intended nesting visible when the builder chain changes.

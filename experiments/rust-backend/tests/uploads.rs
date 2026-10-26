@@ -8,7 +8,12 @@ async fn durable_cleanup_survives_a_dropped_request_without_deleting_ready_files
     sqlx::query("CREATE TABLE attachments (id bigint PRIMARY KEY REFERENCES uploads(id), object_key text NOT NULL)").execute(&pool).await.unwrap();
     for id in [1_i64, 2, 3] {
         let key = format!("generated-{id}");
-        sqlx::query("INSERT INTO uploads VALUES ($1, $2, 'stored')").bind(id).bind(&key).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO uploads VALUES ($1, $2, 'stored')")
+            .bind(id)
+            .bind(&key)
+            .execute(&pool)
+            .await
+            .unwrap();
         std::fs::write(directory.path().join(key), b"fixture bytes").unwrap();
     }
     assert!(cancel(&pool, 1).await.unwrap());
@@ -27,7 +32,10 @@ async fn durable_cleanup_survives_a_dropped_request_without_deleting_ready_files
     std::fs::remove_file(directory.path().join("generated-3")).unwrap();
     assert!(cleanup(&pool, directory.path(), 3).await.unwrap());
     assert!(!publish(&pool, 3).await.unwrap());
-    let visible: Vec<i64> = sqlx::query_scalar("SELECT id FROM attachments ORDER BY id").fetch_all(&pool).await.unwrap();
+    let visible: Vec<i64> = sqlx::query_scalar("SELECT id FROM attachments ORDER BY id")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
     assert_eq!(visible, vec![2]);
     println!("cancelled file removed; ready file retained; repeated delete recovered; visible attachments=[2]");
     discard(pool, "backend_uploads").await;

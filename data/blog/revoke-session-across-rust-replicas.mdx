@@ -1,0 +1,90 @@
+---
+title: "Revoke a Session Across Two Rust Replicas"
+date: "2026-10-26T10:00:00Z"
+tags: ["rust", "authentication", "sessions", "postgresql"]
+draft: true
+reviewed: false
+cluster: "rust-under-the-hood"
+campaign: "editorial"
+summary: "Use two independent PostgreSQL pools and Axum routers to check session revocation. Distinguish later requests from work authorized before logout."
+---
+
+Logout works when one server handles every request. Add a second replica, and the same session still works there.
+
+The browser did not necessarily keep an old cookie. The second process may simply have kept its own answer to the question “is this session valid?”
+
+For a small service, checking one shared session store on each protected request is a useful starting point. It costs a lookup. It also gives revocation a much clearer meaning than an unbounded positive cache in every replica.
+
+The lab uses two separate PostgreSQL pools and two Axum router instances. Both can accept the same synthetic bearer session. After one pool commits revocation, later checks through both routers must reject it.
+
+## A session is something the server can stop accepting
+
+The example table contains a token hash, user ID, expiry, and optional revocation time. The token used by the test is a fixed synthetic string. It is not a suggested way to generate production session tokens.
+
+Production identifiers need an unpredictable value from a suitable secure generator. They should not expose the user's identity or permissions in their text. OWASP's [session management guidance](https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html) covers token generation, server-side invalidation, and the wider session lifecycle.
+
+Here the store keeps a SHA-256 verifier of the token rather than the presented token itself. That choice does not excuse logging the raw token or exposing it to another service. A high-entropy session secret and a user's password are different inputs with different storage requirements.
+
+The request check is small:
+
+```rust
+pub async fn session_user(pool: &PgPool, token: &str) -> Result<Option<i64>, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT user_id FROM sessions
+         WHERE token_hash = $1 AND revoked_at IS NULL
+         AND expires_at > clock_timestamp()",
+    )
+    .bind(verifier(token))
+    .fetch_optional(pool)
+    .await
+}
+```
+
+The service asks the shared database whether this session is still accepted now. It does not trust a user ID supplied beside the token. Further authorization still needs to decide what the resolved user can do to the requested resource.
+
+## Use separate pools in the test
+
+If both router instances share the same in-memory session map, the test has already removed the failure we want to investigate. They need independent application state with a shared durable source of truth.
+
+The fixture creates two pools with separate connections to the same test schema. A protected account route reads a bearer session from the authorization header. It returns 200 for an accepted session, 401 for a rejected session, and 503 when the database lookup itself fails.
+
+The store's revocation operation is:
+
+```rust
+pub async fn revoke(pool: &PgPool, token: &str) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE sessions SET revoked_at = clock_timestamp()
+         WHERE token_hash = $1 AND revoked_at IS NULL",
+    )
+    .bind(verifier(token))
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+```
+
+The driver invokes this operation through pool A. It then sends new account requests through both routers. Both must return 401 after the update has committed. It also checks that an unknown session is not accepted and that repeating revocation is harmless.
+
+The complete setup is in `tests/sessions.rs` in [the lab](https://github.com/mehdiakiki/mehdi-cz/tree/editorial/rust-backend-eight-drafts-2026-10-26/experiments/rust-backend). This is an experiment about session acceptance across independent service states. It is not a complete password-login implementation.
+
+The [OAuth refresh article](/blog/preventing-an-oauth-token-refresh-stampede) deals with several workers trying to refresh one provider token. Revoking a login session is a different problem. Sharing a token-refresh lock does not make every replica stop accepting a revoked application session.
+
+## Logout does not travel backwards
+
+A request can pass its session check just before another request commits logout. That first request already holds the resolved user identity.
+
+The fixture records this boundary directly. It resolves the session, commits revocation, then confirms that the previously obtained identity still exists in the caller's local value. Later lookups reject the token. The old value is not magically erased.
+
+Whether an admitted operation may finish is a product and security decision. For a sensitive write, checking current authority close to the committed effect may be necessary. Some designs use an authorization version or a transaction which coordinates the relevant state. Simply repeating the same check at the start of the HTTP handler does not remove every race.
+
+A read replica introduces another question. If session checks read a lagging replica, a successful logout on the primary may not be visible there immediately. This lab checks the primary. It does not measure replication delay or establish immediate revocation through a distributed cache.
+
+## Keep caching a measured tradeoff
+
+Once the service has a measured reason to cache session acceptance, define the maximum stale interval and what invalidation failure means. A message saying “remove this session” can be missed. Expiry bounds the consequence only if the cached entry really expires and is not silently extended.
+
+An unavailable session store should have a deliberate response. The fixture returns a service-unavailable response for a lookup error, rather than treating it as a valid session. Operational failure and invalid credentials are useful to distinguish in restricted diagnostics.
+
+For browser sessions, cookie settings, CSRF protection, token rotation, and logout responses need additional work. The fixture uses an explicit bearer header so it can keep those transport details outside this question. Do not treat its account route as a complete browser authentication system.
+
+Before adding a cache, keep the two-replica case in CI. It gives “logout succeeded” an observable meaning: a committed revocation changes the decision made by each later request path which relies on this store.

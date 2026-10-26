@@ -1,0 +1,113 @@
+---
+title: "A PostgreSQL Job Lease Expired. The Old Rust Worker Kept Running."
+date: "2026-10-26T10:00:00Z"
+tags: ["rust", "postgresql", "background jobs", "concurrency"]
+draft: true
+reviewed: false
+cluster: "rust-under-the-hood"
+campaign: "editorial"
+summary: "Force a stale-worker history with SQLx and PostgreSQL. Check the current lease generation in the same statement that commits the local business effect."
+---
+
+Worker A claims a job and starts calculating a result. It stops making progress for a while. Its lease expires, so worker B claims the same job.
+
+Then A wakes up.
+
+The lease did not stop its process. It only changed what the shared store considers current ownership. Unless the write path checks that ownership, both workers can still try to apply a result.
+
+This lab uses Rust, SQLx, and one PostgreSQL database. It forces that history without waiting for a random scheduling pause. The protected effect is a row in the same database as the job. An external email or payment is a different boundary.
+
+## A claim needs a generation
+
+Each job has an owner, lease deadline, state, and monotonically increasing epoch. The epoch is the generation of the claim. A successful takeover gets a newer number.
+
+The claim operation returns that number to the worker:
+
+```rust
+pub async fn claim(pool: &PgPool, job: i64, owner: &str) -> Result<Option<i64>, sqlx::Error> {
+    sqlx::query_scalar(
+        "UPDATE jobs SET owner = $2, epoch = epoch + 1,
+             lease_until = clock_timestamp() + interval '1 minute', state = 'running'
+         WHERE id = $1 AND state <> 'done'
+             AND (lease_until IS NULL OR lease_until <= clock_timestamp())
+         RETURNING epoch",
+    )
+    .bind(job)
+    .bind(owner)
+    .fetch_optional(pool)
+    .await
+}
+```
+
+The worker keeps the returned epoch with the job's input. It must not replace it by reading whatever epoch is current just before writing. Doing that would let old work borrow a newer worker's authority.
+
+The owner name is useful for diagnostics. It is not enough as a generation: one process can restart with the same name, or reclaim a job later. The pair of a stable job identity and a fresh claim generation distinguishes those attempts.
+
+This code assumes trusted workers using the job store. An epoch is not a secret authentication credential. Restrict which services can claim jobs and write results; do not expose this operation as an unrestricted user endpoint.
+
+The [durable PostgreSQL work article](/blog/sql-postgresql-rust-listen-notify-durable-work) explains recovering pending work after a listener reconnects. Discovering a job is one question. Preventing an old owner from applying its result is another.
+
+## Check ownership where the effect commits
+
+A worker might read the current epoch, find that it matches, then perform a separate write. Another worker can take over between that check and that write.
+
+The fixture instead combines the acceptance check and the local effect in one SQL statement:
+
+```rust
+pub async fn finish(pool: &PgPool, job: i64, epoch: i64, value: &str) -> Result<u64, sqlx::Error> {
+    Ok(sqlx::query(
+        "WITH accepted AS (
+             UPDATE jobs SET state = 'done'
+             WHERE id = $1 AND epoch = $2 AND state = 'running'
+                 AND lease_until > clock_timestamp()
+             RETURNING id
+         )
+         INSERT INTO effects (job_id, value)
+         SELECT id, $3 FROM accepted
+         ON CONFLICT (job_id) DO UPDATE SET value = EXCLUDED.value",
+    )
+    .bind(job)
+    .bind(epoch)
+    .bind(value)
+    .execute(pool)
+    .await?
+    .rows_affected())
+}
+```
+
+Only an accepted job row feeds the insert. If the epoch is stale, the lease has expired, or the job is already done, the statement inserts no effect. The Rust caller receives the affected row count and treats zero as a refused completion.
+
+PostgreSQL documents [conditional updates and RETURNING](https://www.postgresql.org/docs/18/sql-update.html), as well as [data-modifying statements in WITH](https://www.postgresql.org/docs/18/queries-with.html#QUERIES-WITH-MODIFYING). The application decision is to make this particular check and business effect share that database boundary.
+
+The epoch must keep increasing for the same job identity. Deleting and recreating a job with a reset generation can make an old token look current again. Use a new identity for a genuinely new job, and preserve the generation's meaning through maintenance operations.
+
+## Force the late worker to arrive
+
+The test does not sleep until a one-minute lease happens to expire. It moves the fixture's lease deadline into the past, then runs the next steps in a chosen order.
+
+| Step | Assertion |
+| --- | --- |
+| A claims the pending job | receives epoch 1 |
+| B tries before expiry | no claim |
+| A tries to finish after forced expiry | zero affected rows |
+| B claims the expired job | receives epoch 2 |
+| A tries with epoch 1 while B owns it | zero affected rows |
+| B finishes with epoch 2 | one affected row |
+| A returns after B's completion | zero affected rows |
+| B repeats its completion | zero affected rows |
+
+The final stored value must be `from B`. That last read matters. A test which checked only the successful worker's return value could miss a late overwrite.
+
+This is a deterministic ordering of competing operations, not a benchmark of simultaneous worker throughput. It exercises the dangerous history against real PostgreSQL statements. The full fixture lives in [the lab](https://github.com/mehdiakiki/mehdi-cz/tree/editorial/rust-backend-eight-drafts-2026-10-26/experiments/rust-backend).
+
+## Be precise about what the fence protects
+
+The generation check is often called a fencing check. Here it fences one committed database effect. It does not stop old computation, release a stuck thread, or cancel a request which another service has already received.
+
+If the job sends an email before calling `finish`, this SQL cannot take that email back. Put a durable delivery intent behind the accepted database transition, then give delivery its own idempotency and uncertain-outcome handling. If the remote resource supports a generation or conditional write, check the exact guarantee it provides.
+
+Lease renewal belongs to the current generation too. A renewal which matches only the job ID can accidentally extend a newer owner's claim on behalf of an old worker. Apply the same ownership condition to renewals and decide what the worker does when renewal is refused.
+
+Long work may also need checkpoints. Those writes need the same protection if a stale worker could otherwise publish obsolete progress. Protecting only the final result leaves other mutation paths open.
+
+The lease helps the system recover when an owner disappears. The conditional effect makes a returning old owner harmless for this database operation. Keep both ideas visible in the implementation, because neither one performs the other's job.

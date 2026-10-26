@@ -23,6 +23,10 @@ const sqlRustSeries = JSON.parse(
   )
 );
 
+const rustBackendSeries = JSON.parse(
+  readFileSync(new URL("../docs/editorial/rust-backend-eight-2026-10-26.json", import.meta.url), "utf8")
+);
+
 test("markdown word count ignores fenced code and inline markup", () => {
   assert.equal(markdownWordCount("One **clear** model.\n\n```rust\nlet hidden = true;\n```"), 3);
 });
@@ -222,6 +226,7 @@ test("the repository maps every written campaign source without counting unrelat
     report.unrelatedClusteredPosts.map((post) => post.slug).sort(),
     [
       ...sqlRustSeries.articles.map((article) => article.slug),
+      ...rustBackendSeries.articles.map((article) => article.slug),
       "BufReader-rust",
       "a-filename-became-a-shell-command",
       "a-record-and-replay-harness-for-agent-tests",

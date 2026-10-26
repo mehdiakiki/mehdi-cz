@@ -9,7 +9,10 @@ pub async fn claim(pool: &PgPool, job: i64, owner: &str) -> Result<Option<i64>, 
              AND (lease_until IS NULL OR lease_until <= clock_timestamp())
          RETURNING epoch",
     )
-    .bind(job).bind(owner).fetch_optional(pool).await
+    .bind(job)
+    .bind(owner)
+    .fetch_optional(pool)
+    .await
 }
 // article:end claim
 
@@ -26,6 +29,11 @@ pub async fn finish(pool: &PgPool, job: i64, epoch: i64, value: &str) -> Result<
          SELECT id, $3 FROM accepted
          ON CONFLICT (job_id) DO UPDATE SET value = EXCLUDED.value",
     )
-    .bind(job).bind(epoch).bind(value).execute(pool).await?.rows_affected())
+    .bind(job)
+    .bind(epoch)
+    .bind(value)
+    .execute(pool)
+    .await?
+    .rows_affected())
 }
 // article:end finish

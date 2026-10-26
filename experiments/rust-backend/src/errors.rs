@@ -26,6 +26,9 @@ pub async fn create_invoice(
             Json(json!({"error": {"code": "invalid_quantity"}})),
         );
     }
-    (StatusCode::CREATED, Json(json!({"quantity": invoice.quantity})))
+    (
+        StatusCode::CREATED,
+        Json(json!({"quantity": invoice.quantity})),
+    )
 }
 // article:end rejection

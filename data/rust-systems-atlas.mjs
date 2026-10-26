@@ -9,6 +9,15 @@ export const rustSystemsAtlasGoal = {
 };
 
 export const rustSystemsAtlasEditorialSections = {
+  "axum-json-rejection-handler-never-ran": "async-concurrency",
+  "axum-middleware-order-timeout-boundary": "async-concurrency",
+  "rust-sigterm-drain-inflight-requests": "async-concurrency",
+  "tokio-spawn-loses-request-tracing-span": "async-concurrency",
+  "postgresql-column-migration-two-rust-versions": "async-concurrency",
+  "revoke-session-across-rust-replicas": "async-concurrency",
+  "interrupted-upload-needs-durable-cleanup": "async-concurrency",
+  "postgresql-job-lease-stale-rust-worker": "async-concurrency",
+
   "BufReader-rust": "types-memory-unsafe",
   "where-a-type-becomes-a-layout-fields-padding-and-reordering": "types-memory-unsafe",
   "two-ways-to-make-a-type-disappear-erasure-and-monomorphization": "compiler-internals",

@@ -1,0 +1,76 @@
+---
+title: "Why a Spawned Tokio Task Lost the Request Span"
+date: "2026-10-26T10:00:00Z"
+tags: ["rust", "tokio", "tracing", "sqlx"]
+draft: true
+reviewed: false
+cluster: "rust-under-the-hood"
+campaign: "editorial"
+summary: "Follow an Axum request into a spawned SQLx lookup. Capture the missing span parent, then carry it explicitly with tracing::Instrument."
+---
+
+The HTTP request has a request identifier. The database lookup logs its result. Both events appear in the log viewer, but the database work is no longer grouped under the request.
+
+Searching by time is a poor repair. Several requests can run the same query in the same millisecond.
+
+The missing piece may be the spawn boundary. Starting another Tokio task does not automatically make every event in that task a child of the caller's current tracing span.
+
+The lab sends an HTTP request through an Axum router. Its handler starts a Tokio task which runs `SELECT 42` through SQLx. A small subscriber captures the span ancestry of the event produced after the query. PostgreSQL really runs the query; no canned database result is returned by the test.
+
+## Keep the broken case small
+
+The request future is instrumented with an `http.request` span and a synthetic request identifier. The handler then constructs the database work as an asynchronous block.
+
+There are two ways to spawn that same work:
+
+```rust
+let task = if state.carry_span {
+    tokio::spawn(work.in_current_span())
+} else {
+    tokio::spawn(work)
+};
+task.await.unwrap()
+```
+
+The flag exists only to put the broken and repaired paths next to each other in the test. There is no reason to make this a runtime option in an application.
+
+With plain spawn, the captured database event has no request ancestor. With `in_current_span`, its ancestry contains `http.request`. The SQL result is 42 in both cases, and both HTTP requests succeed. A status-only test would miss the observability regression entirely.
+
+The [Instrument documentation](https://docs.rs/tracing/0.1.41/tracing/trait.Instrument.html) describes how the span is entered when the future is polled. That is the relevant unit in asynchronous code: one logical operation can be polled many times, with other operations running between those polls.
+
+## Do not hold an entered span across await
+
+There is another easy-looking approach: call `span.enter()`, keep the guard in a local variable, then await the query.
+
+The problem is the guard's scope. While that future is suspended, other work can run on the thread. A thread-local entered span is not a reliable description of which logical request that other work belongs to.
+
+Instrumenting the future follows its polling lifetime instead. The same distinction explains several other async problems in [the Rust async investigation](/blog/how-async-rust-works-under-the-hood): source-code scope, task lifetime, and time spent on a runtime thread are different things.
+
+The lab deliberately uses a current-thread runtime so its capture subscriber stays local to the test. That is a test arrangement, not advice to make a production service single threaded. Install the production subscriber at application startup and test the actual runtime configuration as well.
+
+## Capture a relationship, not just a message
+
+The test subscriber records two things from the database event: its fixed stage name and the names of its ancestor spans. It ignores unrelated framework events.
+
+This produces a small check:
+
+| Spawn path | HTTP status | Database result | Request ancestors |
+| --- | ---: | ---: | --- |
+| plain spawn | 200 | 42 | empty |
+| instrumented spawn | 200 | 42 | http.request |
+
+The assertions compare that relationship directly. They do not search for the request identifier somewhere in a large text log, where a second unrelated message could make the test pass.
+
+The complete capture layer is in `tests/tracing.rs` in [the lab](https://github.com/mehdiakiki/mehdi-cz/tree/editorial/rust-backend-eight-drafts-2026-10-26/experiments/rust-backend). It uses tracing-subscriber's event scope to inspect ancestry. There is no collector process or trace backend in this fixture.
+
+That limit is useful to keep clear. This demonstrates propagation inside one Rust process. It does not configure OpenTelemetry export, prove sampling behaviour, or carry W3C trace headers into another service. Those are additional boundaries, each with its own integration test.
+
+## One parent is not always the right model
+
+A task created to finish one request can often carry that request's span. A long-running shared worker is different. Keeping the span from its first caller forever would associate later jobs with the wrong request.
+
+Carry context with each command when the worker processes many requests. Create an operation span for that command and end it when the command finishes. If one batch combines many independent operations, inspect whether links are more appropriate than pretending the batch has one parent.
+
+Also choose the fields deliberately. A synthetic request ID is enough for this test. A production trace should not capture bearer tokens, complete documents, or unrestricted SQL values simply because a function argument implements Debug. Review attributes added by instrumentation macros as carefully as ordinary log statements.
+
+This is a good regression to keep beside a refactor which adds spawning. The application can keep returning correct answers while losing the relationships needed to explain a slow or failed request. Make that loss observable before the next incident requires the trace.
