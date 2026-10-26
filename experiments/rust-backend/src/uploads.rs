@@ -26,6 +26,7 @@ pub async fn publish(pool: &PgPool, id: i64) -> Result<bool, sqlx::Error> {
 }
 // article:end publish
 
+// article:start cancel
 pub async fn cancel(pool: &PgPool, id: i64) -> Result<bool, sqlx::Error> {
     Ok(
         sqlx::query("UPDATE uploads SET state = 'cleanup' WHERE id = $1 AND state = 'stored'")
@@ -36,6 +37,7 @@ pub async fn cancel(pool: &PgPool, id: i64) -> Result<bool, sqlx::Error> {
             == 1,
     )
 }
+// article:end cancel
 
 // article:start cleanup
 pub async fn cleanup(

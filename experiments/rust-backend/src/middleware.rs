@@ -42,3 +42,15 @@ pub fn router(auth_is_outside: bool) -> Router {
     }
 }
 // article:end order
+
+// article:start builder
+pub fn builder_router() -> Router {
+    Router::new()
+        .route("/report", get(|| async { "report" }))
+        .layer(
+            tower::ServiceBuilder::new()
+                .layer(middleware::from_fn(deadline))
+                .layer(middleware::from_fn(slow_auth)),
+        )
+}
+// article:end builder

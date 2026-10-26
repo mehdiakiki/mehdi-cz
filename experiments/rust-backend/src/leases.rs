@@ -16,6 +16,21 @@ pub async fn claim(pool: &PgPool, job: i64, owner: &str) -> Result<Option<i64>, 
 }
 // article:end claim
 
+// article:start renew
+pub async fn renew(pool: &PgPool, job: i64, epoch: i64) -> Result<bool, sqlx::Error> {
+    Ok(sqlx::query(
+        "UPDATE jobs SET lease_until = clock_timestamp() + interval '1 minute'
+         WHERE id = $1 AND epoch = $2 AND state = 'running'
+             AND lease_until > clock_timestamp()",
+    )
+    .bind(job)
+    .bind(epoch)
+    .execute(pool)
+    .await?
+    .rows_affected() == 1)
+}
+// article:end renew
+
 // article:start finish
 pub async fn finish(pool: &PgPool, job: i64, epoch: i64, value: &str) -> Result<u64, sqlx::Error> {
     Ok(sqlx::query(

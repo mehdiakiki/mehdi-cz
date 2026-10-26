@@ -14,9 +14,14 @@ pub async fn create_invoice(
     let Json(invoice) = match input {
         Ok(value) => value,
         Err(error) => {
+            let code = if error.status() == StatusCode::PAYLOAD_TOO_LARGE {
+                "body_too_large"
+            } else {
+                "invalid_json"
+            };
             return (
                 error.status(),
-                Json(json!({"error": {"code": "invalid_json"}})),
+                Json(json!({"error": {"code": code}})),
             );
         }
     };

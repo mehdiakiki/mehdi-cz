@@ -24,12 +24,16 @@ async fn an_expired_worker_cannot_overwrite_the_new_owner() {
     .await
     .unwrap();
     assert_eq!(finish(&pool, 1, old, "expired").await.unwrap(), 0);
+    assert!(!renew(&pool, 1, old).await.unwrap());
     let new = claim(&pool, 1, "B").await.unwrap().unwrap();
     assert!(new > old);
+    assert!(!renew(&pool, 1, old).await.unwrap());
+    assert!(renew(&pool, 1, new).await.unwrap());
     assert_eq!(finish(&pool, 1, old, "stale").await.unwrap(), 0);
     assert_eq!(finish(&pool, 1, new, "from B").await.unwrap(), 1);
     assert_eq!(finish(&pool, 1, old, "late A").await.unwrap(), 0);
     assert_eq!(finish(&pool, 1, new, "duplicate B").await.unwrap(), 0);
+    assert!(!renew(&pool, 1, new).await.unwrap());
     let value: String = sqlx::query_scalar("SELECT value FROM effects WHERE job_id = 1")
         .fetch_one(&pool)
         .await

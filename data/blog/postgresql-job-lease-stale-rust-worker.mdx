@@ -81,6 +81,29 @@ PostgreSQL documents [conditional updates and RETURNING](https://www.postgresql.
 
 The epoch must keep increasing for the same job identity. Deleting and recreating a job with a reset generation can make an old token look current again. Use a new identity for a genuinely new job, and keep that rule when archiving or repairing jobs.
 
+## Renewal must keep the same ownership rule
+
+Long work may need to extend its lease. Match the epoch and require the lease to still be live:
+
+```rust
+pub async fn renew(pool: &PgPool, job: i64, epoch: i64) -> Result<bool, sqlx::Error> {
+    Ok(sqlx::query(
+        "UPDATE jobs SET lease_until = clock_timestamp() + interval '1 minute'
+         WHERE id = $1 AND epoch = $2 AND state = 'running'
+             AND lease_until > clock_timestamp()",
+    )
+    .bind(job)
+    .bind(epoch)
+    .execute(pool)
+    .await?
+    .rows_affected() == 1)
+}
+```
+
+A worker which missed its deadline cannot revive that old claim. It must stop using the old epoch. In the fixture, an expired claim cannot renew, an old epoch cannot renew B's claim, B can renew its own live claim, and a completed job cannot renew.
+
+Choose how often to renew from the job's actual behaviour. A minute is only the fixture value. A renewal failure also needs an explicit worker response; continuing as if renewal succeeded removes the value of the check.
+
 ## Force the late worker to arrive
 
 The test does not sleep until a one-minute lease happens to expire. It moves the fixture's lease deadline into the past, then runs the next steps in a chosen order.
@@ -106,7 +129,7 @@ The generation check is often called a fencing check. Here it fences one write c
 
 If the job sends an email before calling `finish`, this SQL cannot take that email back. Put a durable delivery intent behind the accepted database transition, then make delivery handle duplicates and check uncertain outcomes. If the remote resource supports a generation or conditional write, check the exact guarantee it provides.
 
-Lease renewal belongs to the current generation too. A renewal which matches only the job ID can accidentally extend a newer owner's claim on behalf of an old worker. Apply the same ownership condition to renewals and decide what the worker does when renewal is refused.
+The lease-time condition is checked while the database runs the update. It is not a guarantee that the transaction commits before that clock time. PostgreSQL keeps the update's [row lock until the transaction ends](https://www.postgresql.org/docs/18/explicit-locking.html#LOCKING-ROWS), so another claimant cannot simply replace that same row in the middle of the accepted update. Keep transactions short, and do not use the lease time as proof about an external system's clock.
 
 Long work may also need checkpoints. Those writes need the same protection if a stale worker could otherwise publish obsolete progress. Protecting only the final result leaves those other writes open.
 

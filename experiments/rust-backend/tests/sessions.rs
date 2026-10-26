@@ -83,6 +83,22 @@ async fn a_revoked_session_is_rejected_by_an_independent_replica() {
     assert_eq!(session_user(&b, "unknown-session").await.unwrap(), None);
     revoke(&a, token).await.unwrap();
     println!("before logout: A=200 B=200; after committed logout: A=401 B=401");
+    for (extra_token, expires) in [("expired-fixture", -3600.0_f64), ("other-fixture", 3600.0_f64)] {
+        sqlx::query("INSERT INTO sessions VALUES ($1, 8, clock_timestamp() + make_interval(secs => $2), NULL)")
+            .bind(verifier(extra_token)).bind(expires).execute(&a).await.unwrap();
+    }
+    let check = Router::new().route("/account", get(account)).with_state(b.clone());
+    for (extra_token, expected) in [("expired-fixture", 401), ("other-fixture", 200)] {
+        let response = check.clone().oneshot(Request::get("/account")
+            .header("authorization", format!("Bearer {extra_token}"))
+            .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), expected);
+    }
     b.close().await;
+    let response = check.oneshot(Request::get("/account")
+        .header("authorization", "Bearer other-fixture")
+        .body(Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    println!("expired=401; separate active session=200; closed session store=503");
     discard(a, "backend_sessions").await;
 }
