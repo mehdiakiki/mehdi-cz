@@ -1,10 +1,11 @@
-// Run only in GitHub CI after the production build. Draft HTML stays in an artifact.
+// Run only in GitHub CI after the production build. Review copies stay in an artifact.
 import assert from "node:assert/strict";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { MDXLayoutRenderer } from "pliny/mdx-components";
 import { allBlogs } from "../.contentlayer/generated/index.mjs";
+import { publicationStatus } from "../lib/publication.mjs";
 import { publicArticleHref } from "../lib/editorial-navigation.mjs";
 
 assert.equal(process.env.GITHUB_ACTIONS, "true", "Render through the existing GitHub workflow");
@@ -17,6 +18,8 @@ const search = await readFile("public/search.json", "utf8");
 await mkdir(output, { recursive: true });
 const element = React.createElement;
 const records = [];
+const now = new Date();
+let publicRoutes = 0;
 
 function document(title, content) {
   return (
@@ -40,7 +43,7 @@ function document(title, content) {
         element(
           "body",
           null,
-          element("p", null, "Private first draft; not approved for publication."),
+          element("p", null, "Private review copy; public visibility follows the approved release calendar."),
           content
         )
       )
@@ -51,11 +54,18 @@ function document(title, content) {
 for (const article of manifest.articles) {
   const post = bySlug.get(article.slug);
   assert.ok(post, `Missing compiled draft: ${article.slug}`);
-  assert.equal(post.draft, true);
-  assert.equal(post.reviewed, false);
-  assert.equal(publicArticleHref(allBlogs, article.slug), null);
-  assert.ok(!search.includes(article.slug), `Draft leaked into public search: ${article.slug}`);
-  await assert.rejects(readFile(`.next/server/app/blog/${article.slug}.html`), { code: "ENOENT" });
+  assert.equal(post.draft, false);
+  assert.equal(post.reviewed, true);
+  const due = publicationStatus(post, now) === "published";
+  assert.equal(publicArticleHref(allBlogs, article.slug, now), due ? `/blog/${article.slug}` : null);
+  assert.equal(search.includes(article.slug), due, `Incorrect public search visibility: ${article.slug}`);
+  if (due) {
+    const route = await readFile(`.next/server/app/blog/${article.slug}.html`, "utf8");
+    assert.ok(route.includes(post.title.replaceAll("&", "&amp;")), article.slug);
+    publicRoutes += 1;
+  } else {
+    await assert.rejects(readFile(`.next/server/app/blog/${article.slug}.html`), { code: "ENOENT" });
+  }
   const body = renderToStaticMarkup(element(MDXLayoutRenderer, { code: post.body.code }));
   assert.ok(body.includes("<h2"), article.slug);
   for (const [, target] of body.matchAll(/href="\/blog\/([^"#?]+)"/g)) {
@@ -64,7 +74,7 @@ for (const article of manifest.articles) {
   const content = element(
     React.Fragment,
     null,
-    element("a", { href: "index.html" }, "All eight drafts"),
+    element("a", { href: "index.html" }, "All eight articles"),
     element("h1", null, post.title),
     element("article", { dangerouslySetInnerHTML: { __html: body } })
   );
@@ -81,7 +91,7 @@ assert.equal(records.length, 8);
 const index = element(
   React.Fragment,
   null,
-  element("h1", null, "Rust backend problems: eight unpublished drafts"),
+  element("h1", null, "Rust backend problems: eight reviewed articles"),
   element(
     "ol",
     null,
@@ -97,8 +107,8 @@ const index = element(
 await writeFile(`${output}/index.html`, document(manifest.series_name, index));
 await writeFile(
   `${output}/index.json`,
-  JSON.stringify({ articles: records, publicRoutes: 0 }, null, 2)
+  JSON.stringify({ articles: records, publicRoutes }, null, 2)
 );
 console.log(
-  `Rendered ${records.length} private drafts; none has a production route or public search entry.`
+  `Rendered ${records.length} review copies; ${publicRoutes} due articles have production routes and search entries, and future articles stay private.`
 );

@@ -272,6 +272,8 @@ export const investigations = [
  */
 const articleSlugsByTheme = {
   layers: [
+    "axum-json-rejection-handler-never-ran",
+    "axum-middleware-order-timeout-boundary",
     "sql-postgresql-rust-service-transactions",
     "mysql-rust-stock-reservation-transaction",
     "sql-sqlite-rust-local-database",
@@ -335,6 +337,8 @@ const articleSlugsByTheme = {
     "the-readme-asked-for-a-different-job",
   ],
   "derived-state": [
+    "postgresql-column-migration-two-rust-versions",
+    "revoke-session-across-rust-replicas",
     "sql-postgresql-rust-row-snapshots",
     "sql-postgresql-rust-enum-migration-old-decoder",
     "mysql-mariadb-json-round-trip-rust",
@@ -367,6 +371,9 @@ const articleSlugsByTheme = {
     "the-next-agent-read-the-previous-jobs-files",
   ],
   "interrupted-execution": [
+    "rust-sigterm-drain-inflight-requests",
+    "interrupted-upload-needs-durable-cleanup",
+    "postgresql-job-lease-stale-rust-worker",
     "sql-postgresql-rust-retry-whole-transaction",
     "sql-postgresql-rust-listen-notify-durable-work",
     "mysql-rust-deadlock-order-bounded-retry",
@@ -394,6 +401,7 @@ const articleSlugsByTheme = {
     "the-timeout-ended-one-process-not-the-job",
   ],
   measurement: [
+    "tokio-spawn-loses-request-tracing-span",
     "sql-server-used-a-different-plan-for-the-same-query",
     "duckdb-parquet-projection-filter-plan-rust",
     "duckdb-memory-limit-scratch-rust",
