@@ -66,7 +66,7 @@ architecture identities before making deployment claims.
 
 The verification job checks publication holds, sole-author metadata and Rust excerpts
 against marked source. The production build compiles MDX. Private HTML review copies
-are uploaded in `editorial-rendered-previews/previews/sql-rust-followups`.
+are uploaded in the `editorial-rendered-previews` artifact under `sql-rust-followups`.
 The preview script also checks that no draft has a production route, search result,
 RSS item or sitemap entry, and that links to existing articles are publicly usable.
 

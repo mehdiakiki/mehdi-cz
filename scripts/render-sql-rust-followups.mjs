@@ -30,7 +30,7 @@ const document = (title, body) =>
         h(
           "style",
           null,
-          "body{max-width:76ch;margin:2rem auto;padding:1rem;font:18px/1.65 system-ui}pre{overflow:auto;background:#eee;padding:1rem;font-size:.85em}table{border-collapse:collapse}td,th{border:1px solid #bbb;padding:.4rem}"
+          "body{max-width:76ch;margin:2rem auto;padding:1rem;font:18px/1.65 system-ui}pre{overflow:auto;background:#eee;padding:1rem;font-size:.85em}table{border-collapse:collapse}td,th{border:1px solid #bbb;padding:.4rem}h2 svg,h3 svg{width:1em;height:1em}h2 a[aria-hidden],h3 a[aria-hidden]{display:none}"
         )
       ),
       h(
