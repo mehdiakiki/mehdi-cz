@@ -35,4 +35,5 @@ This block is written and re-added by `next dev` — verify at `node_modules/nex
 
 - The long-term ambition is to become one of the most visited Rust websites. The next traffic milestone is 1,000 per day; the author reported almost 200 per day on October 27, 2026. Keep comparisons on the same analytics metric.
 - Keep the established publication cadence and editorial review. Use traffic as feedback about reader needs while protecting the usefulness and human voice of each article.
+- Audience growth should also help interested readers find the author's engineering work and start relevant conversations about roles, projects, and collaboration. Track those opportunities alongside traffic.
 - The accepted direction and candidate follow-ups are in [the Rust editorial direction](docs/editorial/rust-reader-growth-direction-2026-10-27.md).

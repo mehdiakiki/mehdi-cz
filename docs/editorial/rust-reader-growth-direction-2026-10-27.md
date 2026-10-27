@@ -20,14 +20,14 @@ Before release, read the prose aloud and ask whether a person can follow the exp
 
 The first three themes receive the most attention. Keep the next thirty proposed articles rooted in established SQL databases and database internals. Every executable example in that series must be Rust, with SQL inside Rust query calls.
 
-| Priority | Theme | What the reader should gain |
-| --- | --- | --- |
-| 1 | Debugging across Rust and the database | Separate task scheduling, connection acquisition, database waits, and result handling using observable evidence. |
-| 2 | Cancellation and uncertain outcomes | Understand what the caller knows after a timeout or disconnect and how to recover safely. |
-| 3 | Memory budgets and backpressure | Trace retained data and slow consumers through the whole request or worker. |
-| 4 | Deliberate failure testing | Force the important interruption or execution order and check the resulting data. |
-| 5 | Build diagnosis and dependency costs | Find which input or dependency caused work and judge the cost of a proposed change. |
-| 6 | Rust inside existing systems | Diagnose native clients, deployment dependencies, encoding, and ownership across system boundaries. |
+| Priority | Theme                                  | What the reader should gain                                                                                      |
+| -------- | -------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| 1        | Debugging across Rust and the database | Separate task scheduling, connection acquisition, database waits, and result handling using observable evidence. |
+| 2        | Cancellation and uncertain outcomes    | Understand what the caller knows after a timeout or disconnect and how to recover safely.                        |
+| 3        | Memory budgets and backpressure        | Trace retained data and slow consumers through the whole request or worker.                                      |
+| 4        | Deliberate failure testing             | Force the important interruption or execution order and check the resulting data.                                |
+| 5        | Build diagnosis and dependency costs   | Find which input or dependency caused work and judge the cost of a proposed change.                              |
+| 6        | Rust inside existing systems           | Diagnose native clients, deployment dependencies, encoding, and ownership across system boundaries.              |
 
 The existing Rust atlas supplies the deeper explanations. Extend it with distinct investigations and improve an existing article when it already answers the question.
 
@@ -86,3 +86,9 @@ Use a trailing 28-day daily average on the same traffic metric to judge progress
 Review equally aged article groups after at least 28 days, allowing for reporting delay. Follow the existing [growth experiment](../../data/rust-atlas-growth-experiments.mjs) when its cohorts and decision rule apply. For the new themes, track search clicks to each article and visits to a relevant follow-up article. Read questions and corrections from readers to find explanations that need more work.
 
 Use those findings to choose the next investigation and improve existing answers. Keep the human reader's understanding as the standard for the prose.
+
+## Opportunities from readership
+
+Help readers who want to know more about the author find relevant engineering work and get in touch. Rust articles should offer a clear route to the compiler case study. A reader with a question or correction should feel welcome to ask it. Offer RSS for people who want to follow future writing in a feed reader.
+
+Review the number of relevant conversations about roles, projects, and collaboration alongside traffic. Work and contact clicks show interest; the author can judge which enquiries become useful opportunities. Keep the articles complete and helpful on their own.
