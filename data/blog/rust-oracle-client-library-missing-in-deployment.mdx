@@ -1,0 +1,75 @@
+---
+title: "Your Rust Binary Built, but Oracle Client Is Missing in Deployment"
+date: "2026-10-27"
+tags: ["rust", "oracle", "deployment", "ffi"]
+authors: ["default"]
+draft: true
+reviewed: false
+cluster: "rust-under-the-hood"
+campaign: "editorial"
+summary: "Use a client-only initialization probe to separate an Oracle library loading failure from database authentication. Check architecture, loader paths, and the deployment artifact."
+---
+
+A Rust program compiles successfully. It reaches `main` in its deployment image. Its first Oracle operation then reports `DPI-1047: Cannot locate an Oracle Client library`.
+
+That error does not tell you that the database password is wrong. It says the process could not load a required native client library. The missing file might be the client itself or one of the shared libraries it needs.
+
+The `oracle` crate used here is pinned to 0.6.3. Its database calls pass through ODPI-C to Oracle Client. Building the Rust program and loading Oracle Client are separate steps. A successful compile is therefore incomplete evidence about the deployment image.
+
+This article starts with a probe that makes no database connection. It helps identify the loading boundary before introducing DNS, TLS, credentials, and server compatibility. It builds on [adding Rust to an Oracle system](/blog/adding-rust-to-a-system-that-already-uses-oracle), which covers the broader integration contract.
+
+## Initialize the client before asking for a connection
+
+The small probe prints the target operating system, architecture, and pointer width, then explicitly initializes Oracle Client:
+
+```rust
+fn probe() -> oracle::Result<bool> {
+    println!("os={} arch={} pointer_bits={}",
+        std::env::consts::OS, std::env::consts::ARCH, usize::BITS);
+    oracle::InitParams::new().init()
+}
+```
+
+Run the probe in a fresh process inside the actual deployment environment. It contains no credentials and never calls `Connection::connect`. A loading error is therefore isolated from authentication.
+
+The [InitParams documentation](https://docs.rs/oracle/0.6.3/oracle/struct.InitParams.html) explains that client initialization happens once per process. It can also happen implicitly when another crate operation needs the client. Changing initialization settings after that point does not reconfigure an already loaded client. Restart the process when testing a different setup.
+
+The complete `oracle_client_probe.rs` fixture also offers a negative mode. It expects initialization to fail with `DPI-1047`. Finding an installed client makes that negative check fail, as does receiving an unrelated initialization error. This prevents an arbitrary failed probe from being recorded as the intended missing-library case.
+
+The existing enterprise CI job compiles the probe and runs that negative mode on its Linux runner. It does not install Oracle Client, connect to Oracle Database, or verify a repaired client installation. The successful loading path remains a deployment check requiring the actual native distribution.
+
+## Follow the error into the loader
+
+Start with the artifact you shipped. Record its operating system, CPU architecture, pointer width, Rust target, crate version, and the image identity. Compare those with the Oracle Client distribution placed in the runtime image.
+
+A build stage can contain files which the final runtime stage does not copy. A developer's machine can also find a client through an environment setting which the service never receives. Inspect the environment of the deployed process, not just an interactive login shell.
+
+On Linux, the dynamic loader must also resolve the client's native dependencies. A client shared object can exist and still fail to load because one of its dependencies is absent or incompatible. The directory listing alone does not settle that question.
+
+Oracle documents the supported client distributions, search behaviour, and native dependencies in the [ODPI-C installation guide](https://oracle.github.io/odpi/doc/installation.html). Use the guidance for the selected client and platform. Do not copy a library-path recipe from another operating system and assume that it has the same effect.
+
+For Linux services, configure the loader search path or loader configuration before process startup. `oracle_client_lib_dir` is not a general replacement for resolving all dependent libraries. A path supplied to the Rust initializer does not manufacture an absent dependency or make a client of the wrong architecture usable.
+
+The [dynamic loader article](/blog/how-the-dynamic-loader-finds-a-shared-library) explains this lower boundary. The Rust dependency graph and the operating system's shared-library graph describe different parts of the running program.
+
+## Verify a repair in the final environment
+
+Install a supported Oracle Client distribution and its documented system dependencies into the final runtime environment. Use a trusted package or distribution source and record the exact version. Keep architecture and operating system compatibility explicit.
+
+Then start a new probe process through the same service entrypoint and runtime identity as the application. If it initializes successfully, you have established that this process can load a client. You have not yet established that it can reach the database.
+
+Follow with a connection check using the deployment's normal secret delivery and network settings. Keep passwords and complete connection strings out of logs. Record the client version, server version, TLS or wallet configuration, and the result of a small read-only query suitable for that system.
+
+Only after those checks should you test the application's write and rollback paths. A client can load successfully while authentication, service naming, wallet access, or server compatibility still fails. Each later failure needs its own evidence.
+
+Avoid changing several layers at once. If you replace the client distribution, image base, connection string, and credentials together, a successful retry will not explain which change fixed the problem. Keep a record of the original error and change one relevant input before repeating the probe.
+
+## Keep the evidence narrower than the claim
+
+The probe source is in [the enterprise client lab](https://github.com/mehdiakiki/mehdi-cz/tree/main/experiments/sql-rust/sqlserver-oracle-db2). Its negative test checks a missing-client loading failure in the CI environment. Compilation checks Rust API use. Neither result proves that an arbitrary production image contains a working Oracle Client.
+
+A complete deployment record needs the actual operating system image, CPU architecture, client package identity, Rust lockfile, and server compatibility result. Without the native package, the repaired path remains unverified. That is a useful boundary to preserve in a review: the code can be ready while a deployment requirement still needs evidence.
+
+For a synchronous driver, also choose where database calls run in an async service and how many may run at once. Fixing the loader will not prevent blocking calls from occupying runtime threads. That scheduling decision belongs beside connection and memory budgets in the application design.
+
+The practical sequence is small: establish that the program starts, establish that the client loads, establish that a connection works, then test the application's transaction behaviour. Keeping those observations separate turns a vague deployment failure into a specific missing requirement.

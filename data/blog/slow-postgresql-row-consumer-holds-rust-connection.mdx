@@ -1,0 +1,92 @@
+---
+title: "A Slow PostgreSQL Row Consumer Keeps a Rust Connection Busy"
+date: "2026-10-27"
+tags: ["rust", "postgresql", "sqlx", "backpressure"]
+authors: ["default"]
+draft: true
+reviewed: false
+cluster: "rust-under-the-hood"
+campaign: "editorial"
+summary: "Pause a SQLx row consumer and check what remains occupied. Compare streaming, collecting rows, and cancellation without treating a row stream as a process memory limit."
+---
+
+Streaming a database result often removes a large vector from a Rust handler. That can be useful. It also changes how long the handler needs its connection.
+
+Imagine an export endpoint. PostgreSQL produces rows, Rust encodes them, and an HTTP client downloads the result slowly. If the same task reads a row and waits for the client before reading another, the database stream can remain open for the whole download. A small number of slow clients can occupy the pool even when each query is cheap.
+
+The important budget is wider than the number of rows in a vector. It includes checked-out connections, retained row data, encoder output, queued bytes, and the time each resource remains occupied.
+
+This lab isolates the connection part. It uses PostgreSQL 18 and SQLx 0.8.6, a pool with one connection, and a consumer paused by a channel. It has no HTTP server. The channel represents the point where a downstream write could wait. The complete fixture is `pg_slow_rows.rs` in [the PostgreSQL lab](https://github.com/mehdiakiki/mehdi-cz/tree/main/experiments/sql-rust/postgres-sqlite).
+
+## Stop after one decoded row
+
+The producer query returns 32 rows. Each contains an integer and a fixed 1,024-character ASCII payload. The consumer reads one row, reports that boundary, and waits for permission to continue:
+
+```rust
+async fn consume(
+    pool: PgPool,
+    first: oneshot::Sender<()>,
+    resume: oneshot::Receiver<()>,
+    seen: Arc<AtomicUsize>,
+) -> Result<()> {
+    let mut connection = pool.acquire().await?;
+    let mut rows = sqlx::query(
+        "SELECT i, repeat('x', 1024) AS payload FROM generate_series(1, 32) AS i",
+    ).fetch(&mut *connection);
+    let row = rows.try_next().await?.ok_or("missing first row")?;
+    assert_eq!(row.try_get::<i32, _>("i")?, 1);
+    assert_eq!(row.try_get::<String, _>("payload")?.len(), 1024);
+    seen.fetch_add(1, Ordering::SeqCst);
+    first.send(()).map_err(|_| "observer left")?;
+    resume.await?;
+    while let Some(row) = rows.try_next().await? {
+        assert_eq!(row.try_get::<String, _>("payload")?.len(), 1024);
+        seen.fetch_add(1, Ordering::SeqCst);
+    }
+    Ok(())
+}
+```
+
+While the task is paused, the observer checks that its counter is one and tries to acquire the pool's only connection. That acquisition must time out. Releasing the gate lets the consumer finish all 32 rows. A later borrower must execute a fresh query successfully.
+
+The explicit connection variable makes ownership easy to see. The stream borrows it. Both remain in the task while the gate is pending. PostgreSQL may already have produced the whole small result and sent it into buffers; that does not release this Rust handle.
+
+SQLx's [Pool documentation](https://docs.rs/sqlx/0.8.6/sqlx/struct.Pool.html) explains the capacity used by checked-out handles. The [query implementation](https://docs.rs/sqlx-core/0.8.6/sqlx_core/query/struct.Query.html) distinguishes fetching a stream from collecting the result. Neither interface can choose your endpoint's connection budget for you.
+
+This test demonstrates a connection held by a paused consumer. It does not establish that the server is blocked on a socket write, how many bytes SQLx buffered, or the process's peak memory. Those require separate observations and a larger, controlled workload.
+
+## Collecting moves the cost
+
+The comparison uses `fetch_all` on the same one-connection pool. It retains all 32 decoded rows in a vector. While that vector still exists, another borrower must acquire the connection and run a different query.
+
+That is the tradeoff: a collected result can stop occupying the connection while the application continues to own its rows. Streaming can avoid collecting every decoded row at once, while keeping the connection tied to the consumer's progress.
+
+Neither result says to always collect or always stream. A bounded page of small rows may be cheap to collect. An export containing millions of rows needs another design. Start with the maximum result size and expected consumer speed, not the API name.
+
+Also inspect the query plan. An SQL sort or aggregate can need substantial server work before the first output row is available. A Rust stream does not imply that every database operator produces one row at a time. PostgreSQL's [EXPLAIN guide](https://www.postgresql.org/docs/18/using-explain.html) shows how plan nodes describe that work.
+
+If the main symptom is pool waiting, separate it from database execution before changing the result API. A connection can be retained by code after a fast query has finished. Logging only SQL duration misses that ownership interval.
+
+## Bound bytes at each waiting point
+
+A channel bounded to ten messages does not necessarily hold ten kilobytes. One message could contain a short identifier or a large document. For a row export, count the payload and encoded bytes that can be retained at each stage.
+
+The payload in this fixture is fixed so the assertions are simple. Real row widths vary. A text column, byte array, or JSON value can dominate memory even when the row count stays small. Set maximum value or page sizes when the product can support them. Where large values are required, account for the buffers that hold them.
+
+Moving the stream into a background task does not end the wait. An unbounded channel lets that task read ahead and move the retained data into the queue. A bounded channel eventually makes it wait again, often while it still owns the connection.
+
+For long exports, consider a dedicated connection budget or a background export file with bounded storage and cleanup. For interactive results, bounded pages can release connections between requests. Those choices change consistency: pages can observe changing data unless the design fixes a snapshot or defines a stable cutoff. Specify the product's promise before replacing a transaction with pagination.
+
+The [SQLite worker article](/blog/sql-sqlite-rust-tokio-bounded-database-worker) explores a related ownership boundary. Its engine and worker model differ, but the same question is useful: what resource does the worker retain while the consumer is slow?
+
+## Cancellation must leave a usable next borrower
+
+The fixture repeats the pause and aborts the consumer task. It awaits the task's cancellation, then requires a fresh acquisition and `SELECT 99` to succeed within a bounded time.
+
+Checking that the task ended would be incomplete. The next borrower is the user-visible recovery condition. SQLx may need to drain protocol state or replace a connection as part of reuse. The assertion deliberately promises only that a usable connection becomes available, not that the same backend is retained.
+
+This is a read-only query. Cancellation during a write or commit raises an additional question about persisted data; dropping a task is not proof of rollback. The [PostgreSQL transaction examples](/blog/sql-postgresql-rust-service-transactions) show why the data boundary needs its own assertions.
+
+In an HTTP endpoint, also establish that a client disconnect actually cancels the producer. A detached task can keep consuming rows after the request disappears. Trace request completion, producer completion, and connection release as separate events.
+
+Streaming is useful when its ownership costs fit the workload. Measure connection occupancy alongside memory and latency. A smaller vector is a real improvement only if the resulting connection lifetime also fits the service's capacity.

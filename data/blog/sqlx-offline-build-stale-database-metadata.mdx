@@ -1,0 +1,81 @@
+---
+title: "A SQLx Offline Build Can Pass With Stale Database Metadata"
+date: "2026-10-27"
+tags: ["rust", "sqlx", "postgresql", "builds"]
+authors: ["default"]
+draft: true
+reviewed: false
+cluster: "rust-under-the-hood"
+campaign: "editorial"
+summary: "Change a PostgreSQL column from integer to bigint and compare offline compilation, runtime decoding, and a live macro check against the changed schema."
+---
+
+A Rust build passes in offline mode. The deployment then fails when it reads a database column. Both results can be correct: the build checked one description of the query result, while the database returned another.
+
+SQLx query macros can use saved metadata from a `.sqlx` directory. That lets the compiler check queries without contacting the database. It also makes that directory a build input whose relationship to the schema must be maintained.
+
+The distinction matters when a database migration changes a column without changing the SQL string. A metadata file can still match the query text while describing an older result type.
+
+This reproduction uses SQLx 0.8.6 and PostgreSQL 18. It changes an `integer` primary key to `bigint`. The stored value remains 7, so the test cannot be explained by a large number exceeding an integer range. The failure comes from the type contract.
+
+## One query, two descriptions
+
+The example crate has one macro and one explicit Rust type:
+
+```rust
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let pool = sqlx::PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
+    let record = sqlx::query!("SELECT id FROM metadata_items").fetch_one(&pool).await?;
+    let id: i32 = record.id;
+    assert_eq!(id, 7);
+    pool.close().await;
+    Ok(())
+}
+```
+
+With the initial schema, PostgreSQL describes `id` as its four-byte integer type. SQLx maps that to Rust's `i32`. The explicit assignment agrees with the macro's generated record, and the program expects the value 7.
+
+The baseline live compilation writes metadata using `SQLX_OFFLINE_DIR`. The trial then runs the program offline against the initial database. This checks that the source and saved description work before introducing the migration.
+
+The driver changes the column to `bigint`, PostgreSQL's eight-byte integer type. It does not change the query or the Rust assignment.
+
+The [SQLx 0.8.6 query macro documentation](https://docs.rs/sqlx/0.8.6/sqlx/macro.query.html#offline-mode) explains saved query descriptions. The [PostgreSQL type mappings](https://docs.rs/sqlx-postgres/0.8.6/sqlx_postgres/types/index.html) show the corresponding Rust types. A cached description of an integer remains a description of an integer even after a separate database has changed.
+
+## Check three different boundaries
+
+The trial forces the macro crate to rebuild at each stage. Reusing a previously compiled binary would not demonstrate an offline macro check after the migration.
+
+| Stage after the migration | Assertion |
+| --- | --- |
+| Offline compilation with the old description | Compilation succeeds |
+| Running that program against the changed table | Decoding fails with `ColumnDecode` and `INT8` in the error |
+| Live compilation against the changed table | The explicit `i32` assignment fails because the macro now produces `i64` |
+
+The live expansion also writes a different metadata description. The trial compares its bytes with the baseline file. The SQL text stayed the same; the description changed because the result type changed.
+
+The program does not automatically accept `bigint` merely because 7 fits into `i32`. SQLx checks the database type used for decoding. This is useful: small development data should not conceal a schema mismatch until a larger production value arrives.
+
+These assertions live in `pg_metadata_trial.rs`, which drives the separate [offline metadata crate](https://github.com/mehdiakiki/mehdi-cz/tree/main/experiments/sql-rust/offline-metadata). The driver launches Cargo only inside GitHub CI. It uses a fresh schema and captures the expected compiler and runtime failures. Those failures must match the intended diagnostics; an arbitrary failed command does not count as a successful experiment.
+
+## Give each CI check a clear job
+
+Use an offline build to verify that the committed source can compile with the committed metadata. Use a disposable database at the intended schema version to verify that the descriptions still match the database.
+
+The [SQLx CLI 0.8.6 documentation](https://github.com/launchbadge/sqlx/blob/v0.8.6/sqlx-cli/README.md#enable-building-in-offline-mode-with-query) describes `cargo sqlx prepare --check` for detecting stale metadata. Run it against the schema and query features you intend to support. Include targets or features that hide additional queries; a default build cannot inspect code excluded by configuration.
+
+This lab uses live macro compilation and metadata comparison rather than installing the CLI. The live check exposes this concrete type mismatch. It is not a substitute for exercising the project's full preparation procedure, migrations, feature matrix, and schema permissions in CI.
+
+Set `SQLX_OFFLINE=true` when you need an explicitly offline build. Otherwise, a present `DATABASE_URL` can cause a build to contact the database. Record which mode ran so a successful build has an interpretable meaning.
+
+Treat metadata regeneration as a reviewable change. If a migration changes result types or nullability, inspect the changed description and the application code together. Do not regenerate the cache simply to make a warning disappear.
+
+## A current description still has limits
+
+Compile-time query checking does not prove that a migration is safe for old application replicas. If a rolling deployment leaves an old binary reading the table, the database and both application versions must remain compatible during that overlap.
+
+For this column change, decide how the application will handle `i64`, existing APIs, serialized values, and any later range conversion. An explicit checked conversion can express a product limit. An unchecked cast can lose information. The [PostgreSQL enum migration article](/blog/sql-postgresql-rust-enum-migration-old-decoder) shows another case where the old decoder matters after a schema change.
+
+Metadata also does not prove authorization, transaction isolation, lock behaviour, or query cost. A type-correct query can still wait indefinitely for a lock or scan far more rows than expected. Keep those checks near the behaviour they establish.
+
+When a build's result seems inconsistent with production, record its actual inputs: source revision, lockfile, features, metadata, and schema used for live checks. The [Cargo rebuild investigation](/blog/why-did-cargo-rebuild-this-crate-fingerprints-and-dirty-reasons) uses the same habit at a different boundary. A successful check becomes useful evidence when you can say exactly what it checked.
