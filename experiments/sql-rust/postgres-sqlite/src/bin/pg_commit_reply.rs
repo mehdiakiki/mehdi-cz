@@ -1,7 +1,14 @@
 use sql_rust_postgres_sqlite::{pg::Fixture, Result};
-use sqlx::{postgres::{PgConnectOptions, PgSslMode}, Connection, PgConnection, PgPool};
+use sqlx::{
+    postgres::{PgConnectOptions, PgSslMode},
+    Connection, PgConnection, PgPool,
+};
 use std::{str::FromStr, time::Duration};
-use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::{TcpListener, TcpStream}, time::timeout};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
+    time::timeout,
+};
 
 // article:start apply
 async fn apply(connection: &mut PgConnection, key: &str, amount: i32) -> Result<i32> {
@@ -9,16 +16,26 @@ async fn apply(connection: &mut PgConnection, key: &str, amount: i32) -> Result<
     let inserted = sqlx::query(
         "INSERT INTO operations (key, amount) VALUES ($1, $2)
          ON CONFLICT (key) DO NOTHING",
-    ).bind(key).bind(amount).execute(&mut *tx).await?.rows_affected();
+    )
+    .bind(key)
+    .bind(amount)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
     let recorded: i32 = sqlx::query_scalar("SELECT amount FROM operations WHERE key = $1")
-        .bind(key).fetch_one(&mut *tx).await?;
+        .bind(key)
+        .fetch_one(&mut *tx)
+        .await?;
     if recorded != amount {
         tx.rollback().await?;
         return Err("operation key was reused with a different amount".into());
     }
     if inserted == 1 {
         let changed = sqlx::query("UPDATE account SET balance = balance + $1 WHERE id = 1")
-            .bind(amount).execute(&mut *tx).await?.rows_affected();
+            .bind(amount)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
         if changed != 1 {
             tx.rollback().await?;
             return Err("account missing".into());
@@ -36,7 +53,9 @@ async fn lose_commit_reply(listener: TcpListener, options: PgConnectOptions) -> 
     let (mut server_in, mut server_out) = server.into_split();
     let upstream = async {
         tokio::io::copy(&mut client_in, &mut server_out).await?;
-        Err::<(), Box<dyn std::error::Error + Send + Sync>>("client closed before COMMIT reply".into())
+        Err::<(), Box<dyn std::error::Error + Send + Sync>>(
+            "client closed before COMMIT reply".into(),
+        )
     };
     let downstream = async {
         loop {
@@ -64,29 +83,42 @@ async fn lose_commit_reply(listener: TcpListener, options: PgConnectOptions) -> 
 
 async fn state(pool: &PgPool) -> Result<(i32, i64)> {
     let balance = sqlx::query_scalar("SELECT balance FROM account WHERE id = 1")
-        .fetch_one(pool).await?;
+        .fetch_one(pool)
+        .await?;
     let count = sqlx::query_scalar("SELECT count(*) FROM operations")
-        .fetch_one(pool).await?;
+        .fetch_one(pool)
+        .await?;
     Ok((balance, count))
 }
 async fn check(fixture: &Fixture) -> Result<()> {
-    sqlx::raw_sql("CREATE TABLE account(id integer PRIMARY KEY, balance integer NOT NULL);
+    sqlx::raw_sql(
+        "CREATE TABLE account(id integer PRIMARY KEY, balance integer NOT NULL);
         INSERT INTO account VALUES (1, 0);
-        CREATE TABLE operations(key text PRIMARY KEY, amount integer NOT NULL CHECK(amount > 0))")
-        .execute(&fixture.pool).await?;
+        CREATE TABLE operations(key text PRIMARY KEY, amount integer NOT NULL CHECK(amount > 0))",
+    )
+    .execute(&fixture.pool)
+    .await?;
     let mut direct = fixture.pool.acquire().await?;
     // A known rejection before commit is a different test from a lost commit reply.
     assert!(apply(&mut direct, "bad", -1).await.is_err());
     assert_eq!(state(&fixture.pool).await?, (0, 0));
     // Force a session to end with uncommitted changes, then inspect from another connection.
     let mut interrupted = PgConnection::connect(&std::env::var("SQL_RUST_PG_URL")?).await?;
-    sqlx::query(&format!("SET search_path TO {}", fixture.schema)).execute(&mut interrupted).await?;
+    sqlx::query(&format!("SET search_path TO {}", fixture.schema))
+        .execute(&mut interrupted)
+        .await?;
     let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
-        .fetch_one(&mut interrupted).await?;
+        .fetch_one(&mut interrupted)
+        .await?;
     sqlx::raw_sql("BEGIN; UPDATE account SET balance = 99 WHERE id = 1")
-        .execute(&mut interrupted).await?;
-    assert!(sqlx::query_scalar::<_, bool>("SELECT pg_terminate_backend($1, 2000)")
-        .bind(pid).fetch_one(&fixture.pool).await?);
+        .execute(&mut interrupted)
+        .await?;
+    assert!(
+        sqlx::query_scalar::<_, bool>("SELECT pg_terminate_backend($1, 2000)")
+            .bind(pid)
+            .fetch_one(&fixture.pool)
+            .await?
+    );
     drop(interrupted);
     assert_eq!(state(&fixture.pool).await?, (0, 0));
 
@@ -97,7 +129,9 @@ async fn check(fixture: &Fixture) -> Result<()> {
     let proxy_options = options.clone();
     let proxy = tokio::spawn(lose_commit_reply(listener, proxy_options));
     let mut client = PgConnection::connect_with(&options.host("127.0.0.1").port(port)).await?;
-    sqlx::query(&format!("SET search_path TO {}", fixture.schema)).execute(&mut client).await?;
+    sqlx::query(&format!("SET search_path TO {}", fixture.schema))
+        .execute(&mut client)
+        .await?;
     let error = apply(&mut client, "payment-17", 30).await.unwrap_err();
     proxy.await??;
     println!("Proxy consumed COMMIT CommandComplete; caller received error: {error}");
@@ -117,6 +151,10 @@ async fn run() -> Result<()> {
     fixture.finish(result).await
 }
 #[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<()> { timeout(Duration::from_secs(25), run()).await? }
+async fn main() -> Result<()> {
+    timeout(Duration::from_secs(25), run()).await?
+}
 #[tokio::test]
-async fn integration() -> Result<()> { timeout(Duration::from_secs(25), run()).await? }
+async fn integration() -> Result<()> {
+    timeout(Duration::from_secs(25), run()).await?
+}

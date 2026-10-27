@@ -40,7 +40,8 @@ same source bytes to make Cargo re-expand the macro. Baseline live expansion wri
 metadata, and the baseline offline program must run successfully.
 
 After an integer-to-bigint migration, a stale offline check must still compile.
-Running it must fail with ColumnDecode/INT8. A live check must fail specifically
+The value 7 must still run after migration. Changing it to 2,147,483,648 must fail
+with ColumnDecode/TryFromIntError. A live check must fail specifically
 with an i32/i64 mismatch and write different metadata. Neither an arbitrary command
 failure nor a previously compiled executable satisfies the check.
 

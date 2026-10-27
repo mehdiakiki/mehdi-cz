@@ -3,7 +3,9 @@ use std::{path::Path, process::Command};
 
 fn cargo(project: &Path, url: &str, offline: bool, action: &str) -> Result<std::process::Output> {
     let mut command = Command::new("cargo");
-    command.current_dir(project).args([action, "--locked"])
+    command
+        .current_dir(project)
+        .args([action, "--locked"])
         .env("DATABASE_URL", url)
         .env("SQLX_OFFLINE", if offline { "true" } else { "false" })
         .env("SQLX_OFFLINE_DIR", project.join(".sqlx"));
@@ -35,20 +37,26 @@ async fn run() -> Result<()> {
             .execute(&fixture.pool).await?;
         let stale = cargo(&project, &url, true, "check")?;
         assert!(stale.status.success(), "stale offline metadata still describes int4");
+        let small = cargo(&project, &url, true, "run")?;
+        assert!(small.status.success(), "small bigint still decodes: {}", String::from_utf8_lossy(&small.stderr));
+        sqlx::query("UPDATE metadata_items SET id = 2147483648")
+            .execute(&fixture.pool).await?;
         let runtime = cargo(&project, &url, true, "run")?;
         assert!(!runtime.status.success());
         let runtime_error = String::from_utf8_lossy(&runtime.stderr);
-        assert!(runtime_error.contains("ColumnDecode") && runtime_error.contains("INT8"), "{runtime_error}");
+        assert!(runtime_error.contains("ColumnDecode") && runtime_error.contains("TryFromIntError"), "{runtime_error}");
         let live = cargo(&project, &url, false, "check")?;
         assert!(!live.status.success());
         let live_error = String::from_utf8_lossy(&live.stderr);
         assert!(live_error.contains("expected `i32`, found `i64`"), "{live_error}");
         assert_ne!(cached, std::fs::read(metadata[0].path())?);
-        println!("int4 baseline ran; after bigint migration stale offline check passed, stale executable failed with ColumnDecode/INT8, live check failed with i32/i64 and refreshed metadata differed.");
+        println!("int4 baseline ran; after bigint migration stale offline check passed, small bigint still decoded, value 2147483648 failed with ColumnDecode/TryFromIntError, live check failed with i32/i64 and refreshed metadata differed.");
         println!("Runtime failure: {runtime_error}\nLive compile failure: {live_error}");
         Ok(())
     }.await;
     fixture.finish(outcome).await
 }
 #[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<()> { run().await }
+async fn main() -> Result<()> {
+    run().await
+}

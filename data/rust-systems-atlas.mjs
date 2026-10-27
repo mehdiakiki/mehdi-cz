@@ -9,6 +9,11 @@ export const rustSystemsAtlasGoal = {
 };
 
 export const rustSystemsAtlasEditorialSections = {
+  "rust-request-waiting-for-pool-or-postgresql": "async-concurrency",
+  "postgresql-commit-reply-lost-rust": "async-concurrency",
+  "slow-postgresql-row-consumer-holds-rust-connection": "async-concurrency",
+  "sqlx-offline-build-stale-database-metadata": "cargo-build-linking",
+  "rust-oracle-client-library-missing-in-deployment": "ffi-targets",
   "axum-json-rejection-handler-never-ran": "async-concurrency",
   "axum-middleware-order-timeout-boundary": "async-concurrency",
   "rust-sigterm-drain-inflight-requests": "async-concurrency",

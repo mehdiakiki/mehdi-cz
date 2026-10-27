@@ -272,6 +272,9 @@ export const investigations = [
  */
 const articleSlugsByTheme = {
   layers: [
+    "rust-request-waiting-for-pool-or-postgresql",
+    "slow-postgresql-row-consumer-holds-rust-connection",
+    "rust-oracle-client-library-missing-in-deployment",
     "axum-json-rejection-handler-never-ran",
     "axum-middleware-order-timeout-boundary",
     "sql-postgresql-rust-service-transactions",
@@ -337,6 +340,7 @@ const articleSlugsByTheme = {
     "the-readme-asked-for-a-different-job",
   ],
   "derived-state": [
+    "sqlx-offline-build-stale-database-metadata",
     "postgresql-column-migration-two-rust-versions",
     "revoke-session-across-rust-replicas",
     "sql-postgresql-rust-row-snapshots",
@@ -371,6 +375,7 @@ const articleSlugsByTheme = {
     "the-next-agent-read-the-previous-jobs-files",
   ],
   "interrupted-execution": [
+    "postgresql-commit-reply-lost-rust",
     "rust-sigterm-drain-inflight-requests",
     "interrupted-upload-needs-durable-cleanup",
     "postgresql-job-lease-stale-rust-worker",
