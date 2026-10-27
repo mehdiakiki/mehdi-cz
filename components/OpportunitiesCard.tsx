@@ -1,5 +1,6 @@
 import Link from "@/components/Link";
 import { getContentCluster, type ContentClusterSlug } from "@/data/content-clusters.mjs";
+import siteMetadata from "@/data/siteMetadata";
 import type { RelatedWritingItem } from "lib/related-writing.mjs";
 
 type InvestigationContext = {
@@ -124,7 +125,7 @@ const OpportunitiesCard = ({
         />
       )}
 
-      {cluster ? (
+      {cluster && (
         <div className="rounded-lg bg-gray-50 p-6 dark:bg-gray-900">
           <p className="text-primary-600 dark:text-primary-400 text-sm font-semibold tracking-[0.14em] uppercase">
             Series
@@ -143,70 +144,60 @@ const OpportunitiesCard = ({
           <p className="mt-3 max-w-3xl leading-7 text-gray-600 dark:text-gray-300">
             {cluster.description}
           </p>
-          <div className="mt-5 flex flex-wrap gap-5">
-            <Link
-              href={cluster.cta.primary.href}
-              className="text-primary-700 hover:text-primary-800 dark:text-primary-400 dark:hover:text-primary-300 font-semibold"
-              data-umami-event="article-professional-cta"
-              data-umami-event-source={currentSlug || "article"}
-              data-umami-event-cluster={cluster.slug}
-              data-umami-event-destination={cluster.cta.primary.href}
-            >
-              {cluster.cta.primary.label} &rarr;
-            </Link>
-            <Link
-              href={cluster.cta.secondary.href}
-              className="text-primary-700 hover:text-primary-800 dark:text-primary-400 dark:hover:text-primary-300 font-semibold"
-              data-umami-event="article-professional-cta"
-              data-umami-event-source={currentSlug || "article"}
-              data-umami-event-cluster={cluster.slug}
-              data-umami-event-destination={cluster.cta.secondary.href}
-            >
-              {cluster.cta.secondary.label} &rarr;
-            </Link>
-          </div>
-        </div>
-      ) : (
-        <div>
-          <p className="text-primary-600 dark:text-primary-400 text-sm font-semibold tracking-wide uppercase">
-            About the author
-          </p>
-          <p className="mt-3 max-w-2xl leading-7 text-gray-700 dark:text-gray-300">
-            Mehdi Akiki builds and operates startup products, distributed systems, developer tools,
-            and open-source software. Coding remains part of the work, including every open-source
-            contribution.
-          </p>
-          <div className="mt-5 flex flex-wrap gap-5">
-            <Link
-              href="/work"
-              className="text-primary-600 hover:text-primary-700 dark:text-primary-400 dark:hover:text-primary-300 font-medium"
-              data-umami-event="article-professional-cta"
-              data-umami-event-source={currentSlug || "article"}
-              data-umami-event-destination="work"
-            >
-              Selected work &rarr;
-            </Link>
-            <Link
-              href="/open-source"
-              className="text-primary-600 hover:text-primary-700 dark:text-primary-400 dark:hover:text-primary-300 font-medium"
-              data-umami-event="article-professional-cta"
-              data-umami-event-source={currentSlug || "article"}
-              data-umami-event-destination="open-source"
-            >
-              Open source &rarr;
-            </Link>
-            <Link
-              href="/contact"
-              className="text-primary-600 hover:text-primary-700 dark:text-primary-400 dark:hover:text-primary-300 font-medium"
-              data-umami-event="article-professional-cta"
-              data-umami-event-source={currentSlug || "article"}
-              data-umami-event-destination="contact"
-            >
-              Start a conversation &rarr;
-            </Link>
-          </div>
         </div>
       )}
+
+      <div className="border-t border-gray-200 pt-8 dark:border-gray-800">
+        <p className="text-primary-600 dark:text-primary-400 text-sm font-semibold tracking-wide uppercase">
+          About the author
+        </p>
+        <h3 className="mt-3 text-xl font-bold text-gray-950 dark:text-gray-100">
+          <Link
+            href="/about"
+            className="hover:text-primary-600 dark:hover:text-primary-400"
+            data-umami-event="article-author-click"
+            data-umami-event-source={currentSlug || "article"}
+          >
+            {siteMetadata.author}
+          </Link>
+        </h3>
+        <p className="mt-3 max-w-2xl leading-7 text-gray-700 dark:text-gray-300">
+          {cluster?.cta.description ||
+            "I build startup products, distributed systems, and developer tools, and contribute to open-source software."}
+        </p>
+        <div className="mt-5 flex flex-wrap gap-5">
+          <Link
+            href={cluster?.cta.primary.href || "/work"}
+            className="text-primary-600 hover:text-primary-700 dark:text-primary-400 dark:hover:text-primary-300 font-medium"
+            data-umami-event="article-professional-cta"
+            data-umami-event-source={currentSlug || "article"}
+            data-umami-event-destination={cluster?.cta.primary.href || "/work"}
+            {...(cluster ? { "data-umami-event-cluster": cluster.slug } : {})}
+          >
+            {cluster?.cta.primary.label || "Selected work"} &rarr;
+          </Link>
+          <Link
+            href={cluster?.cta.secondary.href || "/contact"}
+            className="text-primary-600 hover:text-primary-700 dark:text-primary-400 dark:hover:text-primary-300 font-medium"
+            data-umami-event="article-professional-cta"
+            data-umami-event-source={currentSlug || "article"}
+            data-umami-event-destination={cluster?.cta.secondary.href || "/contact"}
+            {...(cluster ? { "data-umami-event-cluster": cluster.slug } : {})}
+          >
+            {cluster?.cta.secondary.label || "Talk about a role or project"} &rarr;
+          </Link>
+          <a
+            href="/feed.xml"
+            type="application/rss+xml"
+            className="text-primary-600 hover:text-primary-700 dark:text-primary-400 dark:hover:text-primary-300 font-medium"
+            data-umami-event="article-feed-click"
+            data-umami-event-source={currentSlug || "article"}
+            data-umami-event-destination="/feed.xml"
+          >
+            Follow new articles with RSS &rarr;
+          </a>
+        </div>
+      </div>
     </aside>
   );
 };

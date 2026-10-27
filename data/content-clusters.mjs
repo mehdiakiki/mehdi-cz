@@ -46,10 +46,10 @@ export const contentClusters = [
       "How do compiler and rust-analyzer concepts map source code to meaning?",
     ],
     cta: {
-      title: "When implementation details shape the product",
+      title: "Rust tooling and systems work",
       description:
-        "I work on systems where compiler behaviour, runtime constraints, correctness, and performance are part of the design, not cleanup after it.",
-      primary: { label: "Review open-source work", href: "/open-source" },
+        "I contribute to Rust, Deno, and rust-analyzer, and build distributed systems and developer tools.",
+      primary: { label: "My Rust compiler work", href: "/work/rustc-late-metadata" },
       secondary: { label: "Discuss a role or problem", href: "/contact" },
     },
   },

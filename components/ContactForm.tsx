@@ -153,12 +153,14 @@ const ContactForm = () => {
         >
           <option value="">Select one...</option>
           <option value="Full-time opportunity">Full-time opportunity</option>
+          <option value="Rust or systems engineering">Rust or systems engineering</option>
           <option value="AI-enabled product or agent system">
             AI-enabled product or agent system
           </option>
           <option value="Startup or product engineering">Startup or product engineering</option>
           <option value="Architecture or advisory">Architecture or advisory</option>
           <option value="Open-source collaboration">Open-source collaboration</option>
+          <option value="Article question or correction">Article question or correction</option>
           <option value="Other">Other</option>
         </select>
         {validationErrors.helpType && (
