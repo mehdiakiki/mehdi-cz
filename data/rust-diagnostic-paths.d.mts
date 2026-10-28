@@ -16,6 +16,12 @@ export interface AvailableRustDiagnosticPath {
 export const rustDiagnosticPaths: RustDiagnosticPath[];
 export function availableRustDiagnosticPaths(
   posts: (Publishable & { slug: string; title: string })[],
-  entries: { id: string; destinationAvailable: boolean; isPreview: boolean; destinationPath: string; destinationTitle: string }[],
+  entries: {
+    id: string;
+    destinationAvailable: boolean;
+    isPreview: boolean;
+    destinationPath: string;
+    destinationTitle: string;
+  }[],
   now?: Date
 ): AvailableRustDiagnosticPath[];

@@ -17,8 +17,16 @@ for (const path of rustDiagnosticPaths) {
     const linked = html.includes(`href="/blog/${slug}"`);
     assert.equal(linked, Boolean(available), `${path.slug}: article visibility ${slug}`);
   }
-  records.push({ slug: path.slug, publishedArticles: path.articleSlugs.filter((slug) => publicArticleHref(allBlogs, slug)) });
+  records.push({
+    slug: path.slug,
+    publishedArticles: path.articleSlugs.filter((slug) => publicArticleHref(allBlogs, slug)),
+  });
 }
-await writeFile("/tmp/editorial-evidence/atlas-diagnostic-paths.json", JSON.stringify(records, null, 2));
+await writeFile(
+  "/tmp/editorial-evidence/atlas-diagnostic-paths.json",
+  JSON.stringify(records, null, 2)
+);
 await writeFile("/tmp/editorial-evidence/previews/rust-failure-atlas.html", html);
-console.log("Checked five diagnostic paths in production HTML, published destinations, held drafts and the RSS link.");
+console.log(
+  "Checked five diagnostic paths in production HTML, published destinations, held drafts and the RSS link."
+);

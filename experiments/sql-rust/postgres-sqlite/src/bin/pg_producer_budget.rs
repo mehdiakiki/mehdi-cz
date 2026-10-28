@@ -1,7 +1,16 @@
 use sql_rust_postgres_sqlite::{pg::Fixture, Result};
 use sqlx::PgPool;
-use std::{sync::{Arc, atomic::{AtomicUsize, Ordering}}, time::Duration};
-use tokio::{sync::{mpsc, OwnedSemaphorePermit, Semaphore}, time::timeout};
+use std::{
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
+use tokio::{
+    sync::{mpsc, OwnedSemaphorePermit, Semaphore},
+    time::timeout,
+};
 
 const ROW_BYTES: usize = 8192;
 const PRODUCERS: usize = 4;
@@ -12,15 +21,24 @@ struct Batch {
     _budget: Option<OwnedSemaphorePermit>,
 }
 impl Batch {
-    fn new(payload: String, retained: Arc<AtomicUsize>, budget: Option<OwnedSemaphorePermit>) -> Self {
+    fn new(
+        payload: String,
+        retained: Arc<AtomicUsize>,
+        budget: Option<OwnedSemaphorePermit>,
+    ) -> Self {
         assert_eq!(payload.len(), ROW_BYTES);
         retained.fetch_add(payload.len(), Ordering::SeqCst);
-        Self { payload, retained, _budget: budget }
+        Self {
+            payload,
+            retained,
+            _budget: budget,
+        }
     }
 }
 impl Drop for Batch {
     fn drop(&mut self) {
-        self.retained.fetch_sub(self.payload.len(), Ordering::SeqCst);
+        self.retained
+            .fetch_sub(self.payload.len(), Ordering::SeqCst);
     }
 }
 
@@ -33,7 +51,8 @@ async fn load_with_budget(
 ) -> Result<()> {
     let permit = bytes.acquire_many_owned(ROW_BYTES as u32).await?;
     let payload: String = sqlx::query_scalar("SELECT repeat('x', 8192)")
-        .fetch_one(pool).await?;
+        .fetch_one(pool)
+        .await?;
     let batch = Batch::new(payload, retained, Some(permit));
     output.send(batch).await.map_err(|_| "consumer stopped")?;
     Ok(())
@@ -45,7 +64,8 @@ async fn wait_for_bytes(retained: &AtomicUsize, expected: usize) -> Result<()> {
         while retained.load(Ordering::SeqCst) != expected {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-    }).await?;
+    })
+    .await?;
     Ok(())
 }
 
@@ -59,8 +79,11 @@ async fn check(pool: &PgPool) -> Result<()> {
         let retained = retained.clone();
         tasks.push(tokio::spawn(async move {
             let payload: String = sqlx::query_scalar("SELECT repeat('x', 8192)")
-                .fetch_one(&pool).await?;
-            output.send(Batch::new(payload, retained, None)).await
+                .fetch_one(&pool)
+                .await?;
+            output
+                .send(Batch::new(payload, retained, None))
+                .await
                 .map_err(|_| "consumer stopped")?;
             Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
         }));
@@ -68,8 +91,12 @@ async fn check(pool: &PgPool) -> Result<()> {
     wait_for_bytes(&retained, ROW_BYTES * PRODUCERS).await?;
     assert_eq!(input.len(), 1);
     println!("Queue capacity=1; four database producers retained 32768 payload bytes: one queued row plus three blocked sends.");
-    for _ in 0..PRODUCERS { drop(input.recv().await.ok_or("missing row")?); }
-    for task in tasks { task.await??; }
+    for _ in 0..PRODUCERS {
+        drop(input.recv().await.ok_or("missing row")?);
+    }
+    for task in tasks {
+        task.await??;
+    }
     assert_eq!(retained.load(Ordering::SeqCst), 0);
 
     for cancel in [false, true] {
@@ -90,7 +117,9 @@ async fn check(pool: &PgPool) -> Result<()> {
         assert_eq!(input.len(), 1);
         assert_eq!(budget.available_permits(), 0);
         if cancel {
-            for task in &tasks { task.abort(); }
+            for task in &tasks {
+                task.abort();
+            }
             for task in tasks {
                 match task.await {
                     Ok(result) => result?,
@@ -99,8 +128,12 @@ async fn check(pool: &PgPool) -> Result<()> {
             }
             drop(input);
         } else {
-            for _ in 0..PRODUCERS { drop(input.recv().await.ok_or("missing row")?); }
-            for task in tasks { task.await??; }
+            for _ in 0..PRODUCERS {
+                drop(input.recv().await.ok_or("missing row")?);
+            }
+            for task in tasks {
+                task.await??;
+            }
         }
         assert_eq!(retained.load(Ordering::SeqCst), 0);
         assert_eq!(budget.available_permits(), ROW_BYTES * 2);
@@ -114,6 +147,10 @@ async fn run() -> Result<()> {
     fixture.finish(result).await
 }
 #[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<()> { timeout(Duration::from_secs(20), run()).await? }
+async fn main() -> Result<()> {
+    timeout(Duration::from_secs(20), run()).await?
+}
 #[tokio::test]
-async fn integration() -> Result<()> { timeout(Duration::from_secs(20), run()).await? }
+async fn integration() -> Result<()> {
+    timeout(Duration::from_secs(20), run()).await?
+}
