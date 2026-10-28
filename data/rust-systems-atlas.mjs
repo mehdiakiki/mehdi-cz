@@ -9,6 +9,8 @@ export const rustSystemsAtlasGoal = {
 };
 
 export const rustSystemsAtlasEditorialSections = {
+  "rust-timeout-does-not-stop-postgresql-query": "async-concurrency",
+  "bounded-rust-channel-database-producer-memory": "async-concurrency",
   "rust-request-waiting-for-pool-or-postgresql": "async-concurrency",
   "postgresql-commit-reply-lost-rust": "async-concurrency",
   "slow-postgresql-row-consumer-holds-rust-connection": "async-concurrency",

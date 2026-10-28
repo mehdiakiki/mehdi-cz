@@ -1,6 +1,6 @@
 # Rust and database follow-ups, October 27, 2026
 
-Five manuscripts are listed in `docs/editorial/sql-rust-followups-2026-10-27.json`.
+Seven manuscripts are listed in `docs/editorial/sql-rust-followups-2026-10-27.json`.
 They remain private drafts. Their frontmatter dates record creation, not publication.
 Article authorship belongs to Mehdi Akiki alone.
 
@@ -72,3 +72,21 @@ RSS item or sitemap entry, and that links to existing articles are publicly usab
 
 Formatting, Rust formatting and missing lockfiles are preserved as CI patches.
 Apply those patches and require a clean patch on the final checked revision.
+
+## October 28 additions
+
+The timeout fixture observes the same lock holder before and after a local deadline,
+then checks that the autocommit effect can finish after the future is dropped. Its
+server-timeout comparison requires SQLSTATE 57014, failed transaction state 25P02,
+rollback and a usable next query. It keeps the connection alive; it does not model
+a dropped socket or claim universal driver cancellation behaviour.
+
+The producer-budget fixture reads four fixed-size PostgreSQL payloads into a channel
+with capacity one. It counts queued and pending-send payloads, then reserves a shared
+byte budget before fetching. Both normal consumption and cancellation must release
+payloads and permits. This is logical payload accounting, not a process memory cap.
+
+The research brief records recurring public questions and existing coverage. No
+keyword volume, analytics access, traffic forecast or retention improvement is claimed.
+The atlas diagnostic paths use existing case IDs and published article links. CI checks
+publication gates and the production HTML without adding client-side JavaScript.

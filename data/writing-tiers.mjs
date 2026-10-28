@@ -272,6 +272,7 @@ export const investigations = [
  */
 const articleSlugsByTheme = {
   layers: [
+    "bounded-rust-channel-database-producer-memory",
     "rust-request-waiting-for-pool-or-postgresql",
     "slow-postgresql-row-consumer-holds-rust-connection",
     "rust-oracle-client-library-missing-in-deployment",
@@ -375,6 +376,7 @@ const articleSlugsByTheme = {
     "the-next-agent-read-the-previous-jobs-files",
   ],
   "interrupted-execution": [
+    "rust-timeout-does-not-stop-postgresql-query",
     "postgresql-commit-reply-lost-rust",
     "rust-sigterm-drain-inflight-requests",
     "interrupted-upload-needs-durable-cleanup",

@@ -76,7 +76,7 @@ for (const article of manifest.articles) {
 await writeFile(
   `${output}/index.html`,
   document(
-    "Five Rust and database drafts",
+    "Rust and database drafts",
     h(
       "ol",
       null,
@@ -87,5 +87,5 @@ await writeFile(
   )
 );
 console.log(
-  "Rendered five private review copies; none has a public route, search entry, feed item or sitemap entry."
+  "Rendered seven private review copies; none has a public route, search entry, feed item or sitemap entry."
 );

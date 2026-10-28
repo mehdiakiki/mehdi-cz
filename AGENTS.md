@@ -25,3 +25,4 @@ This block is written and re-added by `next dev` — verify at `node_modules/nex
 - Do not invent a personal history or manufacture grammar mistakes to suggest an identity.
 - The next thirty proposed articles focus on established SQL databases and database internals.
 - Every executable example in that series must be Rust. Put SQL in Rust query calls as needed.
+- The long-term reference-site ambition includes software engineering and development. Build outward from the existing Rust and database expertise. Research recurring reader problems, competing answers and current site coverage before proposing each batch. Keep traffic potential separate from observed search or analytics data. The October 28 priorities and evidence are in [the reader-demand brief](docs/editorial/sql-rust-demand-research-2026-10-28.json).

@@ -7,7 +7,7 @@ assert.equal(process.env.GITHUB_ACTIONS, "true", "Use the existing GitHub workfl
 const manifest = JSON.parse(
   await readFile("docs/editorial/sql-rust-followups-2026-10-27.json", "utf8")
 );
-assert.equal(manifest.articles.length, 5);
+assert.equal(manifest.articles.length, 7);
 for (const article of manifest.articles) {
   const source = await readFile(article.path, "utf8");
   const { data, content } = matter(source);
