@@ -1,57 +1,76 @@
 ---
-title: "A background SQLite import should leave room for normal saves."
-date: "2026-10-25T18:30:00Z"
+title: "A SQLite Import Can Block Normal Saves"
+date: "2026-10-30T19:15:41Z"
+lastmod: "2026-10-30T19:15:41Z"
+authors: ["default"]
 tags: ["rust", "sqlite", "imports", "concurrency"]
-draft: true
-reviewed: false
+draft: false
+reviewed: true
+reviewedHash: "64b93b5620d223768eeae15805a9f46ffc70660a21e2e1bef81bb74b44a0c54f"
 cluster: "reliable-data-integrations"
 campaign: "editorial"
 summary: "Keep an interactive SQLite importer resumable and bounded. Commit batches with their progress and give foreground writes an explicit busy policy."
 ---
 
-You start an import in the background. The progress bar moves, but clicking Save in the rest of the application now hangs or returns a busy error.
+An import runs on a background thread, but ordinary saves now return busy errors. Moving the work away from the interface did not create another SQLite writer slot.
 
-Moving the import to another thread removed CPU work from the interface. It did not give SQLite a second simultaneous writer.
+WAL mode lets readers and a writer overlap. It still serializes writers. Look at the import's transaction lifetime before increasing the connection count or adding a longer timeout. A transaction around the whole input can keep write access long after the next foreground save needs it.
 
-For an interactive application, I would first look at the import transaction. One transaction around the whole file may keep write access for much longer than an ordinary save can tolerate.
+For an import that may commit progressively, I would make each batch small and resumable. Store its rows and checkpoint in the same transaction. Then give foreground work a deliberate turn between batches.
 
-## Choose what a batch means
+## Reproduce contention without a timing guess
 
-Read and validate a bounded part of the input before opening its write transaction. Keep network calls, expensive parsing, and user interaction outside that transaction.
+The fixture opens two connections to a temporary file and enables WAL. One connection imports data. The other represents a foreground save to a settings row. Both are in the same process, on the same host.
 
-Then write the batch and its progress marker together. The Rust outline below shows the boundary; its storage helpers are application-specific:
+The importer begins an immediate transaction, inserts two rows, and advances its progress marker. Before that transaction ends, the foreground connection tries to save. Its busy timeout is zero so the result is a direct `SQLITE_BUSY`, rather than a measurement of a retry policy.
+
+The fixture rolls back the import transaction. An observer must see zero imported rows and the original checkpoint, one. This checks that the progress marker did not get ahead of the data it describes.
+
+The complete Rust source is [sqlite_import_turns.rs](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/sql-rust/postgres-sqlite/src/bin/sqlite_import_turns.rs), using rusqlite 0.41.0 and its pinned bundled SQLite dependency. The [existing WAL investigation](/blog/sql-sqlite-rust-wal-busy-writers) explains the writer behavior behind the busy result.
+
+## Commit the batch with its checkpoint
+
+The comparison imports rows one through four in two batches. Parsing is represented by known small integer inputs. In a real importer, read and validate a bounded amount before taking the write transaction.
 
 ```rust
-let batch = parser.next_batch(max_rows, max_bytes)?;
-
-let tx = connection.transaction()?;
-for row in &batch.rows {
-    insert_import_row(&tx, import_id, row)?;
-}
-store_progress(&tx, import_id, batch.next_offset)?;
-tx.commit()?;
+let tx = importer.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for id in first..=last {
+            tx.execute("INSERT INTO imported VALUES (?1)", [id])?;
+        }
+        tx.execute(
+            "UPDATE progress SET next_id = ?1 WHERE input_id = 'input-v1'",
+            [last + 1],
+        )?;
+        tx.commit()?;
+        foreground.execute("UPDATE settings SET value = 'saved' WHERE id = 1", [])?;
 ```
 
-If the process stops before commit, neither the rows nor their progress should be considered complete. If it stops afterward, resume from the committed marker. Use stable source identities or another deliberate duplicate policy when a source cannot be resumed at an exact offset.
+After each commit, the foreground connection updates its settings row successfully. The order is deliberate: this fixture gives the save a turn between the two import transactions. It does not establish that SQLite automatically schedules waiting writers fairly.
 
-An offset is meaningful only for the same input. Record an input identity and format version. A changed file with the same path should not silently inherit an old checkpoint.
+After the first batch, the importer connection closes and reopens the file. The stored next ID must be three. The second batch continues from that boundary, and the final observer must see rows one, two, three, and four exactly once, with checkpoint five.
 
-## Busy is an outcome to handle
+This is a connection-reopen recovery check. It is not a process-kill, disk-full, or power-loss test. Those failures need additional controlled scenarios and the application's chosen SQLite durability settings.
 
-SQLite's [WAL documentation](https://www.sqlite.org/wal.html) explains that readers and a writer can overlap, while writes still serialize. The [Rust busy-writer example](/blog/sql-sqlite-rust-wal-busy-writers) shows the contention directly.
+## Give the checkpoint an input identity
 
-Give foreground saves a bounded wait and a useful response if they cannot proceed. Give the importer a retry or pause policy too. A busy timeout is not a fairness guarantee, and a tight loop that immediately starts another import transaction can still make interactive work unpleasant.
+The marker is stored under `input-v1`. Its meaning is limited to this fixed ordered input. A file path alone is not a stable identity when the file can change between attempts.
 
-A single database worker can schedule small commands from foreground and background sources. If you choose that design, decide how it shares turns. Two queues are not helpful if the worker drains the import queue forever before looking at saves.
+A real job should record an input content identity or immutable source version, parser version, and the position that can safely be resumed. For a provider stream without stable offsets, use record identities and an explicit duplicate policy instead of pretending an integer byte position is enough.
 
-Avoid opening an unlimited number of connections as a response to contention. More waiting writers do not create another writer slot.
+Commit the marker only with the corresponding data. Writing progress first can skip rows after a restart. Writing data and progress in separate commits can repeat rows. A unique source identity can help detect repeats, but the importer still needs a decision for changed input under the same identity.
 
-## Measure the foreground path
+Rows also have different sizes. A hundred short codes and a hundred large documents can have very different parsing and memory costs. Bound both rows and bytes where appropriate. Do not hold the write transaction open while downloading the next page or waiting for user input.
 
-Use a controlled importer and issue an ordinary save while a batch is active. Record how long the write transaction is held, how long the save waits, and whether it succeeds or receives the expected busy outcome.
+## Choose how foreground work gets a turn
 
-Compare a few batch sizes using the same input. Count both rows and bytes: a batch of a hundred tiny records differs from a hundred large documents. There is no universal correct row count.
+A bounded busy timeout can make a save wait briefly for a writer. It is not a fairness guarantee. An importer that immediately starts another transaction may still make an interactive application unpleasant.
 
-Chunking also changes semantics. If the product requires an all-or-nothing import, partially committed business rows may be unacceptable. Consider loading into staging and making a deliberate final visibility change, while checking the cost of that final operation. Do not quietly weaken atomicity to make the progress bar smoother.
+One option is a database worker that schedules bounded commands from foreground and background queues. Define its turn policy. Another is an explicit pause or admission rule around import batches. The right choice depends on whether the product can pause the import and what latency its save path promises.
 
-For an import that can commit progressively, short transactions and honest progress are usually a good starting point. Test restart and foreground contention together. An importer that resumes perfectly but blocks every normal save still needs work.
+Measure the actual foreground path before choosing batch limits. This fixture makes no throughput or latency comparison. It checks a held transaction, a specific busy outcome, rollback, successful saves between commits, and a resumed checkpoint. Those facts are useful starting points for a later measured workload.
+
+SQLite's [WAL documentation](https://www.sqlite.org/wal.html) describes the concurrency model and its limits. More connections do not create concurrent writers. Keep the distinction clear when reading a connection-pool graph.
+
+Chunking changes atomicity. If an import must become visible all at once, progressively committing business rows may violate the requirement. Consider staging data and a deliberate final visibility change, then check the lock and space cost of that operation. A smooth progress bar is not a reason to quietly weaken the data contract.
+
+A useful importer tells the truth about completed work and leaves room for the rest of the application. Check both properties together: stored progress should support recovery, and normal saves should have a defined way to proceed.

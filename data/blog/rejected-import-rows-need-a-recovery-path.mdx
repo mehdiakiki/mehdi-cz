@@ -1,65 +1,85 @@
 ---
-title: "A rejected import row needs somewhere to go."
-date: "2026-10-25T18:30:00Z"
-tags: ["rust", "sql server", "imports", "data quality"]
-draft: true
-reviewed: false
+title: "A Rejected PostgreSQL Import Row Needs a Recovery Path"
+date: "2026-10-30T19:15:41Z"
+lastmod: "2026-10-30T19:15:41Z"
+authors: ["default"]
+tags: ["rust", "postgresql", "imports", "data quality"]
+draft: false
+reviewed: true
+reviewedHash: "6d41a24cdf1320858c4b9e924874276318a1e933b9fc2d2a90f88200ca67dced"
 cluster: "reliable-data-integrations"
 campaign: "editorial"
 summary: "Give failed import rows durable identities, bounded diagnostics, and a repair path. Make the batch's atomicity and replay behaviour explicit."
 ---
 
-The import finishes with a warning: twelve rows failed. The job is marked complete, and the only explanation is a few lines in yesterday's logs.
+The import reports that twelve rows failed. The job says complete. The only detail was printed in a log that has already rotated.
 
-Which rows? Can they be corrected? Will retrying the file duplicate the rows that succeeded?
+Which rows need repair? Did the other rows commit? Will replaying the file duplicate what already succeeded? Those questions belong in the import design, before the first large file arrives.
 
-An importer needs answers to those questions before it is useful for real data. A rejected row is an outcome the system must manage, not an exception to discard so the job can turn green.
+This reproduction uses PostgreSQL 18 and SQLx 0.8.6. It accepts independent rows, keeps durable attempt outcomes, and repairs one rejected row under a new correction version. It also exposes a common database trap: catching a statement error does not restore an aborted transaction.
 
-## Decide whether rows succeed together
+## State the batch contract first
 
-A bulk operation can be atomic, or it can accept independent rows. State the contract before designing the status page.
+The lab has a business table keyed by source identity and an attempt ledger keyed by source identity plus correction version. Each call processes one row in its own outer transaction. A job can therefore make partial progress by design.
 
-For an atomic batch, one invalid row may roll back every row in that batch. Do not label the other rows committed because the client successfully sent them. For independent outcomes, preserve a stable identity for every item and report which ones actually committed.
+The accepted input contains quantity ten. Another quantity is negative and violates a check constraint. A third input is a synthetic non-integer value. The parser represents that last result as no valid integer and records a parse rejection.
 
-The [SQL Server bulk-loading example](/blog/loading-a-batch-into-sql-server-from-rust) distinguishes sending rows, finishing the bulk stream, and completing the surrounding transaction. Tiberius's [bulk request documentation](https://docs.rs/tiberius/latest/tiberius/struct.BulkLoadRequest.html) describes finalization. Application-level progress must follow the boundary your importer promises.
+The records use short fixture identities and integer quantities. The schema bounds source identities to 64 characters. The ledger keeps a stable reason category rather than copying raw database messages or whole private documents into logs.
 
-## Keep a small rejection record
+If your product needs an all-or-nothing file, this row-by-row contract is different. Do not reuse it while promising atomic batch completion. The [SQL Server bulk-loading guide](/blog/loading-a-batch-into-sql-server-from-rust) explains why sending data, finishing a bulk stream, and committing a transaction are separate events. The new lab is a PostgreSQL example, not a tested SQL Server savepoint recipe.
 
-A rejection needs enough information for a human or a repair process to find the original input and understand the decision. Here is a Rust model for that record:
+## Recover the transaction before storing the rejection
+
+The importer first claims the attempt identity. It creates a savepoint before attempting the business insert. PostgreSQL rejects the negative quantity with code `23514`.
+
+The fixture deliberately issues another statement before rolling back to the savepoint. That statement must fail with `25P02`, showing that the transaction is still in its failed state. Only then does the importer restore the savepoint and write the rejection outcome.
 
 ```rust
-struct RejectedRow {
-    import_id: String,
-    source_record_id: String,
-    source_version: String,
-    reason_code: String,
-    parser_version: String,
-    status: RepairStatus,
-}
-
-enum RepairStatus {
-    Waiting,
-    Resolved,
-    Discarded { reason: String },
-}
+sqlx::query("SAVEPOINT one_row").execute(&mut *tx).await?;
+        let inserted = sqlx::query("INSERT INTO imported_rows VALUES ($1, $2)")
+            .bind(source)
+            .bind(value)
+            .execute(&mut *tx)
+            .await;
+        match inserted {
+            Ok(_) => "accepted",
+            Err(error)
+                if error.as_database_error().and_then(|e| e.code()).as_deref() == Some("23514") =>
+            {
+                let failed = sqlx::query("SELECT 1").execute(&mut *tx).await.unwrap_err();
+                assert_eq!(
+                    failed.as_database_error().unwrap().code().as_deref(),
+                    Some("25P02")
+                );
+                sqlx::query("ROLLBACK TO SAVEPOINT one_row")
+                    .execute(&mut *tx)
+                    .await?;
+                "constraint_rejected"
+            }
+            Err(error) => return Err(error),
+        }
 ```
 
-This is a data model, not a complete storage implementation. Give identities, reason codes, and explanatory text size limits. Keep private source payloads in an appropriately protected store if they must be retained; copying full rows into ordinary logs creates another data problem.
+The full [import recovery fixture](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/rust-backend/tests/practical_database_release.rs) includes the outer transaction and ledger update. The savepoint is a database boundary, not a Rust exception handler. PostgreSQL's [SAVEPOINT documentation](https://www.postgresql.org/docs/18/sql-savepoint.html) describes how rollback restores the state established at that boundary.
 
-Store row numbers only as a convenience. They are fragile when a file changes or a provider returns a different order. Use the source's stable identity and an input version or content identity where possible.
+This example handles its known check violation. Unrelated database errors propagate instead of becoming ordinary row rejections. A lost connection, unavailable database, or programming mistake should not silently turn a failed job into a pile of bad-data records.
 
-## Repair should be repeatable
+## Keep original and corrected attempts
 
-Correct the input or mapping, then replay a selected rejection under the original import identity and a recorded correction version. The handler needs a duplicate policy for a row that already succeeded during an earlier attempt.
+The first negative attempt uses correction version zero. The corrected quantity twelve uses version one. The original rejection remains in the ledger. A later reader can tell what failed and which correction succeeded.
 
-Keep the original rejection history when marking it resolved. Otherwise the next engineer cannot tell whether data was fixed, silently dropped, or accepted under a different rule.
+The fixture closes the pool after the first group and reconnects before replay. It retries the already accepted row, repairs the negative row, then repeats the same correction. The business table must contain only the accepted original row and the repaired row. The ledger must contain four attempt records, including both versions of the repaired input.
 
-If a row is intentionally discarded, make that a separate, explained outcome. Some source data is genuinely unusable. Hiding that decision inside a catch block makes the import totals misleading.
+Reusing an attempt identity with a different quantity returns `input_conflict`. It must not overwrite the earlier attempt or alter the business row. The test checks this by sending thirteen under the correction identity that already stored twelve.
 
-## Check the counts against stored data
+The small lab uses one implicit import identity through its isolated schema. A real ledger key should also include the import or source scope, trusted tenant, and immutable input identity. Record parser or mapping versions when they affect interpretation. Do not treat an untrusted filename as an authorization boundary.
 
-Build a small fixture with valid rows, a malformed value, a constraint violation, and a duplicate identity. Interrupt the job after some committed work, then resume it.
+## Make repair an operation people can follow
 
-Assert the committed rows and rejection records, not just the final summary. Correct one rejected row and replay it twice. It should produce the intended stored result without an extra business effect.
+Give an operator a way to list waiting rejections, inspect safe context, supply a correction, and see the resulting attempt. If intentionally discarding a row is allowed, record who made that decision and why. Discarded and corrected are different outcomes.
 
-Run this recovery check against SQL Server with the actual constraints and transaction settings. Parser tests cannot show whether the bulk operation committed or rolled back. The importer becomes easier to trust when “complete” means every input has a known outcome.
+Retain private source data only in a protected store with appropriate access and retention. A row number can help someone find input, but it is fragile when a file changes order. Prefer stable source identities and explicit versions.
+
+The lab checks a reconnect and repeated correction. It does not kill a process during commit, run competing repair workers, or prove a complete production credential policy. It also does not permit a new correction to edit a row that already succeeded. That requires a separate update contract rather than another insert hidden inside replay.
+
+Check the final business rows and attempt ledger independently of the summary message. Counts alone can hide the wrong identities or values. An import is useful when every accepted input has a known outcome and every rejected input has a deliberate next step. A green job badge cannot supply that history after the fact.

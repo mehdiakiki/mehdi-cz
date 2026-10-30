@@ -8,9 +8,9 @@ import { publicArticleHref } from "../lib/editorial-navigation.mjs";
 
 assert.equal(process.env.GITHUB_ACTIONS, "true", "Use the existing GitHub workflow");
 const manifest = JSON.parse(
-  await readFile("docs/editorial/sql-rust-followups-2026-10-27.json", "utf8")
+  await readFile(process.argv[2] || "docs/editorial/sql-rust-followups-2026-10-27.json", "utf8")
 );
-const output = "/tmp/editorial-evidence/previews/sql-rust-followups";
+const output = process.argv[4] || "/tmp/editorial-evidence/previews/sql-rust-followups";
 await mkdir(output, { recursive: true });
 const search = await readFile("public/search.json", "utf8");
 const feed = await readFile("public/feed.xml", "utf8");
@@ -102,9 +102,9 @@ await writeFile(
     )
   )
 );
-const hub = await readFile(".next/server/app/blog/series/rust-database-failures.html", "utf8");
+const hub = await readFile(`.next/server/app/blog/series/${process.argv[3] || "rust-database-failures"}.html`, "utf8");
 for (const article of manifest.articles)
   assert.ok(hub.includes(`/blog/${article.slug}`), article.slug);
 console.log(
-  "Verified seven approved public routes, canonical URLs, sole-author metadata, search, RSS, sitemap and the reading-series hub; retained review copies."
+  `Verified ${manifest.articles.length} approved public routes, canonical URLs, sole-author metadata, search, RSS, sitemap and the reading-series hub; retained review copies.`
 );

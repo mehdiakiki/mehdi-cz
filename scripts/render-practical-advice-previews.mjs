@@ -40,7 +40,7 @@ function document(title, content) {
         element(
           "body",
           null,
-          element("p", null, "Private first draft; not approved for publication."),
+          element("p", null, "Editorial review copy. Publication follows the recorded review for each article."),
           content
         )
       )
@@ -51,11 +51,17 @@ function document(title, content) {
 for (const article of manifest.articles) {
   const post = bySlug.get(article.slug);
   assert.ok(post, `Missing compiled draft: ${article.slug}`);
-  assert.equal(post.draft, true);
-  assert.equal(post.reviewed, false);
-  assert.equal(publicArticleHref(allBlogs, article.slug), null);
-  assert.ok(!search.includes(article.slug), `Draft leaked into public search: ${article.slug}`);
-  await assert.rejects(readFile(`.next/server/app/blog/${article.slug}.html`), { code: "ENOENT" });
+  if (post.reviewed === true && post.draft === false) {
+    assert.equal(publicArticleHref(allBlogs, article.slug), `/blog/${article.slug}`);
+    assert.ok(search.includes(article.slug), article.slug);
+    await readFile(`.next/server/app/blog/${article.slug}.html`);
+  } else {
+    assert.equal(post.draft, true);
+    assert.equal(post.reviewed, false);
+    assert.equal(publicArticleHref(allBlogs, article.slug), null);
+    assert.ok(!search.includes(article.slug), `Draft leaked into public search: ${article.slug}`);
+    await assert.rejects(readFile(`.next/server/app/blog/${article.slug}.html`), { code: "ENOENT" });
+  }
   const body = renderToStaticMarkup(element(MDXLayoutRenderer, { code: post.body.code }));
   assert.ok(body.includes("<h2"), article.slug);
   for (const [, target] of body.matchAll(/href="\/blog\/([^"#?]+)"/g)) {
@@ -74,6 +80,8 @@ for (const article of manifest.articles) {
     slug: article.slug,
     title: post.title,
     group: article.group,
+    reviewed: post.reviewed,
+    draft: post.draft,
   });
 }
 
@@ -106,8 +114,8 @@ const index = element(
 await writeFile(`${output}/index.html`, document(manifest.series_name, index));
 await writeFile(
   `${output}/index.json`,
-  JSON.stringify({ articles: records, publicRoutes: 0 }, null, 2)
+  JSON.stringify({ articles: records, publicRoutes: records.filter((record) => record.reviewed && !record.draft).length }, null, 2)
 );
 console.log(
-  `Rendered ${records.length} private drafts; none has a production route or public search entry.`
+  `Retained ${records.length} editorial review copies; held drafts remain absent from production routes and public search.`
 );

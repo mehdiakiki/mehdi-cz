@@ -33,7 +33,9 @@ test("every approved practical topic has a distinct manuscript and its deeper de
 
 test("time alone cannot release any of the fifty unapproved drafts", async () => {
   const future = new Date("2030-01-01T00:00:00Z");
-  for (const post of posts) {
+  const held = posts.filter((post) => post.reviewed !== true);
+  assert.equal(held.length, 44);
+  for (const post of held) {
     assert.equal(post.draft, true, post.slug);
     assert.equal(post.reviewed, false, post.slug);
     assert.equal(publicArticleHref(posts, post.slug, future), null);
@@ -41,7 +43,7 @@ test("time alone cannot release any of the fifty unapproved drafts", async () =>
     assert.equal(publicationStatus({ ...post, reviewed: true }, future), "draft");
   }
   const result = await checkLivePublications({
-    posts,
+    posts: held,
     siteUrl: "https://www.mehdi.cz",
     now: future,
     fetchImpl: async () => new Response("<urlset></urlset>", { status: 200 }),

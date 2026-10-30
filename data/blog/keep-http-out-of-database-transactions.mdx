@@ -1,58 +1,80 @@
 ---
-title: "Keep HTTP calls out of the checkout transaction."
-date: "2026-10-25T18:30:00Z"
-tags: ["rust", "mysql", "transactions", "outbox"]
-draft: true
-reviewed: false
+title: "Keep HTTP Calls Outside the Checkout Transaction"
+date: "2026-10-30T19:15:41Z"
+lastmod: "2026-10-30T19:15:41Z"
+authors: ["default"]
+tags: ["rust", "postgresql", "transactions", "outbox"]
+draft: false
+reviewed: true
+reviewedHash: "b88aeecba62e1e0676122c83131faf3302ed5a2e8a6d932eb063fd85669b11f3"
 cluster: "reliable-data-integrations"
 campaign: "editorial"
 summary: "A slow shipping request should not hold stock locks. Commit a pending order and durable delivery intent, then recover the external step explicitly."
 ---
 
-A customer buys the last item. Your handler changes the stock row, calls the shipping service, writes the order, and commits.
+A shipping request is still waiting, and a second checkout cannot update stock. The first handler owns a transaction. Inside it, the code changed stock and then called a provider. A slow dependency now decides how long the database lock remains held.
 
-Everything is inside one transaction. That feels safe until the shipping service becomes slow. Other customers now wait for a database lock because another company's HTTP endpoint has not answered.
+There is a second problem. The provider can accept the shipping command before the local transaction rolls back. Putting an HTTP call between two SQL statements does not put the provider inside the database transaction.
 
-There is also a worse case. Shipping accepts the request, but the database transaction rolls back. The parcel request exists. The order does not. The transaction never included the remote service, even though the code put the call between its statements.
+I would give shipping its own durable state. Commit the local order with a command that a worker can recover. Tell the customer what that state means. Then make the worker's retry contract explicit.
 
-## Give the external step a name
+## Commit an order and its intent together
 
-For this design, I would store an order in a pending state and a shipping command in the same local transaction. The response can say that the order was accepted and shipping is pending. A worker performs the external step later.
+The reproduction uses PostgreSQL 18, SQLx 0.8.6, and a controlled shipping adapter. The complete fixture is in [the Rust database release tests](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/rust-backend/tests/practical_database_release.rs). It uses a disposable schema. It is not a production checkout implementation.
 
-Here is the important part as a Rust SQLx excerpt. It assumes the stock change and order insert have already succeeded on this same transaction:
+There are three local tables: stock, orders, and shipping commands. The command has a unique identity, `ship-42`, and refers to order 42. This is the local transaction:
 
 ```rust
-sqlx::query(
-    "INSERT INTO shipping_outbox
-     (command_id, order_id, state)
-     VALUES (?, ?, 'pending')",
-)
-.bind(command_id)
-.bind(order_id)
-.execute(&mut *tx)
-.await?;
-
-tx.commit().await?;
+async fn checkout(pool: &PgPool, commit: bool) -> std::result::Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("UPDATE stock SET quantity = quantity - 1 WHERE id = 1")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("INSERT INTO orders VALUES (42, 'shipping_pending')")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("INSERT INTO shipping_outbox VALUES ('ship-42', 42, 'pending')")
+        .execute(&mut *tx)
+        .await?;
+    if commit {
+        tx.commit().await?;
+    } else {
+        tx.rollback().await?;
+    }
+    Ok(())
+}
 ```
 
-The schema needs a unique command identity. The real handler also needs authorization, stock checks, and a defined duplicate-order response. The existing [MySQL checkout example](/blog/mysql-rust-stock-reservation-transaction) covers the related writes. The change here is where shipping belongs.
+The boolean is a test control. The rollback branch represents stopping before local acceptance. A real handler needs authorization, a stock condition that prevents overselling, and a stable order identity. Those concerns are covered in [the MySQL checkout example](/blog/mysql-rust-stock-reservation-transaction). This new lab uses PostgreSQL to examine the external-work boundary; it does not claim identical driver behavior across engines.
 
-The worker claims pending work, calls shipping, and records the result. It should not hold the stock transaction open while doing that. A short claim or lease can coordinate workers, but it needs an expiry and recovery policy.
+After rollback, the observer must see stock two, no order, and no command. After commit, it must see stock one, a pending order, and a pending command. Closing the pool and opening another one checks that the command is stored in the database rather than remembered only by a task.
 
-## The outbox does not remove uncertain outcomes
+An outbox is that stored intent. Its value is the shared local commit boundary. The [outbox explanation](/blog/outbox-pattern) develops the pattern further.
 
-Consider a worker that sends the command successfully and crashes before marking it complete. It will find the same pending command after restarting.
+## Let the provider wait outside the stock transaction
 
-If the provider supports a documented idempotency key, send the same stable command identity again. If it offers an outcome lookup, use that to recover. If neither exists, represent uncertainty and give it an operational path. A new random identity on every attempt defeats deduplication.
+The worker reads a pending command and releases the query connection. It calls the controlled adapter with the stored command identity. It then updates command and order state in another short transaction.
 
-This is why “put it in a queue” is not a complete answer. The [outbox pattern](/blog/outbox-pattern) makes the local intent durable with the order. It does not promise one external effect under every failure.
+The adapter pauses after recording acceptance. While it is paused, another transaction updates the stock row with a bounded lock wait. That update must finish. This directly checks that the worker did not keep the checkout's stock lock while waiting for the external step.
 
-The customer experience needs the same honesty. Do not display “shipped” when the database only says “shipping requested.” Define when pending becomes confirmed, failed, or cancelled, and how stock is released if the business allows cancellation.
+A pool with four connections is enough for this fixture. More connections would not repair a stock lock retained by the wrong transaction. In a service, trace both the checkout lifetime and the worker lifetime. A successful SQL statement does not show when its transaction or checked-out connection ends.
 
-## Test the awkward moment
+The adapter is an in-process test double. It models acceptance and duplicate handling. It does not reproduce an HTTP proxy, TLS failure, provider durability, or an undocumented remote idempotency policy. Those need their own integration checks.
 
-Use a controlled shipping adapter and stop execution at three places: before the local commit, after the commit but before the HTTP call, and after provider acceptance but before the worker records success.
+## Stop after acceptance, then recover
 
-Read the stored order, stock, and command after each interruption. Then restart the worker. The useful assertion is that every accepted order has recoverable intent and that a repeated command follows the provider's duplicate contract. A green HTTP response alone proves little.
+The awkward interruption happens after provider acceptance and before the worker records success. The test waits for an explicit signal at that point, aborts the worker task, and waits for cancellation to finish. It then starts a new worker operation using the same pending row.
 
-There are systems that use a wider coordination protocol or deliberately keep a transaction open for a short external check. That choice needs a clear failure model and a strict deadline. For an ordinary checkout, I would first make the pending step explicit. It gives slow shipping somewhere to wait without keeping the stock row locked.
+The provider double keeps one result per command identity. Repeating `ship-42` with the same order returns the same logical result. The test checks one provider identity, a completed command, and a confirmed shipping state after recovery. Running the worker again must leave those results unchanged.
+
+This verifies a cancellation boundary and a database reconnect. It is not an operating-system process-crash or power-loss test. The provider double survives the worker cancellation, just as an independently running provider can outlive a lost caller.
+
+A real provider must document what its key covers, how long it retains that key, and how changed input is handled. If the provider cannot deduplicate or answer an outcome lookup, the local outbox still helps recover intent. It cannot manufacture certainty about a remote effect.
+
+## Make pending useful to the customer and operator
+
+A pending order needs an owner. Define its maximum age, retry budget, and escalation path. Decide whether a customer can cancel it and when stock may be released. A retryable shipping failure and a permanently invalid address usually need different actions.
+
+The small worker in this lab is single-worker code. It does not implement leases, competing claims, or ordering across several workers. Add those before running multiple consumers. Keep the remote call outside long-held database locks while designing the claim protocol.
+
+Return a response that describes the committed fact. An accepted order with shipping pending is useful information. Calling it shipped before confirmation creates a false promise. After an incident, the stored order, command identity, provider lookup, and recorded outcome should let a person explain what happened and continue the operation safely.

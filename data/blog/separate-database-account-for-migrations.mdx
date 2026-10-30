@@ -1,59 +1,76 @@
 ---
-title: "Use a separate database account for migrations."
-date: "2026-10-25T18:30:00Z"
+title: "Use a Separate Database Identity for Migrations"
+date: "2026-10-30T19:15:41Z"
+lastmod: "2026-10-30T19:15:41Z"
+authors: ["default"]
 tags: ["rust", "postgresql", "migrations", "security"]
-draft: true
-reviewed: false
+draft: false
+reviewed: true
+reviewedHash: "8f90b85b806ff8b168c01bed7319f077be8e6170394b15c84de3a13da629613f"
 cluster: "reliable-data-integrations"
 campaign: "editorial"
 summary: "Separate schema ownership from normal application access. Test that the runtime account can do its work and cannot change the tables or security policies."
 ---
 
-The application creates its tables during deployment. Later, the same connection string serves customer requests. Nothing broke, so nobody changes it.
+A deployment starts the application with the same database identity that created its tables. Ordinary requests now run with migration authority. Nothing about a Rust type or query helper removes the permissions attached to that connection.
 
-Now every request runs with the account that can change the schema. A mistake in a maintenance endpoint has the same database authority as a migration.
+Separate the jobs. The migration process changes the schema through a controlled owner identity. The runtime process reads and writes the rows its features need. A permission test should show both facts: useful application work succeeds, and an unintended schema change fails for the right reason.
 
-I would separate these jobs early. The web process needs permission to run its queries. The migration process needs permission to change the structure. Those are different responsibilities, even when both processes use the same Rust repository.
+This lab checks that boundary on PostgreSQL 18 through SQLx 0.8.6. It creates a disposable non-login owner and uses the workflow's non-owner application login. The administrative setup is part of the fixture, not a credential pattern for a production web process.
 
-## Start with ownership
+## Ownership is different from an ordinary grant
 
-For PostgreSQL, a useful arrangement is a non-login owner role, a controlled migration identity that can assume that role, and a runtime login with only the grants the application needs.
+An object owner has authority to change that object. Revoking one ordinary grant from a runtime identity does not help when it still owns the table or can assume its owner role. PostgreSQL's [privilege documentation](https://www.postgresql.org/docs/18/ddl-priv.html) explains that distinction.
 
-Do not make the runtime login a member of the owner role. Removing one explicit grant does not help if membership gives the same power back. Check inherited roles, schema privileges, and routines the account may execute.
+The fixture creates `practical_release_owner` with no login. An administrative connection creates a schema owned by that role. The migration connection assumes the owner role while creating a table, then resets its role before returning to the pool.
 
-Ownership also matters for [row security](https://www.postgresql.org/docs/18/ddl-rowsecurity.html): a table owner normally bypasses its policies. An application that owns its tables can therefore pass misleading tenant tests.
+The application gets schema usage and the table's select, insert, and update privileges. It gets no schema create privilege and no membership in the owner role. The test inserts a row, changes its value from ten to eleven, and reads eleven back through the application connection.
 
-The [separate-role Rust example](/blog/sql-postgresql-rust-row-security-tenant-context) demonstrates that distinction. Here, the deployment rule is the next step: the migration credential should never become the web process's default credential.
+That allowed path matters. A broken connection, wrong password, or role with no useful access would be a poor security demonstration. The test needs to prove an intentional boundary around a working feature.
 
-## Make a denied operation part of the check
+## Reject the exact forbidden operations
 
-After a migration, connect as the real runtime account. Run an allowed query first so a broken connection cannot look like a successful permission test.
-
-This SQLx excerpt illustrates the negative check against a disposable test table:
+The negative checks use three statements: alter the owned table, create another table in the migration schema, and assume the owner role. Each must fail with PostgreSQL code `42501`, which identifies insufficient privilege.
 
 ```rust
-let error = sqlx::query(
-    "ALTER TABLE migration_probe ADD COLUMN forbidden integer",
-)
-.execute(&app_pool)
-.await
-.expect_err("runtime account must not alter the table");
-
-let database_error = error.as_database_error()
-    .expect("expected a PostgreSQL permission error");
-assert_eq!(database_error.code().as_deref(), Some("42501"));
+for statement in [
+        "ALTER TABLE practical_release_roles.migration_probe ADD COLUMN forbidden integer",
+        "CREATE TABLE practical_release_roles.forbidden (id integer)",
+        "SET ROLE practical_release_owner",
+    ] {
+        let error = sqlx::query(statement)
+            .execute(&app)
+            .await
+            .expect_err("runtime privilege boundary");
+        assert_eq!(
+            error.as_database_error().unwrap().code().as_deref(),
+            Some("42501")
+        );
+    }
 ```
 
-The fixture must create the table with the migration owner. It should also confirm that the new column is absent. A connection failure or a misspelled table name is a different failure and should fail this test.
+The complete [role fixture](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/rust-backend/tests/practical_database_release.rs) also checks role membership and queries the catalog through the administrative observer. The forbidden column must be absent. The application role must not be an owner-role member.
 
-Test the actual allowed reads and writes too. A role that can do nothing is easy to secure and useless to deploy. If the service writes generated IDs, include any sequence permissions it requires.
+Do not accept an arbitrary error as permission evidence. A misspelled table name, connection reset, or unavailable server is a different failure. Keep an allowed-path control beside the denied operation, and inspect stored structure afterward.
 
-## Keep the credentials apart during deployment
+These checks are deliberately narrow. They do not audit every role membership, database, schema, function, or object in a production cluster. Extend the list around the operations your application actually exposes. A security-definer routine can introduce authority that a direct table-grant check does not exercise.
 
-Run migrations as a bounded deployment step. Record which revision ran them and whether they finished. Give that step access to its credential, then start the application with its own identity.
+## Keep migration credentials in the deployment step
 
-Avoid solving a failed migration by copying the migration secret into the application environment. Fix the deployment path or the grants. Otherwise the exception quietly becomes the new architecture.
+Give the deployment job the migration credential for its bounded migration operation. Give the web process its runtime credential. Verify the effective identity from inside the running process, rather than assuming an environment variable reached the intended container.
 
-Separate accounts do not make a migration safe. Old and new application versions may run together. An exclusive lock can still delay traffic. Destructive changes still need a rollout and recovery plan.
+Migration failure should lead to a deployment diagnosis. Copying the migration password into the runtime environment may make one release work while quietly removing the boundary. Fix the grants or migration path instead.
 
-For a small local prototype, one owner account can be a reasonable convenience. Before that prototype serves other people's data, make the roles explicit and exercise the denied path. The test is small. Discovering the missing boundary during an incident is much less pleasant.
+For generated IDs, test the relevant sequence access. For new tables, check how default privileges are applied by the role that actually creates them. A grant on today's tables does not automatically settle tomorrow's objects. Prefer an explicit migration assertion over a broad grant added under pressure.
+
+The non-login owner in this lab does not require a runtime password. A real migration login needs a deliberate mechanism to assume ownership, with narrowly assigned membership and controlled secret access. Keep that login out of the request-serving environment.
+
+## Test tenant rules as the runtime user
+
+A table owner normally bypasses row security unless the applicable configuration changes that behavior. An owner-based test can therefore make tenant isolation appear correct while missing the identity used by real requests.
+
+The [row security and Rust tenant-context guide](/blog/sql-postgresql-rust-row-security-tenant-context) demonstrates policy behavior with a separate application identity. Run those application checks using the real runtime role. Keep permission tests and tenant-policy tests together in the deployment review, while remembering that they establish different facts.
+
+Separate identities also do not make every migration safe. A small DDL change can wait on a transaction lock. A destructive change can break an older application process that is still running. Schema ownership, lock behavior, application compatibility, and data recovery each need attention.
+
+Start with a small disposable table and a useful allowed query. Add the forbidden operations that would matter during a mistake or compromise. Then run that check whenever the deployment changes roles or schema ownership. A runtime account that can do its job and cannot take the owner's job is a concrete boundary you can maintain.

@@ -135,6 +135,13 @@ export const editorialSeries = [
       "bounded-rust-channel-database-producer-memory",
     ],
   },
+  {
+    "slug": "rust-database-recovery",
+    "title": "Rust database recovery",
+    "description": "Follow duplicate requests, external work, commit failures and import recovery through complete Rust reproductions.",
+    "introduction": "Start with the state your caller can observe. Check the stored result and choose a recovery path with a clear database and application boundary.",
+    "parts": ["keep-http-out-of-database-transactions", "duplicate-webhooks-select-insert-race", "separate-database-account-for-migrations", "return-success-after-database-commit", "sqlite-import-leave-room-for-normal-saves", "rejected-import-rows-need-a-recovery-path"],
+  },
 ];
 
 export function editorialSeriesForPost(slug) {

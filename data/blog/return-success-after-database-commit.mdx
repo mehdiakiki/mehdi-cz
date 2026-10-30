@@ -1,56 +1,83 @@
 ---
-title: "Don't return success before the commit finishes."
-date: "2026-10-25T18:30:00Z"
-tags: ["rust", "mysql", "transactions", "api design"]
-draft: true
-reviewed: false
+title: "Return HTTP Success After the Database Commit"
+date: "2026-10-30T19:15:41Z"
+lastmod: "2026-10-30T19:15:41Z"
+authors: ["default"]
+tags: ["rust", "postgresql", "transactions", "api design"]
+draft: false
+reviewed: true
+reviewedHash: "23292d8e356b56371538c4352dd5d6699d5e37078780010d9fcb62f0dcb00d46"
 cluster: "reliable-data-integrations"
 campaign: "editorial"
 summary: "Follow a checkout result through the commit and HTTP response. Handle rollback and a lost commit response as different outcomes."
 ---
 
-The handler sends a success response. A moment later, the transaction fails to commit.
+The insert succeeds, so the handler prepares a successful response. Then commit fails. The client has been told that an order exists even though the transaction did not make it durable.
 
-The client has already moved on. It may show a confirmed order, clear a cart, or start another operation that assumes the first write exists. The server cannot take that response back.
+Awaiting the insert is not enough. Some constraints are checked at commit. The database connection can also fail while the application waits for the commit reply. Construct the response after the operation it promises has completed, and keep an unresolved commit outcome distinct from a confirmed database rejection.
 
-This is one reason I prefer a handler whose return value is built after the durable operation it promises. A future created for commit is not a completed commit. A background task that will commit later is not a completed order either.
+The reproduction uses a real Axum request and response path through Tower's in-process service interface, plus PostgreSQL 18 and SQLx 0.8.6. It tests handler ordering and stored state. It does not simulate a TCP connection closing halfway through a response.
 
-## Put the acknowledgement after the promised boundary
+## Make a statement succeed and commit fail
 
-For a synchronous checkout, await the transaction commit before returning the successful result. In a Rust SQLx function, that boundary is small:
+The fixture creates customers and orders. The order's customer reference is a deferrable foreign key that is initially deferred. PostgreSQL accepts the order insert before checking that reference at commit.
+
+One request names customer 999, which does not exist. The insert reaches the end of its statement. Commit then returns foreign-key violation `23503`. This is a controlled database rejection, not an uncertain network outcome.
+
+Here is the exact handler used by the test:
 
 ```rust
-async fn finish_order(
-    tx: sqlx::Transaction<'_, sqlx::MySql>,
-    order_id: i64,
-) -> Result<i64, sqlx::Error> {
-    tx.commit().await?;
-    Ok(order_id)
+async fn create_order(State(pool): State<PgPool>, Path(id): Path<i32>) -> StatusCode {
+    let result = async {
+        let mut tx = pool.begin().await?;
+        sqlx::query("INSERT INTO orders (id, customer_id) VALUES ($1, $1)")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok::<(), sqlx::Error>(())
+    }
+    .await;
+    match result {
+        Ok(()) => StatusCode::CREATED,
+        Err(error)
+            if error.as_database_error().and_then(|e| e.code()).as_deref() == Some("23503") =>
+        {
+            StatusCode::CONFLICT
+        }
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE,
+    }
 }
 ```
 
-This function is only the final step. The caller must have checked authorization, stock, and related writes inside the transaction. The [MySQL checkout example](/blog/mysql-rust-stock-reservation-transaction) shows those operations together.
+The function returns `201 Created` only after awaiting commit. Its known foreign-key rejection becomes `409 Conflict` under this small fixture's API contract. Other errors become `503 Service Unavailable`. A production API needs a richer internal outcome model and a documented recovery response; the catch-all here must not be read as proof that every unavailable operation rolled back.
 
-Do not map the returned ID to a successful HTTP response until the function has completed. If commit fails, preserve a useful internal error category and give the client the API's documented failure or uncertain-outcome response. Avoid sending raw database diagnostics.
+The complete [HTTP commit fixture](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/rust-backend/tests/practical_database_release.rs) dispatches requests through the router and reads stored rows independently. The invalid request must return 409 and leave zero orders. A valid request must return 201 and leave its order visible.
 
-SQLx's [transaction API](https://docs.rs/sqlx/0.8.6/sqlx/struct.Transaction.html) makes commit an asynchronous operation. The await is part of the result, not optional cleanup after the response.
+## Put the acknowledgement after the promised boundary
 
-## A failed response does not prove a failed order
+SQLx's [transaction API](https://docs.rs/sqlx/0.8.6/sqlx/struct.Transaction.html) makes commit asynchronous. Creating that future does not finish the operation. Spawning it in the background changes what the response can honestly promise.
 
-Now reverse the problem. The database commits successfully. The network connection to the client closes before the response arrives.
+For a synchronous order endpoint, the response should follow the durable order. Authorization, stock checks, and related writes belong in the same deliberate transaction. The [MySQL checkout example](/blog/mysql-rust-stock-reservation-transaction) explains that larger business operation. This new test uses PostgreSQL's deferred foreign key to expose the response-ordering mistake; it does not assert identical constraint timing in MySQL.
 
-From the client's view, the request failed. From the database's view, the order exists. There can also be a connection failure while the server is waiting for the commit response, leaving the application unsure what the database did.
+PostgreSQL documents [deferred constraint timing](https://www.postgresql.org/docs/18/sql-set-constraints.html). Checking one example with an immediate constraint would miss this particular failure point. Choose a failure that reaches the boundary you want to inspect.
 
-Do not tell the client to generate a new identity and blindly submit again. Give the operation a stable request key, define what reuse means, and provide an outcome lookup when the product needs it. The [idempotency article](/blog/idempotency-key) covers that contract.
+Do not expose raw database diagnostics to callers. Keep the detailed category in controlled internal diagnostics, and return the API's stable error representation. A foreign-key violation can have several business meanings; the example's 409 mapping is a choice for this test, not a universal status rule.
 
-The useful states are more than success and failure. They may include confirmed, definitely rejected, and not yet resolved. Keep the unresolved case visible until you have evidence.
+## A lost response does not undo a committed order
 
-## Asynchronous acceptance is a different promise
+The test also creates another valid order, receives the response object, and deliberately discards it. A separate query still finds the order. Discarding a response is an application-level model of an unobserved result. It does not prove browser, proxy, or TCP behavior.
 
-An endpoint can legitimately return before an order finishes processing. In that design, persist the accepted job first and return a job identity. The response promises durable acceptance, not final completion.
+The important boundary is visible: response consumption and database commit are separate events. A caller can fail to observe a result that is already stored. An automatic retry with a fresh identity can therefore create another business operation.
 
-HTTP's [202 status](https://www.rfc-editor.org/rfc/rfc9110.html#section-15.3.3) describes an accepted request whose processing is incomplete. A useful API also exposes progress and a final outcome. A task stored only in the web process's memory does not make that promise durable across a restart.
+Use a stable operation identity and a documented lookup or same-key recovery contract where the product needs one. The [idempotency guide](/blog/idempotency-key) explains that API decision. The [lost PostgreSQL commit reply investigation](/blog/postgresql-commit-reply-lost-rust) tests a different boundary with an actual controlled database-protocol relay.
 
-Test three cases separately: rollback before commit, successful commit and response, and successful commit with a lost response. Read the stored order after each one. For the last case, exercise the client's lookup or same-key recovery path.
+This handler intentionally omits authentication, production key storage, and a complete operation-status endpoint. Its integer IDs are fixture identities. Add those product responsibilities before using the shape in a real checkout.
 
-The goal is a response the caller can trust. Be precise about which fact has become durable before saying that fact is complete.
+## Returning early can be a valid different promise
+
+An asynchronous endpoint may return before the final order work finishes. Persist its acceptance record first. Return a job identity and expose progress and a final result. A task stored only in the request process is not durable acceptance across a restart.
+
+HTTP [202 Accepted](https://www.rfc-editor.org/rfc/rfc9110.html#section-15.3.3) describes processing that remains incomplete. A 202 response still needs a useful product contract. Explain whether the job was accepted, started, rejected, completed, or remains unresolved.
+
+Test the response and the stored state together. Force a rejection at commit, a successful commit, and a result that the caller does not consume. Those cases answer different questions. The response becomes trustworthy when it describes the strongest fact the system has actually established.

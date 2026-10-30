@@ -1,63 +1,93 @@
 ---
-title: "Don't handle duplicate webhooks with SELECT, then INSERT."
-date: "2026-10-25T18:30:00Z"
+title: "Two Webhook Deliveries Need One Database Claim"
+date: "2026-10-30T19:15:41Z"
+lastmod: "2026-10-30T19:15:41Z"
+authors: ["default"]
 tags: ["rust", "postgresql", "webhooks", "idempotency"]
-draft: true
-reviewed: false
+draft: false
+reviewed: true
+reviewedHash: "7c7ce917f4726b11a67c2a9690427154ae5b2b54647da9d2b12ff3a6b94a1454"
 cluster: "reliable-data-integrations"
 campaign: "editorial"
 summary: "Two webhook handlers can both pass an existence check. Use a unique database claim, bind it to the payload, and commit it with the business change."
 ---
 
-The webhook handler checks whether it has seen an event. It has not, so it updates the account and records the event ID.
+A duplicate webhook test passes when deliveries run one after another. The first delivery changes the account and records the event. The second finds the record and exits.
 
-Run the same handler twice at the same time. Both requests can finish the check before either inserts the ID. Both now believe they are first.
+Now let both deliveries check at the same time. Each can observe that the event is absent. Each can then apply the change. The existence check was an observation. It never reserved the right to process the event.
 
-This bug can hide for a long time because a sequential duplicate test passes. Send the event, wait for completion, send it again: no problem. The missing case is overlap.
+Use a database constraint to choose the first local application of the event. Keep that claim and its business change in the same transaction. Define what the other caller receives, including the case where an event identity arrives with changed content.
 
-## Let the database choose the winner
+## Give the claim the right scope
 
-Use a unique key for the identity you want to claim. Include the provider and tenant when event IDs are only unique inside those scopes. Do not assume an ID string is globally unique because it looks random.
+The lab uses a primary key over tenant, provider, and event identity. A provider event ID is not automatically unique across all customers and integrations. The scope should match the provider's actual contract and your account mapping.
 
-The Rust SQLx excerpt below assumes a unique constraint on the three identity columns:
+The fixture stores a payload marker beside the identity. Its strings are synthetic matching values, not cryptographic digests. A production implementation should compute an appropriate digest from authenticated event data or retain protected bytes. First verify the provider signature and map the tenant from trusted configuration.
+
+This is the complete application function used by the concurrent test:
 
 ```rust
-let claimed: Option<String> = sqlx::query_scalar(
-    "INSERT INTO received_events
-     (tenant_id, provider, event_id, payload_hash)
-     VALUES ($1, $2, $3, $4)
-     ON CONFLICT (tenant_id, provider, event_id)
-     DO NOTHING
-     RETURNING event_id",
-)
-.bind(tenant_id)
-.bind(provider)
-.bind(event_id)
-.bind(payload_hash)
-.fetch_optional(&mut *tx)
-.await?;
+async fn apply_event(
+    pool: PgPool,
+    payload: &str,
+) -> std::result::Result<&'static str, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let claimed: Option<String> = sqlx::query_scalar(
+        "INSERT INTO received_events (tenant_id, provider, event_id, payload_hash)
+         VALUES ('tenant-a', 'fixture', 'event-42', $1)
+         ON CONFLICT (tenant_id, provider, event_id) DO NOTHING RETURNING event_id",
+    )
+    .bind(payload)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let outcome = if claimed.is_some() {
+        sqlx::query("UPDATE business_effect SET value = value + 1")
+            .execute(&mut *tx)
+            .await?;
+        "applied"
+    } else {
+        let original: String = sqlx::query_scalar("SELECT payload_hash FROM received_events WHERE tenant_id = 'tenant-a' AND provider = 'fixture' AND event_id = 'event-42'")
+            .fetch_one(&mut *tx)
+            .await?;
+        if original == payload {
+            "duplicate"
+        } else {
+            "conflict"
+        }
+    };
+    tx.commit().await?;
+    Ok(outcome)
+}
 ```
 
-When a row is returned, this transaction owns the first claim. It can apply the business update and commit both changes together. PostgreSQL's [INSERT documentation](https://www.postgresql.org/docs/18/sql-insert.html) explains the conflict handling used here.
+The table also has a small counter representing the local business effect. The complete schema and test are in [the release fixture](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/rust-backend/tests/practical_database_release.rs). The function is deliberately small so that the transaction boundary is visible. The fixture uses fixed tenant, provider, and event identities throughout. A real handler should bind its authenticated request identity consistently in both the claim and the lookup.
 
-When no row is returned, load the existing event under the same identity and compare its payload hash. A repeated identity with different content deserves a conflict or quarantine decision. Silently calling it a duplicate can hide a provider bug or an attack.
+## Read the outcome of the claim
 
-Choose what the hash covers. Raw bytes work when the provider promises identical redelivery bytes. If you canonicalize a parsed event, define that format and preserve the fields whose meaning matters. Do not casually normalize away a changed amount or destination.
+When `RETURNING` yields an event identity, this transaction inserted the claim. It increments the counter and commits both facts together. When no identity is returned, it reads the previously stored payload marker and selects either duplicate or conflict.
 
-## Keep the claim with the business effect
+PostgreSQL's [INSERT documentation](https://www.postgresql.org/docs/18/sql-insert.html) describes `ON CONFLICT DO NOTHING`. For this lab, the normal Read Committed isolation level lets the later lookup observe the competing committed row. Do not copy that assumption into another isolation level without checking its visibility and retry rules.
 
-Committing a “seen” record before the business update creates another failure. A crash between those commits leaves an event that will be skipped forever, even though its effect never happened.
+The function returns an outcome only after commit. A connection error while committing can leave the caller uncertain. The [lost commit reply investigation](/blog/postgresql-commit-reply-lost-rust) shows why that error needs a lookup or same-key recovery path rather than a new event identity.
 
-Keep an applied-event claim and the local business mutation in one transaction. If you first persist a received event for later processing, give it an explicit pending state. Reception and successful application are different facts.
+A conflict is different from a duplicate. Reusing the identity with changed content can indicate a provider mistake, a mapping error, or hostile input. Preserve enough safe evidence to investigate it. Do not overwrite the original payload identity just to make the request succeed.
 
-The same principle appears in the [PostgreSQL transaction example](/blog/sql-postgresql-rust-service-transactions). The handler also needs a deliberate response for an existing event. Returning the earlier result is useful when available; a generic database error is not a duplicate contract. See [idempotency keys](/blog/idempotency-key) for that part.
+## Release two deliveries together
 
-## Make the test concurrent on purpose
+The Rust test creates two tasks and a three-party barrier. Both tasks wait before calling the application function. The observer releases them together, then awaits both results. The expected outcomes are one applied and one duplicate.
 
-Create two handler tasks and use a barrier just before the claim. Release both together. After both finish, read the business row and the claim table using a separate connection.
+A separate query then checks one claim and a counter value of one. The test submits the changed payload marker and expects conflict. The counter must remain one. These are stored-state assertions, not just checks that neither task panicked.
 
-Assert one committed effect, one claim, and the expected responses. Then repeat the identity with changed content and assert that the business row stays unchanged.
+This exercises simultaneous calls to PostgreSQL 18 through SQLx 0.8.6. The barrier coordinates attempts at the application boundary. It does not prove every possible scheduler order, network failure, or database isolation setting. The unique constraint is the protection that survives another process or replica; the barrier makes one important overlap easy to reproduce.
 
-The unique constraint is the protection. The test demonstrates the case your previous test missed. An in-process mutex can help a single process, but it cannot coordinate two replicas or another writer using the same database.
+The [transaction guide](/blog/sql-postgresql-rust-service-transactions) explains which local writes should share a commit. Keep the receipt and the effect together even when the effect later grows beyond one counter update.
 
-If the handler sends email or calls another provider, a local claim cannot make that external action atomic. Store durable intent for it and design its retry path separately.
+## Decide whether the claim means received or applied
+
+A receipt committed before the business change needs a pending state and a worker. Otherwise a stopped process can leave an event marked seen even though its effect never happened. The function here uses an applied-event claim: the claim becomes durable with its effect.
+
+A larger design might accept the webhook quickly and process it later. That can be useful, but reception and application are different facts. Persist recoverable input and expose processing failures. The request's success response should describe the fact it actually committed.
+
+Choose a duplicate response that matches the provider's retry contract. The [idempotency guide](/blog/idempotency-key) covers returning an earlier result and rejecting changed requests. Avoid treating every database error as a successful duplicate.
+
+External effects need another boundary. Sending email or requesting a refund inside this transaction does not give PostgreSQL control over that provider. Store durable intent and use a documented remote recovery contract. The useful guarantee here is one committed local application for this scoped identity and the tested path, with a visible conflict when the input changes.
