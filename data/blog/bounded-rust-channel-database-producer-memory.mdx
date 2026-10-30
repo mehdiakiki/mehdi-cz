@@ -1,0 +1,90 @@
+---
+title: "A Bounded Rust Channel Does Not Bound Its Database Producers"
+date: "2026-10-30T10:02:25Z"
+lastmod: "2026-10-30T10:02:25Z"
+tags: ["rust", "tokio", "postgresql", "backpressure"]
+authors: ["default"]
+draft: false
+reviewed: true
+reviewedHash: "6ed9adab433aba69085c70fdcb4f8c81b97ab92e9e134132d7944b6e0e86ad17"
+cluster: "rust-under-the-hood"
+campaign: "editorial"
+summary: "Pause a consumer while several Rust tasks fetch database payloads. Count data retained outside a one-slot queue, then reserve a shared byte budget before fetching."
+---
+
+A queue has capacity one. Four tasks read a batch from PostgreSQL and send it to that queue. While the consumer is paused, how many batches can the application still hold?
+
+Four. One can sit in the queue while the other three remain inside futures waiting for `send` to finish. The channel bounds its queued messages. It does not erase the payloads its producers already created.
+
+That distinction matters in imports, exports, and background jobs. Increasing the number of producers can increase retained data even when the channel capacity stays unchanged. A queue dashboard can show one message while the process holds several large results.
+
+This lab uses four producers, a one-slot Tokio channel, and fixed-size PostgreSQL results. It counts the application payload they retain. It does not measure RSS, allocator overhead, query buffers, or database memory. The source is `pg_producer_budget.rs` in [the PostgreSQL lab](https://github.com/mehdiakiki/mehdi-cz/tree/main/experiments/sql-rust/postgres-sqlite).
+
+## Put the waiting producer in the budget
+
+Each producer reads an 8,192-byte ASCII string through SQLx 0.8.6. It places that string in a small `Batch` value, then calls `send` on Tokio 1.48.0's bounded channel.
+
+The consumer does not receive anything until all four payloads have been constructed. The test tracks construction and destruction of each `Batch`. At that boundary it must see one queued message and 32,768 retained payload bytes.
+
+The other 24,576 bytes are not a channel-capacity bug. The pending sends still own their values. The [Tokio bounded-channel implementation and API documentation](https://github.com/tokio-rs/tokio/blob/tokio-1.48.0/tokio/src/sync/mpsc/bounded.rs) describe how sending waits for capacity. Waiting happens after the caller has supplied its message.
+
+Reducing capacity from ten to one therefore does not mean only one result can exist. Count the producer tasks and the data each can retain before and during its send. Include the consumer's current item as well: receiving removes an item from the queue but does not necessarily finish processing it.
+
+The lab drains all four messages and joins the producers. Its payload counter must return to zero. It checks ownership ending, rather than treating a short delay or a quiet producer as proof that the data was released.
+
+## Reserve the bytes before reading the payload
+
+The comparison gives every producer the same byte semaphore. It has 16,384 permits, with one permit representing one byte of admitted payload. A producer reserves 8,192 before starting its database read:
+
+```rust
+async fn load_with_budget(
+    pool: &PgPool,
+    bytes: Arc<Semaphore>,
+    output: &mpsc::Sender<Batch>,
+    retained: Arc<AtomicUsize>,
+) -> Result<()> {
+    let permit = bytes.acquire_many_owned(ROW_BYTES as u32).await?;
+    let payload: String = sqlx::query_scalar("SELECT repeat('x', 8192)")
+        .fetch_one(pool)
+        .await?;
+    let batch = Batch::new(payload, retained, Some(permit));
+    output.send(batch).await.map_err(|_| "consumer stopped")?;
+    Ok(())
+}
+```
+
+`Batch` owns the payload and the semaphore permit. Its destructor updates the test's payload counter; dropping its fields releases the storage and permit. A successful send moves the whole `Batch` into the channel. Receiving it moves that ownership into the consumer.
+
+This is why the permit belongs to the payload. Returning it immediately after `send` would allow another producer to allocate while the previous payload still lived in the queue. Returning it immediately after `recv` would make the consumer's current work disappear from the budget.
+
+Tokio's [semaphore documentation](https://docs.rs/tokio/1.48.0/tokio/sync/struct.Semaphore.html) describes owned permits and acquiring several permits for one operation. Here the requested weight comes from a known payload bound. The request must fit within the total budget; asking for more permits than can ever become available cannot make progress.
+
+With the consumer paused, two payloads can now exist. One is queued and the other is waiting to send. The remaining producers wait for byte admission before issuing their reads. The assertions require 16,384 retained payload bytes, one queued item, and no available byte permits at that point.
+
+This is admission control across producers. It does not change the channel's one-message capacity.
+
+## A row count is not a byte limit
+
+The query is deliberately fixed-size. It creates an ASCII string with a known byte length. That makes the test's accounting precise without claiming a general upper bound for arbitrary database rows.
+
+A real batch selected with a row limit can contain a large text or binary column. Reserving an estimated size and checking the actual length after decoding does not prevent the earlier allocation from exceeding the estimate.
+
+Choose a real bound: a product-enforced maximum value size, a projection with a justified bound, smaller storage chunks, or an export design that keeps large objects outside the in-memory batch. Include encoding expansion and simultaneous input/output buffers where they matter. A Unicode character count is not necessarily a UTF-8 byte count.
+
+There are additional allocations outside this permit's promise. SQLx can retain protocol data, the allocator can keep capacity, and task state consumes memory. A logical payload counter is useful evidence about this ownership rule, not a process memory cap.
+
+If each payload has the same small maximum, reserving a channel slot before constructing it can also help. Tokio offers `reserve` and `reserve_owned` for that order. A global byte budget answers a broader question when several queues or consumers share the same memory allowance. Pick the resource the limit is meant to protect.
+
+## Check cancellation while producers are waiting
+
+The fixture runs the budgeted case twice. One run consumes all rows and joins every task. The other stops while producers are waiting, aborts and awaits them, then drops the receiver and its queued payload.
+
+Both runs must finish with zero counted payload bytes and all byte permits available again. This catches permits or payloads retained after the work that owned them has ended. A completed task alone is not enough if its output still sits in the queue.
+
+This is a read-only database query. The test does not use task cancellation to make claims about rollback. A write needs a separate assertion about persisted state.
+
+Also bound admission before acquiring a database connection where possible. Holding a connection while waiting for memory can occupy the pool without progressing a query. Acquiring several scarce resources in inconsistent orders can create another waiting problem. The [PostgreSQL transaction guide](/blog/sql-postgresql-rust-service-transactions) explains which operations need to keep their connection and transaction together.
+
+The [slow row consumer investigation](/blog/slow-postgresql-row-consumer-holds-rust-connection) checks the other side of that tradeoff: how long a result stream occupies a database connection.
+
+A useful memory review follows one payload from its database read to the end of processing. List every place it can wait and who owns it there. The [Rust Failure Atlas](/rust-failure-atlas) provides related cases for retained capacity and ownership; the queue length is only one observation in that investigation.

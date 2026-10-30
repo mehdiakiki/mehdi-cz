@@ -1,8 +1,11 @@
 import type { Metadata } from "next";
+import { allBlogs } from "contentlayer/generated";
 
 import { BreadcrumbJsonLd, JsonLd } from "@/components/JsonLd";
 import Link from "@/components/Link";
 import RustFailureAtlasExplorer from "@/components/RustFailureAtlasExplorer";
+import RustDiagnosticPaths from "@/components/RustDiagnosticPaths";
+import { availableRustDiagnosticPaths } from "@/data/rust-diagnostic-paths.mjs";
 import { isRustFailureAtlasLaunched, rustFailureAreas } from "@/data/rust-failure-atlas.mjs";
 import {
   getRustFailureFeatureNote,
@@ -234,6 +237,8 @@ export default function RustFailureAtlasPage() {
           </p>
         </div>
       </section>
+
+      <RustDiagnosticPaths paths={availableRustDiagnosticPaths(allBlogs, entries)} />
 
       {featuredLayers.length > 0 && (
         <section className="py-16 md:py-20" aria-labelledby="atlas-featured">

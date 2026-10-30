@@ -23,6 +23,13 @@ const sqlRustSeries = JSON.parse(
   )
 );
 
+const sqlRustFollowups = JSON.parse(
+  readFileSync(
+    new URL("../docs/editorial/sql-rust-followups-2026-10-27.json", import.meta.url),
+    "utf8"
+  )
+);
+
 const rustBackendSeries = JSON.parse(
   readFileSync(
     new URL("../docs/editorial/rust-backend-eight-2026-10-26.json", import.meta.url),
@@ -230,6 +237,7 @@ test("the repository maps every written campaign source without counting unrelat
     [
       ...sqlRustSeries.articles.map((article) => article.slug),
       ...rustBackendSeries.articles.map((article) => article.slug),
+      ...sqlRustFollowups.articles.map((article) => article.slug),
       "BufReader-rust",
       "a-filename-became-a-shell-command",
       "a-record-and-replay-harness-for-agent-tests",

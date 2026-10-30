@@ -1,0 +1,115 @@
+---
+title: "PostgreSQL Committed, but the Rust Caller Lost the Reply"
+date: "2026-10-30T10:02:25Z"
+lastmod: "2026-10-30T10:02:25Z"
+tags: ["rust", "postgresql", "sqlx", "transactions"]
+authors: ["default"]
+draft: false
+reviewed: true
+reviewedHash: "9aee852946b4ca69f40a1006f20a24c7b58f4ef88c2d2744a19b4eb5256cb0fd"
+cluster: "rust-under-the-hood"
+campaign: "editorial"
+summary: "Drop a PostgreSQL commit reply at a controlled protocol boundary. Recover with an operation key, an atomic receipt, and a replay that checks the original input."
+---
+
+A payment request gets a connection error while committing. The caller wants a simple answer: should it try again?
+
+The error alone cannot answer that. PostgreSQL may have committed the transaction before the connection failed. Returning an error to the caller does not undo a committed write. Retrying with a fresh operation identifier can apply the payment twice.
+
+The difficult part is the gap between what the database did and what the caller learned. This reproduction makes that gap explicit. A small Rust proxy forwards a connection until PostgreSQL sends the command-complete message for `COMMIT`. It consumes that message and closes the client side. A separate connection then checks the persisted data.
+
+The lab uses PostgreSQL 18 and SQLx 0.8.6. It is a constructed failure, not an account of a production payment incident. The full source is `pg_commit_reply.rs` in [the PostgreSQL lab](https://github.com/mehdiakiki/mehdi-cz/tree/main/experiments/sql-rust/postgres-sqlite).
+
+## Test two different interruption points
+
+First, the fixture opens a transaction, changes a balance, and terminates that backend before sending a commit. It waits for backend termination to finish. An observer must see the original balance and no operation receipt.
+
+Then it starts a new connection through the proxy. This connection records an operation and changes the balance in one transaction. The proxy recognizes PostgreSQL's `CommandComplete` frame by its message type and exact command tag:
+
+```rust
+if tag == b'C' && body == b"COMMIT\0" {
+    // PostgreSQL emitted CommandComplete. The Rust caller never receives it.
+    client_out.shutdown().await?;
+    return Ok::<_, Box<dyn std::error::Error + Send + Sync>>(());
+}
+```
+
+The remaining relay forwards complete backend messages, with a bound on frame size. Client bytes travel in the other direction. This is a test fixture for a loopback, plaintext connection to a disposable database. It does not parse encrypted traffic or offer a production proxy implementation.
+
+The [protocol message format](https://www.postgresql.org/docs/18/protocol-message-formats.html#PROTOCOL-MESSAGE-FORMATS-COMMANDCOMPLETE) supplies the tag that makes the interruption precise. The observer supplies the data assertion. A proxy flag saying it dropped a packet would not establish that the intended write was committed.
+
+This case must produce a caller error and one committed receipt with its matching balance change. The pre-commit termination case must leave neither change. The tests cover different facts and should keep different names.
+
+The [PostgreSQL protocol flow](https://www.postgresql.org/docs/18/protocol-flow.html#PROTOCOL-FLOW-TERMINATION) explains why closing a connection is not a general way to reverse work. An open transaction and a command which has already committed are different states. A caller with no reply may not know which state it reached.
+
+A timeout while a statement is still waiting reaches a different boundary. The [local timeout investigation](/blog/rust-timeout-does-not-stop-postgresql-query) observes that work before and after the Rust future is dropped.
+
+## Give a retry the same identity
+
+The example uses a caller-supplied operation key. It stores the amount beside that key. The receipt and the balance change live in the same database transaction:
+
+```rust
+async fn apply(connection: &mut PgConnection, key: &str, amount: i32) -> Result<i32> {
+    let mut tx = connection.begin().await?;
+    let inserted = sqlx::query(
+        "INSERT INTO operations (key, amount) VALUES ($1, $2)
+         ON CONFLICT (key) DO NOTHING",
+    )
+    .bind(key)
+    .bind(amount)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    let recorded: i32 = sqlx::query_scalar("SELECT amount FROM operations WHERE key = $1")
+        .bind(key)
+        .fetch_one(&mut *tx)
+        .await?;
+    if recorded != amount {
+        tx.rollback().await?;
+        return Err("operation key was reused with a different amount".into());
+    }
+    if inserted == 1 {
+        let changed = sqlx::query("UPDATE account SET balance = balance + $1 WHERE id = 1")
+            .bind(amount)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        if changed != 1 {
+            tx.rollback().await?;
+            return Err("account missing".into());
+        }
+    }
+    tx.commit().await?;
+    Ok(recorded)
+}
+```
+
+If the insert succeeds, this attempt owns the new operation and applies its effect. If the key already exists, the function reads the stored amount. A replay with the same amount returns the recorded value. Reusing the key with a different amount is rejected.
+
+Checking the input matters. Otherwise, a client bug can silently turn a new request into an old answer. A real operation might include currency, destination, tenant, and a versioned request format. Choose which fields define the operation and store enough to compare them accurately.
+
+The primary key supplies the conflict boundary. PostgreSQL's [INSERT documentation](https://www.postgresql.org/docs/18/sql-insert.html#SQL-ON-CONFLICT) describes conflict handling. Under the default Read Committed isolation used here, the later receipt read gets a new statement snapshot. Different isolation levels require their own conflict and retry analysis.
+
+In a multi-tenant service, include the authenticated tenant in the uniqueness rule and every lookup. Do not allow a key from one customer to select another customer's result. This fixture has one account and no authorization model; it tests the transaction protocol only.
+
+## Resolve an uncertain result through the primary
+
+After the lost reply, the lab reads the balance and receipts through an independent connection to the same primary. They show a balance of 30 and one operation. Replaying that key with 30 succeeds without another increment. Replaying it with 31 fails, and the stored state stays unchanged.
+
+Those values are assertion targets, not a timing or durability benchmark. The test does not crash the host, promote a replica, or measure storage persistence under power loss.
+
+An absent receipt needs care. A read from a lagging replica cannot settle whether the primary committed. Even a primary read can happen while an earlier attempt is still in flight. Use the same operation key when retrying, so the database conflict rule still controls which attempt applies the change. Do not interpret a momentarily absent row as permission to mint a different key.
+
+If the primary is unreachable, keep the outcome unknown. Tell the caller how to check or retry the existing operation. An API can return a pending operation identity rather than falsely reporting a confirmed failure.
+
+Receipts also need a retention rule. Deleting one while clients may still replay its key removes the protection. Define the retry window and keep the receipt or a suitable tombstone for that window. Do not choose an expiry only because the table looks large.
+
+## Keep the recovery promise within its transaction
+
+The atomic receipt protects a balance change in this PostgreSQL database. It cannot also make an email or an external payment request atomic. A crash after sending an external request but before recording its result creates another uncertain boundary.
+
+For those effects, use the external system's operation identity and reconciliation rules. An outbox can record intent in the database transaction, but its worker still needs a safe delivery and replay protocol. The [transaction article](/blog/sql-postgresql-rust-service-transactions) covers the local atomicity boundary in more detail.
+
+Keep three outcomes distinct in the application: confirmed success, confirmed rejection, and unknown. A SQL constraint rejection before commit is useful evidence. An I/O error during commit is different evidence. Converting both into a generic retryable error loses the distinction the recovery code needs.
+
+The reliable repair is to preserve the operation's identity across that uncertainty. The caller can ask again, and the database can answer from the receipt without repeating the effect.

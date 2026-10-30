@@ -1,0 +1,64 @@
+import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+import matter from "gray-matter";
+import { publicationStatus } from "../lib/publication.mjs";
+import { articleReviewHash } from "../lib/content-review.mjs";
+import { missingDuePublications, parsePublicationFrontmatter } from "./check-publication-due.mjs";
+import { editorialSeriesForPost } from "../data/editorial-series.mjs";
+
+assert.equal(process.env.GITHUB_ACTIONS, "true", "Use the existing GitHub workflow");
+const manifest = JSON.parse(
+  await readFile("docs/editorial/sql-rust-followups-2026-10-27.json", "utf8")
+);
+assert.equal(manifest.articles.length, 7);
+const release = JSON.parse(
+  await readFile("docs/editorial/sql-rust-followups-release-2026-10-30.json", "utf8")
+);
+const posts = [];
+for (const article of manifest.articles) {
+  const source = await readFile(article.path, "utf8");
+  const { data, content } = matter(source);
+  assert.equal(data.title, article.title);
+  assert.equal(data.draft, false);
+  assert.equal(data.reviewed, true);
+  assert.equal(data.date, release.publish_at);
+  assert.equal(data.reviewedHash, articleReviewHash(source), article.slug);
+  const approved = release.articles.find((item) => item.slug === article.slug);
+  assert.equal(data.reviewedHash, approved?.reviewedHash, article.slug);
+  assert.deepEqual(data.authors, ["default"]);
+  const boundary = new Date(release.publish_at);
+  assert.equal(publicationStatus(data, new Date(boundary.getTime() - 1)), "scheduled");
+  assert.equal(publicationStatus(data, boundary), "published");
+  assert.equal(publicationStatus({ ...data, draft: true }, boundary), "draft");
+  assert.equal(publicationStatus({ ...data, reviewed: false }, boundary), "unapproved");
+  assert.equal(editorialSeriesForPost(article.slug)?.slug, release.series);
+  posts.push({
+    ...parsePublicationFrontmatter(source),
+    slug: article.slug,
+    path: `/blog/${article.slug}`,
+  });
+  assert.ok(!source.includes("{{snippet:"), article.slug);
+  const fences = [...content.matchAll(/^```([^\n]*)\n([\s\S]*?)^```/gm)];
+  assert.equal(fences.length, article.snippets.length, article.slug);
+  for (const [index, snippet] of article.snippets.entries()) {
+    assert.equal(fences[index][1], "rust");
+    const fixture = await readFile(snippet.source, "utf8");
+    const marker = new RegExp(
+      `^[ \\t]*// article:start ${snippet.label}\\n([\\s\\S]*?)^[ \\t]*// article:end ${snippet.label}`,
+      "m"
+    );
+    const excerpt = fixture.match(marker)?.[1];
+    assert.ok(excerpt, snippet.label);
+    // Markdown and rustfmt wrap long expressions differently.
+    assert.equal(fences[index][2].replace(/\s/g, ""), excerpt.replace(/\s/g, ""), article.slug);
+  }
+  console.log(`Verified approved release, author, review hash and Rust excerpts: ${article.slug}`);
+}
+const now = new Date(release.publish_at);
+assert.equal(missingDuePublications(posts, "<urlset></urlset>", now).length, 7);
+assert.deepEqual(
+  missingDuePublications(posts, "<urlset></urlset>", new Date(now.getTime() - 1)),
+  []
+);
+const live = `<urlset>${posts.map((post) => `<url><loc>https://www.mehdi.cz${post.path}</loc></url>`).join("")}</urlset>`;
+assert.deepEqual(missingDuePublications(posts, live, now), []);

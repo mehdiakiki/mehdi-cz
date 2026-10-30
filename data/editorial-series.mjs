@@ -118,6 +118,23 @@ export const editorialSeries = [
       "postgresql-job-lease-stale-rust-worker",
     ],
   },
+  {
+    slug: "rust-database-failures",
+    title: "Rust and database failures",
+    description:
+      "Follow request waits, uncertain writes, row streams, memory budgets and deployment dependencies through reproducible Rust examples.",
+    introduction:
+      "Start with the symptom you can observe. Each article explains a different boundary between the Rust application, database driver and database, with source code and checks for the result.",
+    parts: [
+      "rust-request-waiting-for-pool-or-postgresql",
+      "postgresql-commit-reply-lost-rust",
+      "slow-postgresql-row-consumer-holds-rust-connection",
+      "sqlx-offline-build-stale-database-metadata",
+      "rust-oracle-client-library-missing-in-deployment",
+      "rust-timeout-does-not-stop-postgresql-query",
+      "bounded-rust-channel-database-producer-memory",
+    ],
+  },
 ];
 
 export function editorialSeriesForPost(slug) {
