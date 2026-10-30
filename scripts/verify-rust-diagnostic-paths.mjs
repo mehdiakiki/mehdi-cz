@@ -28,5 +28,5 @@ await writeFile(
 );
 await writeFile("/tmp/editorial-evidence/previews/rust-failure-atlas.html", html);
 console.log(
-  "Checked five diagnostic paths in production HTML, published destinations, publication filtering and the RSS link."
+  `Checked ${rustDiagnosticPaths.length} diagnostic paths in production HTML, published destinations, publication filtering and the RSS link.`
 );

@@ -108,7 +108,7 @@ const cases = [
     tests: `
 #[test] fn capture_preserves_intended_message() {
     let mut adapter = CapturedMail::default();
-    adapter.send(Mail { recipient: "test@example.test".into(), subject: "fixture".into(), body: "synthetic".into() });
+    adapter.send(Mail { recipient: "test@example.test".into(), subject: "fixture".into(), body: "synthetic".into() }).unwrap();
     assert_eq!(adapter.messages.len(), 1);
     assert_eq!(adapter.messages[0].recipient, "test@example.test");
     assert_eq!(adapter.messages[0].subject, "fixture");

@@ -151,6 +151,88 @@ export const editorialSeries = [
       "rejected-import-rows-need-a-recovery-path",
     ],
   },
+{
+  "slug": "rust-database-boundaries",
+  "title": "Rust database boundaries",
+  "description": "Check index write costs, tenant isolation, and database permissions.",
+  "introduction": "Check index write costs, tenant isolation, and database permissions. Each guide gives a concrete reproduction, the resulting decision, and the limits of the evidence.",
+  "parts": [
+    "index-cost-write-heavy-postgresql-table",
+    "two-tenants-in-authorization-tests",
+    "reporting-database-account-cannot-write"
+  ]
+},
+{
+  "slug": "rust-service-runtime",
+  "title": "Rust service runtime decisions",
+  "description": "Trace shared locks, queue admission, task ownership, retained memory, and cleanup.",
+  "introduction": "Trace shared locks, queue admission, task ownership, retained memory, and cleanup. Each guide gives a concrete reproduction, the resulting decision, and the limits of the evidence.",
+  "parts": [
+    "release-mutex-before-remote-api-call",
+    "decide-what-happens-when-queue-is-full",
+    "detached-task-does-not-fix-slow-request",
+    "limit-bytes-before-collecting-response-body",
+    "bound-task-fanout-before-spawning",
+    "arc-clones-retain-old-data",
+    "metrics-counter-is-not-a-reservation-protocol",
+    "return-worker-failures-to-caller",
+    "check-drop-on-slow-rust-request-path"
+  ]
+},
+{
+  "slug": "rust-builds-and-testing",
+  "title": "Rust builds, tests, and measurements",
+  "description": "Keep failing inputs, diagnose build inputs, and compare performance with observable controls.",
+  "introduction": "Keep failing inputs, diagnose build inputs, and compare performance with observable controls. Each guide gives a concrete reproduction, the resulting decision, and the limits of the evidence.",
+  "parts": [
+    "save-failing-input-before-fixing-bug",
+    "test-must-fail-for-intended-reason",
+    "flaky-test-needs-signal-not-longer-sleep",
+    "no-timestamp-in-dependency-cache-key",
+    "check-lockfile-before-blaming-rust-upgrade",
+    "test-generated-code-from-empty-output",
+    "keep-debug-symbols-for-shipped-binary",
+    "tail-latency-before-more-request-concurrency",
+    "change-one-performance-variable-at-a-time",
+    "generated-api-client-separate-rust-crate"
+  ]
+},
+{
+  "slug": "rust-integration-recovery",
+  "title": "Rust API integration recovery",
+  "description": "Keep provider outcomes, pagination, caches, durable acceptance, and repairs explicit.",
+  "introduction": "Keep provider outcomes, pagination, caches, durable acceptance, and repairs explicit. Each guide gives a concrete reproduction, the resulting decision, and the limits of the evidence.",
+  "parts": [
+    "keep-provider-status-out-of-ui",
+    "provider-rate-limit-is-not-always-customer-error",
+    "choose-one-layer-to-own-retries",
+    "check-write-outcome-after-timeout",
+    "no-full-integration-repair-inside-get-request",
+    "opaque-cursors-bound-to-query",
+    "tenant-in-cache-key-not-only-record-id",
+    "bulk-response-identify-successful-items",
+    "webhook-response-after-durable-acceptance",
+    "repair-script-preview-before-write"
+  ]
+},
+{
+  "slug": "rust-ai-tool-boundaries",
+  "title": "Rust AI tool boundaries",
+  "description": "Carry identity, permissions, approval, and resource limits to the place effects happen.",
+  "introduction": "Carry identity, permissions, approval, and resource limits to the place effects happen. Each guide gives a concrete reproduction, the resulting decision, and the limits of the evidence.",
+  "parts": [
+    "start-internal-ai-tool-read-only",
+    "model-must-not-select-user-credentials",
+    "log-tool-decisions-without-customer-documents",
+    "offer-tools-for-current-workflow-only",
+    "denied-tool-call-must-leave-no-side-effect",
+    "fallback-model-must-preserve-permissions",
+    "agent-test-must-not-send-real-email",
+    "trusted-tool-still-needs-output-limit",
+    "keep-eval-case-that-found-regression",
+    "overall-eval-score-hides-workflow-regression"
+  ]
+},
 ];
 
 export function editorialSeriesForPost(slug) {

@@ -69,7 +69,8 @@ for (const article of manifest.articles) {
     ["Mehdi Akiki"]
   );
   const body = renderToStaticMarkup(h(MDXLayoutRenderer, { code: post.body.code }));
-  assert.ok(body.includes("<h2") && body.includes("<pre"), article.slug);
+  assert.ok(body.includes("<h2"), article.slug);
+  if (article.fixture || article.snippets?.length) assert.ok(body.includes("<pre"),article.slug);
   for (const [, target] of body.matchAll(/href="\/blog\/([^"#?]+)"/g)) {
     assert.ok(
       publicArticleHref(allBlogs, target),
@@ -102,12 +103,10 @@ await writeFile(
     )
   )
 );
-const hub = await readFile(
-  `.next/server/app/blog/series/${process.argv[3] || "rust-database-failures"}.html`,
-  "utf8"
-);
-for (const article of manifest.articles)
-  assert.ok(hub.includes(`/blog/${article.slug}`), article.slug);
+for (const article of manifest.articles) {
+  const hub = await readFile(`.next/server/app/blog/series/${article.series || process.argv[3] || "rust-database-failures"}.html`,"utf8");
+  assert.ok(hub.includes(`/blog/${article.slug}`),article.slug);
+}
 console.log(
   `Verified ${manifest.articles.length} approved public routes, canonical URLs, sole-author metadata, search, RSS, sitemap and the reading-series hub; retained review copies.`
 );

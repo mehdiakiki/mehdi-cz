@@ -31,10 +31,11 @@ test("every approved practical topic has a distinct manuscript and its deeper de
   }
 });
 
-test("time alone cannot release any of the fifty unapproved drafts", async () => {
+test("time alone cannot release consolidated source bodies", async () => {
   const future = new Date("2030-01-01T00:00:00Z");
   const held = posts.filter((post) => post.reviewed !== true);
-  assert.equal(held.length, 44);
+  assert.equal(held.length, 2);
+  assert.deepEqual(held.map((post) => post.number), [1,19]);
   for (const post of held) {
     assert.equal(post.draft, true, post.slug);
     assert.equal(post.reviewed, false, post.slug);

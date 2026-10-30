@@ -138,7 +138,9 @@ for (const split of [false, true]) {
         edit,
         sample,
         milliseconds: result.milliseconds,
-        generatedFresh: /Fresh\s+generated_client/.test(result.stderr.replace(/\u001b\[[0-9;]*m/g, "")),
+        generatedFresh: /Fresh\s+generated_client/.test(
+          result.stderr.replace(/\u001b\[[0-9;]*m/g, "")
+        ),
       };
       samples.push(row);
       console.log(`CRATE_SAMPLE ${JSON.stringify(row)}`);
@@ -211,17 +213,56 @@ console.log(
 
 // Static probe uses the very same policy module as the HTTP tests, inside an
 // isolated capture process. No bind mounts depend on the Docker host filesystem.
-run("rustup",["target","add","x86_64-unknown-linux-musl"],work);
-const sysroot=execFileSync("rustc",["--print","sysroot"],{encoding:"utf8"}).trim();
-const probe=path.join(work,"egress-probe");
-run("rustc",["--edition=2021","--target=x86_64-unknown-linux-musl","-C",`linker=${sysroot}/lib/rustlib/x86_64-unknown-linux-gnu/bin/rust-lld`,"-C","link-self-contained=yes",path.resolve("experiments/practical-builds/egress.rs"),"-o",probe],work);
-for(const [mode,expected] of [["--capture",0],["--smtp",2]]) {
-  const id=execFileSync("docker",["create","--network","none","--entrypoint","/probe","pgvector/pgvector:0.8.7-pg18-bookworm",mode],{encoding:"utf8"}).trim();
+run("rustup", ["target", "add", "x86_64-unknown-linux-musl"], work);
+const sysroot = execFileSync("rustc", ["--print", "sysroot"], { encoding: "utf8" }).trim();
+const probe = path.join(work, "egress-probe");
+run(
+  "rustc",
+  [
+    "--edition=2021",
+    "--target=x86_64-unknown-linux-musl",
+    "-C",
+    `linker=${sysroot}/lib/rustlib/x86_64-unknown-linux-gnu/bin/rust-lld`,
+    "-C",
+    "link-self-contained=yes",
+    path.resolve("experiments/practical-builds/egress.rs"),
+    "-o",
+    probe,
+  ],
+  work
+);
+for (const [mode, expected] of [
+  ["--capture", 0],
+  ["--smtp", 2],
+]) {
+  const id = execFileSync(
+    "docker",
+    [
+      "create",
+      "--network",
+      "none",
+      "--entrypoint",
+      "/probe",
+      "pgvector/pgvector:0.8.7-pg18-bookworm",
+      mode,
+    ],
+    { encoding: "utf8" }
+  ).trim();
   try {
-    run("docker",["cp",probe,`${id}:/probe`],work);
-    const result=run("docker",["start","--attach",id],work,expected===0);
-    const code=Number(execFileSync("docker",["inspect","--format","{{.State.ExitCode}}",id],{encoding:"utf8"}));assert.equal(code,expected);
-    if(expected===0){assert.match(result.stdout,/external connect=ENETUNREACH/);console.log(result.stdout.trim());}
-  } finally {execFileSync("docker",["rm","--force",id]);}
+    run("docker", ["cp", probe, `${id}:/probe`], work);
+    const result = run("docker", ["start", "--attach", id], work, expected === 0);
+    const code = Number(
+      execFileSync("docker", ["inspect", "--format", "{{.State.ExitCode}}", id], {
+        encoding: "utf8",
+      })
+    );
+    assert.equal(code, expected);
+    if (expected === 0) {
+      assert.match(result.stdout, /external connect=ENETUNREACH/);
+      console.log(result.stdout.trim());
+    }
+  } finally {
+    execFileSync("docker", ["rm", "--force", id]);
+  }
 }
-await writeFile(path.join(evidence,"commands.json"),JSON.stringify(records,null,2)+"\n");
+await writeFile(path.join(evidence, "commands.json"), JSON.stringify(records, null, 2) + "\n");

@@ -57,3 +57,5 @@ assert.equal(missingDuePublications(posts, "<urlset></urlset>", boundary).length
 assert.deepEqual(missingDuePublications(posts, "<urlset></urlset>", before), []);
 const sitemap = `<urlset>${posts.map((post) => `<url><loc>https://www.mehdi.cz${post.path}</loc></url>`).join("")}</urlset>`;
 assert.deepEqual(missingDuePublications(posts, sitemap, boundary), []);
+
+await import("./verify-practical-completion.mjs");

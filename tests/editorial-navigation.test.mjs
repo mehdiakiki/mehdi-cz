@@ -71,10 +71,10 @@ test("series retain their reading order while omitting future and unapproved par
   assert.equal(editorialSeriesForPost("unrelated"), undefined);
 });
 
-test("all eighty-one editorial articles have one reader series with the expected batch sizes", () => {
+test("all approved editorial articles have one reader series with the expected batch sizes", () => {
   const slugs = editorialSeries.flatMap((series) => series.parts);
-  assert.equal(slugs.length, 81);
-  assert.equal(new Set(slugs).size, 81);
+  assert.equal(slugs.length, 123);
+  assert.equal(new Set(slugs).size, 123);
   assert.ok(
     editorialSeries
       .filter(
@@ -84,10 +84,15 @@ test("all eighty-one editorial articles have one reader series with the expected
             "rust-backend-in-practice",
             "rust-database-failures",
             "rust-database-recovery",
+            "rust-database-boundaries",
+            "rust-service-runtime",
           ].includes(series.slug)
       )
       .every((series) => series.parts.length === 10)
   );
+  assert.equal(editorialSeries.find((series) => series.slug === "rust-database-boundaries").parts.length,3);
+  assert.equal(editorialSeries.find((series) => series.slug === "rust-service-runtime").parts.length,9);
+
   assert.equal(
     editorialSeries.find((series) => series.slug === "rust-backend-in-practice").parts.length,
     8

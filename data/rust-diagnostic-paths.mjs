@@ -11,6 +11,8 @@ export const rustDiagnosticPaths = [
       "rust-request-waiting-for-pool-or-postgresql",
       "sql-postgresql-rust-service-transactions",
       "how-async-rust-works-under-the-hood",
+      "release-mutex-before-remote-api-call",
+      "decide-what-happens-when-queue-is-full",
     ],
   },
   {
@@ -21,6 +23,8 @@ export const rustDiagnosticPaths = [
     articleSlugs: [
       "rust-timeout-does-not-stop-postgresql-query",
       "postgresql-commit-reply-lost-rust",
+      "check-write-outcome-after-timeout",
+      "choose-one-layer-to-own-retries",
       "async-cleanup-in-rust-when-drop-cannot-await",
     ],
   },
@@ -34,6 +38,9 @@ export const rustDiagnosticPaths = [
       "bounded-rust-channel-database-producer-memory",
       "slow-postgresql-row-consumer-holds-rust-connection",
       "bounded-channels-are-a-capacity-contract-not-just-a-queue-size",
+      "bound-task-fanout-before-spawning",
+      "arc-clones-retain-old-data",
+      "limit-bytes-before-collecting-response-body",
     ],
   },
   {
@@ -45,6 +52,9 @@ export const rustDiagnosticPaths = [
     articleSlugs: [
       "sqlx-offline-build-stale-database-metadata",
       "why-did-cargo-rebuild-this-crate-fingerprints-and-dirty-reasons",
+      "test-generated-code-from-empty-output",
+      "check-lockfile-before-blaming-rust-upgrade",
+      "keep-debug-symbols-for-shipped-binary",
     ],
   },
   {
@@ -58,6 +68,9 @@ export const rustDiagnosticPaths = [
       "how-the-dynamic-loader-finds-a-shared-library",
     ],
   },
+  {slug:"failure-test-did-not-prove-the-contract",title:"A failure test passed without proving the rule",firstCheck:"Check the intended error, stored state, and a valid control before trusting a rejection.",caseIds:[],articleSlugs:["test-must-fail-for-intended-reason","flaky-test-needs-signal-not-longer-sleep","save-failing-input-before-fixing-bug"]},
+  {slug:"tenant-boundary-and-cache",title:"An account boundary disappears in a cache or tool",firstCheck:"Trace the authenticated scope through reads, cache hits, invalidation, and the effect boundary.",caseIds:[],articleSlugs:["two-tenants-in-authorization-tests","tenant-in-cache-key-not-only-record-id","denied-tool-call-must-leave-no-side-effect"]},
+
 ];
 
 export function availableRustDiagnosticPaths(posts, entries, now = new Date()) {

@@ -1,9 +1,11 @@
 ---
-title: "Don't fix a flaky test with a longer sleep."
-date: "2026-10-25T18:30:00Z"
+title: "Don't fix a flaky test with a longer sleep"
+date: "2026-10-30T21:17:00Z"
 tags: ["rust", "tokio", "testing", "retries"]
-draft: true
-reviewed: false
+draft: false
+reviewed: true
+reviewedHash: "2e2a512fe5b9682512b9b404c9ecfc5e0409f08c1e091a30c9ecbef420aaa2a4"
+authors: ["default"]
 cluster: "reliable-data-integrations"
 campaign: "editorial"
 summary: "Replace timing guesses with observable readiness and controlled time. Keep real transport deadlines separate from a deterministic retry-policy test."
@@ -24,16 +26,26 @@ For a retry-policy test, use a controlled transport that records calls and retur
 Tokio supports [paused time](https://docs.rs/tokio/1.48.0/tokio/time/fn.pause.html) on its current-thread test runtime with the relevant features. Here is a Rust test outline for a client that must refuse a retry beyond its deadline:
 
 ```rust
-#[tokio::test(start_paused = true)]
-async fn retry_after_cannot_extend_the_request_deadline() {
-    let transport = ScriptedTransport::retry_after_seconds(30);
-    let result = fetch_with_retry(
-        &transport,
-        std::time::Duration::from_secs(5),
-    ).await;
-
-    assert!(matches!(result, Err(FetchError::Deadline)));
-    assert_eq!(transport.attempts(), 1);
+async fn fetch_with_retry(
+    transport: &ScriptedTransport,
+    budget: Duration,
+) -> Result<(), FetchError> {
+    let deadline = tokio::time::Instant::now() + budget;
+    for _ in 0..2 {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(FetchError::Deadline);
+        }
+        match transport.call().await? {
+            Reply::Success => return Ok(()),
+            Reply::RetryAfter(delay) => {
+                if delay >= deadline.saturating_duration_since(tokio::time::Instant::now()) {
+                    return Err(FetchError::Deadline);
+                }
+                tokio::time::sleep(delay).await;
+            }
+        }
+    }
+    Err(FetchError::Deadline)
 }
 ```
 
@@ -58,3 +70,17 @@ Try the test under delayed scheduling or a deliberately stalled dependency. A re
 There are valid timing tests. If the requirement is that a real operation times out, elapsed time belongs in the evidence. Even then, a controlled dependency and sensible tolerance are better than an arbitrary sleep before looking at state.
 
 The goal is a test that waits for the thing it cares about. Once that relationship is explicit, the test usually becomes both faster and easier to trust.
+
+## A clock-controlled retry with an ordinary readiness signal
+
+The [complete fixture](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/rust-backend/tests/practical_testing.rs) uses Tokio's clock throughout the retry policy. That detail is easy to miss. Pausing Tokio time would not control a deadline built from the standard library's clock.
+
+Its first transport response asks for a thirty-second wait. The whole operation has a five-second budget. The policy returns `Deadline` after one attempt instead of scheduling work beyond that budget. A second transport asks for two seconds and then succeeds. The recorded call times differ by exactly two virtual seconds.
+
+These checks concern the policy's chosen schedule. They do not claim that a real network request completes in an exact wall-clock interval. The transport is scripted, and the clock is paused. A real HTTP integration still needs bounded connection and response-body handling.
+
+The same test also uses two one-shot channels around a worker. One announces that the worker reached the boundary. The other releases it. The observer waits for readiness, checks the value before release, then joins the worker and checks the final value of forty-two. No arbitrary sleep decides when the assertion runs.
+
+A separate channel deliberately never sends. Waiting for it through a five-second watchdog returns a timeout. This control matters because a useful signal test should fail in a bounded way when the expected event never arrives. Otherwise a regression can turn the CI job into an unexplained hang.
+
+Use signals for observable boundaries in your own code: a transaction started, a request reached the fake server, or a cleanup owner was created. Keep the watchdog longer than the expected scheduling delay, but make the signal establish readiness. A longer sleep alone cannot establish that the event happened.

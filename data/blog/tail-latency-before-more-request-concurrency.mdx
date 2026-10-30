@@ -1,9 +1,11 @@
 ---
-title: "Measure tail latency before raising request concurrency."
-date: "2026-10-25T18:30:00Z"
+title: "Measure tail latency before raising request concurrency"
+date: "2026-10-30T21:17:00Z"
 tags: ["rust", "performance", "concurrency", "api clients"]
-draft: true
-reviewed: false
+draft: false
+reviewed: true
+reviewedHash: "f41b7e11cb7518491ef9c883fac2ea13664f451fa8eed5e81003da915f906b9e"
+authors: ["default"]
 cluster: "reliable-data-integrations"
 campaign: "editorial"
 summary: "More concurrent calls can raise throughput while making slow requests worse. Compare queue time, errors, and latency distributions under the same offered workload."
@@ -27,22 +29,30 @@ The [adaptive-concurrency article](/blog/adaptive-concurrency-for-apis-with-chan
 
 ## Start timing before the local queue
 
-In a Rust client, record admission wait separately from the actual upstream operation. This is an instrumentation outline:
+Record admission wait separately from the actual operation. This is the server handler from the reproduction; the complete client also times the request through its body read:
 
 ```rust
-let queued_at = std::time::Instant::now();
-let permit = limiter.acquire().await?;
-let started_at = std::time::Instant::now();
-let result = transport.send_and_read_bounded(request).await;
-let finished_at = std::time::Instant::now();
-drop(permit);
-
-record_queue_wait(started_at.duration_since(queued_at));
-record_upstream_time(finished_at.duration_since(started_at));
-record_total_time(finished_at.duration_since(queued_at));
+async fn work(State(server): State<Server>) -> (HeaderMap, &'static str) {
+    let queued = Gauge::enter(server.queued.clone());
+    let started = Instant::now();
+    let _permit = server.slots.acquire().await.unwrap();
+    let queue_us = started.elapsed().as_micros();
+    drop(queued);
+    let _active = Gauge::enter(server.active.clone());
+    server
+        .peak
+        .fetch_max(server.active.load(Ordering::SeqCst), Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "x-queue-us",
+        HeaderValue::from_str(&queue_us.to_string()).unwrap(),
+    );
+    (headers, "ok")
+}
 ```
 
-The helpers are application-specific. Here, `send_and_read_bounded` finishes only after reading the required response body within its size limit. Clients such as reqwest expose [body reads separately from response headers](https://docs.rs/reqwest/latest/reqwest/struct.Response.html). Stopping the timer when headers arrive can miss a slow body and release the concurrency permit too early.
+The handler reports its queue wait in a response header. The client reads the fixture's tiny fixed body before recording a success. For an untrusted response, add a streaming byte cap before collecting it. Clients such as reqwest expose [body reads separately from response headers](https://docs.rs/reqwest/latest/reqwest/struct.Response.html). Stopping the timer when headers arrive can miss a slow body and release the concurrency permit too early.
 
 A production implementation also needs cancellation and deadline accounting so timed-out requests remain visible in the outcome data. Include the body-reading policy in the workload description.
 
@@ -63,3 +73,17 @@ A background backfill may accept slower individual requests to maximize completi
 Test several limits through the existing CI or performance workflow. Include an unchanged control and repeat when shared-runner variation matters. Publish measured figures only with the workload and environment that produced them.
 
 The useful conclusion is not “more concurrency is bad.” It is a specific limit, for a specific workload, chosen using both completion rate and the experience of slower requests. Average speed alone cannot make that decision.
+
+## A small HTTP service at and beyond capacity
+
+The [runnable load fixture](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/rust-backend/src/bin/practical_load.rs) starts a loopback HTTP server with two work permits. Every accepted operation simulates twenty milliseconds of work. The client reads the tiny fixed response body and applies an eighty-millisecond request deadline. Each sample sends forty requests with a fixed maximum number in flight.
+
+This is a closed-loop workload. When a request finishes or times out, the client can start another. It does not model an independent arrival stream or an unbounded production burst. Two rounds use opposite order so a single increasing sequence is not the entire comparison.
+
+In the first round, concurrency one completed all forty calls at about 45.7 successful calls per second. Concurrency four completed all forty at about 93.7 per second, but successful p95 latency rose from 22.1 to 43.7 milliseconds. At concurrency twelve, only twelve calls succeeded and twenty-eight timed out. Successful throughput fell to about 41.6 per second. The second round at twelve completed eight and timed out thirty-two.
+
+Those percentiles describe successful calls only. Timed-out calls are reported separately. They are not assigned an invented completed latency or removed from the outcome counts. Small samples also make p99 close to the slowest observed success, so these figures are a teaching reproduction rather than a stable service-level estimate.
+
+Queue timing explains the movement. With four in flight, successful p95 queue wait was about twenty-one milliseconds. With twelve, it was about fifty-nine milliseconds. The two work permits stayed the bottleneck while more requests waited around them.
+
+The eighty-millisecond deadline is a scheduling policy, not a hard real-time guarantee; an observed completion can land slightly beyond it when readiness and the timer race. Preserve the raw outcomes when choosing a real service limit. The [recorded samples](https://github.com/mehdiakiki/mehdi-cz/blob/main/docs/editorial/evidence/remaining-drafts-2026-10-30/load-samples.txt) let you inspect both rounds instead of choosing the best one.

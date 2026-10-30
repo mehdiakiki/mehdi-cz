@@ -25,6 +25,7 @@ const followups = JSON.parse(
 const practicalRelease = JSON.parse(
   await readFile("docs/editorial/practical-advice-50-release-2026-10-30.json", "utf8")
 );
+const completedRelease = JSON.parse(await readFile("docs/editorial/practical-advice-50-completed-release-2026-10-30.json","utf8"));
 const reviewSeries = editorialSeries;
 await mkdir(output, { recursive: true });
 
@@ -104,7 +105,7 @@ assert.equal(
     sqlSeries.articles.length +
     backendSeries.articles.length +
     followups.articles.length +
-    practicalRelease.articles.length
+    practicalRelease.articles.length + completedRelease.articles.length
 );
 await writeFile(
   path.join(output, "index.json"),

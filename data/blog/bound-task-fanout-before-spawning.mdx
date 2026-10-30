@@ -1,9 +1,11 @@
 ---
-title: "One request should not start a thousand tasks at once."
-date: "2026-10-25T18:30:00Z"
+title: "One request should not start a thousand tasks at once"
+date: "2026-10-30T21:17:00Z"
 tags: ["rust", "tokio", "concurrency", "performance"]
-draft: true
-reviewed: false
+draft: false
+reviewed: true
+reviewedHash: "cd557dc0bf678e1aac8408383c1db35bc045d03f7c32872a7c614e9f8bce4970"
+authors: ["default"]
 cluster: "rust-under-the-hood"
 campaign: "editorial"
 summary: "Bound fan-out before creating work. A semaphore inside thousands of spawned tasks limits active calls but leaves thousands of waiting tasks and their data."
@@ -20,22 +22,45 @@ I would put the limit earlier. Admit more work as previous work finishes, instea
 Tokio's [JoinSet](https://docs.rs/tokio/1.48.0/tokio/task/struct.JoinSet.html) owns a collection of tasks and returns their results as they complete. This Rust excerpt keeps only a bounded set outstanding:
 
 ```rust
-let mut tasks = tokio::task::JoinSet::new();
-
-for input in inputs {
-    if tasks.len() >= limit {
-        consume(tasks.join_next().await.unwrap()??);
+async fn fanout(
+    input: std::ops::Range<usize>,
+    limit: usize,
+    gate: Arc<Semaphore>,
+    started: mpsc::UnboundedSender<usize>,
+    retained: Arc<AtomicUsize>,
+) -> Vec<usize> {
+    assert!(limit > 0);
+    struct Input(Arc<AtomicUsize>);
+    impl Drop for Input {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
     }
-    let client = client.clone();
-    tasks.spawn(async move { client.fetch(input).await });
-}
-
-while let Some(result) = tasks.join_next().await {
-    consume(result??);
+    let mut tasks = JoinSet::new();
+    let mut output = Vec::new();
+    for id in input {
+        if tasks.len() >= limit {
+            output.push(tasks.join_next().await.unwrap().unwrap());
+        }
+        let (gate, started, retained) = (gate.clone(), started.clone(), retained.clone());
+        retained.fetch_add(1, Ordering::SeqCst);
+        let input = Input(retained);
+        tasks.spawn(async move {
+            let _input = input;
+            started.send(id).unwrap();
+            let permit = gate.acquire().await.unwrap();
+            permit.forget();
+            id
+        });
+    }
+    while let Some(result) = tasks.join_next().await {
+        output.push(result.unwrap());
+    }
+    output
 }
 ```
 
-This is an aggregation excerpt. It assumes a nonzero validated limit, a cloneable client handle, and an error type that can represent both task and fetch errors. The output consumer must also be bounded. Collecting every large result in memory can create a second problem.
+This is the test scheduler, with its required imports in the linked fixture. It validates a nonzero limit and counts input owners. The semaphore is a one-way test gate: consuming its permits with forget deliberately controls progress. A production concurrency limiter normally drops its permit after the operation, returning capacity. The output consumer must also be bounded. Collecting every large result in memory can create a second problem.
 
 Results arrive in completion order. If the response needs input order, attach an index or stable identity and restore order deliberately. Do not accidentally pair a fast result with the wrong input.
 
