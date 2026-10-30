@@ -1,7 +1,8 @@
 # Rust and database follow-ups, October 27, 2026
 
 Seven manuscripts are listed in `docs/editorial/sql-rust-followups-2026-10-27.json`.
-They remain private drafts. Their frontmatter dates record creation, not publication.
+They are approved for publication on October 30, 2026. Their frontmatter dates record
+release time; the release record freezes the reviewed hashes.
 Article authorship belongs to Mehdi Akiki alone.
 
 Run all workloads through the existing Content safety GitHub workflow. Its runner
@@ -64,11 +65,12 @@ architecture identities before making deployment claims.
 
 ## Editorial checks
 
-The verification job checks publication holds, sole-author metadata and Rust excerpts
+The verification job checks release boundaries, review hashes, sole-author metadata and Rust excerpts
 against marked source. The production build compiles MDX. Private HTML review copies
 are uploaded in the `editorial-rendered-previews` artifact under `sql-rust-followups`.
-The preview script also checks that no draft has a production route, search result,
-RSS item or sitemap entry, and that links to existing articles are publicly usable.
+The preview script checks all seven production routes, canonical URLs, sole-author
+metadata, search results, RSS items, sitemap entries and the reading-series hub.
+Links to other articles must also be publicly usable.
 
 Formatting, Rust formatting and missing lockfiles are preserved as CI patches.
 Apply those patches and require a clean patch on the final checked revision.
