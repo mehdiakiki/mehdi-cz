@@ -102,7 +102,10 @@ await writeFile(
     )
   )
 );
-const hub = await readFile(`.next/server/app/blog/series/${process.argv[3] || "rust-database-failures"}.html`, "utf8");
+const hub = await readFile(
+  `.next/server/app/blog/series/${process.argv[3] || "rust-database-failures"}.html`,
+  "utf8"
+);
 for (const article of manifest.articles)
   assert.ok(hub.includes(`/blog/${article.slug}`), article.slug);
 console.log(

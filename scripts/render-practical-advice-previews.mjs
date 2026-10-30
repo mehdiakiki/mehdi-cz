@@ -40,7 +40,11 @@ function document(title, content) {
         element(
           "body",
           null,
-          element("p", null, "Editorial review copy. Publication follows the recorded review for each article."),
+          element(
+            "p",
+            null,
+            "Editorial review copy. Publication follows the recorded review for each article."
+          ),
           content
         )
       )
@@ -60,7 +64,9 @@ for (const article of manifest.articles) {
     assert.equal(post.reviewed, false);
     assert.equal(publicArticleHref(allBlogs, article.slug), null);
     assert.ok(!search.includes(article.slug), `Draft leaked into public search: ${article.slug}`);
-    await assert.rejects(readFile(`.next/server/app/blog/${article.slug}.html`), { code: "ENOENT" });
+    await assert.rejects(readFile(`.next/server/app/blog/${article.slug}.html`), {
+      code: "ENOENT",
+    });
   }
   const body = renderToStaticMarkup(element(MDXLayoutRenderer, { code: post.body.code }));
   assert.ok(body.includes("<h2"), article.slug);
@@ -114,7 +120,14 @@ const index = element(
 await writeFile(`${output}/index.html`, document(manifest.series_name, index));
 await writeFile(
   `${output}/index.json`,
-  JSON.stringify({ articles: records, publicRoutes: records.filter((record) => record.reviewed && !record.draft).length }, null, 2)
+  JSON.stringify(
+    {
+      articles: records,
+      publicRoutes: records.filter((record) => record.reviewed && !record.draft).length,
+    },
+    null,
+    2
+  )
 );
 console.log(
   `Retained ${records.length} editorial review copies; held drafts remain absent from production routes and public search.`

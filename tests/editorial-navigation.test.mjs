@@ -96,7 +96,10 @@ test("all eighty-one editorial articles have one reader series with the expected
     editorialSeries.find((series) => series.slug === "rust-database-failures").parts.length,
     7
   );
-  assert.equal(editorialSeries.find((series) => series.slug === "rust-database-recovery").parts.length, 6);
+  assert.equal(
+    editorialSeries.find((series) => series.slug === "rust-database-recovery").parts.length,
+    6
+  );
   assert.equal(
     editorialSeries.find((series) => series.slug === "sql-databases-from-rust").parts.length,
     30

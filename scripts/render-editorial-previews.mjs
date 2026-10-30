@@ -22,7 +22,9 @@ const backendSeries = JSON.parse(
 const followups = JSON.parse(
   await readFile("docs/editorial/sql-rust-followups-2026-10-27.json", "utf8")
 );
-const practicalRelease = JSON.parse(await readFile("docs/editorial/practical-advice-50-release-2026-10-30.json", "utf8"));
+const practicalRelease = JSON.parse(
+  await readFile("docs/editorial/practical-advice-50-release-2026-10-30.json", "utf8")
+);
 const reviewSeries = editorialSeries;
 await mkdir(output, { recursive: true });
 
@@ -98,7 +100,11 @@ for (const series of reviewSeries) {
 }
 assert.equal(
   records.length,
-  30 + sqlSeries.articles.length + backendSeries.articles.length + followups.articles.length + practicalRelease.articles.length
+  30 +
+    sqlSeries.articles.length +
+    backendSeries.articles.length +
+    followups.articles.length +
+    practicalRelease.articles.length
 );
 await writeFile(
   path.join(output, "index.json"),
