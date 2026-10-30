@@ -1,0 +1,115 @@
+---
+title: "A Rust Timeout Can Leave PostgreSQL Work Running"
+date: "2026-10-30T10:02:25Z"
+lastmod: "2026-10-30T10:02:25Z"
+tags: ["rust", "sqlx", "postgresql", "cancellation"]
+authors: ["default"]
+draft: false
+reviewed: true
+reviewedHash: "a6627033b7c0f41c705a3489b736afd53c10f617e57a93831e8a0cf17ca9ce70"
+cluster: "rust-under-the-hood"
+campaign: "editorial"
+summary: "Let a Rust query future time out while PostgreSQL waits for a row lock. Observe the server work, then compare a database statement timeout and transaction recovery."
+---
+
+The request timed out, so the database operation must have stopped. That assumption can turn an ordinary retry into a duplicate write.
+
+A Tokio deadline controls how long a Rust future is awaited. The remote database has its own execution state. Dropping a query future does not, by itself, establish that PostgreSQL canceled its statement or rolled back its effect.
+
+This reproduction makes the difference visible. A transaction holds a row lock. Another connection tries to update that row. Rust stops waiting, but an observer can still see the same PostgreSQL session waiting for the same lock. Releasing the lock lets the update complete.
+
+The test uses SQLx 0.8.6, Tokio 1.48.0, and PostgreSQL 18. It keeps the connection alive deliberately. It does not close the socket or test a proxy's disconnect policy. The complete fixture is `pg_timeout_work.rs` in [the PostgreSQL lab](https://github.com/mehdiakiki/mehdi-cz/tree/main/experiments/sql-rust/postgres-sqlite).
+
+## Establish where the query reached
+
+The first transaction updates a row and remains open. That gives the second connection a stable reason to wait.
+
+The observer records both backend PIDs. It uses `pg_blocking_pids` to confirm that the second session is waiting for the first. Only then does it signal the Rust task to start its short deadline.
+
+This order matters. A timeout before connection acquisition would test a different boundary. So would dropping an unpolled future which had never sent a query. PostgreSQL's [session-information functions](https://www.postgresql.org/docs/18/functions-info.html#FUNCTIONS-INFO-SESSION-TABLE) provide the observation used here.
+
+The helper polls the update while waiting for that signal. When the signal arrives, it wraps the already pending operation in a deadline:
+
+```rust
+async fn stop_waiting(
+    mut connection: PoolConnection<Postgres>,
+    start_deadline: oneshot::Receiver<()>,
+) -> Result<PoolConnection<Postgres>> {
+    {
+        let pending = sqlx::query("UPDATE deadline_item SET value = value + 1 WHERE id = 1")
+            .execute(&mut *connection);
+        tokio::pin!(pending);
+        tokio::select! {
+            result = &mut pending => {
+                result?;
+                return Err("the lock gate opened before the observation".into());
+            }
+            ready = start_deadline => { ready?; }
+        }
+        assert!(timeout(Duration::from_millis(100), &mut pending)
+            .await
+            .is_err());
+    }
+    // The query future has been dropped. The connection remains owned here.
+    Ok(connection)
+}
+```
+
+The small scope matters too. The timed operation borrows the connection. When that scope ends, the query future is actually dropped, while the connection remains owned by the helper and is returned to the test.
+
+Tokio's [timeout documentation](https://docs.rs/tokio/1.48.0/tokio/time/fn.timeout.html) describes cancellation of the local future. It does not promise a database protocol message. The pinned [SQLx PostgreSQL executor](https://github.com/launchbadge/sqlx/blob/v0.8.6/sqlx-postgres/src/connection/executor.rs) handles a separate exchange with the server. Treat those as two boundaries when reading an application's timeout code.
+
+The 100-millisecond value is a test gate. It is not a recommended production request deadline or a query performance measurement.
+
+## Inspect the state after the timeout
+
+After the helper returns, the observer checks the blocking relationship again. The same backend must still be waiting on the known holder. This is the evidence that the local timeout did not stop this statement.
+
+The test then rolls back the holder. The waiting autocommit update can acquire the lock and add one to the original value. A fresh query on the retained connection must see 1. A separate connection must also see 1.
+
+Those reads establish a completed effect after the Rust caller stopped waiting. Checking only that `timeout` returned an error would leave the important question unanswered.
+
+This behaviour is specific to the tested driver and connection lifetime. Another driver can send a cancellation request. Closing a connection introduces different server behaviour and timing. The result here is enough to reject the general assumption that a Rust timeout proves rollback; it does not describe every possible disconnection.
+
+If the application's next step is to retry a write, preserve the operation's identity. A receipt stored with the effect can help a later attempt determine what happened. The [PostgreSQL transaction article](/blog/sql-postgresql-rust-service-transactions) explains the local atomicity boundary. A timeout is information about waiting, not a new operation identity.
+
+The [lost commit reply investigation](/blog/postgresql-commit-reply-lost-rust) shows how an operation key and an atomic receipt can resolve a later replay after the commit response disappears.
+
+## Let PostgreSQL enforce a statement limit
+
+The comparison keeps the row lock but gives the second transaction a server-side statement timeout:
+
+```rust
+let mut tx = connection.begin().await?;
+sqlx::query("SET LOCAL statement_timeout = '200ms'")
+    .execute(&mut *tx)
+    .await?;
+let error = sqlx::query("UPDATE deadline_item SET value = value + 1 WHERE id = 1")
+    .execute(&mut *tx)
+    .await
+    .unwrap_err();
+assert_eq!(code(&error).as_deref(), Some("57014"));
+let aborted = sqlx::query("SELECT 1").execute(&mut *tx).await.unwrap_err();
+assert_eq!(code(&aborted).as_deref(), Some("25P02"));
+tx.rollback().await?;
+```
+
+The statement must fail with SQLSTATE `57014`. The next statement in that transaction must fail with `25P02`, which identifies a failed transaction. An explicit rollback ends it. After releasing the holder, the test checks that another increment did not survive and that the connection can execute a fresh query.
+
+The [PostgreSQL timeout documentation](https://www.postgresql.org/docs/18/runtime-config-client.html#GUC-STATEMENT-TIMEOUT) defines the server-side timer. It begins after the command reaches the server. It does not cover an earlier application queue, a pool wait, DNS, or connection establishment.
+
+Here `SET LOCAL` limits the setting to the explicit transaction. That avoids silently leaving a request-specific limit on a pooled connection. Choose the setting's scope deliberately when applying the same idea in a service.
+
+The error code alone does not identify every cancellation source. PostgreSQL also uses `57014` for other query cancellation. This test knows its source because it controls the lock and statement limit. An application should retain the relevant error context rather than classifying every cancellation as a request deadline.
+
+## Keep the deadlines in the same design
+
+A service can need several limits: time in an admission queue, connection acquisition, statement execution, and the whole request. Decide what each limit bounds and what cleanup remains after it fires.
+
+Allow enough room for an intended server timeout and rollback to reach the application before an outer deadline discards their result. That is a design requirement, not a universal set of millisecond values. Network failure can still prevent the reply from arriving.
+
+Also decide who owns the connection during cleanup. Starting a detached rollback task without a shutdown plan can move the unfinished work out of the request's view. The [async cleanup investigation](/blog/async-cleanup-in-rust-when-drop-cannot-await) follows that ownership problem in more detail.
+
+For a read, the remaining concern may be wasted work and occupied capacity. For a write, it also includes whether the effect happened. Record those outcomes separately. An honest pending or unknown result is more useful than reporting a confirmed failure which the application cannot establish.
+
+When a timeout appears during an incident, first locate the boundary it ended. Then inspect or constrain the work on the other side. The [Rust Failure Atlas](/rust-failure-atlas) connects that investigation with task polling, cancellation, and cleanup cases.

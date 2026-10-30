@@ -99,6 +99,42 @@ export const editorialSeries = [
       "duckdb-memory-limit-scratch-rust",
     ],
   },
+
+  {
+    slug: "rust-backend-in-practice",
+    title: "Rust backend problems in practice",
+    description:
+      "Follow failed requests, shutdowns, traces, migrations, sessions, uploads and job leases through small Rust examples.",
+    introduction:
+      "Each article starts with a backend problem and checks a repair against an executable example. Read the problem you have now, then follow the related Rust and database articles when you need more detail.",
+    parts: [
+      "axum-json-rejection-handler-never-ran",
+      "axum-middleware-order-timeout-boundary",
+      "rust-sigterm-drain-inflight-requests",
+      "tokio-spawn-loses-request-tracing-span",
+      "postgresql-column-migration-two-rust-versions",
+      "revoke-session-across-rust-replicas",
+      "interrupted-upload-needs-durable-cleanup",
+      "postgresql-job-lease-stale-rust-worker",
+    ],
+  },
+  {
+    slug: "rust-database-failures",
+    title: "Rust and database failures",
+    description:
+      "Follow request waits, uncertain writes, row streams, memory budgets and deployment dependencies through reproducible Rust examples.",
+    introduction:
+      "Start with the symptom you can observe. Each article explains a different boundary between the Rust application, database driver and database, with source code and checks for the result.",
+    parts: [
+      "rust-request-waiting-for-pool-or-postgresql",
+      "postgresql-commit-reply-lost-rust",
+      "slow-postgresql-row-consumer-holds-rust-connection",
+      "sqlx-offline-build-stale-database-metadata",
+      "rust-oracle-client-library-missing-in-deployment",
+      "rust-timeout-does-not-stop-postgresql-query",
+      "bounded-rust-channel-database-producer-memory",
+    ],
+  },
 ];
 
 export function editorialSeriesForPost(slug) {

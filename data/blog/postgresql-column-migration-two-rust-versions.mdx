@@ -1,0 +1,123 @@
+---
+title: "A PostgreSQL Column Migration While Two Rust Versions Can Write"
+date: "2026-10-29T09:00:00Z"
+tags: ["rust", "postgresql", "sqlx", "migrations"]
+draft: false
+reviewed: true
+reviewedHash: "e44275f5bbc48ca0d09f148458ef09129c1a219860db69523f51f2cf3782a6c8"
+cluster: "rust-under-the-hood"
+campaign: "editorial"
+summary: "Exercise old and new SQLx write paths during a column migration. See why a completed backfill and a non-null check do not prove rollout compatibility."
+---
+
+The new application reads `display_name`. The old application still writes `full_name`. The migration added the new column, the backfill copied the existing values, and every row has a value.
+
+That sounds ready. It is missing one question: can an old writer still change the row?
+
+Rolling a Rust service means several versions may use the same database for a while. A background worker, an old deployment, or a rollback can keep the old SQL statements in use after the main API has moved on.
+
+This lab uses PostgreSQL and two SQLx functions representing old and new application writes. It checks whether both versions of those SQL statements still work. It does not launch two complete application binaries or perform a Kubernetes rollout.
+
+## Add somewhere to write before requiring everyone to use it
+
+The original table has an integer ID and a required `full_name`. The expansion adds a `display_name` column which allows NULL, without a default.
+
+PostgreSQL describes this behaviour in its [table modification documentation](https://www.postgresql.org/docs/18/ddl-alter.html). Existing rows can have null in the added column, and an old insert which omits it can still succeed.
+
+The old function continues to insert only the original column. The new function supplies both:
+
+```rust
+pub async fn new_insert(pool: &PgPool, id: i32, name: &str) -> Result<(), sqlx::Error> {
+    sqlx::query("INSERT INTO profiles (id, full_name, display_name) VALUES ($1, $2, $2)")
+        .bind(id)
+        .bind(name)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+```
+
+There is one statement, so the pair of values is written together. While both versions are running, both application versions should still read from the old column. Adding a column does not mean readers should switch to it yet.
+
+Do the same for updates. Fixing only the insert path leaves existing profiles able to drift:
+
+```rust
+pub async fn new_update(pool: &PgPool, id: i32, name: &str) -> Result<u64, sqlx::Error> {
+    Ok(
+        sqlx::query("UPDATE profiles SET full_name = $2, display_name = $2 WHERE id = $1")
+            .bind(id)
+            .bind(name)
+            .execute(pool)
+            .await?
+            .rows_affected(),
+    )
+}
+```
+
+The fixture updates a profile through this function and checks both stored values. Audit bulk imports, repair tools, and background jobs for the same rule.
+
+The field rename is intentionally simple. If the new value has different business meaning, copying strings is not a migration strategy. Define the conversion and the cases which cannot be converted before scheduling the backfill.
+
+The [PostgreSQL enum compatibility article](/blog/sql-postgresql-rust-enum-migration-old-decoder) examines a different version boundary: an old reader receiving a newly allowed value. Here the problem is which writer still controls the stored value.
+
+## The first backfill can become stale
+
+The fixture copies the old name to the new column for one range of row IDs:
+
+```rust
+pub async fn backfill_range(pool: &PgPool, first: i32, last: i32) -> Result<u64, sqlx::Error> {
+    Ok(sqlx::query(
+        "UPDATE profiles SET display_name = full_name
+         WHERE id >= $1 AND id <= $2
+         AND display_name IS DISTINCT FROM full_name",
+    )
+    .bind(first)
+    .bind(last)
+    .execute(pool)
+    .await?
+    .rows_affected())
+}
+```
+
+Then it makes an old writer change `full_name` on an already copied row. That produces two non-null values which disagree:
+
+| Column       | Value after the old update |
+| ------------ | -------------------------- |
+| full_name    | Changed by old             |
+| display_name | Old writer                 |
+
+This is why checking only for remaining nulls is too weak. A reader which switches to `COALESCE(display_name, full_name)` can return the stale new value, because that value is already present.
+
+The lab asserts this disagreement before repairing it. The failure is part of the demonstration, not an assumption hidden in the surrounding explanation.
+
+For a real rollout, either keep reading the old column until old writers are retired, or maintain the relationship with a reviewed database trigger or another explicit rule. A trigger introduces its own semantics and operational work. It is not used in this lab.
+
+## Stop the old writers before switching reads
+
+The safe transition needs a deployment decision before the final copy. Stop every writer which knows only the old column. Include scheduled jobs and tools, not just the main service replicas. Close the rollback window for those writers too.
+
+Now repeat the copy and verify the relationship. The range update uses `IS DISTINCT FROM`, so it repairs stale non-null values as well as nulls. Running the same range again changes zero rows when the values agree. Unlike `<>`, [`IS DISTINCT FROM`](https://www.postgresql.org/docs/18/functions-comparison.html) also compares a NULL with a non-NULL value without returning an unknown result. That is why the same update can repair both missing and stale names.
+
+| Rollout stage               | Reads        | Writes                                             |
+| --------------------------- | ------------ | -------------------------------------------------- |
+| Old and new writers coexist | full_name    | old writes full_name; new writes both              |
+| Old-only writers retired    | full_name    | both columns, then final backfill and check        |
+| New readers deployed        | display_name | both columns until the next rollback window closes |
+
+The names in both columns have the same meaning in this example. A migration which changes that meaning needs a different conversion and validation plan.
+
+New supported writers keep writing both columns during this phase. That preserves a useful rollback option to a version which still understands the old column and also maintains the new one.
+
+Only after this point should readers move to the new column. The fixture then adds `NOT NULL`. A retired old insert fails with PostgreSQL code 23502, while the supported dual-write insert succeeds.
+
+That error check matters. Any-error assertions could accept a disconnected database and pretend the migration boundary was tested. The program checks the database error code and runs the supported insert against the same schema.
+
+## A schema change also has an operational cost
+
+The tiny table says nothing about migration duration on a production dataset. An ALTER operation can need locks, and a long-running transaction can make a seemingly small change wait.
+
+Choose lock and statement timeouts for the actual migration process. Measure the backfill's effect on normal writes, replication, and maintenance. The ID ranges in this example show a restartable unit of work; they do not choose a safe batch size for your database.
+
+Dropping `full_name` is a later change. First deploy a version which no longer reads or writes it, then close the rollback window for every version which still references it. Combining expansion, reader switching, and removal in one release makes it much harder to recover from a partial rollout.
+
+The complete sequence is in [the migration fixture](https://github.com/mehdiakiki/mehdi-cz/tree/main/experiments/rust-backend). Its most useful result is the stale row in the middle. A backfill can finish while the old application is still able to undo it. Check which writers are alive before changing which column readers trust.

@@ -1,0 +1,108 @@
+---
+title: "Why Your Axum Handler Never Ran: JSON Rejections and API Errors"
+date: "2026-10-26T11:00:00Z"
+tags: ["rust", "axum", "http", "api errors"]
+draft: false
+reviewed: true
+reviewedHash: "5974a3e592421254d5cc6c76f8a66d6801ffb17ba235d9f7b3ffe91cd00307f2"
+cluster: "rust-under-the-hood"
+campaign: "editorial"
+summary: "Send malformed JSON, missing fields, and the wrong content type through an Axum router. Keep useful HTTP statuses while giving clients one error shape."
+---
+
+The endpoint works when you send the example JSON. Then a client sends a body with one missing field. Your first log line is absent, and the response does not look like the errors returned by your application.
+
+It is tempting to add more logging inside the handler. That cannot show a path which never entered the handler.
+
+Axum extracts arguments before calling an ordinary handler. A `Json<NewInvoice>` argument asks the framework to read the body and turn the JSON into that type. If that fails, the extractor can return a response on its own. The [extractor documentation](https://docs.rs/axum/0.8.9/axum/extract/index.html) describes this boundary and how to handle its rejection.
+
+The example uses Axum 0.8.9. It sends real HTTP request values through the router with Tower's `oneshot`. It does not start a socket server. That is enough to investigate routing, extraction, and the returned body without putting a proxy in the middle.
+
+## First, prove where the request stopped
+
+The first test uses a plain JSON argument and a counter inside the handler. It submits a body containing only an opening brace, with the JSON content type.
+
+The test checks two things: the response status must be 400, and the handler counter must remain zero. Checking only the status would not tell us which code produced it.
+
+This gives a more useful debugging route. Look at the request reaching the router: method, path, content type, and a request ID that is safe to log. Inspect the rejection without logging the whole body. A malformed request can contain a password, customer data, or a very large string.
+
+The [code playground article](/blog/building-a-sandboxed-code-playground-in-rust) has a more involved Axum service. Start with a smaller router when the question is simply whether extraction rejected your request. Authentication, proxies, and subprocesses can wait until this layer is understood.
+
+## Return the same error format
+
+For one endpoint, the extractor can be wrapped in a `Result`. If extraction fails, the handler receives the error and decides how to represent it.
+
+The lab's `NewInvoice` has one field, `quantity: u32`. The complete function is:
+
+```rust
+pub async fn create_invoice(
+    input: Result<Json<NewInvoice>, JsonRejection>,
+) -> (StatusCode, Json<Value>) {
+    let Json(invoice) = match input {
+        Ok(value) => value,
+        Err(error) => {
+            let code = if error.status() == StatusCode::PAYLOAD_TOO_LARGE {
+                "body_too_large"
+            } else {
+                "invalid_json"
+            };
+            return (error.status(), Json(json!({"error": {"code": code}})));
+        }
+    };
+    if invoice.quantity == 0 {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({"error": {"code": "invalid_quantity"}})),
+        );
+    }
+    (
+        StatusCode::CREATED,
+        Json(json!({"quantity": invoice.quantity})),
+    )
+}
+```
+
+The imports and input type are in [the source bundle](https://github.com/mehdiakiki/mehdi-cz/tree/main/experiments/rust-backend). The returned `Json<Value>` produces a JSON response rather than a string which happens to contain braces.
+
+Notice the two different checks. Extraction asks whether the body can become the input type. The quantity rule asks whether the decoded input is acceptable for this operation. A valid JSON document can still fail either check.
+
+Keeping `error.status()` preserves a useful distinction. Malformed JSON, a missing required field, and a missing JSON content type do not all mean the same thing. The public code stays stable without copying the framework's detailed error text into every client.
+
+## Five bad requests and one good one
+
+The router tests check these requests:
+
+| Request                                         | Status | Public error code |
+| ----------------------------------------------- | -----: | ----------------- |
+| Opening brace only, JSON content type           |    400 | invalid_json      |
+| Empty object, JSON content type                 |    422 | invalid_json      |
+| Valid invoice, missing JSON content type        |    415 | invalid_json      |
+| Quantity zero, JSON content type                |    422 | invalid_quantity  |
+| Body over the endpoint limit, JSON content type |    413 | body_too_large    |
+| Quantity two, JSON content type                 |    201 | no error          |
+
+These are assertions for the pinned lab, not a promise about every future Axum release. The test also parses the response as JSON and checks its content type. Otherwise a refactor could keep the status while quietly returning a different body format.
+
+The successful case matters. A rejection test which never proves the endpoint works can be satisfied by a broken router. Here the valid request still reaches the creation path.
+
+An API may choose another documented error format. That is fine. What helps clients is a small, consistent set of meanings, including errors produced before business logic starts. If several endpoints need this treatment, move the mapping into a custom extractor rather than copy the match everywhere.
+
+## This is still an input boundary
+
+The example does not save an invoice. It proves rejection and response behaviour. Database constraints, tenant checks, and commit failures need their own tests when persistence is added.
+
+The oversized-body test sets a small limit so it does not need a large fixture:
+
+```rust
+let app = Router::new()
+    .route("/invoices", post(create_invoice))
+    .layer(DefaultBodyLimit::max(64));
+```
+
+A valid JSON body larger than 64 bytes must return 413 with `body_too_large`, still as JSON. Sixty-four bytes is just a test value. Choose a limit which fits the real endpoint.
+
+Axum's [DefaultBodyLimit documentation](https://docs.rs/axum/0.8.9/axum/extract/struct.DefaultBodyLimit.html) explains that the default limit applies to `Json` and other extractors built on `Bytes`. It is not a global limit on code which reads body frames directly. Keep that distinction when adding a custom upload extractor.
+
+For diagnostics, record the rejection category and request identifier on the server. Give the client a useful error code and a safe explanation. There is rarely a reason to return a raw JSON parser error with fragments of the submitted data.
+
+When the first handler log is missing, check routing and extraction before adding logs further down the function. Then check the business rule on the decoded value. Each observation should tell you which boundary the request actually reached.

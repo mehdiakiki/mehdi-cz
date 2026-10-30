@@ -31,6 +31,10 @@ export default function Contact() {
           <h2 id="send-message" className="text-2xl font-bold text-gray-950 dark:text-gray-100">
             Send a message
           </h2>
+          <p className="mt-3 max-w-2xl leading-7 text-gray-600 dark:text-gray-400">
+            Questions and corrections about the articles are welcome too. Include the article link
+            and what you are trying to understand or reproduce.
+          </p>
           <div className="mt-6">
             {!formKey ? (
               <p className="text-lg leading-8 text-gray-600 dark:text-gray-400">

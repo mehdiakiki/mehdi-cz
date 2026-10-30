@@ -1,0 +1,91 @@
+---
+title: "Rust SIGTERM Handling: Finish the Request Before the Process Stops"
+date: "2026-10-27T09:00:00Z"
+tags: ["rust", "axum", "shutdown", "sigterm"]
+draft: false
+reviewed: true
+reviewedHash: "1ffeafaf0a5b6223fb9126d1e1609ceb953cf5ff9aa0b5505097fd2cf32b7026"
+cluster: "rust-under-the-hood"
+campaign: "editorial"
+summary: "Send a real SIGTERM to a small Axum process. Observe a request finishing during shutdown and a separate request reaching the shutdown deadline."
+---
+
+The deployment looks clean. A new process is ready, the old one receives a termination signal, and the rollout finishes.
+
+One client still has a different view: its request lost the connection halfway through the operation.
+
+A Rust process needs one task which handles shutdown. The runtime cannot decide which requests should finish, which background jobs can be recovered, or how long the platform will wait.
+
+For this lab I use one Axum process, one slow request, and a real Unix SIGTERM. The request waits for an explicit test signal rather than a guessed sleep. That lets the test choose exactly when shutdown interrupts normal work.
+
+## Wait until a request is running
+
+The server exposes `/ready` and `/work`. It listens on loopback on a port chosen by the operating system, then prints the selected port for the test driver.
+
+The driver first checks that readiness returns 200. It starts a work request and waits until the child announces `working`. Only then does it send SIGTERM. This avoids a test which signals a process before any request is actually running.
+
+The child registers its signal listener before announcing the port. That detail is easy to miss: a process can start listening before its termination handling is installed.
+
+The work handler waits on a `Notify`. A separate test thread reads the child's standard input; the word `finish` releases the request. Standard input is only a test control here. A production handler would wait for its actual operation.
+
+The complete process and driver are in [the source bundle](https://github.com/mehdiakiki/mehdi-cz/tree/main/experiments/rust-backend). The driver talks over HTTP and sends the operating-system signal. It is not a unit test which calls a shutdown function directly.
+
+## Stop accepting, then wait with a limit
+
+The server uses Axum's `with_graceful_shutdown`. After the signal, the main task runs this part:
+
+```rust
+state.ready.store(false, Ordering::SeqCst);
+stop.send(true)?;
+announce("draining");
+let grace = std::env::var("SHUTDOWN_GRACE_MS")
+    .unwrap_or_else(|_| "2000".into())
+    .parse()?;
+match tokio::time::timeout(Duration::from_millis(grace), &mut server).await {
+    Ok(result) => {
+        result??;
+        announce("stopped");
+    }
+    Err(_) => {
+        server.abort();
+        announce("deadline");
+        return Err("shutdown deadline reached".into());
+    }
+}
+```
+
+The watch sender wakes the shutdown future attached to the server. The main task then waits for the server task. Keeping the task handle matters: a detached server task gives the process no clear completion result to inspect.
+
+The readiness flag changes before the shutdown notification. In this small process the listener then starts closing, so the test does not claim that a load balancer observed a 503 readiness response. A deployment needs to arrange its traffic-removal stage deliberately.
+
+The [async cleanup article](/blog/async-cleanup-in-rust-when-drop-cannot-await) explains why cleanup should have an asynchronous owner. The same idea applies at process scale. A destructor is not a good place to hide a wait for the whole server to drain.
+
+## Run both endings
+
+There are two process tests. They use the same startup and signal sequence.
+
+In the first, the driver sends `finish` after the child announces `draining`. The existing request must return HTTP 200 with the body `completed`. The process must then announce `stopped` and exit successfully.
+
+In the second, the driver never releases the work. The fixture uses a shorter shutdown grace for this case. The child must announce `deadline`, exit unsuccessfully, and leave the client with an interrupted request.
+
+Neither test depends on a sleep which hopes the request has started. The messages establish the ordering. Client timeouts and an outer CI timeout keep a broken test from waiting forever.
+
+The second result tells the caller what to expect. A deadline limits how long shutdown can wait. It does not make unfinished work successful. If a write can outlive the connection, the caller needs a way to inspect its outcome before repeating it.
+
+## The platform has a clock too
+
+This example runs as an ordinary Linux child process in GitHub CI. It does not run a Kubernetes rollout or demonstrate how an external proxy removes an endpoint.
+
+Kubernetes has its own [Pod termination sequence](https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#pod-termination). Read it together with the ingress and load-balancer behaviour used by the deployment. Include traffic removal, application draining, and final process termination in one budget.
+
+Setting the application grace longer than the platform allows cannot give the process more time. Conversely, closing the listener immediately may be too early if some traffic still reaches the old endpoint. A readiness flag inside the application is only one part of that coordination.
+
+Check that the signal reaches the Rust process too. A [shell-form container entrypoint](https://docs.docker.com/reference/dockerfile/#entrypoint) can leave a shell between the container runtime and the binary. An exec-form entrypoint runs the binary directly. If a wrapper script is needed, it must hand over with `exec` or forward signals correctly.
+
+Testing Ctrl+C alone does not test this path. Ctrl+C normally sends SIGINT; this example listens for SIGTERM. Keep the real SIGTERM process test when changing the entrypoint.
+
+Long-lived WebSockets and streaming responses need a separate policy. Waiting for every connection to finish naturally can prevent shutdown indefinitely. Decide how the server tells clients to reconnect and which stream state can be recovered.
+
+Background jobs also need an owner. Save recoverable jobs before confirming they were accepted, stop claiming new jobs during shutdown, and decide what happens to an in-flight claim. The HTTP server finishing does not prove that every task spawned elsewhere has finished.
+
+Keep the two tests when deployment code changes. The useful evidence is quite concrete: one real request survives SIGTERM, and one deliberately unfinished request reaches the documented boundary. Everything beyond that needs evidence from the actual deployment.
