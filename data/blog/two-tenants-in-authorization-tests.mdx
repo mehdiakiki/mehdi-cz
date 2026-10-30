@@ -21,18 +21,15 @@ Testing a database policy directly is useful, but the API can fail earlier. It m
 
 Set up one allowed request and one forbidden request using the same authenticated user. The request's target changes; the authenticated identity does not.
 
-In a Rust API test, the scenario might look like this. These helper names describe the fixture rather than a particular web framework:
+The [complete Axum fixture](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/rust-backend/tests/practical_tenants.rs) uses authenticated test-token mappings and a real PostgreSQL table. The read handler binds the trusted tenant as part of its lookup:
 
 ```rust
-let alice = fixture.user_in("tenant-a").await?;
-let own = fixture.record_in("tenant-a", "external-42").await?;
-let other = fixture.record_in("tenant-b", "external-42").await?;
-
-assert_eq!(api.get_record(&alice, own.id).await.status, 200);
-assert_eq!(api.get_record(&alice, other.id).await.status, 404);
-
-api.rename_record(&alice, other.id, "changed").await;
-assert_eq!(fixture.reload(other.id).await?.name, other.name);
+async fn read_record(State(pool): State<PgPool>, headers: HeaderMap, Path(id): Path<i32>) -> Result<Json<String>, StatusCode> {
+    let tenant = principal(&headers)?;
+    let value: Option<String> = sqlx::query_scalar("SELECT name FROM records WHERE id = $1 AND tenant = $2")
+        .bind(id).bind(tenant).fetch_optional(&pool).await.map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    value.map(Json).ok_or(StatusCode::NOT_FOUND)
+}
 ```
 
 The exact denial response is a product choice. Some APIs use 403; others use 404 to avoid revealing whether the record exists. Make the contract explicit and check that sensitive data is absent from the body.
@@ -56,3 +53,15 @@ Search, exports, bulk operations, background jobs, and attachment downloads also
 OWASP recommends [authorization checks on every request](https://cheatsheetseries.owasp.org/cheatsheets/Authorization_Cheat_Sheet.html). For the fixture, that means a previous allowed action must not grant the next action access by accident.
 
 Two tenants are not a complete security review. They are a cheap way to stop the most misleading happy-path test from being your only evidence. When the next feature adds a new route, reuse those competing records. Let the fixture keep asking the awkward question.
+
+## Follow the authenticated identity through all three routes
+
+The fixture maps two fixed bearer tokens to tenant A and tenant B. It is a test identity registry, not a JWT implementation. An arbitrary tenant header never changes that mapping. Requests use Tower dispatch through the Axum router, so extraction, identity lookup, handler logic, and the database query are exercised together.
+
+Alice can read her own record and list only private-a. Reading Bob's record returns 404 without private-b in the body. Trying to rename it also returns 404. An independent setup connection checks that Bob's stored name stayed unchanged. Bob's own request succeeds, and a request without a recognized token returns 401.
+
+Both records deliberately share external-42. Their internal IDs differ so the test can target the other customer's record directly. Forging the tenant header in either direction must not change whose data the authenticated request can reach.
+
+The application pool has one connection and uses the non-owner application login. Privileged setup only grants the required schema usage, select, and update rights. Requests alternate identities through that same small pool. This case uses bound tenant predicates rather than PostgreSQL row-security settings; the separate row-security guide tests transaction-local database context.
+
+This distinction matters when interpreting a green check. The fixture proves the chosen routes and identity mapping. It does not prove a production token verifier, every export route, or every cache key. Add each alternate data path with the same competing records. The useful habit is to connect authorization to the actual request and independently observed stored result, including successful allowed work and failed cross-tenant work.

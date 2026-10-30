@@ -32,6 +32,7 @@ const cases = [
 }`,
   },
   { number: 16, statement: true },
+  { number: 20, statement: true },
   {
     number: 17,
     tests: `

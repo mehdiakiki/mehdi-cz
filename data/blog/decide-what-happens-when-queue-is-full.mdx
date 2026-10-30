@@ -21,21 +21,20 @@ For work that belongs to the request, waiting briefly for space can make sense. 
 
 For work that can be refused immediately, try to enqueue and return a clear overload outcome when there is no space. Tokio's [bounded channel module](https://docs.rs/tokio/1.48.0/tokio/sync/mpsc/index.html) describes the channel's backpressure behaviour.
 
-Here is the immediate-admission decision in Rust:
+This Axum handler uses immediate admission, then waits for the admitted command to finish:
 
 ```rust
-match sender.try_send(command) {
-    Ok(()) => Admission::Queued,
-    Err(tokio::sync::mpsc::error::TrySendError::Full(command)) => {
-        Admission::Busy(command)
-    }
-    Err(tokio::sync::mpsc::error::TrySendError::Closed(command)) => {
-        Admission::Unavailable(command)
+async fn request_work(State(sender): State<mpsc::Sender<Command>>, Path(id): Path<u32>) -> StatusCode {
+    let (reply, receive) = oneshot::channel();
+    match sender.try_send(Command { id, reply }) {
+        Ok(()) => if receive.await.is_ok() { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE },
+        Err(mpsc::error::TrySendError::Full(_)) => StatusCode::TOO_MANY_REQUESTS,
+        Err(mpsc::error::TrySendError::Closed(_)) => StatusCode::SERVICE_UNAVAILABLE,
     }
 }
 ```
 
-This is a handler excerpt with an application-specific result type. Full and closed are different situations. A temporarily occupied worker is not the same as a worker that has stopped.
+The complete Command type and controlled worker are in [the runtime fixture](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/rust-backend/tests/practical_runtime.rs). A full queue returns 429; a closed worker returns 503. Full and closed are different situations. A temporarily occupied worker is not the same as a worker that has stopped.
 
 Queued also does not mean finished. The HTTP handler may still need to await a reply. If it returns acceptance and promises completion after a restart, an in-memory channel is insufficient. Persist that accepted work and provide an outcome identity.
 
@@ -56,3 +55,15 @@ Use a worker that waits for an explicit signal. Fill the queue, send one more re
 After releasing the worker, account for every accepted command. Rejected requests should leave no business effect. If the design promises durable acceptance, interrupt the process and demonstrate recovery from the store.
 
 The right policy depends on the product. A live autocomplete query and a paid report export should not inherit the same behaviour accidentally. Put that choice in the handler contract, where the next engineer can see it, rather than hiding it behind a queue capacity number.
+
+## Check the response and the effect together
+
+The reproduction runs an Axum handler through Tower's request interface and a one-slot Tokio channel. The first command reaches the worker, which pauses at a signal. A second request fills the channel and waits for its reply. The test observes that the channel has no spare capacity before submitting a third request.
+
+That third caller must receive 429. After the worker is released, the first two callers receive 200 and the recorded effects are exactly identities one and two. The rejected third identity must not appear. Next the worker stops and its receiver drops. A fourth request must receive 503, with no fourth effect.
+
+This fixture chooses request-owned completion. Its handler does not return success merely because `try_send` accepted the command. A closed reply path becomes an unavailable result. A real write still needs an operation identity if the caller can disappear after the write commits; the [commit and response guide](/blog/return-success-after-database-commit) explains that separate boundary.
+
+The test does not claim a durable queue or restart recovery. It uses an in-process worker, and its effects are a captured list. That is enough to exercise admission and caller-visible status without pretending the list is a database. If the product promises acceptance across a restart, replace that promise with a stored job and test its recovery separately.
+
+Use the status codes that fit your documented API. The important contract is that full, closed, admitted, and completed remain distinct states, with an effect check behind the response assertion.

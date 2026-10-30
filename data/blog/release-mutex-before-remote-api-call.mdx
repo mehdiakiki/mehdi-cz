@@ -17,25 +17,27 @@ Changing to an async mutex may stop a thread from blocking while it waits for th
 
 ## Copy the input under a short lock
 
-Take the information needed for the request, then release the guard. The following Rust excerpt assumes an async mutex and application-specific client methods:
+Take the information needed for the request, then release the guard. The Rust reproduction uses an async mutex and a controlled response channel. The channel stands in for a remote client that has not answered yet:
 
 ```rust
-let (version, request) = {
-    let state = shared.lock().await;
-    (state.version, state.refresh_request())
-};
+#[derive(Default)]
+struct Cache { version: usize, value: usize }
 
-let response = client.fetch(request).await?;
-
-let mut state = shared.lock().await;
-if state.version == version {
-    state.apply(response);
+async fn refresh(shared: Arc<Mutex<Cache>>, started: oneshot::Sender<()>, response: oneshot::Receiver<usize>) -> bool {
+    let version = { shared.lock().await.version };
+    started.send(()).unwrap();
+    let response = response.await.unwrap();
+    let mut state = shared.lock().await;
+    if state.version == version {
+        state.value = response;
+        true
+    } else { false }
 }
 ```
 
-The owned request leaves the first scope. The lock guard does not. Other tasks can use the state while the network operation is waiting.
+The copied version leaves the first scope. The lock guard does not. Other tasks can use the state while the network operation is waiting.
 
-The second version check is important. Another request may change the record during the fetch. Applying the old response unconditionally would turn a latency fix into a stale-write bug.
+The second version check is important. The complete fixture is [practical_runtime.rs](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/rust-backend/tests/practical_runtime.rs). Another request may change the record during the fetch. Applying the old response unconditionally would turn a latency fix into a stale-write bug.
 
 Decide what should happen on a version conflict. Discarding the refresh can be correct for a cache. A user-initiated mutation may need an explicit conflict response or a new attempt. Keep that policy visible instead of silently retrying forever.
 
@@ -56,3 +58,15 @@ If several operations must use one stateful socket or a strict protocol sequence
 Some resources really must process one operation at a time. Holding an async mutex across that work may be correct. Check whether the resource requires it and how long other callers can wait.
 
 For an ordinary cache refresh, I would keep the slow external wait outside the lock and make stale results explicit. Then measure lock wait and refresh failures separately. The service needs both acceptable concurrency and correct state.
+
+## A paused refresh and a newer record
+
+The complete fixture runs two refreshes. It starts the first and waits for an explicit signal after the initial lock scope ends. Before allowing the response to arrive, the observer calls `try_lock`. That call must succeed immediately. It then changes the cached value to 99 and advances its version.
+
+The old response carries value twelve. The refresh returns false, and the stored value must remain 99. This checks the correctness consequence of releasing the lock, not only its availability. A second refresh runs without an intervening version change. Its value thirteen must be applied. Together, the cases show that the version check both rejects stale work and permits a valid refresh.
+
+The adapter does not open an HTTP connection. It isolates the ownership rule from DNS, TLS, retries, and response parsing. A production client can spend its wait at any of those layers while retaining an application lock. Trace the actual client operation separately when investigating its latency.
+
+The test uses one process and one cache. The version is local state, not a database transaction identifier or a cross-replica synchronization mechanism. A distributed cache refresh needs an identity and conflict rule that remain meaningful across its writers. Do not assume that moving an await outside a mutex settles that wider protocol.
+
+Keep the lock scope short enough to inspect. Copy the request inputs and version together, perform the slow operation, then apply a result only under the chosen conflict policy. That sequence makes the trade visible during the next code review.

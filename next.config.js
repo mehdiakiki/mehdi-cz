@@ -156,6 +156,16 @@ module.exports = () => {
     async redirects() {
       return [
         {
+          source: "/blog/database-pool-full-check-connection-lifetime",
+          destination: "/blog/rust-request-waiting-for-pool-or-postgresql",
+          permanent: true,
+        },
+        {
+          source: "/blog/message-count-is-not-queue-memory-budget",
+          destination: "/blog/bounded-rust-channel-database-producer-memory",
+          permanent: true,
+        },
+        {
           source: "/blog/ai-engineer-title-means-everything-nothing",
           destination: "/blog/what-is-an-ai-engineer-really",
           permanent: true,

@@ -43,7 +43,10 @@ async fn sample(indexed: bool, sample: usize) -> Result<()> {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
-    for (number, indexed) in [false, true, true, false, false, true].into_iter().enumerate() {
+    for (number, indexed) in [false, true, true, false, false, true]
+        .into_iter()
+        .enumerate()
+    {
         sample(indexed, number + 1).await?;
     }
     Ok(())

@@ -139,6 +139,14 @@ async fn check(pool: &PgPool) -> Result<()> {
         assert_eq!(budget.available_permits(), ROW_BYTES * 2);
         println!("cancel={cancel}: byte admission limited retained application payload to 16384 bytes before draining; all payload and permits were released. This is logical payload accounting, not RSS.");
     }
+    let budget = Arc::new(Semaphore::new(ROW_BYTES * 2));
+    let retained = Arc::new(AtomicUsize::new(0));
+    let (output, input) = mpsc::channel::<Batch>(1);
+    drop(input);
+    assert!(load_with_budget(pool, budget.clone(), &output, retained.clone()).await.is_err());
+    assert_eq!(retained.load(Ordering::SeqCst), 0);
+    assert_eq!(budget.available_permits(), ROW_BYTES * 2);
+    println!("Closed consumer: failed send returns its payload and all byte permits.");
     Ok(())
 }
 async fn run() -> Result<()> {

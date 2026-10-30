@@ -198,19 +198,21 @@ async fn http_collection_enforces_wire_decoded_and_deadline_limits() {
     use std::io::Write;
     use tokio::io::{AsyncReadExt,AsyncWriteExt};
     let mut gzip=flate2::write::GzEncoder::new(Vec::new(),flate2::Compression::default());gzip.write_all(&vec![b'x';1000]).unwrap();let gzip=gzip.finish().unwrap();
+    let mut short=flate2::write::GzEncoder::new(Vec::new(),flate2::Compression::default());short.write_all(b"xxxxxxxx").unwrap();let short=short.finish().unwrap();
     let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let address=listener.local_addr().unwrap();
     let server=tokio::spawn(async move {
         let mut tasks=JoinSet::new();
-        loop { let (mut socket,_)=listener.accept().await.unwrap();let gzip=gzip.clone();tasks.spawn(async move {
+        loop { let (mut socket,_)=listener.accept().await.unwrap();let gzip=gzip.clone();let short=short.clone();tasks.spawn(async move {
             let mut request=[0;2048];let n=socket.read(&mut request).await.unwrap();let request=String::from_utf8_lossy(&request[..n]);
             if request.starts_with("GET /stall ") { std::future::pending::<()>().await; }
-            let compressed=request.starts_with("GET /gzip ");let body=if compressed { gzip } else if request.starts_with("GET /exact ") { vec![b'x';16] } else { vec![b'x';17] };
+            let concat=request.starts_with("GET /concat ");let compressed=request.starts_with("GET /gzip ")||concat;let body=if concat { [short,gzip].concat() } else if compressed { gzip } else if request.starts_with("GET /exact ") { vec![b'x';16] } else { vec![b'x';17] };
             let encoding=if compressed { "Content-Encoding: gzip\r\n" } else { "" };
-            let header=format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n{encoding}Connection: close\r\n\r\n{:x}\r\n",body.len());
+            let status=if request.starts_with("GET /error ") { "500 Internal Server Error" } else { "200 OK" };
+            let header=format!("HTTP/1.1 {status}\r\nTransfer-Encoding: chunked\r\n{encoding}Connection: close\r\n\r\n{:x}\r\n",body.len());
             let _=socket.write_all(header.as_bytes()).await;let _=socket.write_all(&body).await;let _=socket.write_all(b"\r\n0\r\n\r\n").await;
         }); }
     });
-    for (path,accepted) in [("exact",true),("oversize",false),("gzip",false),("stall",false)] {
+    for (path,accepted) in [("exact",true),("oversize",false),("gzip",false),("concat",false),("error",false),("stall",false)] {
         let url=format!("http://{address}/{path}");let result=tokio::task::spawn_blocking(move ||decoded_http(&url,65536,16)).await.unwrap();
         assert_eq!(result.is_ok(),accepted,"{path}");if accepted { assert_eq!(result.unwrap().len(),16); }
     }
