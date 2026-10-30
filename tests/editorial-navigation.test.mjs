@@ -90,8 +90,14 @@ test("all approved editorial articles have one reader series with the expected b
       )
       .every((series) => series.parts.length === 10)
   );
-  assert.equal(editorialSeries.find((series) => series.slug === "rust-database-boundaries").parts.length,3);
-  assert.equal(editorialSeries.find((series) => series.slug === "rust-service-runtime").parts.length,9);
+  assert.equal(
+    editorialSeries.find((series) => series.slug === "rust-database-boundaries").parts.length,
+    3
+  );
+  assert.equal(
+    editorialSeries.find((series) => series.slug === "rust-service-runtime").parts.length,
+    9
+  );
 
   assert.equal(
     editorialSeries.find((series) => series.slug === "rust-backend-in-practice").parts.length,

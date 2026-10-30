@@ -37,6 +37,7 @@ async fn refresh(
     let mut state = shared.lock().await;
     if state.version == version {
         state.value = response;
+        state.version = state.version.checked_add(1).expect("version exhausted");
         true
     } else {
         false
@@ -65,6 +66,7 @@ async fn refresh_releases_the_lock_and_does_not_overwrite_a_newer_version() {
     release.send(13).unwrap();
     assert!(task.await.unwrap());
     assert_eq!(shared.lock().await.value, 13);
+    assert_eq!(shared.lock().await.version, 2);
     println!("MUTEX: second caller acquires during remote gate; stale response rejected; unchanged-version refresh applied=13");
 }
 
