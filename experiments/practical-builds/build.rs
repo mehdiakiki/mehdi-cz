@@ -7,10 +7,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|error| format!("required schema/api.txt: {error}"))?;
     let value: i32 = fs::read_to_string("template.cfg")
         .map_err(|error| format!("required template.cfg: {error}"))?
-        .trim().parse()?;
+        .trim()
+        .parse()?;
     let mut generated = String::new();
     for name in schema.lines() {
-        if name.is_empty() || name.len() > 16 || !name.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_') {
+        if name.is_empty()
+            || name.len() > 16
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        {
             return Err("invalid fixture API name".into());
         }
         generated.push_str(&format!("pub fn api_{name}() -> i32 {{ {value} }}\n"));

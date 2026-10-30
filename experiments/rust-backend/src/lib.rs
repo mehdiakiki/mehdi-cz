@@ -3,6 +3,7 @@ pub mod errors;
 pub mod leases;
 pub mod middleware;
 pub mod migration;
+pub mod practical_repair;
 pub mod sessions;
 pub mod uploads;
 
