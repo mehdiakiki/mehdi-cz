@@ -46,20 +46,28 @@ for (const article of manifest.articles) {
   assert.ok(post, article.slug);
   assert.equal(publicArticleHref(allBlogs, article.slug), `/blog/${article.slug}`);
   assert.ok(
-    search.includes(article.slug) &&
-      feed.includes(article.slug) &&
-      sitemap.includes(article.slug),
+    search.includes(article.slug) && feed.includes(article.slug) && sitemap.includes(article.slug),
     article.slug
   );
   const route = await readFile(`.next/server/app/blog/${article.slug}.html`, "utf8");
   assert.ok(route.includes(post.title), article.slug);
-  assert.ok(route.includes(`rel="canonical" href="https://www.mehdi.cz/blog/${article.slug}"`), article.slug);
-  const structured = [...route.matchAll(/<script[^>]+type="application\/ld\+json"[^>]*>([\s\S]*?)<\/script>/g)]
-    .flatMap((match) => { const value = JSON.parse(match[1]); return Array.isArray(value) ? value : [value]; });
+  assert.ok(
+    route.includes(`rel="canonical" href="https://www.mehdi.cz/blog/${article.slug}"`),
+    article.slug
+  );
+  const structured = [
+    ...route.matchAll(/<script[^>]+type="application\/ld\+json"[^>]*>([\s\S]*?)<\/script>/g),
+  ].flatMap((match) => {
+    const value = JSON.parse(match[1]);
+    return Array.isArray(value) ? value : [value];
+  });
   const metadata = structured.find((item) => ["Article", "BlogPosting"].includes(item["@type"]));
   assert.ok(metadata, `${article.slug}: missing article metadata`);
   const authors = Array.isArray(metadata.author) ? metadata.author : [metadata.author];
-  assert.deepEqual(authors.map((author) => typeof author === "string" ? author : author.name), ["Mehdi Akiki"]);
+  assert.deepEqual(
+    authors.map((author) => (typeof author === "string" ? author : author.name)),
+    ["Mehdi Akiki"]
+  );
   const body = renderToStaticMarkup(h(MDXLayoutRenderer, { code: post.body.code }));
   assert.ok(body.includes("<h2") && body.includes("<pre"), article.slug);
   for (const [, target] of body.matchAll(/href="\/blog\/([^"#?]+)"/g)) {
@@ -95,5 +103,8 @@ await writeFile(
   )
 );
 const hub = await readFile(".next/server/app/blog/series/rust-database-failures.html", "utf8");
-for (const article of manifest.articles) assert.ok(hub.includes(`/blog/${article.slug}`), article.slug);
-console.log("Verified seven approved public routes, canonical URLs, sole-author metadata, search, RSS, sitemap and the reading-series hub; retained review copies.");
+for (const article of manifest.articles)
+  assert.ok(hub.includes(`/blog/${article.slug}`), article.slug);
+console.log(
+  "Verified seven approved public routes, canonical URLs, sole-author metadata, search, RSS, sitemap and the reading-series hub; retained review copies."
+);

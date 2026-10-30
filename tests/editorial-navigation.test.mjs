@@ -78,7 +78,12 @@ test("all seventy-five editorial articles have one reader series with the expect
   assert.ok(
     editorialSeries
       .filter(
-        (series) => !["sql-databases-from-rust", "rust-backend-in-practice", "rust-database-failures"].includes(series.slug)
+        (series) =>
+          ![
+            "sql-databases-from-rust",
+            "rust-backend-in-practice",
+            "rust-database-failures",
+          ].includes(series.slug)
       )
       .every((series) => series.parts.length === 10)
   );
@@ -86,7 +91,10 @@ test("all seventy-five editorial articles have one reader series with the expect
     editorialSeries.find((series) => series.slug === "rust-backend-in-practice").parts.length,
     8
   );
-  assert.equal(editorialSeries.find((series) => series.slug === "rust-database-failures").parts.length, 7);
+  assert.equal(
+    editorialSeries.find((series) => series.slug === "rust-database-failures").parts.length,
+    7
+  );
   assert.equal(
     editorialSeries.find((series) => series.slug === "sql-databases-from-rust").parts.length,
     30

@@ -32,7 +32,11 @@ for (const article of manifest.articles) {
   assert.equal(publicationStatus({ ...data, draft: true }, boundary), "draft");
   assert.equal(publicationStatus({ ...data, reviewed: false }, boundary), "unapproved");
   assert.equal(editorialSeriesForPost(article.slug)?.slug, release.series);
-  posts.push({ ...parsePublicationFrontmatter(source), slug: article.slug, path: `/blog/${article.slug}` });
+  posts.push({
+    ...parsePublicationFrontmatter(source),
+    slug: article.slug,
+    path: `/blog/${article.slug}`,
+  });
   assert.ok(!source.includes("{{snippet:"), article.slug);
   const fences = [...content.matchAll(/^```([^\n]*)\n([\s\S]*?)^```/gm)];
   assert.equal(fences.length, article.snippets.length, article.slug);
@@ -52,6 +56,9 @@ for (const article of manifest.articles) {
 }
 const now = new Date(release.publish_at);
 assert.equal(missingDuePublications(posts, "<urlset></urlset>", now).length, 7);
-assert.deepEqual(missingDuePublications(posts, "<urlset></urlset>", new Date(now.getTime() - 1)), []);
+assert.deepEqual(
+  missingDuePublications(posts, "<urlset></urlset>", new Date(now.getTime() - 1)),
+  []
+);
 const live = `<urlset>${posts.map((post) => `<url><loc>https://www.mehdi.cz${post.path}</loc></url>`).join("")}</urlset>`;
 assert.deepEqual(missingDuePublications(posts, live, now), []);
