@@ -48,8 +48,7 @@ async fn reporting_login_reads_approved_data_and_cannot_modify_it() -> AnyResult
     for command in ["INSERT INTO reporting_permission_probe VALUES (2,9)","DELETE FROM reporting_permission_probe WHERE id = 1"] {
         assert_eq!(client.execute(command,&[]).await.unwrap_err().code(),Some(229));
     }
-    let private = client.query("SELECT secret FROM private_probe",&[]).await;
-    let error = match private { Ok(_) => panic!("private table was readable"), Err(error) => error };
+    let error = match client.query("SELECT secret FROM private_probe",&[]).await { Ok(stream) => stream.into_results().await.expect_err("private table was readable"), Err(error) => error };
     assert_eq!(error.code(),Some(229));
     let stored = admin.query("SELECT value FROM reporting_permission_probe WHERE id = 1",&[]).await?.into_row().await?.unwrap();
     assert_eq!(stored.try_get::<i32,_>(0)?,Some(7));

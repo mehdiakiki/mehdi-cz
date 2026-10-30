@@ -53,7 +53,7 @@ async fn authenticated_reads_lists_and_writes_stay_inside_their_tenant() {
     let setup = database("practical_tenant_requests").await;
     sqlx::query("CREATE TABLE records (id integer PRIMARY KEY, tenant text NOT NULL, external_id text NOT NULL, name text NOT NULL)").execute(&setup).await.unwrap();
     sqlx::query("INSERT INTO records VALUES (1,'tenant-a','external-42','private-a'), (2,'tenant-b','external-42','private-b')").execute(&setup).await.unwrap();
-    sqlx::query("GRANT USAGE ON SCHEMA practical_tenant_requests TO editorial_app; GRANT SELECT, UPDATE ON practical_tenant_requests.records TO editorial_app")
+    sqlx::raw_sql("GRANT USAGE ON SCHEMA practical_tenant_requests TO editorial_app; GRANT SELECT, UPDATE ON practical_tenant_requests.records TO editorial_app")
         .execute(&setup).await.unwrap();
     let pool = sqlx::postgres::PgPoolOptions::new().max_connections(1)
         .after_connect(|connection, _| Box::pin(async move {
