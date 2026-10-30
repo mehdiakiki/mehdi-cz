@@ -282,6 +282,7 @@ const articleSlugsByTheme = {
     "provider-rate-limit-is-not-always-customer-error",
     "start-internal-ai-tool-read-only",
     "model-must-not-select-user-credentials",
+    "log-tool-decisions-without-customer-documents",
     "offer-tools-for-current-workflow-only",
     "denied-tool-call-must-leave-no-side-effect",
     "fallback-model-must-preserve-permissions",

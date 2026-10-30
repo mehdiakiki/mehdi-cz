@@ -45,7 +45,7 @@ for (const article of release.articles) {
   assert.equal(publicationStatus({ ...data, draft: true }, at), "draft");
   assert.equal(publicationStatus({ ...data, reviewed: false }, at), "unapproved");
   assert.equal(editorialSeriesForPost(article.slug)?.slug, article.series);
-  assert.equal(writingTier(article.slug), "article");
+  assert.equal(writingTier(article.slug), "article", article.slug);
   const blocks = [...content.matchAll(/^```rust\n([\s\S]*?)^```/gm)];
   assert.equal(blocks.length, article.snippets.length, article.slug);
   for (const [index, snippet] of article.snippets.entries()) {
