@@ -1,6 +1,6 @@
 // Run in GitHub CI after the production build; output is a private review artifact.
 import assert from "node:assert/strict";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
@@ -32,6 +32,7 @@ const aiRelease = JSON.parse(
   await readFile("docs/editorial/ai-era-sql-2026-10-31/release.json", "utf8")
 );
 const reviewSeries = editorialSeries;
+await rm(output, { recursive: true, force: true });
 await mkdir(output, { recursive: true });
 
 for (const series of reviewSeries) {

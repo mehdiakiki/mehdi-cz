@@ -16,7 +16,7 @@ already published pgvector page.
 The MCP and vector pages are classified as articles and assigned writing themes. They join
 the existing Rust AI tool reading series and the AI topic hub. The request and
 commit guides link to the MCP article. That article offers a related vector
-investigation through the existing publication-aware link component. The vector article links back to
+investigation at its published URL. The vector article links back to
 the tool's identity and database-role example.
 
 These links answer related reader questions. Their placement is not a claim
