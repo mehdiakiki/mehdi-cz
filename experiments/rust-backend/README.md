@@ -89,3 +89,19 @@ checks, unfinished agent runs, malformed or excessive output, and valid
 positive cases. Command construction is inspected without launching Claude.
 These tests do not authenticate a GitHub artifact, implement the vendor result
 adapter, or measure the quality of live AI reviews.
+
+## PostgreSQL rows through a slow HTTP download
+
+`tests/http_row_stream.rs` uses a real Axum HTTP/1.1 response and a loopback TCP
+client that reads one record, then pauses. A socket wrapper observes an actual
+pending write before the test probes the one-slot database pool. The comparisons
+keep a SQLx row stream checked out, release checkouts between bounded pages,
+resume and validate the complete response, or disconnect and join the producer.
+
+Fixed 4,096-byte records make the payload allowance meaningful before fetching.
+Reservations follow owned `Bytes` through the HTTP stack; cleanup checks return
+all permits and run another database query. This counts owned payload, not total
+process or database-driver memory. Small socket buffers arrange the test; the
+results are not production throughput measurements or an export snapshot policy.
+The existing PostgreSQL job discovers all three cases through its normal backend
+test command. Inspect that run before calling the planned checks observations.

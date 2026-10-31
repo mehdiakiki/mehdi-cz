@@ -20,6 +20,9 @@ const revisedEditions = JSON.parse(
 const priorRevisions = JSON.parse(
   await readFile("docs/editorial/ai-writing-release-2026-10-31.json", "utf8")
 );
+const referenceRevisions = JSON.parse(
+  await readFile("docs/editorial/rust-reference-release-2026-10-31.json", "utf8")
+);
 const posts = [];
 for (const article of manifest.articles) {
   const source = await readFile(article.path, "utf8");
@@ -33,7 +36,9 @@ for (const article of manifest.articles) {
   const revised = revisedEditions.articles.find(
     (item) => item.kind === "revision" && item.slug === article.slug
   );
-  const priorRevision = priorRevisions.articles.find((item) => item.slug === article.slug);
+  const priorRevision = [...referenceRevisions.articles, ...priorRevisions.articles].find(
+    (item) => item.slug === article.slug && item.kind === "update"
+  );
   if (revised) {
     assert.equal(
       revised.previousReviewedHash,
@@ -45,7 +50,11 @@ for (const article of manifest.articles) {
     const manuscript = await readFile(revised.review_copy, "utf8");
     assert.equal(articleReviewHash(manuscript), articleReviewHash(source), article.slug);
   } else {
-    assert.equal(data.reviewedHash, approved?.reviewedHash, article.slug);
+    assert.equal(
+      data.reviewedHash,
+      priorRevision?.reviewedHash ?? approved?.reviewedHash,
+      article.slug
+    );
   }
   assert.deepEqual(data.authors, ["default"]);
   const boundary = new Date(release.publish_at);

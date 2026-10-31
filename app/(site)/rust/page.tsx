@@ -3,6 +3,7 @@ import type { Metadata } from "next";
 
 import { BreadcrumbJsonLd, JsonLd } from "@/components/JsonLd";
 import Link from "@/components/Link";
+import { availableRustDiagnosticPaths } from "@/data/rust-diagnostic-paths.mjs";
 import { authorityOpportunities } from "@/data/authority-opportunities.mjs";
 import {
   getRustAtlasClaim,
@@ -97,6 +98,7 @@ function visibleRustMaterial() {
 
 export default function RustSystemsAtlasPage() {
   const material = visibleRustMaterial();
+  const startingPaths = availableRustDiagnosticPaths(allBlogs, []).slice(0, 3);
   const failureAtlasLaunched = isRustFailureAtlasLaunched();
   const availableArticleSlugs = new Set(
     material.filter((item) => item.kind === "Article").map((item) => item.slug)
@@ -148,22 +150,89 @@ export default function RustSystemsAtlasPage() {
 
       <header className="max-w-5xl pt-8 pb-14 md:pt-12 md:pb-20">
         <p className="text-primary-600 dark:text-primary-400 text-sm font-semibold tracking-[0.16em] uppercase">
-          Rust, from symptom to implementation
+          Rust, explained from the problem you can see
         </p>
         <h1 className="mt-4 text-4xl leading-tight font-bold tracking-tight text-gray-950 md:text-6xl dark:text-gray-100">
           Rust Systems Atlas
         </h1>
         <p className="mt-7 max-w-4xl text-xl leading-9 text-gray-600 dark:text-gray-300">
-          I am building one connected map of Rust: the compiler representations, Cargo decisions,
-          runtime behavior, memory rules, target boundaries, release changes, and failures that make
-          these details matter in real code.
+          A Rust program can compile and still get stuck, use too much memory, or leave a database
+          write uncertain. Start with what you can observe. Follow the explanation, check the
+          example, and see what a useful fix changes.
         </p>
         <p className="mt-5 max-w-3xl leading-7 text-gray-600 dark:text-gray-400">
-          This is not another language introduction and it is not a copy of the standard library
-          documentation. Each page should answer one difficult question with a source trail, a
-          runnable experiment, or another piece of evidence that a reader can challenge.
+          I am Mehdi Akiki. These guides connect Rust code to the database, runtime, compiler, and
+          operating system it depends on. Each investigation starts with a concrete problem and
+          explains the terms as they become useful.
         </p>
       </header>
+
+      {startingPaths.length > 0 && (
+        <section className="pb-14 md:pb-20" aria-labelledby="rust-start-here">
+          <h2
+            id="rust-start-here"
+            className="text-3xl font-bold tracking-tight text-gray-950 dark:text-gray-100"
+          >
+            Start with your problem
+          </h2>
+          <p className="mt-4 max-w-3xl text-lg leading-8 text-gray-600 dark:text-gray-300">
+            You do not need to read the whole atlas. Choose the question closest to yours.
+          </p>
+          <div className="mt-8 grid gap-5 lg:grid-cols-3">
+            {startingPaths.map((path) => (
+              <article
+                key={path.slug}
+                className="rounded-lg border border-gray-200 p-6 dark:border-gray-800"
+              >
+                <h3 className="text-xl font-bold text-gray-950 dark:text-gray-100">{path.title}</h3>
+                <p className="mt-4 leading-7 text-gray-600 dark:text-gray-300">{path.firstCheck}</p>
+                {path.links[0] && (
+                  <Link
+                    href={path.links[0].href}
+                    prefetch={false}
+                    className="text-primary-700 dark:text-primary-400 mt-5 block font-semibold"
+                    data-umami-event="rust-start-here-open"
+                    data-umami-event-path={path.slug}
+                  >
+                    {path.links[0].label} &rarr;
+                  </Link>
+                )}
+                <Link
+                  href={`/rust-failure-atlas#diagnose-${path.slug}`}
+                  prefetch={false}
+                  className="mt-4 inline-block text-sm font-semibold text-gray-600 dark:text-gray-400"
+                >
+                  Follow the related checks &rarr;
+                </Link>
+              </article>
+            ))}
+          </div>
+        </section>
+      )}
+
+      <section
+        className="border-t border-gray-200 py-10 dark:border-gray-800"
+        aria-labelledby="rust-work-behind-the-guides"
+      >
+        <h2
+          id="rust-work-behind-the-guides"
+          className="text-2xl font-bold text-gray-950 dark:text-gray-100"
+        >
+          Work behind the explanations
+        </h2>
+        <p className="mt-4 max-w-3xl leading-7 text-gray-600 dark:text-gray-300">
+          You can also inspect my changes to the Rust compiler and the design of Bitarena, a Rust
+          collection that keeps stable handles while values are added and removed.
+        </p>
+        <div className="mt-6 flex flex-wrap gap-5 font-semibold">
+          <Link href="/work/rustc-late-metadata" className="text-primary-700 dark:text-primary-400">
+            Changing what goes inside a Rust library &rarr;
+          </Link>
+          <Link href="/work/bitarena" className="text-primary-700 dark:text-primary-400">
+            Bitarena: design, tests, and tradeoffs &rarr;
+          </Link>
+        </div>
+      </section>
 
       <section
         className="grid gap-5 border-y border-gray-200 py-10 md:grid-cols-3 dark:border-gray-800"

@@ -20,7 +20,7 @@ const descents = [
     layer: "Compiler · rust-lang/rust",
     title: "A linker question that changed what goes inside a Rust rlib",
     description:
-      "rustc guessed which archive members were Rust object files from their names. Four merged pull requests added a link-time metadata member that the compiler reads instead.",
+      "Five merged compiler changes make Rust libraries describe their compiled files directly, then improve how that information is read.",
     href: "/work/rustc-late-metadata",
   },
   {
