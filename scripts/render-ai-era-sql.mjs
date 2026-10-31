@@ -71,15 +71,19 @@ for (const article of manifest.articles) {
     const route = await readFile(`.next/server/app/blog/${article.slug}.html`, "utf8");
     assert.ok(route.includes(edition.rendered_marker), article.slug);
     assert.ok(route.includes(`rel="canonical" href="https://www.mehdi.cz/blog/${article.slug}"`));
-    const entities = [...route.matchAll(/<script[^>]+type="application\/ld\+json"[^>]*>([\s\S]*?)<\/script>/g)]
-      .flatMap((match) => {
-        const value = JSON.parse(match[1]);
-        return Array.isArray(value) ? value : [value];
-      });
+    const entities = [
+      ...route.matchAll(/<script[^>]+type="application\/ld\+json"[^>]*>([\s\S]*?)<\/script>/g),
+    ].flatMap((match) => {
+      const value = JSON.parse(match[1]);
+      return Array.isArray(value) ? value : [value];
+    });
     const metadata = entities.find((value) => ["Article", "BlogPosting"].includes(value["@type"]));
     assert.ok(metadata, article.slug);
     const authors = Array.isArray(metadata.author) ? metadata.author : [metadata.author];
-    assert.deepEqual(authors.map((author) => typeof author === "string" ? author : author.name), ["Mehdi Akiki"]);
+    assert.deepEqual(
+      authors.map((author) => (typeof author === "string" ? author : author.name)),
+      ["Mehdi Akiki"]
+    );
     assert.equal(Date.parse(metadata.datePublished), Date.parse(edition.date));
     assert.equal(Date.parse(metadata.dateModified), Date.parse(edition.lastmod));
   } else {
@@ -94,9 +98,12 @@ for (const article of manifest.articles) {
     const href = publicArticleHref(allBlogs, slug);
     return h(href ? "a" : React.Fragment, href ? { href } : null, children);
   }
-  const body = renderToStaticMarkup(h(MDXLayoutRenderer, {
-    code: post.body.code, components: { ArticleLink },
-  }));
+  const body = renderToStaticMarkup(
+    h(MDXLayoutRenderer, {
+      code: post.body.code,
+      components: { ArticleLink },
+    })
+  );
   assert.ok(body.includes("<h2") && body.includes("<pre"), article.slug);
   assert.ok(body.includes(edition.rendered_marker), article.slug);
   for (const [, target] of body.matchAll(/href="\/blog\/([^"#?]+)"/g)) {
@@ -146,10 +153,16 @@ await writeFile(
 );
 await writeFile(
   `${output}/index.json`,
-  JSON.stringify({
-    articles: records,
-    publicNewArticles: records.filter((article) => article.kind === "new" && article.state === "published").length,
-  }, null, 2)
+  JSON.stringify(
+    {
+      articles: records,
+      publicNewArticles: records.filter(
+        (article) => article.kind === "new" && article.state === "published"
+      ).length,
+    },
+    null,
+    2
+  )
 );
 console.log(
   "Verified public editions, canonical URLs, sole-author metadata, daily release gates and the reading paths; retained five HTML copies."

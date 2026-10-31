@@ -97,10 +97,16 @@ for (const article of additions) {
   const at = new Date(article.date);
   const xml = `<urlset>${live.map((slug) => `<url><loc>https://www.mehdi.cz/blog/${slug}</loc></url>`).join("")}</urlset>`;
   assert.deepEqual(missingDuePublications(newPosts, xml, before), []);
-  assert.deepEqual(missingDuePublications(newPosts, xml, at).map((post) => post.slug), [article.slug]);
+  assert.deepEqual(
+    missingDuePublications(newPosts, xml, at).map((post) => post.slug),
+    [article.slug]
+  );
   assert.equal(publicArticleHref(newPosts, article.slug, before), null);
   assert.equal(publicArticleHref(newPosts, article.slug, at), `/blog/${article.slug}`);
   live.push(article.slug);
-  assert.deepEqual(publishedSeriesParts(series, newPosts, at).map((post) => post.slug), live);
+  assert.deepEqual(
+    publishedSeriesParts(series, newPosts, at).map((post) => post.slug),
+    live
+  );
 }
 console.log("Verified the two daily publication boundaries and reader-series rollover.");
