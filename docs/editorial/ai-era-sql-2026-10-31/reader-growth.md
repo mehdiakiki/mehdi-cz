@@ -7,16 +7,16 @@ kept the same before making a numerical growth comparison.
 
 ## Work included in this release
 
-Three existing answers receive substantive updates: request waits, stale SQLx
-metadata and uncertain commit outcomes. Their URLs and original publication
-dates remain intact. The two new articles cover a bounded PostgreSQL MCP tool
-and filtered pgvector results.
+Four existing answers receive substantive updates: request waits, stale SQLx
+metadata, uncertain commit outcomes and filtered pgvector results. Their URLs and
+original publication dates remain intact. One new article covers a bounded
+PostgreSQL MCP tool. The overlapping vector draft is consolidated into the
+already published pgvector page.
 
-The new pages are classified as articles and assigned writing themes. They join
+The MCP and vector pages are classified as articles and assigned writing themes. They join
 the existing Rust AI tool reading series and the AI topic hub. The request and
 commit guides link to the MCP article. That article offers a related vector
-investigation through the existing publication-aware link component, which
-becomes a link when the second article is due. The vector article links back to
+investigation through the existing publication-aware link component. The vector article links back to
 the tool's identity and database-role example.
 
 These links answer related reader questions. Their placement is not a claim
@@ -36,11 +36,12 @@ search type, country and device filters. Record clicks, impressions, click rate
 and average position. The [Performance report documentation](https://support.google.com/webmasters/answer/7576553)
 defines those measurements. Keep the export dates and filters with each result.
 
-Compare the two new pages over their first 28 complete days, rather than using
-the same calendar cutoff for differently aged articles. The earliest joint
-review is December 2, allowing three days after the second page's first 28-day
-window. For the revisions, compare each URL's 28 days before and after its
-update, and account for site-wide traffic changes and article age.
+Review the new MCP page after its first 28 complete days. Allow three more days
+for reporting lag; with an October 31 release, that review can start December 1.
+For the revisions, compare each URL's 28 days before and after its update, and
+account for site-wide traffic changes and article age. The vector page was
+published shortly before this revision, so its pre-update window cannot show
+an established-page trend. Treat it as a newly published page in that comparison.
 
 Review questions and corrections from readers alongside the numbers. Track
 visits to useful follow-up articles and interest in engineering work or contact

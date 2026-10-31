@@ -18,24 +18,23 @@ Before release, read the prose aloud and ask whether a person can follow the exp
 
 ## Accepted themes
 
-### Writing for readers who use AI to code
+### When AI writes the first implementation
 
-On October 31, the author asked to develop the Rust and AI coverage for a reader
-who already uses AI to write code. A working implementation is one part of an
-article's value. Help the reader decide what that implementation must preserve,
-which competing explanation fits the observations, and what would disprove a
-suggested repair. AI can help construct and investigate those proposals too.
+On October 31, the author asked for the Rust and AI articles to go beyond producing code. Assume a reader can ask a coding agent for an initial implementation. Help that reader decide what it should do, identify what remains uncertain, and collect evidence before accepting the change.
 
-Use a concrete counterexample when it makes the decision clearer. Record the
-database state, wait, permission denial, or query plan that supports the answer.
-Choose assertions from the intended behavior before treating a candidate's own
-tests as sufficient evidence. Explain the cost and limits of the chosen repair.
-Do not invent model experiments or claim that a model cannot solve the problem.
+A SQLx example should help distinguish a pool wait from a database lock, explain why a smaller connection scope changes progress, and check whether the repair preserves the write contract. A retrieval example should inspect the documents sent to the model and account for edits, access boundaries, and deletion. A skill guide should explain how to judge a workflow's results as well as how to write its frontmatter.
 
-Retain useful search questions in titles. Deepen an existing answer when it
-already covers the question. A further article needs a distinct decision and
-enough evidence to answer it on its own. The October 31 batch is recorded in
-[the AI-era SQL review brief](ai-era-sql-2026-10-31/README.md).
+Use a plausible wrong repair to make the decision concrete. Choose assertions from the requirement rather than from the implementation an agent happened to produce. Retain source versions and execution evidence, and say what the experiment cannot establish. These are editorial questions, not a required article template. Do not speculate about permanent limits on AI capability.
+
+The first writing batch expands the connection-pool investigation and the existing Claude Code skills guide, and adds a Rust/PostgreSQL retrieval investigation. New SQL articles retain Rust executable examples. The approved daily calendar continues to govern releases.
+
+The pool expansion is now folded into the existing pool-wait guide, `rust-request-waiting-for-pool-or-postgresql`. The overlapping source remains held and redirected. Its new value is the quote revision contract, cancellation check, and deliberately gated progress comparison. The retrieval manuscript adds a Rust serving and publication contract to the existing conceptual retrieval guides; it does not claim a complete model integration or a relevance benchmark.
+
+The second batch keeps the existing SQLite writer and stale-snapshot explanation intact. A distinct checkpoint investigation follows the history retained by a long reader. A pgvector investigation compares exact and actual HNSW plans under the same tenant predicate. The existing Claude Code CI guide is revised around trusted source identity, independent requirement checks, bounded results, and publishing authority. The scope and primary sources are recorded in `ai-writing-second-batch-2026-10-31.json`.
+
+The additional [SQL review batch](ai-era-sql-2026-10-31/README.md) adds a bounded PostgreSQL MCP operation and deepens the existing request, metadata, commit and filtered-vector guides. The vector comparison is consolidated into the published pgvector URL.
+
+### Subject priorities
 
 The first three themes receive the most attention. Keep the next thirty proposed articles rooted in established SQL databases and database internals. Every executable example in that series must be Rust, with SQL inside Rust query calls.
 
@@ -121,3 +120,11 @@ A current documentation search confirms that the basic rules already have good s
 Give the database and runtime paths the most attention when evaluating this release. Useful entry questions include a full connection pool with an idle database, work that survives a lost reply, queued payload outside a channel's nominal capacity, and stale generated output that survives a rebuild. Use actual search queries and reader questions to decide which explanations need refinement. Do not infer demand from the number of pages published.
 
 The target still needs roughly eight hundred additional daily visits on the author's original metric. There is no defensible fixed number of articles that guarantees that increase. Compare the trailing 28-day average, article search clicks, follow-up reading, and relevant work enquiries after the cohort has had time to be discovered. Prioritize improving pages with relevant impressions but weak clicks, or useful entry traffic with poor follow-up reading. Keep the existing scheduled calendar separate from this explicitly requested draft release.
+
+## October 31 publication request
+
+The author asked to make these articles more human and publish them once revised. The resulting release adds the Rust/PostgreSQL retrieval, SQLite checkpoint, and filtered pgvector investigations. It updates the existing pool-wait, Claude Code skills, and Claude Code CI guides at their current URLs.
+
+The prose now starts with concrete symptoms, explains terms beside the problem, and removes repeated review language. Compiled Rust excerpts and observed results remain intact. Constructed examples are not presented as personal incidents, and local policy checks are not presented as a model-quality evaluation. The author remains Mehdi Akiki alone.
+
+`ai-writing-release-2026-10-31.json` records the requested release and hashes of the reviewed sources. Existing GitHub checks and the production deployment workflow govern publication. The other scheduled calendar is unchanged.

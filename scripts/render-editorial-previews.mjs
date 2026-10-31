@@ -112,7 +112,7 @@ assert.equal(
     followups.articles.length +
     practicalRelease.articles.length +
     completedRelease.articles.length +
-    aiRelease.articles.filter((article) => article.kind === "new").length
+    aiRelease.series_additions.length
 );
 await writeFile(
   path.join(output, "index.json"),

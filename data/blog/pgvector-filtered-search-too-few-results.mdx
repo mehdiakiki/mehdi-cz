@@ -1,0 +1,138 @@
+---
+title: "Why pgvector Returns Too Few Results After Filtering"
+date: "2026-10-31T18:08:21Z"
+tags: ["rust", "postgresql", "pgvector", "rag", "query plans"]
+authors: ["default"]
+draft: false
+reviewed: true
+cluster: "reliable-ai-systems"
+campaign: "editorial"
+summary: "Your tenant has enough documents, but an HNSW query returns too few. Compare real plans, iterative scans, and an exact fallback without weakening access checks."
+lastmod: "2026-10-31T19:37:31Z"
+reviewedHash: "890068bddfb6cdce81f5b9164a44a05e1cb94a10c142c36b3ec1e6f38954446c"
+---
+
+You ask for five passages from a customer's documents. Ten matching documents exist. The query returns none.
+
+Then you remove the vector index, and the same query returns five.
+
+That can happen with pgvector's approximate search. The index finds nearby candidates, and PostgreSQL filters them. If those candidates mostly belong to other customers, the scan can run out of work before finding enough that this customer may use.
+
+Increasing `LIMIT` is an easy suggestion for a coding agent to make. It does not explain which rows disappeared. Let's keep the data and access rule fixed and look at the plans.
+
+## Start with a result you can compare against
+
+The [Rust test](https://github.com/mehdiakiki/mehdi-cz/blob/6c1abf15084ad31d0a672a97fae83e9fb6e9735a/experiments/rust-backend/tests/pgvector_filter.rs) creates 1,010 vectors. One thousand belong to tenant 8 and are close to the query. Ten belong to tenant 7 and are farther away.
+
+The query asks for tenant 7:
+
+```rust
+const FILTERED: &str = "SELECT id FROM filtered_documents WHERE tenant_id = $1 \
+     ORDER BY embedding OPERATOR(public.<=>) $2::public.vector LIMIT 5";
+```
+
+```rust
+let ids: Vec<i64> = sqlx::query_scalar(FILTERED)
+    .bind(7_i64)
+    .bind("[1,0,0]")
+    .fetch_all(connection)
+    .await?;
+```
+
+In an application, the server gets the tenant from the authenticated request. Seven is a test constant here. Both the tenant and vector are bound as values.
+
+The first run uses exact search. Inside the test transaction, index scans are disabled. The plan must show a sequential scan, and the query must return five rows. This gives us a useful baseline: enough eligible rows exist for these exact inputs.
+
+The coordinates are three hand-written numbers. This is a controlled way to expose filtering behavior, not a relevance benchmark for an embedding model.
+
+## What the indexed plan actually did
+
+The next run uses HNSW, an index that searches a graph of vectors rather than scoring every eligible row. The test requires the named HNSW index in the plan. It sets `hnsw.ef_search` to 40 and turns iterative scans off.
+
+In the [recorded execution](https://github.com/mehdiakiki/mehdi-cz/blob/6c1abf15084ad31d0a672a97fae83e9fb6e9735a/docs/editorial/evidence/ai-writing-second-batch-2026-10-31/pgvector-filter.txt), the query returned zero rows. The plan reported forty rows removed by the tenant filter.
+
+Nothing had deleted tenant 7's documents. The limited approximate search had not found them before its available candidates were filtered out.
+
+The [pgvector filtering documentation](https://github.com/pgvector/pgvector#filtering) explains this interaction. The tenant predicate controls which rows may be returned. It does not guarantee that a bounded approximate scan will discover five matching rows.
+
+To make each path observable, the test changes planner settings inside its transaction. Do not copy those settings into a service as a general tuning recipe. An exact scan over a small filtered set may be the plan you want. Inspect the plan your actual query uses.
+
+## Letting the scan search further
+
+Iterative scanning allows more search work when filtering leaves too few results:
+
+```rust
+sqlx::query("SET LOCAL hnsw.iterative_scan = 'strict_order'")
+    .execute(&mut *tx)
+    .await?;
+```
+
+The test checks the active setting and the index plan again. In the recorded run, it returned five rows after the tenant filter removed 370.
+
+That is a useful result, but it is not a promise that this setting always fills the request. Iterative scans still have work and memory limits. Another index build or data distribution can produce a different count. Check the returned rows.
+
+`strict_order` also does not mean exact recall. It orders the candidates found; it does not prove that the scan found every true nearest neighbor.
+
+The SQLx transaction keeps these `SET LOCAL` changes scoped to the experiment, and the test rolls it back. Session-wide changes on a pooled connection need more care because another request can borrow that session later.
+
+Keep the tenant predicate in every query. Sending foreign passages to a model and asking it to discard them would already cross the access boundary.
+
+## What should the application do with a short result?
+
+Some features can use three passages when five were requested. Others require five if at least five eligible rows exist. Make that choice in the application.
+
+This test uses an exact fallback when approximate search returns fewer than five:
+
+```rust
+let fallback_sql = "WITH authorized AS MATERIALIZED ( \
+       SELECT id, embedding FROM filtered_documents WHERE tenant_id = $1 \
+     ) \
+     SELECT id FROM authorized \
+     ORDER BY embedding OPERATOR(public.<=>) $2::public.vector, id LIMIT 5";
+let mut completions = Vec::new();
+for candidates in [&expanded, &limited] {
+    let completed: Vec<i64> = if candidates.len() == 5 {
+        candidates.to_vec()
+    } else {
+        sqlx::query_scalar(fallback_sql)
+            .bind(7_i64)
+            .bind("[1,0,0]")
+            .fetch_all(&mut *tx)
+            .await?
+    };
+    completions.push(completed);
+}
+```
+
+The materialized relation contains only tenant 7's rows. The outer query sorts those rows by exact distance, then ID. The test checks the plan to confirm that HNSW is not supplying that ordering.
+
+The loop tries both inputs: the iterative result and the known-short limited result. This exercises the fallback even when iterative scanning finds five. Both completed results must contain five distinct, eligible IDs.
+
+An exact fallback has a cost. Materializing and sorting a large tenant's vectors can exceed your request budget. The ten authorized rows here do not establish a safe size for production. Use this approach when the eligible set and work budget allow it. Otherwise, return a clear partial or incomplete result. Never widen access to fill the count.
+
+## Choose a plan for your data
+
+These were the results with SQLx 0.8.6, pgvector 0.8.7, and PostgreSQL 18.6:
+
+| Search path                            | Returned rows | Observation                                          |
+| -------------------------------------- | ------------- | ---------------------------------------------------- |
+| Exact search                           | 5             | Enough eligible documents existed                    |
+| HNSW, iterative scanning off           | 0             | Tenant filtering removed forty candidates            |
+| HNSW, iterative scanning on            | 5             | More work found five eligible candidates in this run |
+| Exact fallback over the authorized set | 5             | Ten authorized rows were available to sort           |
+
+This small test makes no speedup or recall claim. For a real comparison, keep an exact reference for the same data revision, distance metric, and access rules. Compare the returned IDs, then measure latency and resource use at the intended concurrency. Five irrelevant passages would still be a poor result; the [retrieval evaluation guide](/blog/evaluate-retrieval-separately-from-answer-generation) covers that question.
+
+For a small tenant, an ordinary tenant index followed by exact distance sorting may be enough. Repeated filters may justify a partial index or partitioning. Those choices add write and maintenance costs, so use the distribution of your real queries to decide.
+
+Also check simpler explanations: missing embeddings, stale revisions, a mismatched model configuration, or vector values that are not indexed for the chosen distance. Search settings cannot recover a passage that was never eligible.
+
+## Check which five rows came back
+
+A full result count does not prove that the approximate search found the nearest five eligible rows. Compare the returned IDs with the exact reference. For top-k recall, divide the number of reference IDs returned by the smaller of k and the eligible row count. Track the returned count separately. Report an empty eligible set separately rather than dividing by zero.
+
+Keep the visible data stable during the comparison. PostgreSQL's default Read Committed isolation can give successive statements different snapshots, even in one transaction. A separate [Rust comparison fixture](https://github.com/mehdiakiki/mehdi-cz/blob/4d724693adecd572444b69211bae411e9a1e6259/experiments/rust-backend/tests/ai_database_review.rs) selects and checks Repeatable Read, binds the same tenant in the plan and result queries, and compares distinct-distance synthetic neighbors. Its limited HNSW path returns no IDs; the iterative path matches the exact five. This checks a controlled case, not production recall. See PostgreSQL's [isolation documentation](https://www.postgresql.org/docs/18/transaction-iso.html) before comparing results while other writers change the corpus.
+
+The [read-only PostgreSQL tool example](/blog/read-only-postgresql-mcp-tool-limits) follows the tenant identity back to the host and tests a restricted database role. A fixed tenant in a search fixture does not authenticate an application caller.
+
+I would keep the exact baseline, indexed plan, returned count, and access predicate together when reviewing a repair. That makes it possible to tell whether more search work helped, and whether the response still contains only documents this customer may use.

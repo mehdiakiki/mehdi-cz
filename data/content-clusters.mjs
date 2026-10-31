@@ -110,7 +110,7 @@ export const contentClusters = [
       "A software-engineering view of AI-enabled products: where models help, where deterministic boundaries remain necessary, and how to operate the whole system responsibly.",
     featuredSlugs: [
       "read-only-postgresql-mcp-tool-limits",
-      "pgvector-fewer-results-after-tenant-filter",
+      "pgvector-filtered-search-too-few-results",
       "what-evidence-an-ai-feature-needs-before-you-ship-it",
       "make-retried-agent-actions-idempotent-before-adding-autonomy",
     ],

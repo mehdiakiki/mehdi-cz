@@ -17,6 +17,9 @@ const release = JSON.parse(
 const revisedEditions = JSON.parse(
   await readFile("docs/editorial/ai-era-sql-2026-10-31/release.json", "utf8")
 );
+const priorRevisions = JSON.parse(
+  await readFile("docs/editorial/ai-writing-release-2026-10-31.json", "utf8")
+);
 const posts = [];
 for (const article of manifest.articles) {
   const source = await readFile(article.path, "utf8");
@@ -30,8 +33,9 @@ for (const article of manifest.articles) {
   const revised = revisedEditions.articles.find(
     (item) => item.kind === "revision" && item.slug === article.slug
   );
+  const priorRevision = priorRevisions.articles.find((item) => item.slug === article.slug);
   if (revised) {
-    assert.equal(revised.previousReviewedHash, approved?.reviewedHash, article.slug);
+    assert.equal(revised.previousReviewedHash, priorRevision?.reviewedHash ?? approved?.reviewedHash, article.slug);
     assert.equal(revised.reviewedHash, data.reviewedHash, article.slug);
     assert.equal(data.lastmod, revisedEditions.applied_at);
     const manuscript = await readFile(revised.review_copy, "utf8");
@@ -59,7 +63,9 @@ for (const article of manifest.articles) {
     assert.equal(fences[index][1], "rust");
     const fixture = await readFile(snippet.source, "utf8");
     const marker = new RegExp(
-      `^[ \\t]*// article:start ${snippet.label}\\n([\\s\\S]*?)^[ \\t]*// article:end ${snippet.label}`,
+      snippet.markerStyle === "named"
+        ? `^[ \\t]*// article:${snippet.label}:start\\n([\\s\\S]*?)^[ \\t]*// article:${snippet.label}:end`
+        : `^[ \\t]*// article:start ${snippet.label}\\n([\\s\\S]*?)^[ \\t]*// article:end ${snippet.label}`,
       "m"
     );
     const excerpt = fixture.match(marker)?.[1];

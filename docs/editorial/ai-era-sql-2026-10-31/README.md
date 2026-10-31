@@ -1,9 +1,11 @@
 # Rust and AI articles for readers who use AI to write code
 
 Prepared October 31, 2026. The author requested the final editorial pass, marking
-and publication. The [release record](release.json) applies three reviewed
-revisions and releases the two new articles one per day at 18:00 UTC, on October
-31 and November 1. The existing approved calendars are unchanged.
+and publication. The [release record](release.json) applies four reviewed
+revisions and releases one new PostgreSQL MCP article. While this work was in
+review, another batch published the filtered pgvector investigation. This batch
+adds its comparison guidance to that existing URL. The separate vector draft
+has no public page or November 1 release. Other approved calendars are unchanged.
 
 The reader can ask an AI assistant to implement a query, handler or retry loop.
 Help that reader choose the required behavior, investigate a plausible patch,
@@ -19,15 +21,15 @@ diagnosis share the same existing canonical article.
 
 | Manuscript                                                                                    | Change            | Reader decision                                                              |
 | --------------------------------------------------------------------------------------------- | ----------------- | ---------------------------------------------------------------------------- |
-| [Request waits](rust-request-waiting-for-pool-or-postgresql.mdx)                              | Proposed revision | Choose a repair using the resource wait and the behavior it must preserve    |
-| [SQLx metadata](sqlx-offline-build-stale-database-metadata.mdx)                               | Proposed revision | Separate query compatibility from the lock budget of deploying a migration   |
-| [Lost commit reply](postgresql-commit-reply-lost-rust.mdx)                                    | Proposed revision | Decide who owns operation identity when an agent retries or resumes          |
-| [Read-only MCP tool](../../../data/blog/read-only-postgresql-mcp-tool-limits.mdx)             | New draft         | Bound identity, privileges, time and returned text at the database operation |
-| [Filtered pgvector search](../../../data/blog/pgvector-fewer-results-after-tenant-filter.mdx) | New draft         | Compare an approximate repair with an authorized exact reference             |
+| [Request waits](rust-request-waiting-for-pool-or-postgresql.mdx)                              | Revision | Choose a repair using the resource wait and the behavior it must preserve    |
+| [SQLx metadata](sqlx-offline-build-stale-database-metadata.mdx)                               | Revision | Separate query compatibility from the lock budget of deploying a migration   |
+| [Lost commit reply](postgresql-commit-reply-lost-rust.mdx)                                    | Revision | Decide who owns operation identity when an agent retries or resumes          |
+| [Read-only MCP tool](../../../data/blog/read-only-postgresql-mcp-tool-limits.mdx)             | New article | Bound identity, privileges, time and returned text at the database operation |
+| [Filtered pgvector search](pgvector-filtered-search-too-few-results.mdx) | Revision | Compare an approximate repair with an authorized exact reference             |
 
-The three revision copies stay here as review snapshots. Their bodies match the
+The four revision copies stay here as review snapshots. Their bodies match the
 public editions. The original publication dates are retained and `lastmod`
-records the update. The new articles have explicit review hashes and publication
+records the update. The new article has an explicit review hash and publication
 timestamps. All bylines and structured author data credit Mehdi Akiki alone.
 
 ## Editorial pass after the first CI run

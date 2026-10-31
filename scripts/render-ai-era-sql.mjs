@@ -121,7 +121,7 @@ for (const article of manifest.articles) {
       )
     )
   );
-  if (article.kind === "new") {
+  if (release.series_additions.includes(article.slug)) {
     const href = `href="/blog/${article.slug}"`;
     for (const path of [
       ".next/server/app/blog/topics/reliable-ai-systems.html",
@@ -164,6 +164,7 @@ await writeFile(
     2
   )
 );
+assert.equal(publicArticleHref(allBlogs, release.consolidation.unpublished_vector_slug), null);
 console.log(
-  "Verified public editions, canonical URLs, sole-author metadata, daily release gates and the reading paths; retained five HTML copies."
+  "Verified five public editions, canonical URLs, sole-author metadata, the MCP release gate and reading paths."
 );

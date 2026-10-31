@@ -72,8 +72,12 @@ for (const article of manifest.articles) {
   for (const [index, snippet] of article.snippets.entries()) {
     assert.equal(fences[index][1], "rust", article.slug);
     const fixture = await readFile(snippet.source, "utf8");
-    const start = `// article:start ${snippet.label}\n`;
-    const end = `// article:end ${snippet.label}`;
+    const start = snippet.markerStyle === "named"
+      ? `// article:${snippet.label}:start\n`
+      : `// article:start ${snippet.label}\n`;
+    const end = snippet.markerStyle === "named"
+      ? `// article:${snippet.label}:end`
+      : `// article:end ${snippet.label}`;
     assert.ok(fixture.includes(start) && fixture.includes(end), snippet.label);
     const excerpt = fixture.split(start)[1].split(end)[0];
     assert.deepEqual(tokens(fences[index][2]), tokens(excerpt), `${article.slug}: Rust excerpt`);
@@ -87,8 +91,11 @@ for (const article of manifest.articles) {
 }
 
 const additions = release.articles.filter((article) => article.kind === "new");
-assert.equal(additions.length, 2);
-assert.equal(Date.parse(additions[1].date) - Date.parse(additions[0].date), 86400000);
+assert.equal(additions.length, 1);
+assert.equal(release.articles.filter((article) => article.kind === "revision").length, 4);
+await assert.rejects(readFile(`data/blog/${release.consolidation.unpublished_vector_slug}.mdx`), {
+  code: "ENOENT",
+});
 const series = editorialSeries.find((item) => item.slug === additions[0].series);
 const newPosts = posts.filter((post) => additions.some((article) => article.slug === post.slug));
 const live = [];
@@ -109,4 +116,4 @@ for (const article of additions) {
     live
   );
 }
-console.log("Verified the two daily publication boundaries and reader-series rollover.");
+console.log("Verified the MCP publication boundary and the consolidated vector URL.");
