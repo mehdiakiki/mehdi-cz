@@ -1,23 +1,39 @@
 ---
-title: "Database pool full? Check who is holding the connections."
+title: "SQLx Pool Timed Out: Find Who Holds the Connections"
 date: "2026-10-25T18:30:00Z"
+lastmod: "2026-10-31"
 tags: ["rust", "postgresql", "sqlx", "performance"]
 draft: true
 reviewed: false
 cluster: "reliable-data-integrations"
 campaign: "editorial"
-summary: "Find Rust handlers that keep a SQLx connection during unrelated work. Measure pool waits separately from queries before raising the connection limit."
+summary: "Diagnose a SQLx pool timeout, prove whether unrelated waiting holds connections, and check that a shorter checkout preserves the write contract."
 ---
 
-The query takes a few milliseconds. The endpoint takes seconds. The database dashboard looks calm, but requests keep failing while waiting for a connection.
+The queries take a few milliseconds. The endpoint takes seconds. PostgreSQL looks quiet, but Rust requests fail with `sqlx::Error::PoolTimedOut`.
 
-Before adding more connections, follow one connection through the handler. It may spend most of its life doing nothing for the database.
+A coding agent can suggest a larger pool in seconds. The decision needs more evidence. Which requests hold the existing connections? What are they waiting for? Would a proposed repair change which writes are valid?
 
-Imagine an endpoint that loads a customer, asks a remote service for a delivery quote, and then saves the selected quote. Keeping one connection for that whole function looks tidy. The remote call is the problem. Every slow quote keeps a scarce database session away from another request.
+Consider a delivery endpoint. It reads a customer's address, asks a remote service for a quote, then saves that quote. The example is a constructed investigation. It is not an account of a production incident.
 
-## Look at the lifetime, not only the query
+## First find the wait
 
-This is the shape I would question in review. The application helpers are omitted so the connection lifetime stays visible:
+Keep three durations separate: waiting to acquire a connection, executing a database operation, and holding the connection. Use a monotonic clock. Record failed acquisitions too; a timer reported only after a successful `acquire()` would miss the timeouts we are investigating.
+
+| Observation                                                                | What to inspect next                                                           |
+| -------------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
+| Acquisition waits are long; queries are short; checkout lifetimes are long | Work between database calls, open transactions, and result streams             |
+| Queries are slow while a connection is held                                | Database waits, blocking sessions, query plans, and result transfer            |
+| Acquiring a connection is slow even before the pool is full                | Connection establishment, health checks, and configured connection hooks       |
+| Checkouts are short but the pool stays busy                                | Arrival rate, bounded concurrency, and the database's capacity for useful work |
+
+These observations guide the investigation. They do not prove one cause by themselves. SQLx's [acquisition timeout](https://docs.rs/sqlx/0.8.6/sqlx/pool/struct.PoolOptions.html#method.acquire_timeout) covers more than waiting behind another request. Creating or checking a connection can also consume that budget.
+
+Look at application spans and PostgreSQL activity together. An idle server session can still belong to a Rust handler. A transaction waiting on a lock needs a different repair from a connection waiting for an HTTP response. Increasing an acquisition timeout changes how long callers wait; it does not return a held connection.
+
+## Follow ownership across the remote call
+
+This handler shape deserves attention. The application helpers are omitted so the ownership stays visible:
 
 ```rust
 let mut connection = pool.acquire().await?;
@@ -26,9 +42,9 @@ let quote = delivery_client.quote(&customer).await?;
 save_quote(&mut connection, customer_id, &quote).await?;
 ```
 
-The connection is still owned while the delivery service answers. Making the HTTP client faster might help today. It does not fix this ownership choice.
+There is no database work during the remote call. The handler still owns a checked-out connection. Enough slow quotes can occupy the pool while PostgreSQL has very little to do.
 
-Give the first database operation a smaller scope:
+SQLx returns a checked-out connection to its pool when it is dropped. Passing a [pool directly to a query](https://docs.rs/sqlx/0.8.6/sqlx/struct.Pool.html) can also manage the checkout for that operation. For this handler, an explicit scope makes the intended lifetime easy to review:
 
 ```rust
 let customer = {
@@ -42,24 +58,59 @@ let mut connection = pool.acquire().await?;
 save_quote(&mut connection, customer_id, &quote).await?;
 ```
 
-These are handler excerpts, not a complete SQLx application. They assume the returned customer owns its data. It cannot borrow from a row that has already been dropped.
+The returned customer must own the data needed by the remote call. It cannot borrow from a row that has already been dropped. Also inspect iterators and streams: returning a stream from a helper may extend the connection's lifetime beyond the helper's last line.
 
-SQLx documents that a checked-out connection [returns to its pool when dropped](https://docs.rs/sqlx/0.8.6/sqlx/struct.Pool.html). The inner scope makes that return happen before unrelated waiting.
+This change lets another request use the connection during the quote. It also makes a second question easier to see: what if the customer changes before the quote returns?
 
-There is a correctness question too. The customer might change while the quote is calculated. Save against the version or relevant input that produced the quote, or reject a stale result. Holding an idle connection would not, by itself, protect those values anyway.
+## A faster checkout still needs a valid write
 
-## Three timings are more useful than one
+Suppose the quote used address revision 12. Another request saves a new address at revision 13. The old quote must not silently become the quote for the new address.
 
-Record the time spent waiting to acquire a connection, the time executing database operations, and the total time the handler holds a connection. Use a monotonic clock for durations. Keep customer identifiers out of metric labels.
+The sample lab gives each customer a revision and checks it when saving:
 
-Those measurements answer different questions. A slow query needs query investigation. A long hold with short queries needs a handler investigation. A long acquisition wait can be caused by either, or by a connection limit that is too small for legitimate work.
+```rust
+let changed = sqlx::query(
+    "UPDATE pool_customers SET quote_cents = $1 \
+     WHERE id = $2 AND revision = $3",
+)
+.bind(quote_cents)
+.bind(customer_id)
+.bind(expected_revision)
+.execute(pool)
+.await?
+.rows_affected();
+```
 
-For a small reproduction, use a pool with a few connections and a controlled delivery service that waits for a release signal. Start enough requests to occupy the pool. Then send a request that only needs the database. Compare whether it can progress before releasing the delivery calls. This gives a causal check without pretending that one laptop timing is a production capacity result.
+One affected row means the update matched the revision used to calculate the quote. Zero means the row is gone or no longer matches. The caller must handle that outcome. It may ask for a new quote, or tell the user the input changed. Do not report success after ignoring the count.
 
-## A larger pool can still be the right answer
+This contract depends on every change to a quote input also advancing the revision. A counter that covers the display name but misses the delivery address does not protect the quote. Decide whether saving a quote should itself advance the revision, and how two quotes for the same input should compete. Those are product rules the SQL cannot choose for us.
 
-Some services need more concurrent database work. After removing avoidable hold time, measure that workload and the database's available capacity. Count every service replica and worker pool before changing the number.
+Keeping the original connection checked out would not protect an address by itself. A transaction and its locking or isolation behavior are separate decisions. Preserve a real transaction when its operations must commit together; the [PostgreSQL transaction example](/blog/sql-postgresql-rust-service-transactions) explains that boundary.
 
-Do not break a real transaction into unrelated checkouts just to improve a graph. Reads and writes that must commit together still need their transaction. The deeper [PostgreSQL transaction example](/blog/sql-postgresql-rust-service-transactions) shows that boundary.
+## Make the wrong repair fail for a clear reason
 
-For this handler, the first useful change is smaller: return the connection while the application has no database work to do. Then measure again.
+The accompanying [Rust lab](https://github.com/mehdiakiki/mehdi-cz/blob/0550168d61e22bb24bf282e93e28defab13733cf/experiments/rust-backend/tests/pool_lifetime.rs) uses PostgreSQL and a pool with one slot. A controlled future stands in for the delivery service. A channel tells the test when the handler reaches that wait. Another channel releases it. This avoids guessing when a real HTTP request will become slow.
+
+The test asks a specific question: can an unrelated database request finish while the quote is still waiting?
+
+| Change under review                   | What the test needs to establish                                                         |
+| ------------------------------------- | ---------------------------------------------------------------------------------------- |
+| Keep the checkout through the quote   | The only connection remains occupied; another acquisition reaches its configured timeout |
+| Return the checkout before the quote  | An independent database query completes before the test releases the quote               |
+| Cancel a handler during the quote     | Its checkout becomes usable again; the test waits for task cancellation to finish        |
+| Save after the input revision changes | The guarded update affects zero rows and leaves the quote unset                          |
+| Save with the current revision        | The guarded update affects one row and stores the quote                                  |
+
+A test that releases the quote before making the unrelated query would miss the original problem. A test with a much larger pool could also pass while every handler still holds a connection unnecessarily. Keep the release signal withheld until the assertion being investigated has an answer.
+
+The [recorded PostgreSQL execution](https://github.com/mehdiakiki/mehdi-cz/actions/runs/41209727237/job/124561980630) passed all three pool tests. The held version reached `PoolTimedOut`. The shortened version completed `SELECT 1` before the dependency was released. Cancellation returned the checkout, the stale quote affected zero rows, and a quote for the current revision affected one row. The run checked merge revision `10885c5`, including source revision `0550168`.
+
+The lab belongs to the existing GitHub Content safety workflow. Its assertions check ownership, progress, cancellation, and affected rows. The short acquisition timeout makes the held case observable. It is not a latency benchmark or a recommended production timeout. Execution evidence must identify the source revision before it can support an observed result.
+
+## Choose the next change from the evidence
+
+If the checkout is now short and acquisitions still queue, inspect actual database concurrency. More connections may help a workload the database can serve. They may also add more competing queries. Count every application replica, worker, and rolling deployment overlap when comparing pool limits with the server budget.
+
+Keep acquisition waits, checkout lifetimes, query durations, and rejected work visible after the change. A lower endpoint latency can hide a growing queue somewhere else. Use bounded admission when the service cannot keep up.
+
+For this endpoint, I would accept a repair after the unrelated query can progress during the quote, cancellation returns the resource, and a stale quote cannot overwrite the current input. A larger pool alone answers none of those questions.

@@ -1,0 +1,94 @@
+---
+title: "Why Your SQLite WAL File Keeps Growing"
+date: "2026-10-31T18:08:21Z"
+tags: ["rust", "sqlite", "wal", "debugging", "database internals"]
+authors: ["default"]
+draft: false
+reviewed: true
+cluster: "reliable-data-integrations"
+campaign: "editorial"
+summary: "A finished query can leave a read transaction open. Use Rust to see how that snapshot limits SQLite checkpoints and what changes when the reader ends."
+lastmod: "2026-10-31T18:08:21Z"
+reviewedHash: "5c3002418008497c322f982e8e5f3bacdab9d537989d68f1231c0255eee31d76"
+---
+
+The writes are small. The queries finish quickly. The SQLite WAL file keeps growing.
+
+You add a checkpoint. The call succeeds. The file is still there, still getting bigger.
+
+One possible cause is a reader that has finished its query but kept its transaction open. SQLite must preserve the database view that reader still uses. More checkpoint attempts cannot make it let go.
+
+Here is a small Rust reproduction that makes the difference visible.
+
+## The query finished. The transaction did not.
+
+The [complete example](https://github.com/mehdiakiki/mehdi-cz/blob/6c1abf15084ad31d0a672a97fae83e9fb6e9735a/experiments/sql-rust/postgres-sqlite/src/bin/sqlite_checkpoint.rs) opens two connections to a temporary database. One starts a read transaction and reads a counter at zero.
+
+The other connection commits twelve updates. It sees twelve. The reader still sees zero.
+
+That is the point of its snapshot: the transaction keeps a consistent view while other work commits. There is no slow query in this example. The read operation has already returned.
+
+This can be easy to miss in application code. A report handler may read its rows, then keep the transaction while formatting a response or waiting for a consumer. The query timer looks fine. The transaction lives much longer.
+
+SQLite's [WAL explanation](https://sqlite.org/wal.html#concurrency) describes how a reader's end mark limits checkpoint progress. Finding an open connection is not enough. Look for the transaction or unfinished read that still owns the old view.
+
+## Read the row returned by the checkpoint
+
+A checkpoint copies eligible page changes from the write-ahead log into the database file. It may copy some pages while a reader prevents it from finishing.
+
+The Rust code reads all three values:
+
+```rust
+let progress: (i32, i32, i32) =
+    connection.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+    })?;
+```
+
+They are the busy indicator, the number of frames in the log, and the number checkpointed. Each frame records a database page in the WAL.
+
+In the [recorded run](https://github.com/mehdiakiki/mehdi-cz/blob/6c1abf15084ad31d0a672a97fae83e9fb6e9735a/docs/editorial/evidence/ai-writing-second-batch-2026-10-31/sqlite-checkpoint.txt), this returned `(0, 15, 3)`.
+
+The zero can be misleading. For a passive checkpoint, it does not mean that all fifteen frames were copied. Only three were checkpointed. Work remains.
+
+Likewise, Rust's `Ok` means the statement returned its row successfully. The application still has to interpret that row. Checking only `is_ok()` would miss this problem.
+
+The [PRAGMA reference](https://sqlite.org/pragma.html#pragma_wal_checkpoint) explains the modes and return values. PASSIVE does what it can without waiting for readers to finish. TRUNCATE requires the stronger checkpoint to complete before reducing the file to zero bytes.
+
+## A smaller threshold leaves the same reader
+
+The test keeps the read transaction open while trying three approaches:
+
+| Attempt                                                                | Observed result | What it tells us                                   |
+| ---------------------------------------------------------------------- | --------------- | -------------------------------------------------- |
+| Passive checkpoint                                                     | `(0, 15, 3)`    | The call succeeded, but progress stopped short     |
+| Truncating checkpoint with no busy wait                                | `(1, 15, 3)`    | It could not finish while the reader remained      |
+| Automatic checkpoint threshold of one page, followed by another commit | `(0, 16, 3)`    | More attempts did not move the checkpoint boundary |
+
+The writer has now committed thirteen. The old reader still sees zero. Lowering the threshold changes when SQLite tries to checkpoint. It does not shorten that reader's transaction.
+
+Only then does the test roll back the read transaction. A truncating checkpoint returns `(0, 0, 0)`, the WAL length becomes zero, and a fresh read sees thirteen.
+
+That last read matters. A smaller file is useful only if the committed data is still there.
+
+This run used rusqlite 0.41.0 with bundled SQLite 3.54.1. The source prints SQLite's version and source ID. The first WAL size observation was 61,832 bytes. These values describe this temporary database, not a predicted growth rate for your workload.
+
+## A large file is not always unfinished work
+
+SQLite can retain allocated WAL space for reuse after checkpointing catches up. File length and pending checkpoint work answer different questions.
+
+In this reproduction, the frame counts show unfinished work while the reader is open. The final TRUNCATE also shows physical reclamation. A service may reasonably reuse space instead of shrinking the file after each commit.
+
+Putting a stronger checkpoint on every request can add waiting to that request, depending on the busy policy. Repeating it while the same reader remains can spend time without solving the cause. Check the progress counts alongside file size before choosing that policy.
+
+## Shorter reads have a tradeoff
+
+For a small result, release the read transaction before unrelated waiting. Inspect error and cancellation paths too. The transaction may live in a helper or a stream rather than in the handler you first looked at.
+
+An export is harder. One snapshot gives the whole export a consistent view. Reading each page in a new transaction can observe writes between pages.
+
+Choose which behavior the export promises. If it needs one snapshot, give that snapshot a time budget, support cancellation, and allow for the history it can retain. If newer pages are acceptable, use a stable cursor and explain the consistency rule. A pool setting cannot make that decision for you.
+
+In async Rust, synchronous SQLite calls also need to stay off executor threads. The [bounded database worker guide](/blog/sql-sqlite-rust-tokio-bounded-database-worker) covers that part. The [WAL writer article](/blog/sql-sqlite-rust-wal-busy-writers) covers writer contention and stale snapshots; here, writes continue while checkpoint progress is limited.
+
+To check a repair, keep the original reader alive long enough to reproduce the partial checkpoint. Then change its lifetime and check progress, file reclamation when required, and a fresh read of committed data. That gives you a cause to act on. Two file-size screenshots alone leave too much unexplained.

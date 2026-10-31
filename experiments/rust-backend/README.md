@@ -36,6 +36,45 @@ Article snippets are extracted from marked source regions. The content check
 requires those snippets to match the compiled fixture code. Keep the markers
 when editing the lab or updating the manuscripts.
 
+## Connection lifetime and retrieval investigations
+
+`tests/pool_lifetime.rs` compares a checkout held across a gated dependency with
+a checkout returned before that dependency completes. A one-slot pool makes
+ownership observable. The tests also await cancellation and inspect a quote
+update's affected rows after the input revision changes. The 200 ms acquisition
+timeout is a fixture mechanism, not a performance result or production default.
+
+`tests/retrieval_contract.rs` uses the configured pgvector extension and a small
+corpus with tenant, deletion, revision, and embedding-model boundaries. It
+compares an incomplete query with the serving query, checks late embedding
+publication after edits and deletion, and inspects bounded context construction.
+The vectors are synthetic. There is no external embedding or language-model
+call, relevance benchmark, approximate index, or deployed-role RLS test. The
+serving guarantee is tied to the retrieval statement's snapshot; it does not
+recall text that was already sent to a provider.
+
+The existing PostgreSQL job discovers both files through `cargo test
+--all-targets`. Retain its artifact and source SHA before treating any planned
+assertion as an observed result. These manuscripts follow the existing review
+and publication controls.
+
 Selected observed outputs are saved in [results/observations.txt](results/observations.txt).
 The file links to the exact GitHub run and source revision. Virtual milliseconds
 in the middleware example are test-clock values, not performance measurements.
+
+## Filtered search and CI review evidence
+
+`tests/pgvector_filter.rs` builds a real HNSW index over 1,010 synthetic vectors.
+It checks the actual plans for exact, limited approximate, and iterative search
+under the same tenant predicate. An authorized exact fallback preserves the
+five-result serving requirement when approximate results remain short.
+Its result counts describe this constructed
+case, not a corpus relevance or capacity benchmark.
+
+`tests/agent_review_evidence.rs` checks the rules for preparing an advisory
+review packet from trusted-run stand-ins and synthetic proposals. It covers
+stale source identity, a changed requirement harness, missing or unsuccessful
+checks, unfinished agent runs, malformed or excessive output, and valid
+positive cases. Command construction is inspected without launching Claude.
+These tests do not authenticate a GitHub artifact, implement the vendor result
+adapter, or measure the quality of live AI reviews.

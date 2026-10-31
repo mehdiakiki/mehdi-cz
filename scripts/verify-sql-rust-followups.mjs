@@ -14,6 +14,9 @@ assert.equal(manifest.articles.length, 7);
 const release = JSON.parse(
   await readFile("docs/editorial/sql-rust-followups-release-2026-10-30.json", "utf8")
 );
+const revisions = JSON.parse(
+  await readFile("docs/editorial/ai-writing-release-2026-10-31.json", "utf8")
+);
 const posts = [];
 for (const article of manifest.articles) {
   const source = await readFile(article.path, "utf8");
@@ -24,7 +27,10 @@ for (const article of manifest.articles) {
   assert.equal(data.date, release.publish_at);
   assert.equal(data.reviewedHash, articleReviewHash(source), article.slug);
   const approved = release.articles.find((item) => item.slug === article.slug);
-  assert.equal(data.reviewedHash, approved?.reviewedHash, article.slug);
+  const updated = revisions.articles.find(
+    (item) => item.slug === article.slug && item.kind === "update"
+  );
+  assert.equal(data.reviewedHash, updated?.reviewedHash ?? approved?.reviewedHash, article.slug);
   assert.deepEqual(data.authors, ["default"]);
   const boundary = new Date(release.publish_at);
   assert.equal(publicationStatus(data, new Date(boundary.getTime() - 1)), "scheduled");
@@ -44,7 +50,9 @@ for (const article of manifest.articles) {
     assert.equal(fences[index][1], "rust");
     const fixture = await readFile(snippet.source, "utf8");
     const marker = new RegExp(
-      `^[ \\t]*// article:start ${snippet.label}\\n([\\s\\S]*?)^[ \\t]*// article:end ${snippet.label}`,
+      snippet.markerStyle === "named"
+        ? `^[ \\t]*// article:${snippet.label}:start\\n([\\s\\S]*?)^[ \\t]*// article:${snippet.label}:end`
+        : `^[ \\t]*// article:start ${snippet.label}\\n([\\s\\S]*?)^[ \\t]*// article:end ${snippet.label}`,
       "m"
     );
     const excerpt = fixture.match(marker)?.[1];
