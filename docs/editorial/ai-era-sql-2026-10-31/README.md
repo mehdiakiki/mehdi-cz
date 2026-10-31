@@ -94,12 +94,3 @@ Technical references checked on October 31 include the pinned
 [string functions](https://www.postgresql.org/docs/18/functions-string.html),
 [pgvector 0.8.7](https://github.com/pgvector/pgvector/blob/v0.8.7/README.md#filtering),
 and the [MCP tool specification](https://modelcontextprotocol.io/specification/2025-11-25/server/tools).
-
-Traffic potential remains an editorial hypothesis. Compare search clicks after
-equally aged windows and keep the existing daily traffic metric for the site's
-1,000-per-day milestone. Publication still follows the established review and
-calendar process.
-
-The [reader growth follow-up](reader-growth.md) records the released cohort,
-measurement definitions and the next SQL investigations. It contains no claimed
-search-volume estimate or traffic improvement.

@@ -24,21 +24,18 @@ This block is written and re-added by `next dev` — verify at `node_modules/nex
 - Use short sentences and familiar words that are easy for non-native English readers.
 - Keep a natural, conversational voice. Explain unfamiliar terms and use concrete problems.
 - Do not invent a personal history or manufacture grammar mistakes to suggest an identity.
-- The next thirty proposed articles focus on established SQL databases and database internals.
-- Every executable example in that series must be Rust. Put SQL in Rust query calls as needed.
+- Use Rust for executable examples in SQL and database articles. Put SQL in Rust query calls as needed.
 - Write for human readers. Help a person understand a problem, make a decision, or fix something. Preserve the author's voice and judgment, with natural variation in structure and length.
 - Use plain, accurate titles. Avoid keyword stuffing, filler, repetitive article templates, and splitting one useful answer into several thin pages.
 - Ground personal observations in the author's actual experience. Use clearly described reproductions or hypothetical examples when there is no personal account.
 - Assume readers can use AI to write and revise code. Give articles value through explicit requirements, competing explanations, counterexamples, observed evidence, and the tradeoffs of a repair. Treat AI suggestions as proposals to investigate; avoid unsupported claims about what AI can or cannot do.
-- Prioritize Rust debugging across application and database boundaries, cancellation and uncertain outcomes, memory budgets and backpressure, deliberate failure testing, build diagnosis, and integration with existing systems. Give the first three themes the most attention.
 - Assume readers can use AI to write the first implementation. Develop the judgment needed to specify correct behavior, investigate failures, compare repairs, and decide whether a change is ready to ship.
 - Give each article a concrete question that generated code alone does not settle. Show useful evidence, competing explanations, and the limits of the conclusion. Keep setup instructions in service of that question.
 - Treat AI-written code and tests as proposals. Derive the expected behavior from the requirement, and include a case that could expose a plausible wrong implementation. Do not claim that a task is beyond AI without evidence.
 
-## Site growth direction
+## Private planning
 
-- The long-term ambition is to become one of the most visited Rust websites. The next traffic milestone is 1,000 per day; the author reported almost 200 per day on October 27, 2026. Keep comparisons on the same analytics metric.
-- Keep the established publication cadence and editorial review. Use traffic as feedback about reader needs while protecting the usefulness and human voice of each article.
-- Audience growth should also help interested readers find the author's engineering work and start relevant conversations about roles, projects, and collaboration. Track those opportunities alongside traffic.
-- The accepted direction and candidate follow-ups are in [the Rust editorial direction](docs/editorial/rust-reader-growth-direction-2026-10-27.md).
-- The long-term reference-site ambition includes software engineering and development. Build outward from the existing Rust and database expertise. Research recurring reader problems, competing answers and current site coverage before proposing each batch. Keep traffic potential separate from observed search or analytics data. The October 28 priorities and evidence are in [the reader-demand brief](docs/editorial/sql-rust-demand-research-2026-10-28.json).
+- Keep editorial strategy, traffic goals, analytics exports, audience research, and unpublished topic plans in the ignored `internal/editorial-strategy/` directory.
+- Read `internal/editorial-strategy/AGENTS.md` for local planning context when it exists.
+- In a linked worktree, check the main checkout's ignored directory for that local context.
+- Do not copy private planning into tracked files, public pull-request descriptions, release notes, or CI artifacts. Public records should contain only the technical information needed to build, verify, and publish the site.
