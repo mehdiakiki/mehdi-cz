@@ -28,6 +28,14 @@ import { selectPrerenderEntries } from "lib/prerender-budget.mjs";
 import { isNotePost } from "lib/content-format.mjs";
 import { articleStyleRequirements } from "lib/article-style-requirements.mjs";
 import { selectAdjacentWriting, selectRelatedWriting } from "lib/related-writing.mjs";
+import agentGuides from "@/data/agent-guides.json";
+
+function markdownVersion(post: Blog) {
+  const guide = agentGuides.guides.find((candidate) => candidate.slug === post.slug);
+  return guide && post.reviewed === true && isPostPublished(post) && post.reviewedHash === guide.reviewedHash
+    ? `/blog/${post.slug}.md`
+    : undefined;
+}
 
 const defaultLayout = "PostLayout";
 const layouts = {
@@ -73,7 +81,10 @@ export async function generateMetadata({
   return {
     title: post.title,
     description: post.summary,
-    alternates: { canonical: post.canonicalUrl || `/${post.path}` },
+    alternates: {
+      canonical: post.canonicalUrl || `/${post.path}`,
+      ...(markdownVersion(post) ? { types: { "text/markdown": markdownVersion(post)! } } : {}),
+    },
     openGraph: {
       title: post.title,
       description: post.summary,
@@ -244,6 +255,13 @@ export default async function Page({ params }: { params: Promise<{ slug: string[
             </>
           )}
         </p>
+        {markdownVersion(post) && (
+          <p className="not-prose mb-6 text-sm text-gray-500 dark:text-gray-400">
+            <a href={markdownVersion(post)} className="underline underline-offset-4">
+              Markdown version
+            </a>
+          </p>
+        )}
         <MDXLayoutRenderer code={post.body.code} components={components} toc={post.toc} />
         {!note && <EditorialSeriesNav slug={post.slug} />}
         {!note && (
