@@ -18,6 +18,20 @@ Before release, read the prose aloud and ask whether a person can follow the exp
 
 ## Accepted themes
 
+### When AI writes the first implementation
+
+On October 31, the author asked for the Rust and AI articles to go beyond producing code. Assume a reader can ask a coding agent for an initial implementation. Help that reader decide what it should do, identify what remains uncertain, and collect evidence before accepting the change.
+
+A SQLx example should help distinguish a pool wait from a database lock, explain why a smaller connection scope changes progress, and check whether the repair preserves the write contract. A retrieval example should inspect the documents sent to the model and account for edits, access boundaries, and deletion. A skill guide should explain how to judge a workflow's results as well as how to write its frontmatter.
+
+Use a plausible wrong repair to make the decision concrete. Choose assertions from the requirement rather than from the implementation an agent happened to produce. Retain source versions and execution evidence, and say what the experiment cannot establish. These are editorial questions, not a required article template. Do not speculate about permanent limits on AI capability.
+
+The first writing batch expands the connection-pool investigation and the existing Claude Code skills guide, and adds a Rust/PostgreSQL retrieval investigation. New SQL articles retain Rust executable examples. The approved daily calendar continues to govern releases.
+
+The pool manuscript is a held working expansion for the existing pool-wait guide, `rust-request-waiting-for-pool-or-postgresql`. Reconcile it into that answer during review rather than publishing an overlapping page. Its new value is the quote revision contract, cancellation check, and deliberately gated progress comparison. The retrieval manuscript adds a Rust serving and publication contract to the existing conceptual retrieval guides; it does not claim a complete model integration or a relevance benchmark.
+
+### Subject priorities
+
 The first three themes receive the most attention. Keep the next thirty proposed articles rooted in established SQL databases and database internals. Every executable example in that series must be Rust, with SQL inside Rust query calls.
 
 | Priority | Theme                                  | What the reader should gain                                                                                      |

@@ -30,6 +30,9 @@ This block is written and re-added by `next dev` — verify at `node_modules/nex
 - Use plain, accurate titles. Avoid keyword stuffing, filler, repetitive article templates, and splitting one useful answer into several thin pages.
 - Ground personal observations in the author's actual experience. Use clearly described reproductions or hypothetical examples when there is no personal account.
 - Prioritize Rust debugging across application and database boundaries, cancellation and uncertain outcomes, memory budgets and backpressure, deliberate failure testing, build diagnosis, and integration with existing systems. Give the first three themes the most attention.
+- Assume readers can use AI to write the first implementation. Develop the judgment needed to specify correct behavior, investigate failures, compare repairs, and decide whether a change is ready to ship.
+- Give each article a concrete question that generated code alone does not settle. Show useful evidence, competing explanations, and the limits of the conclusion. Keep setup instructions in service of that question.
+- Treat AI-written code and tests as proposals. Derive the expected behavior from the requirement, and include a case that could expose a plausible wrong implementation. Do not claim that a task is beyond AI without evidence.
 
 ## Site growth direction
 

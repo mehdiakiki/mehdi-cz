@@ -36,6 +36,28 @@ Article snippets are extracted from marked source regions. The content check
 requires those snippets to match the compiled fixture code. Keep the markers
 when editing the lab or updating the manuscripts.
 
+## Connection lifetime and retrieval investigations
+
+`tests/pool_lifetime.rs` compares a checkout held across a gated dependency with
+a checkout returned before that dependency completes. A one-slot pool makes
+ownership observable. The tests also await cancellation and inspect a quote
+update's affected rows after the input revision changes. The 200 ms acquisition
+timeout is a fixture mechanism, not a performance result or production default.
+
+`tests/retrieval_contract.rs` uses the configured pgvector extension and a small
+corpus with tenant, deletion, revision, and embedding-model boundaries. It
+compares an incomplete query with the serving query, checks late embedding
+publication after edits and deletion, and inspects bounded context construction.
+The vectors are synthetic. There is no external embedding or language-model
+call, relevance benchmark, approximate index, or deployed-role RLS test. The
+serving guarantee is tied to the retrieval statement's snapshot; it does not
+recall text that was already sent to a provider.
+
+The existing PostgreSQL job discovers both files through `cargo test
+--all-targets`. Retain its artifact and source SHA before treating any planned
+assertion as an observed result. These manuscripts follow the existing review
+and publication controls.
+
 Selected observed outputs are saved in [results/observations.txt](results/observations.txt).
 The file links to the exact GitHub run and source revision. Virtual milliseconds
 in the middleware example are test-clock values, not performance measurements.
