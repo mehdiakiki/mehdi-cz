@@ -13,8 +13,8 @@ export const contentClusters = [
     description:
       "Practical explanations of the Rust behaviour that only becomes obvious after reading compiler output, measuring a program, or working close to the language and its tools.",
     featuredSlugs: [
+      "rust-request-waiting-for-pool-or-postgresql",
       "hir-thir-and-mir-the-same-rust-function-at-three-compiler-stages",
-      "rustc-defid-vs-hirid",
       "deno_files",
       "tokio-main-deep-dive",
     ],
@@ -109,9 +109,9 @@ export const contentClusters = [
     description:
       "A software-engineering view of AI-enabled products: where models help, where deterministic boundaries remain necessary, and how to operate the whole system responsibly.",
     featuredSlugs: [
+      "read-only-postgresql-mcp-tool-limits",
+      "pgvector-filtered-search-too-few-results",
       "what-evidence-an-ai-feature-needs-before-you-ship-it",
-      "the-final-answer-can-be-right-while-the-tool-trajectory-is-unsafe",
-      "eval-scores-move-between-runs-how-to-compare-two-versions-honestly",
       "make-retried-agent-actions-idempotent-before-adding-autonomy",
     ],
     introduction: [

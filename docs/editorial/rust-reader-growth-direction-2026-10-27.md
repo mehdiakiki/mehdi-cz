@@ -32,6 +32,8 @@ The pool expansion is now folded into the existing pool-wait guide, `rust-reques
 
 The second batch keeps the existing SQLite writer and stale-snapshot explanation intact. A distinct checkpoint investigation follows the history retained by a long reader. A pgvector investigation compares exact and actual HNSW plans under the same tenant predicate. The existing Claude Code CI guide is revised around trusted source identity, independent requirement checks, bounded results, and publishing authority. The scope and primary sources are recorded in `ai-writing-second-batch-2026-10-31.json`.
 
+The additional [SQL review batch](ai-era-sql-2026-10-31/README.md) adds a bounded PostgreSQL MCP operation and deepens the existing request, metadata, commit and filtered-vector guides. The vector comparison is consolidated into the published pgvector URL.
+
 ### Subject priorities
 
 The first three themes receive the most attention. Keep the next thirty proposed articles rooted in established SQL databases and database internals. Every executable example in that series must be Rust, with SQL inside Rust query calls.

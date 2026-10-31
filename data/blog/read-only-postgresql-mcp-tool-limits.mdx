@@ -1,0 +1,206 @@
+---
+title: "Review a Read-Only PostgreSQL MCP Tool Before You Ship It"
+date: "2026-10-31T18:00:00Z"
+tags: ["rust", "postgresql", "mcp", "ai", "authorization"]
+authors: ["default"]
+draft: false
+reviewed: true
+cluster: "reliable-ai-systems"
+campaign: "editorial"
+summary: "Review database permissions, tenant identity, query time and response size in a Rust MCP tool. Use a real restricted PostgreSQL role to check the boundaries."
+lastmod: "2026-10-31T19:37:31Z"
+reviewedHash: "4ff220c0e9b9b9d30d7554e5ee54189dc4fce2db36b41ba0bb827c73bf61c797"
+---
+
+An AI assistant can help write the handler that looks up an invoice. The harder
+review starts when you ask which invoices the handler may return and how much
+work one lookup may consume.
+
+Calling the tool read-only answers one question: it should not change the
+business records. It leaves several others open. A reader may see another
+customer's data. A query may keep a connection busy for minutes. Ten returned
+rows may contain ten enormous documents. A correct answer can still take a path
+the product cannot afford.
+
+Consider an MCP tool that lists invoices for a signed-in customer. MCP is the
+protocol connecting the assistant to the host's tools. We will review the Rust
+database operation behind that tool. The fixture does not implement an MCP
+transport or an authentication service. Those adapters must supply the trusted
+principal and preserve the same constraints.
+
+The reproduction uses SQLx 0.8.6 and PostgreSQL 18. Its complete code is in
+[the database review lab](https://github.com/mehdiakiki/mehdi-cz/blob/4d724693adecd572444b69211bae411e9a1e6259/experiments/rust-backend/tests/ai_database_review.rs).
+It uses a separate login, two tenants, a reused connection, and an intentionally
+slow read. The data and credentials belong to the disposable CI database.
+
+## Decide which inputs belong to the model
+
+The tool accepts a cursor and a page size. The cursor is the last invoice ID the
+reader saw. The host supplies the tenant from its authenticated session.
+
+Keeping the tenant outside the tool arguments matters even if the model normally
+chooses the right customer. A caller should not gain permission by placing a
+different tenant in a valid JSON field. Here the argument type rejects unknown
+fields, including an attempted tenant field. The host's principal is a separate
+Rust type that the argument decoder never constructs.
+
+The fixture uses two synthetic principals. Both tenants have an invoice with ID
+one. A test with globally distinct IDs could miss a lookup that forgot the tenant
+boundary. With colliding IDs, the assertion must distinguish the actual record.
+
+This is still an application contract. If the host accepts an untrusted tenant
+header as authentication, the Rust function cannot repair that mistake. Review
+how the principal is created, passed, and logged. A type name alone does not prove
+that identity came from an authorized session.
+
+## Give the database fewer privileges than the administrator
+
+The fixture provisions a login with SELECT on one table and no write grant. It
+does not own the table and cannot bypass row-level security. Row-level security
+is PostgreSQL's rule for deciding which table rows a role may access.
+
+A policy compares each row's tenant with a transaction-local setting supplied by
+the host. Without that setting, the restricted login sees neither tenant. The
+query also binds the trusted tenant explicitly. These checks work together; the
+tool never accepts arbitrary SQL that could replace the setting or the query.
+
+The [PostgreSQL row-security documentation](https://www.postgresql.org/docs/18/ddl-rowsecurity.html)
+explains the owner and bypass exceptions. Test with the actual application role.
+A successful administrator query says little about the policy your tool uses.
+
+The test disables the session's read-only default before attempting an UPDATE.
+It must still receive SQLSTATE `42501`, insufficient privilege. This distinguishes
+a missing write grant from a session preference that the same role can change.
+A read-only transaction is a useful additional boundary, but it does not replace
+the privilege design.
+
+## Bound the query and the returned text
+
+Here is the database function under review. Its surrounding fixture defines
+`Principal`, the argument type, and the error alias:
+
+```rust
+async fn list_invoices(
+    pool: &PgPool,
+    principal: &Principal,
+    input: InvoicePage,
+) -> Result<Vec<(i64, String, String)>> {
+    if !(1..=10).contains(&input.limit) || input.after_id < 0 {
+        return Err("invalid page boundary".into());
+    }
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET TRANSACTION READ ONLY")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "SELECT set_config('app.tenant_id', $1, true),
+                set_config('statement_timeout', '250ms', true)",
+    )
+    .bind(principal.tenant)
+    .execute(&mut *tx)
+    .await?;
+    let rows = sqlx::query_as(
+        "SELECT id, left(title, 64), left(summary, 128)
+         FROM ai_tool_review.invoices
+         WHERE tenant_id = $1 AND id > $2
+         ORDER BY id LIMIT $3",
+    )
+    .bind(principal.tenant)
+    .bind(input.after_id)
+    .bind(input.limit)
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(rows)
+}
+```
+
+The projection bounds each text field before sending it to Rust. PostgreSQL's
+`left` counts characters. UTF-8 characters can occupy several bytes, so a
+character cap is not the same number of bytes. JSON escaping can grow a character
+further. The fixture includes both long multibyte strings and control characters
+that JSON encodes as six-byte escapes. Both pages must stay below 16 KiB.
+
+For this tuple, ten rows contain at most 1,920 projected text characters. At up to
+six JSON bytes per character, the text uses at most 11,520 bytes. IDs, quotes and
+array delimiters add a small fixed amount. This leaves space in the tested tuple
+envelope. Adding fields requires checking that bound again. The MCP adapter must
+also cap its final encoded response, including its own surrounding metadata;
+the database function does not implement that transport limit.
+
+The [recorded PostgreSQL job](https://github.com/mehdiakiki/mehdi-cz/actions/runs/41209854369/job/124562361320)
+encoded the Unicode page to 5,427 bytes and the escaped-control page to 11,631
+bytes on revision `d500347`. Those are synthetic payload sizes for the tuple
+returned here. The test does not measure process memory or a complete MCP reply.
+
+These fields are previews. The tool description and response schema should say
+so, rather than presenting shortened text as the complete invoice. A product
+that needs the full record can offer a separate authorized read with its own
+budget. Changing the projection also changes what the assistant can conclude
+from the result; it is a data-contract decision as well as a size limit.
+
+The page size limits returned rows. It does not establish a cheap execution plan.
+The example's primary key begins with tenant and ID, matching its lookup. Review
+the actual plan and data distribution before claiming an execution-cost bound.
+
+The statement timeout limits each database statement. It is not the whole tool's
+deadline. Queueing, connection establishment, result encoding, and transport have
+their own costs. A production host also needs admission limits and a total
+deadline that fits the caller's remaining budget. The example pool has one
+connection to make session reuse visible; that is a test choice.
+
+## Exercise the boundaries independently
+
+The fixture calls the tool for alpha, then beta, on the same pool. Each call must
+return its own records. A later query with no tenant setting must see no invoices.
+This checks that a transaction-local identity does not become the next caller's
+identity when the session returns to the pool.
+
+Check the policy separately from the query predicate. The fixture sets alpha's
+identity, then directly asks the restricted role for beta's rows. It must get
+none. If every test also included the correct tenant predicate, a broken row
+policy could go unnoticed.
+
+It also runs a slow read inside a read-only transaction with a statement budget.
+That query must fail with SQLSTATE `57014`. After an explicit rollback, another
+query must succeed. The timeout test establishes a server-side failure and a
+usable connection afterward. It is not a measurement of a production service's
+tail latency.
+
+There is also a controlled Rust cancellation. A task opens a transaction, sets
+alpha's identity, signals that setup has finished, and waits on a test gate. The
+test aborts it at that point. Before another tool sets its own tenant, an
+unscoped query must see no invoices. A later beta call through the one-connection
+pool must still return only beta's invoice. Checking cleanup before that call
+prevents its new tenant setup from hiding a leaked setting.
+SQLx documents [rollback when an unfinished transaction is dropped](https://docs.rs/sqlx/0.8.6/sqlx/struct.Transaction.html).
+The fixture checks the state a later borrower sees rather than assuming that
+dropping a Rust value means all cleanup has already completed.
+
+That cancellation happens between database commands. It does not establish what
+happens when an executing query loses its caller. The
+[PostgreSQL timeout investigation](/blog/rust-timeout-does-not-stop-postgresql-query)
+examines that different interruption point.
+
+Notice what the test does not ask: whether a live model will choose that slow
+read. The host should enforce its limits regardless of why an invocation arrived.
+Keep policy tests deterministic. Evaluate model behavior separately when you
+want evidence about tool selection or answer quality.
+
+MCP tool annotations describe intent. The
+[protocol's tool specification](https://modelcontextprotocol.io/specification/2025-11-25/server/tools)
+does not turn a read-only annotation into database privileges. Check the operation
+that actually runs, with the credentials and identity it actually receives.
+
+After this review, the useful promise is specific: this invoice tool reads a
+bounded page for the host's tenant through a restricted role. A general SQL tool,
+an export endpoint, or an administrative connection needs its own contract.
+The [authorization-through-tools article](/blog/carry-user-authorization-through-every-ai-tool-call)
+follows that identity boundary through a longer workflow.
+
+For vector search, a tenant filter also changes which candidates can survive.
+
+<ArticleLink slug="pgvector-filtered-search-too-few-results">
+  The filtered pgvector investigation
+</ArticleLink>
+compares the search with an exact reference over the same eligible rows.

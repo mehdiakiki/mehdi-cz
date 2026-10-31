@@ -230,6 +230,8 @@ export const editorialSeries = [
     introduction:
       "Carry identity, permissions, approval, and resource limits to the place effects happen. Each guide gives a concrete reproduction, the resulting decision, and the limits of the evidence.",
     parts: [
+      "read-only-postgresql-mcp-tool-limits",
+      "pgvector-filtered-search-too-few-results",
       "start-internal-ai-tool-read-only",
       "model-must-not-select-user-credentials",
       "log-tool-decisions-without-customer-documents",

@@ -14,7 +14,10 @@ assert.equal(manifest.articles.length, 7);
 const release = JSON.parse(
   await readFile("docs/editorial/sql-rust-followups-release-2026-10-30.json", "utf8")
 );
-const revisions = JSON.parse(
+const revisedEditions = JSON.parse(
+  await readFile("docs/editorial/ai-era-sql-2026-10-31/release.json", "utf8")
+);
+const priorRevisions = JSON.parse(
   await readFile("docs/editorial/ai-writing-release-2026-10-31.json", "utf8")
 );
 const posts = [];
@@ -27,10 +30,23 @@ for (const article of manifest.articles) {
   assert.equal(data.date, release.publish_at);
   assert.equal(data.reviewedHash, articleReviewHash(source), article.slug);
   const approved = release.articles.find((item) => item.slug === article.slug);
-  const updated = revisions.articles.find(
-    (item) => item.slug === article.slug && item.kind === "update"
+  const revised = revisedEditions.articles.find(
+    (item) => item.kind === "revision" && item.slug === article.slug
   );
-  assert.equal(data.reviewedHash, updated?.reviewedHash ?? approved?.reviewedHash, article.slug);
+  const priorRevision = priorRevisions.articles.find((item) => item.slug === article.slug);
+  if (revised) {
+    assert.equal(
+      revised.previousReviewedHash,
+      priorRevision?.reviewedHash ?? approved?.reviewedHash,
+      article.slug
+    );
+    assert.equal(revised.reviewedHash, data.reviewedHash, article.slug);
+    assert.equal(data.lastmod, revisedEditions.applied_at);
+    const manuscript = await readFile(revised.review_copy, "utf8");
+    assert.equal(articleReviewHash(manuscript), articleReviewHash(source), article.slug);
+  } else {
+    assert.equal(data.reviewedHash, approved?.reviewedHash, article.slug);
+  }
   assert.deepEqual(data.authors, ["default"]);
   const boundary = new Date(release.publish_at);
   assert.equal(publicationStatus(data, new Date(boundary.getTime() - 1)), "scheduled");
@@ -45,8 +61,9 @@ for (const article of manifest.articles) {
   });
   assert.ok(!source.includes("{{snippet:"), article.slug);
   const fences = [...content.matchAll(/^```([^\n]*)\n([\s\S]*?)^```/gm)];
-  assert.equal(fences.length, article.snippets.length, article.slug);
-  for (const [index, snippet] of article.snippets.entries()) {
+  const snippets = revised?.snippets || article.snippets;
+  assert.equal(fences.length, snippets.length, article.slug);
+  for (const [index, snippet] of snippets.entries()) {
     assert.equal(fences[index][1], "rust");
     const fixture = await readFile(snippet.source, "utf8");
     const marker = new RegExp(

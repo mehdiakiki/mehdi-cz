@@ -1,15 +1,15 @@
 ---
 title: "A SQLx Offline Build Can Pass With Stale Database Metadata"
 date: "2026-10-30T10:02:25Z"
-lastmod: "2026-10-30T10:02:25Z"
 tags: ["rust", "sqlx", "postgresql", "builds"]
 authors: ["default"]
 draft: false
 reviewed: true
-reviewedHash: "bb7e5cdd992bf421e5a16ea724e28ff5ed01afdb1bd736ae3378e77e5cae8bde"
 cluster: "rust-under-the-hood"
 campaign: "editorial"
 summary: "Change a PostgreSQL column from integer to bigint and compare offline compilation, runtime decoding, and a live macro check against the changed schema."
+lastmod: "2026-10-31T19:37:31Z"
+reviewedHash: "90b4a6a4f84b6aa506e50eeb34c603b45be3c988eba6eb75f9566ee2e230bb31"
 ---
 
 A Rust build passes in offline mode. The deployment then fails when it reads a database column. Both results can be correct: the build checked one description of the query result, while the database returned another.
@@ -76,6 +76,53 @@ This lab uses live macro compilation and metadata comparison rather than install
 Set `SQLX_OFFLINE=true` when you need an explicitly offline build. Otherwise, a present `DATABASE_URL` can cause a build to contact the database. Record which mode ran so a successful build has an interpretable meaning.
 
 Treat metadata regeneration as a reviewable change. If a migration changes result types or nullability, inspect the changed description and the application code together. Do not regenerate the cache simply to make a warning disappear.
+
+## A passing query check does not give a migration a time budget
+
+Suppose a coding agent adds a nullable text column. The old query still selects
+only `id`. Regenerated SQLx metadata and an integration test against the final
+schema can both pass. Neither result establishes that the migration can acquire
+its lock while the old application is running.
+
+The additional `type_compatible_migration_can_still_wait_for_a_reader` fixture
+keeps a transaction open after reading a row. Another session attempts to add the
+column, then a third session issues an ordinary read. The observer must identify
+both links: the old reader blocks the migration, and the waiting migration blocks
+the later read. An unrelated failure cannot satisfy those assertions.
+
+PostgreSQL's [ALTER TABLE documentation](https://www.postgresql.org/docs/18/sql-altertable.html)
+describes the locks required by each form. Even a change that preserves the
+query's result type can need an incompatible lock. A long-lived reader can delay
+it, and a queued schema change can affect later requests. Query compatibility and
+deployment behavior need separate evidence. PostgreSQL's
+[blocking-session function](https://www.postgresql.org/docs/18/functions-info.html#FUNCTIONS-INFO-SESSION-TABLE)
+can report a session waiting ahead in the lock queue as a blocker. The migration
+does not have to acquire its requested lock before it affects later readers.
+
+Here is the bounded migration excerpt from that fixture:
+
+```rust
+let mut tx = pool.begin().await?;
+sqlx::raw_sql("SET LOCAL lock_timeout = '2s'; SET LOCAL statement_timeout = '5s'")
+    .execute(&mut *tx)
+    .await?;
+sqlx::query("ALTER TABLE items ADD COLUMN note text")
+    .execute(&mut *tx)
+    .await?;
+tx.commit().await?;
+```
+
+The blocked migration must fail with SQLSTATE `55P03` and leave no new column.
+The later read must then return its row while the original transaction is still
+open. Only afterward does the original reader roll back. A fresh bounded
+migration must succeed and preserve the row. The deadlines are choices for this
+CI fixture; choose the deployment budget from the service's requirements.
+
+Before accepting a generated migration, decide how much blocking your release
+can tolerate, what happens after that budget expires, and which application
+versions must keep working. Ask for the observations that establish those
+properties. A longer timeout can change who waits without resolving why the lock
+is held.
 
 ## A current description still has limits
 

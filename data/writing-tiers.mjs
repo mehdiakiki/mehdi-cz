@@ -272,6 +272,7 @@ export const investigations = [
  */
 const articleSlugsByTheme = {
   layers: [
+    "read-only-postgresql-mcp-tool-limits",
     "two-tenants-in-authorization-tests",
     "reporting-database-account-cannot-write",
     "release-mutex-before-remote-api-call",
@@ -452,6 +453,7 @@ const articleSlugsByTheme = {
     "the-timeout-ended-one-process-not-the-job",
   ],
   measurement: [
+    "pgvector-filtered-search-too-few-results",
     "index-cost-write-heavy-postgresql-table",
     "save-failing-input-before-fixing-bug",
     "test-must-fail-for-intended-reason",

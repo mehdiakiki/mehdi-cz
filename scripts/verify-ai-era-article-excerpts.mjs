@@ -9,6 +9,9 @@ assert.equal(process.env.GITHUB_ACTIONS, "true", "Use the existing GitHub workfl
 const release = JSON.parse(
   await readFile("docs/editorial/ai-writing-release-2026-10-31.json", "utf8")
 );
+const revisions = JSON.parse(
+  await readFile("docs/editorial/ai-era-sql-2026-10-31/release.json", "utf8")
+);
 assert.equal(release.articles.length, 6);
 assert.equal(new Set(release.articles.map((entry) => entry.slug)).size, 6);
 assert.equal(release.articles.filter((entry) => entry.kind === "new").length, 3);
@@ -23,9 +26,15 @@ for (const entry of release.articles) {
   assert.equal(data.draft, false, entry.slug);
   assert.equal(data.reviewed, true, entry.slug);
   assert.equal(data.reviewedHash, articleReviewHash(source), entry.slug);
-  assert.equal(data.reviewedHash, entry.reviewedHash, entry.slug);
+  const revision = revisions.articles.find(
+    (item) => item.kind === "revision" && item.slug === entry.slug
+  );
+  if (revision) {
+    assert.equal(revision.previousReviewedHash, entry.reviewedHash, entry.slug);
+  }
+  assert.equal(data.reviewedHash, revision?.reviewedHash ?? entry.reviewedHash, entry.slug);
   assert.equal(data.date, entry.date, entry.slug);
-  assert.equal(data.lastmod, release.publish_at, entry.slug);
+  assert.equal(data.lastmod, revision?.lastmod ?? release.publish_at, entry.slug);
   assert.equal(publicationStatus(data, boundary), "published", entry.slug);
   if (entry.kind === "new") {
     assert.equal(data.date, release.publish_at);
