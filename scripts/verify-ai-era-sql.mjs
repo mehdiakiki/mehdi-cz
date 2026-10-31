@@ -28,6 +28,14 @@ function tokens(code) {
     .filter((token) => !token.startsWith("//"));
 }
 
+function unindent(code) {
+  const lines = code.trimEnd().replace(/^\n/, "").split("\n");
+  const indentation = Math.min(
+    ...lines.filter((line) => line.trim()).map((line) => line.match(/^ */)[0].length)
+  );
+  return lines.map((line) => line.slice(indentation)).join("\n");
+}
+
 for (const article of manifest.articles) {
   const source = await readFile(article.path, "utf8");
   const edition = release.articles.find((item) => item.slug === article.slug);
@@ -72,15 +80,21 @@ for (const article of manifest.articles) {
   for (const [index, snippet] of article.snippets.entries()) {
     assert.equal(fences[index][1], "rust", article.slug);
     const fixture = await readFile(snippet.source, "utf8");
-    const start = snippet.markerStyle === "named"
-      ? `// article:${snippet.label}:start\n`
-      : `// article:start ${snippet.label}\n`;
-    const end = snippet.markerStyle === "named"
-      ? `// article:${snippet.label}:end`
-      : `// article:end ${snippet.label}`;
+    const start =
+      snippet.markerStyle === "named"
+        ? `// article:${snippet.label}:start\n`
+        : `// article:start ${snippet.label}\n`;
+    const end =
+      snippet.markerStyle === "named"
+        ? `// article:${snippet.label}:end`
+        : `// article:end ${snippet.label}`;
     assert.ok(fixture.includes(start) && fixture.includes(end), snippet.label);
     const excerpt = fixture.split(start)[1].split(end)[0];
-    assert.deepEqual(tokens(fences[index][2]), tokens(excerpt), `${article.slug}: Rust excerpt`);
+    if (snippet.markerStyle === "named") {
+      assert.equal(unindent(fences[index][2]), unindent(excerpt), `${article.slug}: Rust excerpt`);
+    } else {
+      assert.deepEqual(tokens(fences[index][2]), tokens(excerpt), `${article.slug}: Rust excerpt`);
+    }
   }
   posts.push({
     ...parsePublicationFrontmatter(publicSource),

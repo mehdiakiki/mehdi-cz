@@ -35,7 +35,11 @@ for (const article of manifest.articles) {
   );
   const priorRevision = priorRevisions.articles.find((item) => item.slug === article.slug);
   if (revised) {
-    assert.equal(revised.previousReviewedHash, priorRevision?.reviewedHash ?? approved?.reviewedHash, article.slug);
+    assert.equal(
+      revised.previousReviewedHash,
+      priorRevision?.reviewedHash ?? approved?.reviewedHash,
+      article.slug
+    );
     assert.equal(revised.reviewedHash, data.reviewedHash, article.slug);
     assert.equal(data.lastmod, revisedEditions.applied_at);
     const manuscript = await readFile(revised.review_copy, "utf8");

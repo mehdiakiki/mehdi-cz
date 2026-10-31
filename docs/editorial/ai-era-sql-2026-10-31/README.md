@@ -19,13 +19,13 @@ waits, stale SQLx metadata and lost commit replies. Improve those answers rather
 than creating overlapping search pages. Connection ownership and hanging-request
 diagnosis share the same existing canonical article.
 
-| Manuscript                                                                                    | Change            | Reader decision                                                              |
-| --------------------------------------------------------------------------------------------- | ----------------- | ---------------------------------------------------------------------------- |
-| [Request waits](rust-request-waiting-for-pool-or-postgresql.mdx)                              | Revision | Choose a repair using the resource wait and the behavior it must preserve    |
-| [SQLx metadata](sqlx-offline-build-stale-database-metadata.mdx)                               | Revision | Separate query compatibility from the lock budget of deploying a migration   |
-| [Lost commit reply](postgresql-commit-reply-lost-rust.mdx)                                    | Revision | Decide who owns operation identity when an agent retries or resumes          |
-| [Read-only MCP tool](../../../data/blog/read-only-postgresql-mcp-tool-limits.mdx)             | New article | Bound identity, privileges, time and returned text at the database operation |
-| [Filtered pgvector search](pgvector-filtered-search-too-few-results.mdx) | Revision | Compare an approximate repair with an authorized exact reference             |
+| Manuscript                                                                        | Change      | Reader decision                                                              |
+| --------------------------------------------------------------------------------- | ----------- | ---------------------------------------------------------------------------- |
+| [Request waits](rust-request-waiting-for-pool-or-postgresql.mdx)                  | Revision    | Choose a repair using the resource wait and the behavior it must preserve    |
+| [SQLx metadata](sqlx-offline-build-stale-database-metadata.mdx)                   | Revision    | Separate query compatibility from the lock budget of deploying a migration   |
+| [Lost commit reply](postgresql-commit-reply-lost-rust.mdx)                        | Revision    | Decide who owns operation identity when an agent retries or resumes          |
+| [Read-only MCP tool](../../../data/blog/read-only-postgresql-mcp-tool-limits.mdx) | New article | Bound identity, privileges, time and returned text at the database operation |
+| [Filtered pgvector search](pgvector-filtered-search-too-few-results.mdx)          | Revision    | Compare an approximate repair with an authorized exact reference             |
 
 The four revision copies stay here as review snapshots. Their bodies match the
 public editions. The original publication dates are retained and `lastmod`
