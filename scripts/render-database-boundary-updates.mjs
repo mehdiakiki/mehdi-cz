@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
+import matter from "gray-matter";
 import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { MDXLayoutRenderer } from "pliny/mdx-components";
 import { allBlogs } from "../.contentlayer/generated/index.mjs";
 import { publicArticleHref } from "../lib/editorial-navigation.mjs";
 import { publicationStatus } from "../lib/publication.mjs";
+import { articleReviewHash } from "../lib/content-review.mjs";
 
 assert.equal(process.env.GITHUB_ACTIONS, "true", "Render in the existing GitHub workflow");
 const release = JSON.parse(
@@ -23,7 +25,17 @@ const records = [];
 for (const article of release.articles) {
   const post = allBlogs.find((post) => post.slug === article.slug);
   assert.ok(post, article.slug);
-  assert.equal(post.sourceHash, article.reviewedHash);
+  const source = await readFile(article.path, "utf8");
+  const { content } = matter(source);
+  assert.equal(articleReviewHash(source), article.reviewedHash);
+  assert.equal(post.reviewedHash, article.reviewedHash);
+  assert.equal(post.body.raw.trim(), content.trim(), article.slug);
+  assert.equal(post.reviewed, true);
+  assert.equal(post.draft, false);
+  assert.equal(post.title, article.title);
+  assert.deepEqual(post.authors, ["default"]);
+  assert.equal(Date.parse(post.date), Date.parse(article.date));
+  assert.equal(Date.parse(post.lastmod), Date.parse(article.lastmod));
   const state = publicationStatus(post);
   const published = state === "published";
   for (const surface of surfaces)
