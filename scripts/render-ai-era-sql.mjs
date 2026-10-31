@@ -23,16 +23,37 @@ const surfaces = await Promise.all(
 const records = [];
 const h = React.createElement;
 function document(title, body) {
-  return "<!doctype html>" + renderToStaticMarkup(
-    h("html", { lang: "en" },
-      h("head", null,
-        h("meta", { charSet: "utf-8" }),
-        h("meta", { name: "robots", content: "noindex, nofollow" }),
-        h("title", null, title),
-        h("style", null, "body{max-width:78ch;margin:2rem auto;padding:1rem;font:18px/1.65 system-ui}pre{overflow:auto;padding:1rem;background:#eee;font-size:.85em}table{border-collapse:collapse}td,th{padding:.5rem;border:1px solid #aaa}")),
-      h("body", null,
-        h("p", null, "Draft for review. Author: Mehdi Akiki. Publication is pending editorial review."),
-        body)));
+  return (
+    "<!doctype html>" +
+    renderToStaticMarkup(
+      h(
+        "html",
+        { lang: "en" },
+        h(
+          "head",
+          null,
+          h("meta", { charSet: "utf-8" }),
+          h("meta", { name: "robots", content: "noindex, nofollow" }),
+          h("title", null, title),
+          h(
+            "style",
+            null,
+            "body{max-width:78ch;margin:2rem auto;padding:1rem;font:18px/1.65 system-ui}pre{overflow:auto;padding:1rem;background:#eee;font-size:.85em}table{border-collapse:collapse}td,th{padding:.5rem;border:1px solid #aaa}"
+          )
+        ),
+        h(
+          "body",
+          null,
+          h(
+            "p",
+            null,
+            "Draft for review. Author: Mehdi Akiki. Publication is pending editorial review."
+          ),
+          body
+        )
+      )
+    )
+  );
 }
 for (const article of manifest.articles) {
   const { content } = matter(await readFile(article.path, "utf8"));
@@ -44,7 +65,9 @@ for (const article of manifest.articles) {
     assert.equal(post.reviewed, false);
     assert.equal(publicArticleHref(allBlogs, article.slug), null);
     for (const surface of surfaces) assert.ok(!surface.includes(article.slug), article.slug);
-    await assert.rejects(readFile(`.next/server/app/blog/${article.slug}.html`), { code: "ENOENT" });
+    await assert.rejects(readFile(`.next/server/app/blog/${article.slug}.html`), {
+      code: "ENOENT",
+    });
     code = post.body.code;
   } else {
     ({ code } = await bundleMDX({
@@ -62,14 +85,42 @@ for (const article of manifest.articles) {
   for (const [, target] of body.matchAll(/href="\/blog\/([^"#?]+)"/g)) {
     assert.ok(publicArticleHref(allBlogs, target), `${article.slug}: unavailable related article`);
   }
-  await writeFile(`${output}/${article.slug}.html`, document(article.title,
-    h(React.Fragment, null,
-      h("h1", null, article.title),
-      h("article", { dangerouslySetInnerHTML: { __html: body } }))));
+  await writeFile(
+    `${output}/${article.slug}.html`,
+    document(
+      article.title,
+      h(
+        React.Fragment,
+        null,
+        h("h1", null, article.title),
+        h("article", { dangerouslySetInnerHTML: { __html: body } })
+      )
+    )
+  );
   records.push({ slug: article.slug, kind: article.kind, title: article.title });
 }
-await writeFile(`${output}/index.html`, document("Rust and AI: five review manuscripts",
-  h("ol", null, ...records.map((article) => h("li", { key: article.slug },
-    h("a", { href: `${article.slug}.html` }, article.title), ` (${article.kind})`)))));
-await writeFile(`${output}/index.json`, JSON.stringify({ articles: records, publicNewArticles: 0 }, null, 2));
-console.log("Rendered five private manuscripts; new drafts have no route, search, RSS or sitemap entry.");
+await writeFile(
+  `${output}/index.html`,
+  document(
+    "Rust and AI: five review manuscripts",
+    h(
+      "ol",
+      null,
+      ...records.map((article) =>
+        h(
+          "li",
+          { key: article.slug },
+          h("a", { href: `${article.slug}.html` }, article.title),
+          ` (${article.kind})`
+        )
+      )
+    )
+  )
+);
+await writeFile(
+  `${output}/index.json`,
+  JSON.stringify({ articles: records, publicNewArticles: 0 }, null, 2)
+);
+console.log(
+  "Rendered five private manuscripts; new drafts have no route, search, RSS or sitemap entry."
+);

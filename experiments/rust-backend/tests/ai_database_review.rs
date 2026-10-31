@@ -38,7 +38,7 @@ async fn list_invoices(
     .execute(&mut *tx)
     .await?;
     let rows = sqlx::query_as(
-        "SELECT id, left(title, 128), left(summary, 256)
+        "SELECT id, left(title, 64), left(summary, 128)
          FROM ai_tool_review.invoices
          WHERE tenant_id = $1 AND id > $2
          ORDER BY id LIMIT $3",
@@ -71,6 +71,9 @@ async fn a_read_only_tool_needs_identity_time_and_output_boundaries() -> Result<
              INSERT INTO invoices
                  SELECT 'alpha', n, repeat('界', 300), repeat('界', 10000)
                  FROM generate_series(2, 20) AS n;
+             INSERT INTO invoices
+                 SELECT 'alpha', n, repeat(chr(1), 300), repeat(chr(1), 10000)
+                 FROM generate_series(21, 30) AS n;
              ALTER TABLE invoices ENABLE ROW LEVEL SECURITY;
              CREATE POLICY invoice_tenant ON invoices TO ai_tool_review_reader
                  USING (tenant_id = current_setting('app.tenant_id', true));
@@ -112,6 +115,15 @@ async fn a_read_only_tool_needs_identity_time_and_output_boundaries() -> Result<
         assert!(alpha.iter().all(|row| row.1 != "beta invoice"));
         let encoded = serde_json::to_vec(&alpha)?;
         assert!(encoded.len() < 16 * 1024);
+        let escaped = list_invoices(
+            &reader,
+            &Principal { tenant: "alpha" },
+            InvoicePage { after_id: 20, limit: 10 },
+        )
+        .await?;
+        assert_eq!(escaped.len(), 10);
+        let escaped_bytes = serde_json::to_vec(&escaped)?;
+        assert!(escaped_bytes.len() < 16 * 1024);
         let beta = list_invoices(
             &reader,
             &Principal { tenant: "beta" },
@@ -147,7 +159,7 @@ async fn a_read_only_tool_needs_identity_time_and_output_boundaries() -> Result<
             sqlx::query_scalar::<_, i32>("SELECT 42").fetch_one(&reader).await?,
             42
         );
-        println!("Tool boundary: UPDATE rejected with 42501; tenant argument rejected; alpha/beta stayed separate on one pooled session; 10 Unicode rows encoded to {} bytes; read-only pg_sleep cancelled with 57014; connection recovered.", encoded.len());
+        println!("Tool boundary: UPDATE rejected with 42501; tenant argument rejected; alpha/beta stayed separate on one pooled session; Unicode page={} bytes, escaped-control page={} bytes; read-only pg_sleep cancelled with 57014; connection recovered.", encoded.len(), escaped_bytes.len());
         reader.close().await;
         discard(admin, "ai_tool_review").await;
         let cleanup = PgPool::connect(&std::env::var("SQL_RUST_PG_URL")?).await?;

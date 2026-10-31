@@ -15,13 +15,13 @@ waits, stale SQLx metadata and lost commit replies. Improve those answers rather
 than creating overlapping search pages. Connection ownership and hanging-request
 diagnosis share the same existing canonical article.
 
-| Manuscript | Change | Reader decision |
-| --- | --- | --- |
-| [Request waits](rust-request-waiting-for-pool-or-postgresql.mdx) | Proposed revision | Choose a repair using the resource wait and the behavior it must preserve |
-| [SQLx metadata](sqlx-offline-build-stale-database-metadata.mdx) | Proposed revision | Separate query compatibility from the lock budget of deploying a migration |
-| [Lost commit reply](postgresql-commit-reply-lost-rust.mdx) | Proposed revision | Decide who owns operation identity when an agent retries or resumes |
-| [Read-only MCP tool](../../../data/blog/read-only-postgresql-mcp-tool-limits.mdx) | New draft | Bound identity, privileges, time and returned text at the database operation |
-| [Filtered pgvector search](../../../data/blog/pgvector-fewer-results-after-tenant-filter.mdx) | New draft | Compare an approximate repair with an authorized exact reference |
+| Manuscript                                                                                    | Change            | Reader decision                                                              |
+| --------------------------------------------------------------------------------------------- | ----------------- | ---------------------------------------------------------------------------- |
+| [Request waits](rust-request-waiting-for-pool-or-postgresql.mdx)                              | Proposed revision | Choose a repair using the resource wait and the behavior it must preserve    |
+| [SQLx metadata](sqlx-offline-build-stale-database-metadata.mdx)                               | Proposed revision | Separate query compatibility from the lock budget of deploying a migration   |
+| [Lost commit reply](postgresql-commit-reply-lost-rust.mdx)                                    | Proposed revision | Decide who owns operation identity when an agent retries or resumes          |
+| [Read-only MCP tool](../../../data/blog/read-only-postgresql-mcp-tool-limits.mdx)             | New draft         | Bound identity, privileges, time and returned text at the database operation |
+| [Filtered pgvector search](../../../data/blog/pgvector-fewer-results-after-tenant-filter.mdx) | New draft         | Compare an approximate repair with an authorized exact reference             |
 
 The three revision copies stay here until reviewed. Their public counterparts
 retain their reviewed source and release records. The new blog manuscripts use

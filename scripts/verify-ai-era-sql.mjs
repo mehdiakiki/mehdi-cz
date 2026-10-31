@@ -11,7 +11,8 @@ const manifest = JSON.parse(
 
 // Ignore Rust formatting outside literals. Preserve SQL and other string bytes.
 function tokens(code) {
-  return code.match(/"(?:\\.|[^"\\])*"|\/\/[^\n]*|[A-Za-z_][A-Za-z_0-9]*|\d+|[^\s]/g)
+  return code
+    .match(/"(?:\\.|[^"\\])*"|\/\/[^\n]*|[A-Za-z_][A-Za-z_0-9]*|\d+|[^\s]/g)
     .filter((token) => !token.startsWith("//"));
 }
 
