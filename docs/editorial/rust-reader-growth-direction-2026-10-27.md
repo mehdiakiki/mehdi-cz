@@ -28,7 +28,7 @@ Use a plausible wrong repair to make the decision concrete. Choose assertions fr
 
 The first writing batch expands the connection-pool investigation and the existing Claude Code skills guide, and adds a Rust/PostgreSQL retrieval investigation. New SQL articles retain Rust executable examples. The approved daily calendar continues to govern releases.
 
-The pool manuscript is a held working expansion for the existing pool-wait guide, `rust-request-waiting-for-pool-or-postgresql`. Reconcile it into that answer during review rather than publishing an overlapping page. Its new value is the quote revision contract, cancellation check, and deliberately gated progress comparison. The retrieval manuscript adds a Rust serving and publication contract to the existing conceptual retrieval guides; it does not claim a complete model integration or a relevance benchmark.
+The pool expansion is now folded into the existing pool-wait guide, `rust-request-waiting-for-pool-or-postgresql`. The overlapping source remains held and redirected. Its new value is the quote revision contract, cancellation check, and deliberately gated progress comparison. The retrieval manuscript adds a Rust serving and publication contract to the existing conceptual retrieval guides; it does not claim a complete model integration or a relevance benchmark.
 
 The second batch keeps the existing SQLite writer and stale-snapshot explanation intact. A distinct checkpoint investigation follows the history retained by a long reader. A pgvector investigation compares exact and actual HNSW plans under the same tenant predicate. The existing Claude Code CI guide is revised around trusted source identity, independent requirement checks, bounded results, and publishing authority. The scope and primary sources are recorded in `ai-writing-second-batch-2026-10-31.json`.
 
@@ -118,3 +118,11 @@ A current documentation search confirms that the basic rules already have good s
 Give the database and runtime paths the most attention when evaluating this release. Useful entry questions include a full connection pool with an idle database, work that survives a lost reply, queued payload outside a channel's nominal capacity, and stale generated output that survives a rebuild. Use actual search queries and reader questions to decide which explanations need refinement. Do not infer demand from the number of pages published.
 
 The target still needs roughly eight hundred additional daily visits on the author's original metric. There is no defensible fixed number of articles that guarantees that increase. Compare the trailing 28-day average, article search clicks, follow-up reading, and relevant work enquiries after the cohort has had time to be discovered. Prioritize improving pages with relevant impressions but weak clicks, or useful entry traffic with poor follow-up reading. Keep the existing scheduled calendar separate from this explicitly requested draft release.
+
+## October 31 publication request
+
+The author asked to make these articles more human and publish them once revised. The resulting release adds the Rust/PostgreSQL retrieval, SQLite checkpoint, and filtered pgvector investigations. It updates the existing pool-wait, Claude Code skills, and Claude Code CI guides at their current URLs.
+
+The prose now starts with concrete symptoms, explains terms beside the problem, and removes repeated review language. Compiled Rust excerpts and observed results remain intact. Constructed examples are not presented as personal incidents, and local policy checks are not presented as a model-quality evaluation. The author remains Mehdi Akiki alone.
+
+`ai-writing-release-2026-10-31.json` records the requested release and hashes of the reviewed sources. Existing GitHub checks and the production deployment workflow govern publication. The other scheduled calendar is unchanged.

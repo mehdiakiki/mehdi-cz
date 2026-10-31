@@ -1,56 +1,59 @@
 ---
 title: "Is Your Rust Request Waiting for a Connection or for PostgreSQL?"
 date: "2026-10-30T10:02:25Z"
-lastmod: "2026-10-30T20:17:47Z"
+lastmod: "2026-10-31T18:08:21Z"
 tags: ["rust", "sqlx", "postgresql", "debugging"]
 authors: ["default"]
 draft: false
 reviewed: true
-reviewedHash: "38c6bdc21d37944086abf7fd9d1a35c54e9a863a4d1b670afa6a72b1be3819a3"
+reviewedHash: "34081b83132917acc760288afea887464afcf224fbcf58f722805af724cad593"
 cluster: "rust-under-the-hood"
 campaign: "editorial"
-summary: "Separate an application wait, a SQLx pool wait, and a PostgreSQL lock wait. Use connection ownership and backend observations to choose the next step."
+summary: "Trace a Rust request from SQLx acquisition to PostgreSQL locks. Find long-held connections, release them during unrelated work, and keep stale quotes from being saved."
 ---
 
-A request takes twelve seconds. The query normally takes a few milliseconds. There is no slow-query entry for most of those twelve seconds.
+A request takes twelve seconds. Its query normally takes a few milliseconds. There is no slow-query entry for most of the wait.
 
-Start by asking when the request obtained a database connection. A timer around a function named `load_account` may include a queue, connection acquisition, the SQL exchange, and work done after the result arrived. Its name does not tell you where the time went.
+Before changing the pool size, find out when the request obtained a connection. A timer around `load_account` might include a queue, connection acquisition, SQL, and work after the result arrived. The function name does not tell you where those twelve seconds went.
 
-This article uses three small reproductions. One task waits before asking for a connection. Another waits because the only connection is held elsewhere. A third has a connection and waits for a PostgreSQL row lock. They all look like an unfinished Rust future from the handler, but each needs a different repair.
+We can separate three cases: a task that has not asked for a connection yet, a task waiting for a connection someone else holds, and a query waiting for a PostgreSQL lock. Then we can check a common repair: returning the connection before a slow HTTP call.
 
-The fixture is `pg_waits.rs` in [the PostgreSQL lab](https://github.com/mehdiakiki/mehdi-cz/tree/main/experiments/sql-rust/postgres-sqlite). It uses SQLx 0.8.6 and PostgreSQL 18. The waiting order is controlled with channels and database observations. The timeout values bound the experiment; they are not performance results.
+## Start the trace before acquire
 
-## Put the first boundary before acquire
+Record a request ID and a stage just before `pool.acquire()`. Record when acquisition returns, including failures. Time the query separately. Keep response encoding and writing in their own spans. Use a monotonic clock for durations.
 
-Record a request identifier and a stage before calling `pool.acquire()`. Record another stage when acquisition returns. Time the query separately, and keep result encoding or response writing in its own span.
+This gives you a first place to look:
 
-That gives you a useful first split. If acquisition has not started, inspect the application. If acquisition started but has not returned, inspect the pool and its current borrowers. If acquisition returned, you can follow that connection into the database.
+| Last known stage | Where to investigate |
+| --- | --- |
+| Acquisition has not started | Application gates, task polling, runtime progress |
+| Acquisition started but is pending | Pool borrowers, connection creation, health checks |
+| Query started | That database session and its waits |
+| Query finished | Decoding, queues, encoding, response consumption |
 
-The first case deliberately parks a task on a channel before acquisition. The observer waits until the task reports that it entered, then checks that the pool still offers a connection. Releasing the channel lets the task run its query.
+In the first [PostgreSQL reproduction](https://github.com/mehdiakiki/mehdi-cz/blob/6c1abf15084ad31d0a672a97fae83e9fb6e9735a/experiments/sql-rust/postgres-sqlite/src/bin/pg_waits.rs), a channel parks a task before acquisition. The observer checks that the pool still has a connection. Releasing the channel lets the query run.
 
-This is an application wait with a healthy database path. It does not reproduce a blocked runtime thread. A production task could instead be waiting for a semaphore, a mutex, another service, or a future that its caller never polls. Check task progress and runtime scheduling when the database stages have not begun. The [async Rust investigation](/blog/how-async-rust-works-under-the-hood) explains why a pending future alone does not name the resource it needs.
+The database path is healthy. The task is waiting elsewhere. In a service, that could be a semaphore, mutex, another service, or a future its caller has stopped polling. The [async Rust investigation](/blog/how-async-rust-works-under-the-hood) explains why a pending future alone does not name the resource it needs.
 
-Use a monotonic clock for durations. Keep the request identity across task boundaries. Avoid recording query parameters or customer documents just to make the trace easier to search.
+Keep request identity across task boundaries. You do not need private query parameters or customer documents in ordinary logs to make these stages useful.
 
-## An idle backend can belong to a busy application
+## An idle backend may still be checked out
 
-In the second case, the pool has a maximum of one connection. A borrower acquires it, asks for its backend PID, and keeps the handle. A second acquisition cannot finish while that handle remains checked out.
+The second case uses a one-connection pool. One task acquires the connection, reads its backend PID, and holds the handle. Another task tries to acquire.
 
-The observer uses a separate pool. It finds the held backend in `pg_stat_activity` and checks that its state is `idle`. This means PostgreSQL is waiting for another command on that session. It does not mean SQLx has that connection available for another borrower.
+A separate observer finds the first backend in `pg_stat_activity`. Its state is `idle`. PostgreSQL is waiting for the next command, but SQLx cannot give that checked-out connection to another borrower.
 
-The [SQLx Pool documentation](https://docs.rs/sqlx/0.8.6/sqlx/struct.Pool.html) describes how checked-out connections use the pool's capacity. Look for the scope that owns the handle. An HTTP call, slow serializer, or waiting channel can extend that scope long after the SQL statement finished.
+This is the ownership detail I would inspect first when queries are short and pool waits are long. A handler can hold a connection while waiting for HTTP, serializing data, or waiting on a channel. A returned stream can keep borrowing it after a helper function has returned.
 
-Releasing the held handle is the repair in this reproduction. The fixture then acquires again and executes a different query. It checks recovery, not just the expected timeout.
+The [SQLx pool documentation](https://docs.rs/sqlx/0.8.6/sqlx/struct.Pool.html) describes checkout and release. Look at the whole lifetime of the handle, not only the SQL duration. In this reproduction, dropping the handle lets the next task acquire and run another query.
 
-In a service, compare acquisition latency, checked-out connections, and the time between acquisition and release. Those numbers answer different questions. Raising the pool limit may move the queue into PostgreSQL and increase contention. First establish why each borrower still needs its connection.
+The error `pool timed out while waiting for an open connection` does not prove that another request held every slot. The [acquisition timeout](https://docs.rs/sqlx/0.8.6/sqlx/pool/struct.PoolOptions.html#method.acquire_timeout) can also cover establishing or checking a connection. DNS, TLS, authentication, and pool hooks may consume that time.
 
-The message `pool timed out while waiting for an open connection` does not identify that cause on its own. Acquisition can also include checking or establishing a connection. Compare the wait stages and driver context before applying a workaround from an older issue. The [SQLx acquisition timeout documentation](https://docs.rs/sqlx/0.8.6/sqlx/pool/struct.PoolOptions.html#method.acquire_timeout) describes what its timer includes.
+## A lock wait belongs to a database session
 
-## A database wait needs a backend identity
+The third case begins a transaction and updates a row. Before it commits, a second connection tries to update the same row.
 
-The third case begins a transaction and updates one row. Before committing, it starts another connection which tries to update the same row.
-
-The second request has already passed acquisition. Its backend PID identifies the session to inspect. The observer asks for its wait category and blocking PIDs:
+The second request has passed acquisition. Capture its backend PID and ask what it is waiting for:
 
 ```rust
 async fn blockers(pool: &PgPool, pid: i32) -> Result<(Option<String>, Vec<i32>)> {
@@ -65,33 +68,61 @@ async fn blockers(pool: &PgPool, pid: i32) -> Result<(Option<String>, Vec<i32>)>
 }
 ```
 
-The fixture polls this observation until the wait category is `Lock` and the blocking list contains the exact holder PID. Only then does it roll back the holder. The waiting update must finish, and a separate read must see one increment. A long sleep followed by a successful update would establish much less: the second query might never have reached the lock before the first transaction ended.
+The test waits until the category is `Lock` and the blocker list contains the exact PID of the first connection. Only then does it roll back the holder. The waiting update finishes, and a separate read sees one increment.
 
-PostgreSQL documents [activity and wait events](https://www.postgresql.org/docs/18/monitoring-stats.html#PG-STAT-ACTIVITY-VIEW) separately from [blocking-session functions](https://www.postgresql.org/docs/18/functions-info.html#FUNCTIONS-INFO-SESSION-TABLE). Read the category before interpreting the event name. A backend doing CPU work can have no wait event. An active backend is not necessarily consuming CPU.
+That ordering is useful. Sleeping for a while and then releasing the first transaction would not show that the second query had reached the lock.
 
-Ordinary roles may lack permission to inspect other users' activity. Arrange an approved monitoring role. Do not add administrator credentials to the application merely to make this query work. PIDs also change when connections reconnect, so capture the identity for the session you are investigating.
+PostgreSQL documents [activity and wait events](https://www.postgresql.org/docs/18/monitoring-stats.html#PG-STAT-ACTIVITY-VIEW) and [blocking-session functions](https://www.postgresql.org/docs/18/functions-info.html#FUNCTIONS-INFO-SESSION-TABLE). Read the wait category before interpreting the event name. An active backend need not be using CPU; one doing CPU work may have no wait event.
 
-## Choose the repair at the boundary that explains the wait
+Use an approved monitoring role to inspect other sessions. Do not put administrator credentials in the application just for this query. PIDs can also change after reconnects, so capture the identity for the connection you are investigating.
 
-| Observation                                               | What to inspect next                                  |
-| --------------------------------------------------------- | ----------------------------------------------------- |
-| No acquisition stage yet                                  | Application gates, task polling, and runtime progress |
-| Acquisition pending; current borrower has an idle backend | Scope and lifetime of the checked-out connection      |
-| Query pending; backend reports a lock and a blocker       | The blocking transaction and why it remains open      |
-| Query finished; request still pending                     | Decoding, encoding, queues, and response consumption  |
+## Return the connection before unrelated waiting
 
-These are starting points, not a complete classification of slow requests. Connection establishment can involve DNS, TLS, authentication, or pool hooks. Database execution can wait for storage or another process. A proxy can introduce another queue between the driver and PostgreSQL.
+Consider an endpoint that reads an address, asks a delivery service for a quote, then saves it. The HTTP call does not use PostgreSQL. Keeping the checkout through that call ties up database capacity while the database has nothing to do.
 
-For a lock wait, inspect the holder before stopping it. A transaction may be waiting on an external call while retaining locks. Shortening that transaction can help more than changing a Rust task limit. The [PostgreSQL transaction article](/blog/sql-postgresql-rust-service-transactions) shows the data changes that must remain together when you move work outside the transaction.
+Read the address into owned data, end the checkout scope, and call the delivery service. Acquire again when there is database work to do. Passing a pool directly to a SQLx query can also scope the checkout to that operation.
 
-The [slow row consumer investigation](/blog/slow-postgresql-row-consumer-holds-rust-connection) follows one reason a connection remains checked out after the first row arrives.
+The [HTTP reproduction](https://github.com/mehdiakiki/mehdi-cz/blob/6c1abf15084ad31d0a672a97fae83e9fb6e9735a/experiments/rust-backend/tests/practical_connection_scope.rs) uses a real loopback exchange and a one-slot pool. It pauses the HTTP response after the server reports that the request arrived.
 
-Keep the stages after the incident is fixed. The useful outcome is being able to say which resource the next slow request is waiting for, with enough evidence to change that resource's lifetime or capacity.
+When the handler retains its connection, an independent borrower cannot acquire. With the shorter scope, that borrower completes a query returning seven while HTTP is still paused. After the handler finishes, another query returns eight.
 
-## Keep an unrelated HTTP wait outside the checkout scope
+An [additional test](https://github.com/mehdiakiki/mehdi-cz/blob/6c1abf15084ad31d0a672a97fae83e9fb6e9735a/experiments/rust-backend/tests/pool_lifetime.rs) uses a gated future for the quote. It checks the same progress question and cancels a task while it owns the checkout. The test waits for cancellation to finish, then acquires again. That checks resource recovery, rather than assuming that sending a cancellation request has completed it.
 
-The [connection-scope fixture](https://github.com/mehdiakiki/mehdi-cz/blob/main/experiments/rust-backend/tests/practical_connection_scope.rs) adds a real loopback HTTP exchange to the pool diagnosis. A one-connection pool runs a query, then the request waits for a controlled HTTP response. The observer waits until the HTTP handler reports arrival before checking the pool.
+The short timeouts bound these tests. They are not recommended production settings or latency measurements. They also do not prove that cancelling a Rust task stops database work already sent to PostgreSQL. The [database timeout article](/blog/rust-timeout-does-not-stop-postgresql-query) investigates that separate problem.
 
-With the connection handle retained across the HTTP call, the pool offers no connection. With the same query and a shorter handle scope, another borrower can query seven while HTTP is still paused. After either request finishes, another query returns eight. The repair changes the handle lifetime, and the final query checks that the path recovers.
+## What if the address changes during the quote?
 
-This is a deliberately small HTTP server and client. It does not measure production latency, trace a proxy, or claim that every external call can leave its transaction. If the later write depends on the earlier read, moving the call can change the data contract. Choose that contract first, then keep the database resource only for the interval that needs it.
+Shorter connection lifetimes solve the capacity problem. They do not decide whether the later write is still valid.
+
+Suppose the quote used address revision 12. Another request saves revision 13 before the quote returns. Saving the old price unconditionally would attach it to an address it was never calculated for.
+
+The example checks the revision when saving:
+
+```rust
+let changed = sqlx::query(
+    "UPDATE pool_customers SET quote_cents = $1 \
+     WHERE id = $2 AND revision = $3",
+)
+.bind(quote_cents)
+.bind(customer_id)
+.bind(expected_revision)
+.execute(pool)
+.await?
+.rows_affected();
+```
+
+One affected row means the customer still matched the input revision. Zero means the row disappeared or changed. Handle that result: obtain a new quote or tell the caller the input changed. Ignoring it can report success even though nothing was saved.
+
+Every change to a quote input must advance the revision. Decide how two quotes for the same revision compete, and whether saving a quote should advance it too. SQL cannot choose those product rules.
+
+Keeping the original connection would not protect the address by itself. A transaction, locks, and isolation are separate choices. Keep operations together when they must commit together; the [PostgreSQL transaction guide](/blog/sql-postgresql-rust-service-transactions) explains that boundary.
+
+In the [recorded run](https://github.com/mehdiakiki/mehdi-cz/actions/runs/41209727237/job/124561980630), all three added pool tests passed. The held checkout produced `PoolTimedOut`. The shorter scope allowed `SELECT 1` before the quote was released. Cancellation returned the connection. A stale quote affected zero rows; a quote for the current revision affected one and was stored.
+
+## If requests still queue
+
+Now compare arrival rate, acquisition waits, checkout lifetimes, and database capacity. More connections may help if PostgreSQL can do more useful work. They can also move the queue into the server and increase contention. Count all application replicas, workers, and rolling deployment overlap against the connection budget.
+
+For a lock wait, inspect the holder before stopping it. It may be waiting on an external call with a transaction still open. For a checkout that survives the first result row, follow the [slow consumer investigation](/blog/slow-postgresql-row-consumer-holds-rust-connection).
+
+A useful fix leaves you able to answer the next incident more precisely: where did this request wait, who owned the resource, and did releasing it preserve the intended write?

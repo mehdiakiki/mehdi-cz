@@ -1,7 +1,44 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
+import matter from "gray-matter";
+import { articleReviewHash } from "../lib/content-review.mjs";
+import { publicationStatus } from "../lib/publication.mjs";
 
 assert.equal(process.env.GITHUB_ACTIONS, "true", "Use the existing GitHub workflow");
+
+const release = JSON.parse(
+  await readFile("docs/editorial/ai-writing-release-2026-10-31.json", "utf8")
+);
+assert.equal(release.articles.length, 6);
+assert.equal(new Set(release.articles.map((entry) => entry.slug)).size, 6);
+assert.equal(release.articles.filter((entry) => entry.kind === "new").length, 3);
+assert.equal(release.articles.filter((entry) => entry.kind === "update").length, 3);
+const boundary = new Date(release.publish_at);
+for (const entry of release.articles) {
+  assert.equal(entry.path, `data/blog/${entry.slug}.mdx`);
+  const source = await readFile(entry.path, "utf8");
+  const { data } = matter(source);
+  assert.deepEqual(data.authors, ["default"], entry.slug);
+  assert.equal(data.title, entry.title);
+  assert.equal(data.draft, false, entry.slug);
+  assert.equal(data.reviewed, true, entry.slug);
+  assert.equal(data.reviewedHash, articleReviewHash(source), entry.slug);
+  assert.equal(data.reviewedHash, entry.reviewedHash, entry.slug);
+  assert.equal(data.date, entry.date, entry.slug);
+  assert.equal(data.lastmod, release.publish_at, entry.slug);
+  assert.equal(publicationStatus(data, boundary), "published", entry.slug);
+  if (entry.kind === "new") {
+    assert.equal(data.date, release.publish_at);
+    assert.equal(
+      publicationStatus(data, new Date(boundary.getTime() - 1)),
+      "scheduled",
+      entry.slug
+    );
+  }
+  assert.equal(publicationStatus({ ...data, draft: true }, boundary), "draft");
+  assert.equal(publicationStatus({ ...data, reviewed: false }, boundary), "unapproved");
+  console.log(`Checked release, author and exact review hash: ${entry.slug}`);
+}
 
 function unindent(text) {
   const lines = text.trimEnd().replace(/^\n/, "").split("\n");
@@ -13,9 +50,9 @@ function unindent(text) {
 
 const cases = [
   {
-    article: "data/blog/database-pool-full-check-connection-lifetime.mdx",
+    article: "data/blog/rust-request-waiting-for-pool-or-postgresql.mdx",
     source: "experiments/rust-backend/tests/pool_lifetime.rs",
-    excerpts: [{ fence: 2, label: "quote-revision" }],
+    excerpts: [{ fence: 1, label: "quote-revision" }],
   },
   {
     article: "data/blog/rag-rust-postgresql-model-context.mdx",

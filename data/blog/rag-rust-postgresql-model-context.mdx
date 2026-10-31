@@ -1,43 +1,46 @@
 ---
-title: "RAG with Rust and PostgreSQL: Check the Model's Context"
-date: "2026-10-31T13:00:00Z"
+title: "RAG with Rust and PostgreSQL: Check What You Send to the Model"
+date: "2026-10-31T18:08:21Z"
 tags: ["rust", "postgresql", "pgvector", "rag", "ai"]
-draft: true
-reviewed: false
+draft: false
+reviewed: true
 cluster: "reliable-ai-systems"
 campaign: "editorial"
-summary: "Test a Rust retrieval path before trusting its answers. Inspect tenant boundaries, source revisions, late embedding jobs, deletion, and context byte limits in PostgreSQL."
+summary: "A good answer can still use the wrong document. Test tenant access, stale embeddings, deletion, and context size before sending retrieved text to a model."
+authors: ["default"]
+lastmod: "2026-10-31T18:08:21Z"
+reviewedHash: "e29334a7ce59c14f7bcdd6bce16912c6f41865ed1afd37394e24246d113d44d1"
 ---
 
-A support assistant gives the right instructions for resuming an upload. Its answer looks good. The passage sent to the model came from another customer's private document.
+A support assistant gives the right instructions for resuming an upload. There is just one problem: those instructions came from another customer's private document.
 
-An answer-quality check could mark that run as successful. The application has already sent material the caller was not allowed to use. Fixing the final wording cannot undo that request.
+Checking the answer would miss this. The mistake happened earlier, when the application chose what to send to the model.
 
-This is a constructed failure to investigate before shipping retrieval-augmented generation, or RAG. A coding agent can produce the Rust query, vector column, and model call. We still have to choose the access contract, define when changed documents stop being eligible, and check the actual context prepared for the model.
+Retrieval-augmented generation, or RAG, adds retrieved material to a model's request. Getting a first version working is fairly easy now. An AI coding tool can write the Rust query and model call. The harder part is deciding which text may leave your system, and checking what happens when that text changes.
 
-## Decide which passages are eligible
+Let's make those questions visible with a small PostgreSQL example.
 
-The [Rust lab](https://github.com/mehdiakiki/mehdi-cz/blob/0550168d61e22bb24bf282e93e28defab13733cf/experiments/rust-backend/tests/retrieval_contract.rs) uses SQLx 0.8.6 and the PostgreSQL/pgvector service in this repository's GitHub Content safety workflow. It stores one short passage per document. The vectors are hand-written three-dimensional values. They exercise SQL behavior; they do not measure an embedding model's relevance.
+## A search result can look right and still be wrong
 
-Start with five documents:
+The [Rust example](https://github.com/mehdiakiki/mehdi-cz/blob/6c1abf15084ad31d0a672a97fae83e9fb6e9735a/experiments/rust-backend/tests/retrieval_contract.rs) stores one passage per document. A tenant is one customer's account. Here are the five documents in the test:
 
-| Document | Tenant | State                                                         | Expected for tenant 7 using fixture-v1 |
-| -------- | ------ | ------------------------------------------------------------- | -------------------------------------- |
-| 101      | 7      | Current text and matching embedding revision                  | Eligible                               |
-| 102      | 7      | Text changed; embedding still describes the previous revision | Excluded                               |
-| 201      | 8      | Private text with a very close vector                         | Excluded                               |
-| 103      | 7      | Deleted document with a matching embedding revision           | Excluded                               |
-| 104      | 7      | Current text embedded with fixture-v2                         | Excluded                               |
+| Document | Tenant | What happened | May tenant 7 use it? |
+| --- | --- | --- | --- |
+| 101 | 7 | Text and embedding are current | Yes |
+| 102 | 7 | Text changed after it was embedded | No |
+| 201 | 8 | Private document with a very close vector | No |
+| 103 | 7 | Document was deleted | No |
+| 104 | 7 | Embedding uses a different model configuration | No |
 
-These expected outcomes come from the serving contract. A document belongs to the authenticated tenant, is present, and has an embedding for its current text and the selected model configuration.
+An embedding is a vector used to compare text by similarity. For this test, the vectors are three hand-written numbers. That lets us arrange the failure without depending on a provider. It says nothing about how well a real embedding model understands a question.
 
-Decide the freshness rule with the product owner. This example hides a document while its new embedding is missing. That trades temporary availability for a clear relationship between text and vector. Another product might serve a complete older revision, or use a keyword path while embedding work catches up. It must make that choice explicitly.
+In the [recorded GitHub run](https://github.com/mehdiakiki/mehdi-cz/actions/runs/41209727237/job/124561980630), a query that checked only distance returned `102, 201, 101`. Its first two results were unusable: one had an old embedding, and one belonged to another customer.
 
-The model configuration identifies compatible document and query embeddings. Equal vector dimensions do not establish compatibility between two models. In a real system, record the relevant model, preprocessing, and chunking configuration in that identity.
+The corrected query returned only `101@1` for tenant 7. A separate check returned `201@1` for tenant 8. Both matter. Returning nothing would hide the leak, but also break the feature. Hard-coding tenant 7 would pass only the first case.
 
-## Put the contract in the query that reads text
+## Select the text and check access in the same query
 
-The serving query joins document identity and tenant identity, then checks deletion, revision, and embedding configuration:
+This query joins the document to its embedding, including the tenant identity. It then checks deletion, the source revision, and the model configuration:
 
 ```rust
 let rows: Vec<(i64, i64, String)> = sqlx::query_as(
@@ -57,21 +60,21 @@ let rows: Vec<(i64, i64, String)> = sqlx::query_as(
 .await?;
 ```
 
-This excerpt comes from the lab's `retrieve` function. The fixed `Tenant` values stand in for an authenticated application context. They are not an authentication implementation. In the application, the server supplies that context and selects the embedding configuration. A model-generated tool argument must not choose the tenant.
+The server must supply `tenant` from the authenticated request. A model's tool arguments must not choose it. The fixed `Tenant` values in this example stand in for that server context; the example does not implement login or authentication.
 
-The query binds the vector as data. The qualified operator and type locate pgvector in the `public` schema while the fixture's tables live in an isolated schema.
+The revision comparison means that the vector describes the text being returned. The model configuration must also match the query embedding. Two models producing vectors of the same size do not necessarily produce compatible vectors. Include preprocessing and chunking choices in that configuration when they affect compatibility.
 
-The [pgvector documentation](https://github.com/pgvector/pgvector#querying) describes cosine distance and exact versus approximate search. This lab creates no approximate index. It cannot establish index recall, throughput, or a useful relevance threshold.
+This example hides an edited document until its new embedding is ready. That is a product choice. You could instead serve a complete older revision or use keyword search while the worker catches up. Choose the behavior deliberately. Mixing a new body with an old vector makes the result harder to explain.
 
-Filtering text after sending it to a reranker or model is too late for this contract. Keep the same access boundary on keyword search, identifier lookup, cached results, and citation rendering. The [retrieval permissions guide](/blog/filter-before-retrieval-permissions-are-part-of-relevance) develops that broader design.
+The same access checks belong on keyword search, cached results, document lookup, and citations. Filtering after a reranker or model has received private text is too late. The [retrieval permissions guide](/blog/filter-before-retrieval-permissions-are-part-of-relevance) follows those other paths.
 
-This test runs with a fixture database owner. It checks the application query, not PostgreSQL row-level security or the permissions of a deployed database account. A separate application role and RLS tests provide a different layer of evidence.
+These tests use SQLx 0.8.6 and a database owner account. They check this application query. Test your deployed database role and any row-level security rules separately. There is also no approximate index here; the [pgvector guide](https://github.com/pgvector/pgvector#querying) explains the difference between exact and approximate search. The [filtered HNSW investigation](/blog/pgvector-filtered-search-too-few-results) follows what happens when that index returns too few eligible rows.
 
-## A delayed embedding job must not make old text current
+## What if an old embedding job finishes last?
 
-An embedding job reads document 101 at revision 1. While the model provider works, a user edits it. The edit commits revision 2. The old embedding finishes afterward.
+Imagine a worker reads revision 1 and sends it for embedding. The user edits the document. Revision 2 commits. Then the worker receives the vector for revision 1.
 
-An unconditional upsert can quietly associate that result with whatever text is current. Preserve the revision that produced the input and check it when publishing:
+The worker should keep the revision it actually read. When it publishes, it checks whether that revision is still current:
 
 ```rust
 let changed = sqlx::query(
@@ -93,54 +96,32 @@ let changed = sqlx::query(
 .rows_affected();
 ```
 
-Zero affected rows means this statement found no eligible source revision. Treat that as obsolete work, not as a successful refresh. The worker should not relabel its old vector with a newer revision and retry.
+If this affects zero rows, the work is obsolete. Do not relabel the old vector as revision 2 and retry it.
 
-The lab deliberately commits the edit before the old job's publication statement. It then checks that the old job affects zero rows, retrieval returns no passage for the document, and a job for revision 2 restores the revised passage.
+The test commits the edit before letting the old job publish. That job affects zero rows. Retrieval stays empty until a job for revision 2 publishes, affecting one row. After deletion, retrieval is empty again, and another late job cannot bring the document back.
 
-The ordering matters. With PostgreSQL's [Read Committed isolation](https://www.postgresql.org/docs/18/transaction-iso.html#XACT-READ-COMMITTED), the publication statement reads its own snapshot. If an edit commits after that snapshot, an older embedding may still be stored. The serving query's revision comparison is therefore necessary too: subsequent retrieval excludes that stored row when it no longer matches the current document.
+There is a concurrency detail worth keeping. Under PostgreSQL's [Read Committed isolation](https://www.postgresql.org/docs/18/transaction-iso.html#XACT-READ-COMMITTED), the publication statement sees a snapshot. An edit that commits after that snapshot may still leave an old embedding stored. This is why the retrieval query also compares revisions. A later query excludes the stored vector once it no longer matches the document.
 
-Every text change must advance the source revision. Enforce that across all writers, including imports and repair tools. A revision counter ignored by one writer weakens both checks.
+Every writer must advance the revision when relevant text changes. That includes import scripts and repair tools. Otherwise, both checks can agree on a revision number that no longer describes the text.
 
-## Test the context before a model receives it
+## Three passages can still be too much text
 
-The lab includes a deliberately incomplete nearest-neighbor query. It has the right distance operator and plausible results, but omits tenant and revision checks. The fixture makes another tenant's passage and an obsolete embedding closer than the eligible passage.
+`LIMIT 3` limits rows. It does not limit bytes.
 
-The important assertions inspect identities, revisions, and the context string. They do not ask a model to explain whether it leaked something.
+The example uses a database constraint to keep each body within 4,096 bytes. Its context builder has a separate total byte limit, including headers and separators. A test uses non-ASCII text to catch the mistake of counting characters instead of UTF-8 bytes.
 
-For tenant 7, the context must contain only document 101 at revision 1. For tenant 8, its own document 201 must remain available. That second positive case catches a repair that always filters to tenant 7. The first catches a repair that returns nothing for everyone.
+When a passage would exceed the total, the builder returns an error. A real product might use fewer passages or shorten them under an agreed rule. Decide that behavior before adding retries. A retry with broader access would undo the earlier checks.
 
-The lifecycle case then forces an edit, an old job completion, a current job completion, deletion, and another late completion. It checks the stored publication counts and the context after each relevant boundary.
+This only bounds the stored bodies and the constructed context in this path. Downloads, extracted text, driver buffers, embedding batches, and concurrent requests need their own limits. A small final prompt does not prove the process used little memory to build it.
 
-These are bounded database and context-construction checks. The lab does not call an AI provider or record generated answers. It cannot establish answer quality, resistance to prompt injection, or the behavior of a provider receiving this context.
+## Deletion has an awkward boundary
 
-In the [recorded PostgreSQL execution](https://github.com/mehdiakiki/mehdi-cz/actions/runs/41209727237/job/124561980630), the incomplete query returned IDs `102, 201, 101`. The serving query prepared only `101@1` for tenant 7 and `201@1` for tenant 8. The old embedding job affected zero rows after the edit; a current job affected one. Deletion left the context empty, and the UTF-8 budget boundary passed. All three retrieval tests passed. The run checked merge revision `10885c5`, including source revision `0550168`.
+A later query can exclude a deleted document. It cannot take back text already sent to a provider.
 
-When evaluating the real workflow, capture the prepared request at the model gateway in a controlled test. Check its passages before allowing an external call. A correct final answer does not establish that only eligible text was sent. Evaluate answer quality separately, with real embeddings and representative questions, as described in the [retrieval evaluation guide](/blog/evaluate-retrieval-separately-from-answer-generation).
+The tests establish which documents are eligible at the retrieval statement's snapshot. Rechecking just before dispatch narrows the time between the check and the send. It still cannot make a database transaction atomic with an external model request.
 
-## Three passages are still a byte budget
+If deletion must stop in-flight requests, the product needs a coordination and cancellation policy. Include caches, queued work, stored conversations, and citations. The [invalidation article](/blog/a-retrieval-index-needs-an-invalidation-strategy) explains why each copy of the text needs attention.
 
-`LIMIT 3` bounds rows. Three large documents can still create an unacceptable allocation or model request.
+For a real integration, I would inspect the prepared request at the model gateway during a controlled test. Check document IDs, revisions, tenant identity, model configuration, and total size before allowing the call. Keep private passages out of ordinary logs.
 
-The fixture limits each stored body to 4,096 bytes using a database constraint. Its context builder checks a separate total byte budget, including document headers and separators, before appending each passage. The tests include non-ASCII text so a character count cannot accidentally stand in for UTF-8 bytes.
-
-This bounds one small fixture path. It does not account for all allocations in a database driver or an embedding client. A production ingestion path must also bound downloaded bodies, extracted text, batches, and concurrent work before materializing them.
-
-The example rejects a context that exceeds the budget. Choose what the product does next: use fewer passages, return a clear failure, or apply a reviewed shortening policy. Silently retrying with unrestricted documents would break the earlier contract.
-
-## Decide what deletion means for an in-flight request
-
-A later query excludes a deleted document. That does not erase text already read into an application's memory or already sent to a provider.
-
-Our test establishes eligibility at the retrieval statement's snapshot. It does not promise immediate revocation of every request that is already in flight. Rechecking before dispatch can narrow a window, but it cannot make a PostgreSQL transaction atomic with an external model request.
-
-If the product needs a stricter cutoff, define a coordination and cancellation protocol, decide how already transmitted text is handled, and test that protocol. Include caches, replicas, queued jobs, stored conversations, and citations in the deletion policy. The [invalidation guide](/blog/a-retrieval-index-needs-an-invalidation-strategy) explains why each serving copy needs an owner and a freshness rule.
-
-For an operational trace, retain source and query revisions, the embedding configuration, the authorized tenant context, returned passage identities, and the model attempt identity. Keep raw private passages out of ordinary logs. A reproducible investigation can use a controlled fixture or appropriately protected evidence.
-
-## What I would require before accepting the implementation
-
-I would first check that each allowed document can be retrieved, and that each forbidden state is excluded for the right reason. Then I would force an edit and late worker completion, inspect the prepared context, and exercise the byte limit. Those checks can expose a plausible implementation that looks correct during a happy-path demo.
-
-The remaining release evidence is different: real model relevance, representative corpus size, permission enforcement with the deployed database role, latency under the intended load, and the product's chosen revocation behavior. Keep those questions visible instead of filling them with scores from a five-document fixture.
-
-Writing the Rust query is one step. The acceptance decision needs a clear answer to which documents may reach the model, which revision each passage represents, and what happens when that answer changes during a request.
+Then evaluate the answers with real embeddings and representative questions. All three database tests passed in the linked run, but they do not call a model, measure relevance, or test prompt injection. Those are separate questions. The [retrieval evaluation guide](/blog/evaluate-retrieval-separately-from-answer-generation) shows how to separate them without letting a good answer hide a bad retrieval.
