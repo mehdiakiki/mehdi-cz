@@ -47,7 +47,10 @@ fn run() -> Result<()> {
     let bytes_held = std::fs::metadata(&wal_path)?.len();
     assert!(bytes_held > 0);
     let blocked = truncate(&writer)?;
-    assert_eq!(blocked.0, 1, "TRUNCATE cannot finish while this reader remains");
+    assert_eq!(
+        blocked.0, 1,
+        "TRUNCATE cannot finish while this reader remains"
+    );
 
     // A smaller automatic-checkpoint threshold cannot invalidate the reader's snapshot.
     writer.execute_batch("PRAGMA wal_autocheckpoint = 1;")?;
@@ -55,7 +58,10 @@ fn run() -> Result<()> {
     let lower_threshold = passive(&writer)?;
     assert_eq!(lower_threshold.0, 0);
     assert!(lower_threshold.1 > lower_threshold.2);
-    assert!(lower_threshold.1 > first.1, "commits continue growing the logical WAL");
+    assert!(
+        lower_threshold.1 > first.1,
+        "commits continue growing the logical WAL"
+    );
     let still_old: i64 = snapshot.query_row("SELECT value FROM counter", [], |row| row.get(0))?;
     assert_eq!(still_old, 0);
     let latest: i64 = writer.query_row("SELECT value FROM counter", [], |row| row.get(0))?;

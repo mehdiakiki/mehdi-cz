@@ -66,7 +66,9 @@ in the middleware example are test-clock values, not performance measurements.
 
 `tests/pgvector_filter.rs` builds a real HNSW index over 1,010 synthetic vectors.
 It checks the actual plans for exact, limited approximate, and iterative search
-under the same tenant predicate. Its result counts describe this constructed
+under the same tenant predicate. An authorized exact fallback preserves the
+five-result serving requirement when approximate results remain short.
+Its result counts describe this constructed
 case, not a corpus relevance or capacity benchmark.
 
 `tests/agent_review_evidence.rs` checks the rules for preparing an advisory

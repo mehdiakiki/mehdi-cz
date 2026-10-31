@@ -37,6 +37,7 @@ const cases = [
       { fence: 0, label: "filtered-vector-definition" },
       { fence: 1, label: "filtered-vector-query" },
       { fence: 2, label: "iterative-vector-scan" },
+      { fence: 3, label: "complete-filtered-result" },
     ],
   },
   {

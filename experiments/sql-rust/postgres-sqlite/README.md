@@ -55,19 +55,19 @@ URLs or connect these fixtures to production.
 Run each bin with
 `cargo run --locked --manifest-path experiments/sql-rust/postgres-sqlite/Cargo.toml --features postgres-integration --bin NAME`:
 
-| Proposal | NAME | Expected evidence |
-| --- | --- | --- |
-| 1 | `pg_service` | One committed credit transfer; duplicate request failure rolls back its writes; negative/oversized operations refused; stored check enforced |
-| 3 | `sqlite_local` | Committed note survives connection close/reopen; rolled-back note absent; migration rerun preserves data; invalid flag rejected |
-| 9 | `pg_snapshots` | Coordinated second connection changes Read Committed's second read; Repeatable Read retains its first view until commit |
-| 10 | `pg_retry` | Actual first-attempt serialization conflict; second attempt rereads current value; two attempts and final value checked |
-| 11 | `pg_hot` | Current-transaction update/HOT pairs `(10, 10)` then `(11, 10)` in one explicit transaction; final row checked |
-| 12 | `pg_rls` | Real separate non-owner login; absent context sees nothing; each tenant sees its own row; context resets; wrong-tenant write denied |
-| 13 | `pg_notify` | Live notification works; newly subscribed listener has no past event; table scan recovers work; later live event also works |
-| 14 | `pg_enum` | Uncommitted new enum label use rejected; committed addition permits storage; unchanged old Rust decoder rejects the new label |
-| 19 | `sqlite_wal` | Old committed read allowed during write; second writer gets busy; stale reader gets BUSY_SNAPSHOT; fresh transaction succeeds |
-| 20 | `sqlite_worker` | Current-thread Tokio task progresses while a submitted insert cannot finish; queue slots fill and excess job rejected; released lock permits one saved note |
-| 21 | `sqlite_foreign_keys` | Deliberate unchecked orphan found; checked opens reject new orphans; RESTRICT and CASCADE exercised; reopening reapplies enforcement |
+| Proposal | NAME                  | Expected evidence                                                                                                                                           |
+| -------- | --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1        | `pg_service`          | One committed credit transfer; duplicate request failure rolls back its writes; negative/oversized operations refused; stored check enforced                |
+| 3        | `sqlite_local`        | Committed note survives connection close/reopen; rolled-back note absent; migration rerun preserves data; invalid flag rejected                             |
+| 9        | `pg_snapshots`        | Coordinated second connection changes Read Committed's second read; Repeatable Read retains its first view until commit                                     |
+| 10       | `pg_retry`            | Actual first-attempt serialization conflict; second attempt rereads current value; two attempts and final value checked                                     |
+| 11       | `pg_hot`              | Current-transaction update/HOT pairs `(10, 10)` then `(11, 10)` in one explicit transaction; final row checked                                              |
+| 12       | `pg_rls`              | Real separate non-owner login; absent context sees nothing; each tenant sees its own row; context resets; wrong-tenant write denied                         |
+| 13       | `pg_notify`           | Live notification works; newly subscribed listener has no past event; table scan recovers work; later live event also works                                 |
+| 14       | `pg_enum`             | Uncommitted new enum label use rejected; committed addition permits storage; unchanged old Rust decoder rejects the new label                               |
+| 19       | `sqlite_wal`          | Old committed read allowed during write; second writer gets busy; stale reader gets BUSY_SNAPSHOT; fresh transaction succeeds                               |
+| 20       | `sqlite_worker`       | Current-thread Tokio task progresses while a submitted insert cannot finish; queue slots fill and excess job rejected; released lock permits one saved note |
+| 21       | `sqlite_foreign_keys` | Deliberate unchecked orphan found; checked opens reject new orphans; RESTRICT and CASCADE exercised; reopening reapplies enforcement                        |
 
 Every PostgreSQL run creates a unique schema. Completed runs and returned
 errors attempt schema cleanup; a process kill or panic can leave a schema in

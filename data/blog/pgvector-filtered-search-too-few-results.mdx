@@ -14,7 +14,7 @@ The query asks for five passages from one customer's documents. PostgreSQL has t
 
 An AI-generated repair might increase the limit or move the tenant filter outside the retrieval step. Before accepting either change, establish where candidates are lost. The access rule still applies when search becomes approximate.
 
-This investigation keeps the data and the predicate fixed. It compares an exact query, a limited HNSW scan, and an iterative HNSW scan. HNSW is an approximate nearest-neighbor index. It searches a graph of vectors rather than scoring every eligible row.
+This investigation keeps the data and the predicate fixed. It compares an exact query, a limited HNSW scan, an iterative HNSW scan, and an authorized exact fallback. HNSW is an approximate nearest-neighbor index. It searches a graph of vectors rather than scoring every eligible row.
 
 ## First establish that matching data exists
 
@@ -56,7 +56,7 @@ The [pgvector filtering guide](https://github.com/pgvector/pgvector#filtering) e
 
 The test requires the limited scan to return fewer than five rows. If it does not, the fixture has not reproduced the claimed failure. Printing a configuration value without inspecting the actual plan would not establish which search path ran.
 
-## Give the scan more work without widening access
+## Check what more scan work actually returns
 
 The third path keeps the tenant predicate and turns on iterative scanning:
 
@@ -66,13 +66,39 @@ sqlx::query("SET LOCAL hnsw.iterative_scan = 'strict_order'")
     .await?;
 ```
 
-The fixture then inspects the plan again, requires the same HNSW index, and checks that five tenant-7 rows are returned. It also checks the returned IDs against the fixture's eligible range.
+The fixture then inspects the plan again, requires the same HNSW index, and verifies the active setting. It records the returned count and checks every returned ID against the eligible range. It does not equate enabling a setting with meeting the serving requirement.
 
 This comparison changes the search policy while preserving eligibility. It does not let the model see foreign candidates and ask it to discard them afterward. The [retrieval permissions guide](/blog/filter-before-retrieval-permissions-are-part-of-relevance) explains why filtering before model and reranker requests matters.
 
 The query runs on a SQLx transaction. The `SET LOCAL` values and the experiment's schema work are rolled back at the end. Avoid casually turning a local experiment into session-wide pool state.
 
-Iterative scanning still has work and memory limits. Getting five rows from this arrangement does not establish that the same settings will fill every result on a different corpus. Nor does `strict_order` mean the selected set is an exact nearest-neighbor answer. Ordering the candidates found and finding all of the true nearest candidates are different properties.
+Iterative scanning still has work and memory limits. An iterative scan can still finish with fewer eligible rows than the caller requested. The actual count must remain part of the decision. Nor does `strict_order` mean the selected set is an exact nearest-neighbor answer. Ordering the candidates found and finding all of the true nearest candidates are different properties.
+
+## Keep the completeness requirement explicit
+
+If this request requires five results and at least five eligible rows exist, a short approximate result is not a completed request. This fixture chooses an exact fallback for that case:
+
+```rust
+let fallback_sql =
+    "WITH authorized AS MATERIALIZED ( \
+       SELECT id, embedding FROM filtered_documents WHERE tenant_id = $1 \
+     ) \
+     SELECT id FROM authorized \
+     ORDER BY embedding OPERATOR(public.<=>) $2::public.vector, id LIMIT 5";
+let completed: Vec<i64> = if expanded.len() == 5 {
+    expanded.clone()
+} else {
+    sqlx::query_scalar(fallback_sql)
+        .bind(7_i64)
+        .bind("[1,0,0]")
+        .fetch_all(&mut *tx)
+        .await?
+};
+```
+
+The materialized relation contains only the authorized tenant's rows. The outer query computes exact distances over that relation, and the fixture inspects its plan to confirm the HNSW index is not supplying that ordering. The final assertion still requires five distinct eligible IDs.
+
+That policy has a cost. Materializing a large authorized set and sorting it can exceed the request budget. Use a fallback only when the eligible set and the available work budget make it appropriate, or return an explicit incomplete outcome. A conventional tenant index can help produce the authorized set; it does not make an unlimited exact sort cheap. The ten-row set here makes no production capacity claim.
 
 ## Compare the questions each path answers
 
@@ -80,7 +106,8 @@ Iterative scanning still has work and memory limits. Getting five rows from this
 | --- | --- | --- |
 | Exact search with the same tenant predicate | Plan, bound inputs, returned IDs | Five eligible results exist |
 | HNSW with iterative scanning off | Actual index plan and returned count | Limited approximate work can miss eligible results |
-| HNSW with iterative scanning on | Actual index plan and eligible IDs | More scan work fills the result for this fixture |
+| HNSW with iterative scanning on | Active settings, actual index plan, count, and eligible IDs | Whether more work met the request |
+| Authorized exact fallback | Materialized-set plan and distinct eligible IDs | The final response meets the five-result contract here |
 
 The lab checks pgvector 0.8.7 and SQLx 0.8.6 against the existing GitHub PostgreSQL service. It prints each result and plan. There is no claimed speedup, recall percentage, or latency target from these 1,010 rows.
 
@@ -100,6 +127,6 @@ If the search remains incomplete within the request budget, give the application
 
 ## The acceptance decision
 
-I would accept a proposed repair after seeing the same authorized query find its baseline results, the actual index plan reproduce the shortfall, and a bounded change improve completeness without returning another tenant's rows.
+I would accept a proposed repair after seeing the same authorized query find its baseline results, the actual index plan reproduce the shortfall, and an explicit serving policy produce the required result without returning another tenant's rows.
 
 That is more useful than accepting a larger limit because the demo looks better. Keep the data, authorization rule, query plan, and search-work settings together so the next investigation can explain what changed.

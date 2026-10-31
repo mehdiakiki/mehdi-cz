@@ -19,7 +19,7 @@ async fn filtered(connection: &mut PgConnection) -> Result<Vec<i64>, sqlx::Error
 }
 
 async fn plan(connection: &mut PgConnection) -> Result<String, sqlx::Error> {
-    let lines: Vec<String> = sqlx::query_scalar(&format!("EXPLAIN (COSTS OFF) {FILTERED}"))
+    let lines: Vec<String> = sqlx::query_scalar(&format!("EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) {FILTERED}"))
         .bind(7_i64)
         .bind("[1,0,0]")
         .fetch_all(connection)
@@ -115,9 +115,51 @@ async fn keep_the_tenant_filter_while_increasing_the_hnsw_search_work() -> Resul
     let expanded_plan = plan(&mut tx).await.unwrap();
     assert!(expanded_plan.contains("Index Scan using filtered_hnsw"), "{expanded_plan}");
     let expanded = filtered(&mut tx).await.unwrap();
-    assert_eq!(expanded.len(), 5);
     assert!(expanded.iter().all(|id| (1001..=1010).contains(id)));
-    println!("PGVECTOR {version}: exact={} IDs={exact:?}; HNSW off={} IDs={limited:?}; iterative={} IDs={expanded:?}\nexact plan:\n{exact_plan}\nHNSW plan:\n{approximate_plan}\niterative plan:\n{expanded_plan}", exact.len(), limited.len(), expanded.len());
+    let settings: (String, String, String, String) = sqlx::query_as(
+        "SELECT current_setting('hnsw.iterative_scan'), current_setting('hnsw.ef_search'), \
+         current_setting('hnsw.max_scan_tuples'), current_setting('work_mem')",
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    assert_eq!(settings.0, "strict_order");
+    assert_eq!(settings.1, "40");
+    sqlx::query("SET LOCAL enable_seqscan = on")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    // article:complete-filtered-result:start
+    let fallback_sql =
+        "WITH authorized AS MATERIALIZED ( \
+           SELECT id, embedding FROM filtered_documents WHERE tenant_id = $1 \
+         ) \
+         SELECT id FROM authorized \
+         ORDER BY embedding OPERATOR(public.<=>) $2::public.vector, id LIMIT 5";
+    let completed: Vec<i64> = if expanded.len() == 5 {
+        expanded.clone()
+    } else {
+        sqlx::query_scalar(fallback_sql)
+            .bind(7_i64)
+            .bind("[1,0,0]")
+            .fetch_all(&mut *tx)
+            .await?
+    };
+    // article:complete-filtered-result:end
+    assert_eq!(completed.len(), 5, "the serving requirement is unchanged");
+    assert!(completed.iter().all(|id| (1001..=1010).contains(id)));
+    assert_eq!(completed.iter().collect::<std::collections::HashSet<_>>().len(), 5);
+    let fallback_plan: Vec<String> = sqlx::query_scalar(&format!(
+        "EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) {fallback_sql}"
+    ))
+    .bind(7_i64)
+    .bind("[1,0,0]")
+    .fetch_all(&mut *tx)
+    .await?;
+    let fallback_plan = fallback_plan.join("\n");
+    assert!(fallback_plan.contains("CTE Scan on authorized"), "{fallback_plan}");
+    assert!(!fallback_plan.contains("Index Scan using filtered_hnsw"));
+    println!("PGVECTOR {version}: exact={} IDs={exact:?}; HNSW off={} IDs={limited:?}; iterative={} IDs={expanded:?}; completed={} IDs={completed:?}; iterative/ef/scan/work_mem={settings:?}\nexact plan:\n{exact_plan}\nHNSW plan:\n{approximate_plan}\niterative plan:\n{expanded_plan}\nfallback plan:\n{fallback_plan}", exact.len(), limited.len(), expanded.len(), completed.len());
     tx.rollback().await.unwrap();
     discard(pool, "backend_pgvector_filter").await;
     Ok(())

@@ -81,7 +81,11 @@ fn prepare_review(
         return Err("verification used a different requirement harness");
     }
     for required in ["build", "tests", "contract-fixtures"] {
-        let matching: Vec<_> = evidence.checks.iter().filter(|(name, _)| *name == required).collect();
+        let matching: Vec<_> = evidence
+            .checks
+            .iter()
+            .filter(|(name, _)| *name == required)
+            .collect();
         if matching.len() != 1 || matching[0].1 != CheckState::Passed {
             return Err("required verification is missing, ambiguous, or unsuccessful");
         }
@@ -93,15 +97,19 @@ fn prepare_review(
     if agent.proposal.len() > 32768 {
         return Err("proposal byte limit exceeded");
     }
-    let proposal: Proposal = serde_json::from_slice(agent.proposal).map_err(|_| "invalid proposal schema")?;
-    if proposal.summary.is_empty() || proposal.summary.len() > 2048 || proposal.findings.len() > 20 {
+    let proposal: Proposal =
+        serde_json::from_slice(agent.proposal).map_err(|_| "invalid proposal schema")?;
+    if proposal.summary.is_empty() || proposal.summary.len() > 2048 || proposal.findings.len() > 20
+    {
         return Err("proposal content limit exceeded");
     }
     for finding in &proposal.findings {
         let path = Path::new(&finding.file);
         if finding.file.is_empty()
             || finding.file.len() > 256
-            || !path.components().all(|part| matches!(part, Component::Normal(_)))
+            || !path
+                .components()
+                .all(|part| matches!(part, Component::Normal(_)))
             || finding.line == 0
             || finding.description.is_empty()
             || finding.description.len() > 512
@@ -116,12 +124,20 @@ fn passing() -> TrustedRun<'static> {
     TrustedRun {
         source_sha: CANDIDATE,
         harness_sha: HARNESS,
-        checks: vec![("build", CheckState::Passed), ("tests", CheckState::Passed), ("contract-fixtures", CheckState::Passed)],
+        checks: vec![
+            ("build", CheckState::Passed),
+            ("tests", CheckState::Passed),
+            ("contract-fixtures", CheckState::Passed),
+        ],
     }
 }
 
 fn agent(bytes: &[u8]) -> AgentRun<'_> {
-    AgentRun { exit_success: true, completed: true, proposal: bytes }
+    AgentRun {
+        exit_success: true,
+        completed: true,
+        proposal: bytes,
+    }
 }
 
 const EMPTY_REVIEW: &[u8] = br#"{"summary":"No findings in the supplied change.","findings":[]}"#;
@@ -201,9 +217,20 @@ fn a_valid_finding_is_still_advisory_data() {
 fn constructing_the_cli_command_does_not_spawn_a_shell_or_call_a_model() {
     let command = review_command("fixture-model-identity");
     assert_eq!(command.get_program(), "claude");
-    let args: Vec<_> = command.get_args().map(|value| value.to_str().unwrap()).collect();
-    assert!(args.windows(2).any(|pair| pair == ["--tools", "Read,Grep,Glob"]));
-    assert!(args.windows(2).any(|pair| pair == ["--disallowedTools", "mcp__*"]));
-    assert!(args.windows(2).any(|pair| pair == ["--model", "fixture-model-identity"]));
-    assert!(!args.iter().any(|value| *value == "Bash" || *value == "Edit"));
+    let args: Vec<_> = command
+        .get_args()
+        .map(|value| value.to_str().unwrap())
+        .collect();
+    assert!(args
+        .windows(2)
+        .any(|pair| pair == ["--tools", "Read,Grep,Glob"]));
+    assert!(args
+        .windows(2)
+        .any(|pair| pair == ["--disallowedTools", "mcp__*"]));
+    assert!(args
+        .windows(2)
+        .any(|pair| pair == ["--model", "fixture-model-identity"]));
+    assert!(!args
+        .iter()
+        .any(|value| *value == "Bash" || *value == "Edit"));
 }
