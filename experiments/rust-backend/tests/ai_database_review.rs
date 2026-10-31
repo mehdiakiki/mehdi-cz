@@ -168,6 +168,9 @@ async fn a_read_only_tool_needs_identity_time_and_output_boundaries() -> Result<
             sqlx::query_scalar::<_, i32>("SELECT 42").fetch_one(&reader).await?,
             42
         );
+        let after_failure: i64 = sqlx::query_scalar("SELECT count(*) FROM ai_tool_review.invoices")
+            .fetch_one(&reader).await?;
+        assert_eq!(after_failure, 0, "explicit rollback clears the failed call's identity");
         // Arrange cancellation after identity setup, while the transaction is open.
         let (entered, observed) = oneshot::channel();
         let interrupted_pool = reader.clone();
@@ -183,6 +186,9 @@ async fn a_read_only_tool_needs_identity_time_and_output_boundaries() -> Result<
         observed.await?;
         interrupted.abort();
         assert!(interrupted.await.unwrap_err().is_cancelled());
+        let after_abort: i64 = sqlx::query_scalar("SELECT count(*) FROM ai_tool_review.invoices")
+            .fetch_one(&reader).await?;
+        assert_eq!(after_abort, 0, "check cleanup before the next tool sets another tenant");
         let beta_after_abort = list_invoices(
             &reader,
             &Principal { tenant: "beta" },
