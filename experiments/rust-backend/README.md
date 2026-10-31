@@ -61,3 +61,18 @@ and publication controls.
 Selected observed outputs are saved in [results/observations.txt](results/observations.txt).
 The file links to the exact GitHub run and source revision. Virtual milliseconds
 in the middleware example are test-clock values, not performance measurements.
+
+## Filtered search and CI review evidence
+
+`tests/pgvector_filter.rs` builds a real HNSW index over 1,010 synthetic vectors.
+It checks the actual plans for exact, limited approximate, and iterative search
+under the same tenant predicate. Its result counts describe this constructed
+case, not a corpus relevance or capacity benchmark.
+
+`tests/agent_review_evidence.rs` checks the rules for preparing an advisory
+review packet from trusted-run stand-ins and synthetic proposals. It covers
+stale source identity, a changed requirement harness, missing or unsuccessful
+checks, unfinished agent runs, malformed or excessive output, and valid
+positive cases. Command construction is inspected without launching Claude.
+These tests do not authenticate a GitHub artifact, implement the vendor result
+adapter, or measure the quality of live AI reviews.

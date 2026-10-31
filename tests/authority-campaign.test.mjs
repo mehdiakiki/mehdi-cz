@@ -288,6 +288,8 @@ test("the repository maps every written campaign source without counting unrelat
       "pattern-shape-simd-search-performance-rust",
       "prompt-for-one-verifiable-change",
       "rag-rust-postgresql-model-context",
+      "sqlite-wal-growing-reader-checkpoint",
+      "pgvector-filtered-search-too-few-results",
       "reading-proc-self-maps-line-by-line",
       "recovery-code-must-survive-a-crash-too",
       "relocations-the-holes-the-compiler-leaves-for-the-linker",

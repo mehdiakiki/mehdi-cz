@@ -25,6 +25,28 @@ const cases = [
       { fence: 1, label: "embedding-publication" },
     ],
   },
+  {
+    article: "data/blog/sqlite-wal-growing-reader-checkpoint.mdx",
+    source: "experiments/sql-rust/postgres-sqlite/src/bin/sqlite_checkpoint.rs",
+    excerpts: [{ fence: 0, label: "passive-checkpoint" }],
+  },
+  {
+    article: "data/blog/pgvector-filtered-search-too-few-results.mdx",
+    source: "experiments/rust-backend/tests/pgvector_filter.rs",
+    excerpts: [
+      { fence: 0, label: "filtered-vector-definition" },
+      { fence: 1, label: "filtered-vector-query" },
+      { fence: 2, label: "iterative-vector-scan" },
+    ],
+  },
+  {
+    article: "data/blog/claude-code-ci-automation.mdx",
+    source: "experiments/rust-backend/tests/agent_review_evidence.rs",
+    excerpts: [
+      { fence: 0, label: "review-command" },
+      { fence: 1, label: "review-evidence" },
+    ],
+  },
 ];
 
 for (const entry of cases) {

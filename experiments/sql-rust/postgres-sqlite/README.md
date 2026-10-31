@@ -99,3 +99,13 @@ Per-article sources, prose counts, and claim limits are recorded in
 `docs/editorial/sql-rust-writer-a.json`. Keep actual run/commit evidence there
 or in the parent verification record; never replace a failed run with an
 assertion that the example was expected to pass.
+
+## A reader that limits checkpoint progress
+
+`sqlite_checkpoint` keeps an explicit read snapshot open while another
+connection commits counter updates. It checks a successful partial PASSIVE
+checkpoint, a blocked TRUNCATE, and the effect of lowering the automatic
+checkpoint threshold. After ending the snapshot it checks successful
+truncation, a zero-length WAL, and a fresh read of the committed value.
+The existing PostgreSQL/SQLite GitHub job compiles and runs the program.
+There is no throughput, power-loss, or production file-growth claim.

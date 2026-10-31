@@ -30,6 +30,8 @@ The first writing batch expands the connection-pool investigation and the existi
 
 The pool manuscript is a held working expansion for the existing pool-wait guide, `rust-request-waiting-for-pool-or-postgresql`. Reconcile it into that answer during review rather than publishing an overlapping page. Its new value is the quote revision contract, cancellation check, and deliberately gated progress comparison. The retrieval manuscript adds a Rust serving and publication contract to the existing conceptual retrieval guides; it does not claim a complete model integration or a relevance benchmark.
 
+The second batch keeps the existing SQLite writer and stale-snapshot explanation intact. A distinct checkpoint investigation follows the history retained by a long reader. A pgvector investigation compares exact and actual HNSW plans under the same tenant predicate. The existing Claude Code CI guide is revised around trusted source identity, independent requirement checks, bounded results, and publishing authority. The scope and primary sources are recorded in `ai-writing-second-batch-2026-10-31.json`.
+
 ### Subject priorities
 
 The first three themes receive the most attention. Keep the next thirty proposed articles rooted in established SQL databases and database internals. Every executable example in that series must be Rust, with SQL inside Rust query calls.
