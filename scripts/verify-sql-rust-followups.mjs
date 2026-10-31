@@ -17,6 +17,9 @@ const release = JSON.parse(
 const revisions = JSON.parse(
   await readFile("docs/editorial/ai-writing-release-2026-10-31.json", "utf8")
 );
+const referenceRevisions = JSON.parse(
+  await readFile("docs/editorial/rust-reference-release-2026-10-31.json", "utf8")
+);
 const posts = [];
 for (const article of manifest.articles) {
   const source = await readFile(article.path, "utf8");
@@ -27,7 +30,7 @@ for (const article of manifest.articles) {
   assert.equal(data.date, release.publish_at);
   assert.equal(data.reviewedHash, articleReviewHash(source), article.slug);
   const approved = release.articles.find((item) => item.slug === article.slug);
-  const updated = revisions.articles.find(
+  const updated = [...referenceRevisions.articles, ...revisions.articles].find(
     (item) => item.slug === article.slug && item.kind === "update"
   );
   assert.equal(data.reviewedHash, updated?.reviewedHash ?? approved?.reviewedHash, article.slug);
