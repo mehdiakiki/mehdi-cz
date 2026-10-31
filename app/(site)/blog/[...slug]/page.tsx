@@ -32,7 +32,10 @@ import agentGuides from "@/data/agent-guides.json";
 
 function markdownVersion(post: Blog) {
   const guide = agentGuides.guides.find((candidate) => candidate.slug === post.slug);
-  return guide && post.reviewed === true && isPostPublished(post) && post.reviewedHash === guide.reviewedHash
+  return guide &&
+    post.reviewed === true &&
+    isPostPublished(post) &&
+    post.reviewedHash === guide.reviewedHash
     ? `/blog/${post.slug}.md`
     : undefined;
 }

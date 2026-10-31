@@ -20,10 +20,14 @@ for (const guide of catalog.guides) {
 // file-serving path. Reading a generated file alone would miss routing errors.
 const port = "4187";
 const origin = `http://127.0.0.1:${port}`;
-const server = spawn(process.execPath, ["node_modules/next/dist/bin/next", "start", "--hostname", "127.0.0.1", "--port", port], {
-  stdio: ["ignore", "inherit", "inherit"],
-  env: { ...process.env, NODE_ENV: "production" },
-});
+const server = spawn(
+  process.execPath,
+  ["node_modules/next/dist/bin/next", "start", "--hostname", "127.0.0.1", "--port", port],
+  {
+    stdio: ["ignore", "inherit", "inherit"],
+    env: { ...process.env, NODE_ENV: "production" },
+  }
+);
 const get = (path) => fetch(origin + path, { signal: AbortSignal.timeout(20000) });
 try {
   let ready = false;
@@ -32,7 +36,9 @@ try {
     try {
       ready = (await get("/llms.txt")).ok;
       if (ready) break;
-    } catch { /* Wait for Next.js to bind its listener. */ }
+    } catch {
+      /* Wait for Next.js to bind its listener. */
+    }
     await delay(500);
   }
   assert.ok(ready, "The built server did not become ready");
@@ -57,10 +63,12 @@ try {
     assert.ok(body.includes(`href="${guide.paths.markdown}"`));
     assert.ok(body.includes("Markdown version"));
   }
-  for (const slug of ["missing-agent-guide", [...heldArticleSlugs][0]]) {
+  for (const slug of ["missing-agent-guide", "sql-sqlite-rust-local-database", ...heldArticleSlugs]) {
     assert.equal((await get(`/blog/${slug}.md`)).status, 404);
   }
-  console.log("Verified all three Markdown copies, HTML alternates, discovery files, headers, and unpublished/unknown 404s through the built server.");
+  console.log(
+    "Verified all three Markdown copies, HTML alternates, discovery files, headers, and unexported/unknown 404s through the built server."
+  );
 } finally {
   if (server.exitCode === null && server.signalCode === null) {
     const exited = once(server, "exit");

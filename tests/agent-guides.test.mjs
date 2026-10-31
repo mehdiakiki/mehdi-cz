@@ -9,9 +9,7 @@ import { guidePaths, reviewedGuide, guideIndex, llmsText } from "../lib/agent-gu
 
 const catalog = JSON.parse(readFileSync("data/agent-guides.json", "utf8"));
 const now = new Date("2026-11-01T00:00:00Z");
-const sources = catalog.guides.map((guide) =>
-  readFileSync(`data/blog/${guide.slug}.mdx`, "utf8")
-);
+const sources = catalog.guides.map((guide) => readFileSync(`data/blog/${guide.slug}.mdx`, "utf8"));
 
 test("the three exports preserve the complete reviewed bodies and Rust examples", () => {
   assert.equal(catalog.guides.length, 3);
@@ -49,22 +47,29 @@ test("preview mode cannot export drafts, held, scheduled, invalid, or unreviewed
     const guide = catalog.guides[0];
     const source = sources[0];
     for (const replacement of [
-      ['draft: false', 'draft: true'],
-      ['draft: false', 'draft: "false"'],
-      ['reviewed: true', 'reviewed: false'],
-      ['reviewed: true', 'reviewed: "true"'],
-      ['reviewed: true\n', ''],
+      ["draft: false", "draft: true"],
+      ["draft: false", 'draft: "false"'],
+      ["reviewed: true", "reviewed: false"],
+      ["reviewed: true", 'reviewed: "true"'],
+      ["reviewed: true\n", ""],
       ['date: "2026-10-30T10:02:25Z"', 'date: "2099-01-01T00:00:00Z"'],
       ['date: "2026-10-30T10:02:25Z"', 'date: "invalid"'],
     ]) {
       assert.ok(source.includes(replacement[0]));
       assert.equal(reviewedGuide(catalog, guide, source.replace(...replacement), now), null);
     }
-    const held = [...heldArticleSlugs][0];
-    assert.ok(held);
-    assert.equal(reviewedGuide(catalog, { ...guide, slug: held }, source, now), null);
+    const held = "held-agent-guide-fixture";
+    heldArticleSlugs.add(held);
+    try {
+      assert.equal(reviewedGuide(catalog, { ...guide, slug: held }, source, now), null);
+    } finally {
+      heldArticleSlugs.delete(held);
+    }
     assert.equal(reviewedGuide(catalog, guide, source + "\nChanged after review.\n", now), null);
-    assert.equal(reviewedGuide(catalog, { ...guide, reviewedHash: "0".repeat(64) }, source, now), null);
+    assert.equal(
+      reviewedGuide(catalog, { ...guide, reviewedHash: "0".repeat(64) }, source, now),
+      null
+    );
     assert.equal(guideIndex(catalog, []).guides.length, 0);
     assert.ok(!llmsText(catalog, []).includes(guidePaths(guide.slug).markdown));
   } finally {
@@ -74,7 +79,10 @@ test("preview mode cannot export drafts, held, scheduled, invalid, or unreviewed
 });
 
 test("the source reference must be refreshed even when only release metadata changes", () => {
-  const changed = sources[0].replace('lastmod: "2026-10-31T19:37:31Z"', 'lastmod: "2026-10-31T20:00:00Z"');
+  const changed = sources[0].replace(
+    'lastmod: "2026-10-31T19:37:31Z"',
+    'lastmod: "2026-10-31T20:00:00Z"'
+  );
   assert.notEqual(changed, sources[0]);
   assert.throws(() => reviewedGuide(catalog, catalog.guides[0], changed, now), /immutable source/);
 });
