@@ -263,6 +263,10 @@ export default async function Page({ params }: { params: Promise<{ slug: string[
             <a href={markdownVersion(post)} className="underline underline-offset-4">
               Markdown version
             </a>
+            {" · "}
+            <Link href="/rust/guides" className="underline underline-offset-4">
+              More Rust database questions
+            </Link>
           </p>
         )}
         <MDXLayoutRenderer code={post.body.code} components={components} toc={post.toc} />

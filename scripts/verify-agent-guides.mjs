@@ -12,7 +12,7 @@ const expected = [];
 for (const guide of catalog.guides) {
   const source = await readFile(`data/blog/${guide.slug}.mdx`, "utf8");
   const result = reviewedGuide(catalog, guide, source);
-  assert.ok(result, `Review or remove the ineligible pilot entry ${guide.slug}`);
+  assert.ok(result, `Review or remove the ineligible guide entry ${guide.slug}`);
   expected.push(result);
 }
 
@@ -49,7 +49,24 @@ try {
   assert.equal(index.status, 200);
   assert.match(index.headers.get("content-type"), /application\/json/);
   assert.deepEqual(await index.json(), guideIndex(catalog, expected));
+  const directory = await get("/rust/guides");
+  assert.equal(directory.status, 200);
+  const directoryBody = await directory.text();
+  assert.ok(
+    directoryBody.includes(`rel="canonical" href="${catalog.siteUrl}/rust/guides"`)
+  );
+  const escaped = (value) => value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#x27;");
   for (const guide of expected) {
+    assert.ok(directoryBody.includes(`id="${guide.entry.slug}"`));
+    assert.ok(directoryBody.includes(escaped(guide.entry.question)));
+    assert.ok(directoryBody.includes(escaped(guide.entry.limitations[0])));
+    assert.ok(directoryBody.includes(`href="${guide.paths.html}"`));
+    assert.ok(directoryBody.includes(`href="${guide.paths.markdown}"`));
     const markdown = await get(guide.paths.markdown);
     assert.equal(markdown.status, 200);
     assert.match(markdown.headers.get("content-type"), /text\/markdown/);
@@ -62,7 +79,11 @@ try {
     assert.ok(body.includes(`type="text/markdown" href="${guide.entry.markdownUrl}"`));
     assert.ok(body.includes(`href="${guide.paths.markdown}"`));
     assert.ok(body.includes("Markdown version"));
+    assert.ok(body.includes('href="/rust/guides"'));
   }
+  const sitemap = await get("/sitemap.xml");
+  assert.equal(sitemap.status, 200);
+  assert.ok((await sitemap.text()).includes(`${catalog.siteUrl}/rust/guides`));
   for (const slug of [
     "missing-agent-guide",
     "sql-sqlite-rust-local-database",
@@ -71,7 +92,7 @@ try {
     assert.equal((await get(`/blog/${slug}.md`)).status, 404);
   }
   console.log(
-    "Verified all three Markdown copies, HTML alternates, discovery files, headers, and unexported/unknown 404s through the built server."
+    `Verified ${expected.length} Markdown copies, the question index, HTML alternates, sitemap, headers, and unexported/unknown 404s through the built server.`
   );
 } finally {
   if (server.exitCode === null && server.signalCode === null) {
