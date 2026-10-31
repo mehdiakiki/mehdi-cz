@@ -2,8 +2,7 @@ use rust_backend_labs::{database, discard};
 use sqlx::PgConnection;
 
 // article:filtered-vector-definition:start
-const FILTERED: &str =
-    "SELECT id FROM filtered_documents WHERE tenant_id = $1 \
+const FILTERED: &str = "SELECT id FROM filtered_documents WHERE tenant_id = $1 \
      ORDER BY embedding OPERATOR(public.<=>) $2::public.vector LIMIT 5";
 // article:filtered-vector-definition:end
 
@@ -19,11 +18,13 @@ async fn filtered(connection: &mut PgConnection) -> Result<Vec<i64>, sqlx::Error
 }
 
 async fn plan(connection: &mut PgConnection) -> Result<String, sqlx::Error> {
-    let lines: Vec<String> = sqlx::query_scalar(&format!("EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) {FILTERED}"))
-        .bind(7_i64)
-        .bind("[1,0,0]")
-        .fetch_all(connection)
-        .await?;
+    let lines: Vec<String> = sqlx::query_scalar(&format!(
+        "EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) {FILTERED}"
+    ))
+    .bind(7_i64)
+    .bind("[1,0,0]")
+    .fetch_all(connection)
+    .await?;
     Ok(lines.join("\n"))
 }
 
@@ -39,10 +40,11 @@ async fn keep_the_tenant_filter_while_increasing_the_hnsw_search_work() -> Resul
         .execute(&mut *tx)
         .await
         .unwrap();
-    let version: String = sqlx::query_scalar("SELECT extversion FROM pg_extension WHERE extname = 'vector'")
-        .fetch_one(&mut *tx)
-        .await
-        .unwrap();
+    let version: String =
+        sqlx::query_scalar("SELECT extversion FROM pg_extension WHERE extname = 'vector'")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
     assert_eq!(version, "0.8.7");
     sqlx::query(
         "CREATE TABLE filtered_documents \
@@ -103,9 +105,15 @@ async fn keep_the_tenant_filter_while_increasing_the_hnsw_search_work() -> Resul
         .await
         .unwrap();
     let approximate_plan = plan(&mut tx).await.unwrap();
-    assert!(approximate_plan.contains("Index Scan using filtered_hnsw"), "{approximate_plan}");
+    assert!(
+        approximate_plan.contains("Index Scan using filtered_hnsw"),
+        "{approximate_plan}"
+    );
     let limited = filtered(&mut tx).await.unwrap();
-    assert!(limited.len() < 5, "fixture must expose missing authorized results: {limited:?}");
+    assert!(
+        limited.len() < 5,
+        "fixture must expose missing authorized results: {limited:?}"
+    );
 
     // article:iterative-vector-scan:start
     sqlx::query("SET LOCAL hnsw.iterative_scan = 'strict_order'")
@@ -113,7 +121,10 @@ async fn keep_the_tenant_filter_while_increasing_the_hnsw_search_work() -> Resul
         .await?;
     // article:iterative-vector-scan:end
     let expanded_plan = plan(&mut tx).await.unwrap();
-    assert!(expanded_plan.contains("Index Scan using filtered_hnsw"), "{expanded_plan}");
+    assert!(
+        expanded_plan.contains("Index Scan using filtered_hnsw"),
+        "{expanded_plan}"
+    );
     let expanded = filtered(&mut tx).await.unwrap();
     assert!(expanded.iter().all(|id| (1001..=1010).contains(id)));
     let settings: (String, String, String, String) = sqlx::query_as(
@@ -130,25 +141,36 @@ async fn keep_the_tenant_filter_while_increasing_the_hnsw_search_work() -> Resul
         .await
         .unwrap();
     // article:complete-filtered-result:start
-    let fallback_sql =
-        "WITH authorized AS MATERIALIZED ( \
+    let fallback_sql = "WITH authorized AS MATERIALIZED ( \
            SELECT id, embedding FROM filtered_documents WHERE tenant_id = $1 \
          ) \
          SELECT id FROM authorized \
          ORDER BY embedding OPERATOR(public.<=>) $2::public.vector, id LIMIT 5";
-    let completed: Vec<i64> = if expanded.len() == 5 {
-        expanded.clone()
-    } else {
-        sqlx::query_scalar(fallback_sql)
-            .bind(7_i64)
-            .bind("[1,0,0]")
-            .fetch_all(&mut *tx)
-            .await?
-    };
+    let mut completions = Vec::new();
+    for candidates in [&expanded, &limited] {
+        let completed: Vec<i64> = if candidates.len() == 5 {
+            candidates.to_vec()
+        } else {
+            sqlx::query_scalar(fallback_sql)
+                .bind(7_i64)
+                .bind("[1,0,0]")
+                .fetch_all(&mut *tx)
+                .await?
+        };
+        completions.push(completed);
+    }
     // article:complete-filtered-result:end
-    assert_eq!(completed.len(), 5, "the serving requirement is unchanged");
-    assert!(completed.iter().all(|id| (1001..=1010).contains(id)));
-    assert_eq!(completed.iter().collect::<std::collections::HashSet<_>>().len(), 5);
+    for completed in &completions {
+        assert_eq!(completed.len(), 5, "the serving requirement is unchanged");
+        assert!(completed.iter().all(|id| (1001..=1010).contains(id)));
+        assert_eq!(
+            completed
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            5
+        );
+    }
     let fallback_plan: Vec<String> = sqlx::query_scalar(&format!(
         "EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) {fallback_sql}"
     ))
@@ -157,9 +179,12 @@ async fn keep_the_tenant_filter_while_increasing_the_hnsw_search_work() -> Resul
     .fetch_all(&mut *tx)
     .await?;
     let fallback_plan = fallback_plan.join("\n");
-    assert!(fallback_plan.contains("CTE Scan on authorized"), "{fallback_plan}");
+    assert!(
+        fallback_plan.contains("CTE Scan on authorized"),
+        "{fallback_plan}"
+    );
     assert!(!fallback_plan.contains("Index Scan using filtered_hnsw"));
-    println!("PGVECTOR {version}: exact={} IDs={exact:?}; HNSW off={} IDs={limited:?}; iterative={} IDs={expanded:?}; completed={} IDs={completed:?}; iterative/ef/scan/work_mem={settings:?}\nexact plan:\n{exact_plan}\nHNSW plan:\n{approximate_plan}\niterative plan:\n{expanded_plan}\nfallback plan:\n{fallback_plan}", exact.len(), limited.len(), expanded.len(), completed.len());
+    println!("PGVECTOR {version}: exact={} IDs={exact:?}; HNSW off={} IDs={limited:?}; iterative={} IDs={expanded:?}; completed cases={completions:?}; iterative/ef/scan/work_mem={settings:?}\nexact plan:\n{exact_plan}\nHNSW plan:\n{approximate_plan}\niterative plan:\n{expanded_plan}\nfallback plan:\n{fallback_plan}", exact.len(), limited.len(), expanded.len());
     tx.rollback().await.unwrap();
     discard(pool, "backend_pgvector_filter").await;
     Ok(())
