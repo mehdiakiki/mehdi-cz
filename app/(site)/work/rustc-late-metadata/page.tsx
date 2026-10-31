@@ -4,7 +4,9 @@ import { genPageMetadata } from "app/seo";
 export const metadata = genPageMetadata({
   title: "Changing What Goes Inside a Rust rlib",
   description:
-    "Four merged rustc pull requests that add a link-time metadata member to rlib archives, replace a filename heuristic, and move link-only data out of crate metadata.",
+    "Five merged Rust compiler changes, explained step by step: what an rlib contains, why link-time metadata belongs separately, and what review changed.",
+  alternates: { canonical: "/work/rustc-late-metadata" },
+  authors: [{ name: "Mehdi Akiki", url: "https://www.mehdi.cz" }],
 });
 
 const pullRequests = [
@@ -38,10 +40,10 @@ const pullRequests = [
   },
   {
     number: 161698,
-    state: "Open, waiting on author",
+    state: "Merged October 17, 2026",
     title: "Fix rmeta-link metadata not being read on AIX",
     detail:
-      "On XCOFF the payload is written to a different section than on other formats, and the reader did not account for it. Review asked for the target's AIX flag instead of parsing the file, and one change remains before it can merge. It is not tested on AIX: CI has no AIX runner and I do not have access to a machine.",
+      "Passes the existing AIX target flag to the shared reader, so it uses the XCOFF metadata reader on the paths that need it. The change merged, but I did not run it on AIX hardware and the PR reported no AIX CI runner.",
   },
 ];
 
@@ -50,7 +52,7 @@ export default function RustcLateMetadataCaseStudy() {
     <CaseStudyLayout
       eyebrow="Upstream work · rust-lang/rust"
       title="Changing what goes inside a Rust rlib"
-      summary="A Rust library is an archive that the compiler reads at two different times: early, to compile the crates that depend on it, and late, when it links the final binary. Some facts were only needed at link time but lived in the early metadata, and some were guessed from file names. I worked on a series of compiler changes that move them into a new archive member that only the linking code reads."
+      summary="Building a Rust program has two different jobs: understand the code, then join the compiled pieces into a program. A Rust library stores information for both. I worked on five merged compiler changes that put link-time details in their own part of the library, replace a guess based on file names, and fix a reader that handled AIX differently."
       links={[
         {
           label: "Tracking issue #138243",
@@ -62,6 +64,56 @@ export default function RustcLateMetadataCaseStudy() {
         },
       ]}
     >
+      <p className="text-sm text-gray-500 dark:text-gray-400">
+        By Mehdi Akiki. Pull request status checked October 31, 2026.
+      </p>
+      <h2>First, what is an rlib?</h2>
+      <p>
+        An <code>rlib</code> is a Rust library file. Think of it as a box containing smaller files.
+        The compiler needs some of those files to understand a library&apos;s types and functions.
+        Later, it needs others to build the final executable.
+      </p>
+      <p>
+        The second step is called <strong>linking</strong>: joining compiled code and its
+        dependencies into the result you run. The linker does not need every fact that helped the
+        compiler check your Rust code. The compiler does not need every link-time detail while
+        checking the next crate.
+      </p>
+      <p>
+        My changes make that boundary clearer. They do not change how you write a function or add a
+        new Rust language feature.
+      </p>
+
+      <div className="not-prose my-8 overflow-x-auto">
+        <table className="w-full border-collapse text-left text-sm leading-6">
+          <caption className="mb-3 text-left font-semibold">A simplified view of a Rust library</caption>
+          <thead>
+            <tr className="border-b border-gray-300 dark:border-gray-700">
+              <th className="p-3">Part of the archive</th>
+              <th className="p-3">What it tells the compiler</th>
+              <th className="p-3">When it is needed</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr className="border-b border-gray-200 dark:border-gray-800">
+              <td className="p-3"><code>lib.rmeta</code></td>
+              <td className="p-3">Information about the crate&apos;s Rust code</td>
+              <td className="p-3">While compiling code that uses the crate</td>
+            </tr>
+            <tr className="border-b border-gray-200 dark:border-gray-800">
+              <td className="p-3"><code>lib.rmeta-link</code></td>
+              <td className="p-3">Which objects came from Rust, and link-only library filenames</td>
+              <td className="p-3">While linking</td>
+            </tr>
+            <tr>
+              <td className="p-3">Object files and bundled native libraries</td>
+              <td className="p-3">The compiled code that will be joined together</td>
+              <td className="p-3">While linking</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
       <h2>How I came to this</h2>
       <p>
         I came to this work by reading the current compiler code: how rustc writes an rlib, reads it
@@ -88,6 +140,56 @@ export default function RustcLateMetadataCaseStudy() {
       <p>
         The tracking issue, opened by Vadim Petrochenkov, proposed one more metadata member for
         rlibs: link-time facts, read only when rustc links the rlib into something.
+      </p>
+
+      <h2>Why a filename was not enough</h2>
+      <p>
+        A filename is a label, not proof of where the code came from. Rust-generated object files
+        used a particular ending, <code>.rcgu.o</code>. A bundled native library could also contain
+        a file with that ending.
+      </p>
+      <p>
+        The first change records the Rust object members explicitly in <code>lib.rmeta-link</code>.
+        Code doing link-time optimization can read that list instead of guessing. Link-time
+        optimization, or LTO, lets the compiler optimize across compiled pieces before it finishes
+        the program.
+      </p>
+      <p>
+        In plain terms, the archive now carries a list written by the component that knows which
+        objects it produced. The reader uses that list. The old filename check was removed in{" "}
+        <a href="https://github.com/rust-lang/rust/pull/154861">the merged change</a>.
+      </p>
+
+      <h2>Moving the information also meant moving its reader</h2>
+      <p>
+        A later change moved the filenames of bundled native libraries out of the ordinary crate
+        metadata. A native library here is compiled code from outside Rust, such as a C library.
+        Rust still needs to know about these libraries. The change moves the filenames needed for
+        linking; it does not remove all native-library information from crate metadata.
+      </p>
+      <p>
+        Putting the field in a new file would not help much if the early metadata loader immediately
+        read it back. Review asked for the field to leave that loader entirely. The linking code
+        reads it when needed. The filename list follows the order of the native-library list,
+        because a library name alone is not a reliable key.
+      </p>
+      <p>
+        Those decisions are visible in the reviews of{" "}
+        <a href="https://github.com/rust-lang/rust/pull/156735#discussion_r3265352732">when to read the data</a>{" "}
+        and <a href="https://github.com/rust-lang/rust/pull/156735#discussion_r3265394249">how to identify each library</a>.
+      </p>
+
+      <h2>A cache with a small lifetime</h2>
+      <p>
+        The same library can be inspected more than once during linking. Reading and decoding its
+        link-time metadata each time repeats work. <code>RmetaLinkCache</code> keeps the decoded
+        result, keyed by the rlib path, for that link operation.
+      </p>
+      <p>
+        It is not a persistent build cache shared by future builds. That short lifetime matters:
+        a later build must read its own inputs. The cache became{" "}
+        <a href="https://github.com/rust-lang/rust/pull/158194">a separate pull request</a> while
+        the filename move was under review.
       </p>
 
       <h2>How far down it went</h2>
@@ -166,8 +268,22 @@ export default function RustcLateMetadataCaseStudy() {
         was now partially implemented.
       </p>
       <p>
-        Not everything in the tracking issue is done. Bundling object files into the rlib for
-        link-time <code>cfg</code> has not started, and the AIX read path is still open.
+        The AIX follow-up merged on October 17, 2026. AIX uses the XCOFF object format. An archive
+        member is a file inside the archive; a section is a region inside that file. Finding the
+        right archive member is only the first step. The reader also has to find the metadata
+        inside it in the way that format expects.
+      </p>
+      <p>
+        The merged fix passes the existing <code>is_like_aix</code> target flag through the shared
+        reader and the LTO paths. This reuses information the compiler already knows. It also removes
+        a separate AIX path that had duplicated part of the reading logic. The{" "}
+        <a href="https://github.com/rust-lang/rust/pull/161698#discussion_r3935089872">review</a>{" "}
+        and <a href="https://github.com/rust-lang/rust/pull/161698/files">merged diff</a> show that choice.
+      </p>
+      <p>
+        I did not test the change on AIX hardware. The pull request reported that its CI had no AIX
+        runner. A merged change and a successful run on that target are different pieces of
+        information, so I keep that limit explicit.
       </p>
 
       <h2>Review</h2>
@@ -177,10 +293,21 @@ export default function RustcLateMetadataCaseStudy() {
         everything on this page is in the pull requests and their review threads.
       </p>
 
-      <h2>What is next</h2>
+      <h2>What this work establishes</h2>
       <p>
-        A longer technical write-up is planned: the archive layout before and after, why the
-        filename heuristic existed, and how each review comment changed the design.
+        Five changes merged: an explicit object list, link-only filenames, a per-link cache, a
+        cleanup of unused work, and the AIX reader follow-up. The tracking issue covers a wider
+        design; these changes do not complete every item in it.
+      </p>
+      <p>
+        I do not claim a general build-time speedup from moving a field. Review included performance
+        regressions and changes to avoid repeated work. Any performance claim needs its benchmark,
+        compiler revisions, workload, and measurement conditions beside it.
+      </p>
+      <p>
+        The useful design lesson is concrete: record a fact where it is known, read it where it is
+        needed, and check every reader when the format changes. That applies to an rlib, a generated
+        file, or an application cache.
       </p>
     </CaseStudyLayout>
   );

@@ -30,7 +30,7 @@ export const deepWork: WorkItem[] = [
   {
     id: "rustc-late-metadata",
     title: "Changing what goes inside a Rust rlib",
-    context: "rust-lang/rust · 4 merged pull requests, 1 open",
+    context: "rust-lang/rust · 5 merged pull requests",
     problem:
       "rustc decided which rlib archive members were Rust object files from their names, which a bundled native library can imitate, and link-only data such as bundled native library filenames was stored with the early crate metadata.",
     depth:

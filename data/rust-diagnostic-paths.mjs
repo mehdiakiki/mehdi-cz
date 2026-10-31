@@ -5,7 +5,7 @@ export const rustDiagnosticPaths = [
     slug: "request-stops-progressing",
     title: "A request stops making progress",
     firstCheck:
-      "Separate waiting for a task, waiting for a connection, and waiting inside the database.",
+      "Check whether the request is waiting for Rust work, a free connection, or PostgreSQL.",
     caseIds: ["RFA-014", "RFA-036"],
     articleSlugs: [
       "rust-request-waiting-for-pool-or-postgresql",
@@ -18,7 +18,7 @@ export const rustDiagnosticPaths = [
   {
     slug: "timeout-and-unknown-outcomes",
     title: "The request timed out. Did its work stop?",
-    firstCheck: "Check the remote operation before deciding whether a retry can repeat its effect.",
+    firstCheck: "Find out whether the database is still working before you retry the request.",
     caseIds: ["RFA-012", "RFA-013"],
     articleSlugs: [
       "rust-timeout-does-not-stop-postgresql-query",
@@ -32,7 +32,7 @@ export const rustDiagnosticPaths = [
     slug: "memory-and-slow-consumers",
     title: "Memory grows while a consumer is slow",
     firstCheck:
-      "Count payload held by producers and consumers, then distinguish live data from retained capacity.",
+      "Follow data through the tasks and queues. Check which of them still holds it.",
     caseIds: ["RFA-011", "RFA-207"],
     articleSlugs: [
       "bounded-rust-channel-database-producer-memory",
