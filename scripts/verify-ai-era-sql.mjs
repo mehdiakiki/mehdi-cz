@@ -8,6 +8,9 @@ assert.equal(process.env.GITHUB_ACTIONS, "true", "Use the existing GitHub workfl
 const manifest = JSON.parse(
   await readFile("docs/editorial/ai-era-sql-2026-10-31/manifest.json", "utf8")
 );
+const review = JSON.parse(await readFile(manifest.review_record, "utf8"));
+assert.equal(review.independent_review_claimed, false);
+assert.equal(review.articles.length, manifest.articles.length);
 
 // Ignore Rust formatting outside literals. Preserve SQL and other string bytes.
 function tokens(code) {
@@ -17,7 +20,15 @@ function tokens(code) {
 }
 
 for (const article of manifest.articles) {
-  const { data, content } = matter(await readFile(article.path, "utf8"));
+  const source = await readFile(article.path, "utf8");
+  const { data, content } = matter(source);
+  const reviewed = review.articles.find((item) => item.slug === article.slug);
+  assert.ok(reviewed, `${article.slug}: missing editorial record`);
+  assert.equal(
+    createHash("sha256").update(source).digest("hex"),
+    reviewed.source_sha256,
+    `${article.slug}: editorial record does not cover this exact manuscript`
+  );
   assert.equal(data.title, article.title);
   assert.equal(data.draft, true, article.slug);
   assert.equal(data.reviewed, false, article.slug);

@@ -37,12 +37,14 @@ requires those snippets to match the compiled fixture code. Keep the markers
 when editing the lab or updating the manuscripts.
 
 The October 31 manuscripts add `tests/ai_database_review.rs`. It checks a
-type-compatible migration blocked by an open reader, a restricted database tool
-with two tenants and bounded results, and filtered HNSW output against an exact
-authorized reference. It runs in the existing PostgreSQL job with the rest of
+migration lock queue, a restricted database tool after success, failure and
+task interruption, filtered HNSW output against an exact authorized reference,
+and a stored approved intent compared with fresh attempt keys. It runs in the
+existing PostgreSQL job with the rest of
 the backend tests. The tool test uses synthetic host principals, not production
 authentication. The vector test uses synthetic coordinates, not an embedding
-model. See `docs/editorial/ai-era-sql-2026-10-31/manifest.json` for the manuscript
+model. Reopening the intent pool is a connection-lifecycle check, not a process
+or operating-system crash test. See `docs/editorial/ai-era-sql-2026-10-31/manifest.json` for the manuscript
 and excerpt map.
 
 Selected observed outputs are saved in [results/observations.txt](results/observations.txt).

@@ -27,21 +27,38 @@ The three revision copies stay here until reviewed. Their public counterparts
 retain their reviewed source and release records. The new blog manuscripts use
 `draft: true`, `reviewed: false`, and Mehdi Akiki's sole-author metadata.
 
+## Editorial pass after the first CI run
+
+The next pass found five claims or checks that needed more precision. The
+[review record](review.json) describes each correction and fingerprints the exact
+manuscripts it covers. It records a source and evidence pass by the current
+assistant. It does not claim an independent reviewer or author release approval.
+
+The revisions now separate a transaction from a stable comparison snapshot,
+observe later reads queued behind waiting DDL, inspect tenant state after a
+failed or aborted transaction, and compare retry identity choices with a negative
+control. The request article also makes the stale-input check atomic with its
+write; a separate validation query could race again.
+
 ## Evidence and review
 
 The [manifest](manifest.json) maps manuscripts to exact Rust excerpts and records
 the public source revision each proposed edit starts from. Existing experiments
 cover connection ownership, request waits, lost replies and metadata drift.
 The new [database review fixture](../../../experiments/rust-backend/tests/ai_database_review.rs)
-adds three controlled checks:
+now contains four controlled checks:
 
-- Observe the exact reader blocking an additive migration, require SQLSTATE
-  `55P03`, then verify the bounded migration succeeds after the reader releases.
+- Observe the old reader blocking an additive migration and the waiting
+  migration blocking a later read. Require SQLSTATE `55P03`, verify the later
+  read recovers before the original reader ends, then retry the migration.
 - Use a restricted login, colliding invoice IDs and one reused connection to
   check tenant isolation, denied writes, bounded output, statement cancellation
-  and recovery after rollback.
-- Require an HNSW index scan, compare filtered output with an exact authorized
-  reference, then inspect the result after enabling iterative search.
+  and recovery after rollback or a task aborted after identity setup.
+- Require sequential and HNSW plans with the same bound tenant and an explicitly
+  checked Repeatable Read transaction, then compare their results.
+- Arrange overlapping calls for one stored approved intent. Compare the single
+  receipt and effect with two fresh attempt keys, then retry through a new pool
+  and reject a foreign intent or a changed approved amount.
 
 These are database and policy experiments. They do not compare live models or
 measure production capacity. The MCP example covers the data operation, not the
