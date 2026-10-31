@@ -63,7 +63,11 @@ try {
     assert.ok(body.includes(`href="${guide.paths.markdown}"`));
     assert.ok(body.includes("Markdown version"));
   }
-  for (const slug of ["missing-agent-guide", "sql-sqlite-rust-local-database", ...heldArticleSlugs]) {
+  for (const slug of [
+    "missing-agent-guide",
+    "sql-sqlite-rust-local-database",
+    ...heldArticleSlugs,
+  ]) {
     assert.equal((await get(`/blog/${slug}.md`)).status, 404);
   }
   console.log(
