@@ -1,7 +1,9 @@
 # Rust and AI articles for readers who use AI to write code
 
-Prepared October 31, 2026. These are manuscripts for author review. They have no
-publication date or review approval. Article dates are creation metadata.
+Prepared October 31, 2026. The author requested the final editorial pass, marking
+and publication. The [release record](release.json) applies three reviewed
+revisions and releases the two new articles one per day at 18:00 UTC, on October
+31 and November 1. The existing approved calendars are unchanged.
 
 The reader can ask an AI assistant to implement a query, handler or retry loop.
 Help that reader choose the required behavior, investigate a plausible patch,
@@ -23,16 +25,18 @@ diagnosis share the same existing canonical article.
 | [Read-only MCP tool](../../../data/blog/read-only-postgresql-mcp-tool-limits.mdx)             | New draft         | Bound identity, privileges, time and returned text at the database operation |
 | [Filtered pgvector search](../../../data/blog/pgvector-fewer-results-after-tenant-filter.mdx) | New draft         | Compare an approximate repair with an authorized exact reference             |
 
-The three revision copies stay here until reviewed. Their public counterparts
-retain their reviewed source and release records. The new blog manuscripts use
-`draft: true`, `reviewed: false`, and Mehdi Akiki's sole-author metadata.
+The three revision copies stay here as review snapshots. Their bodies match the
+public editions. The original publication dates are retained and `lastmod`
+records the update. The new articles have explicit review hashes and publication
+timestamps. All bylines and structured author data credit Mehdi Akiki alone.
 
 ## Editorial pass after the first CI run
 
 The next pass found five claims or checks that needed more precision. The
 [review record](review.json) describes each correction and fingerprints the exact
 manuscripts it covers. It records a source and evidence pass by the current
-assistant. It does not claim an independent reviewer or author release approval.
+assistant. It does not claim an independent reviewer. The later author request
+to complete and publish the work is recorded in the release record.
 
 The revisions now separate a transaction from a stable comparison snapshot,
 observe later reads queued behind waiting DDL, inspect tenant state after a
@@ -66,9 +70,11 @@ complete protocol transport. Synthetic vectors isolate index behavior; they do
 not establish semantic retrieval quality.
 
 The existing Content safety workflow runs the Rust tests, checks excerpts,
-builds the site, and retains private HTML review copies. No workload runs on the
-workstation. CI evidence and any formatting changes are recorded after the run.
-Code execution does not establish editorial approval or independent review.
+builds the site, checks publication boundaries and public discovery paths, and
+retains HTML review copies. No workload runs on the workstation. The original
+release records remain intact; revised editions explicitly bind their prior
+review hash to the new approved hash. Code execution does not establish an
+independent editorial review.
 
 During review, check that each addition changes a reader's decision and that the
 evidence supports that decision. Keep the natural voice of the existing article.
@@ -91,3 +97,7 @@ Traffic potential remains an editorial hypothesis. Compare search clicks after
 equally aged windows and keep the existing daily traffic metric for the site's
 1,000-per-day milestone. Publication still follows the established review and
 calendar process.
+
+The [reader growth follow-up](reader-growth.md) records the released cohort,
+measurement definitions and the next SQL investigations. It contains no claimed
+search-volume estimate or traffic improvement.

@@ -73,8 +73,8 @@ test("series retain their reading order while omitting future and unapproved par
 
 test("all approved editorial articles have one reader series with the expected batch sizes", () => {
   const slugs = editorialSeries.flatMap((series) => series.parts);
-  assert.equal(slugs.length, 123);
-  assert.equal(new Set(slugs).size, 123);
+  assert.equal(slugs.length, 125);
+  assert.equal(new Set(slugs).size, 125);
   assert.ok(
     editorialSeries
       .filter(
@@ -86,9 +86,14 @@ test("all approved editorial articles have one reader series with the expected b
             "rust-database-recovery",
             "rust-database-boundaries",
             "rust-service-runtime",
+            "rust-ai-tool-boundaries",
           ].includes(series.slug)
       )
       .every((series) => series.parts.length === 10)
+  );
+  assert.equal(
+    editorialSeries.find((series) => series.slug === "rust-ai-tool-boundaries").parts.length,
+    12
   );
   assert.equal(
     editorialSeries.find((series) => series.slug === "rust-database-boundaries").parts.length,
