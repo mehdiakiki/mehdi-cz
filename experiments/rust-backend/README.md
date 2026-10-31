@@ -36,6 +36,15 @@ Article snippets are extracted from marked source regions. The content check
 requires those snippets to match the compiled fixture code. Keep the markers
 when editing the lab or updating the manuscripts.
 
+The October 31 manuscripts add `tests/ai_database_review.rs`. It checks a
+type-compatible migration blocked by an open reader, a restricted database tool
+with two tenants and bounded results, and filtered HNSW output against an exact
+authorized reference. It runs in the existing PostgreSQL job with the rest of
+the backend tests. The tool test uses synthetic host principals, not production
+authentication. The vector test uses synthetic coordinates, not an embedding
+model. See `docs/editorial/ai-era-sql-2026-10-31/manifest.json` for the manuscript
+and excerpt map.
+
 Selected observed outputs are saved in [results/observations.txt](results/observations.txt).
 The file links to the exact GitHub run and source revision. Virtual milliseconds
 in the middleware example are test-clock values, not performance measurements.

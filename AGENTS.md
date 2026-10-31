@@ -29,6 +29,7 @@ This block is written and re-added by `next dev` — verify at `node_modules/nex
 - Write for human readers. Help a person understand a problem, make a decision, or fix something. Preserve the author's voice and judgment, with natural variation in structure and length.
 - Use plain, accurate titles. Avoid keyword stuffing, filler, repetitive article templates, and splitting one useful answer into several thin pages.
 - Ground personal observations in the author's actual experience. Use clearly described reproductions or hypothetical examples when there is no personal account.
+- Assume readers can use AI to write and revise code. Give articles value through explicit requirements, competing explanations, counterexamples, observed evidence, and the tradeoffs of a repair. Treat AI suggestions as proposals to investigate; avoid unsupported claims about what AI can or cannot do.
 - Prioritize Rust debugging across application and database boundaries, cancellation and uncertain outcomes, memory budgets and backpressure, deliberate failure testing, build diagnosis, and integration with existing systems. Give the first three themes the most attention.
 
 ## Site growth direction

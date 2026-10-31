@@ -18,6 +18,25 @@ Before release, read the prose aloud and ask whether a person can follow the exp
 
 ## Accepted themes
 
+### Writing for readers who use AI to code
+
+On October 31, the author asked to develop the Rust and AI coverage for a reader
+who already uses AI to write code. A working implementation is one part of an
+article's value. Help the reader decide what that implementation must preserve,
+which competing explanation fits the observations, and what would disprove a
+suggested repair. AI can help construct and investigate those proposals too.
+
+Use a concrete counterexample when it makes the decision clearer. Record the
+database state, wait, permission denial, or query plan that supports the answer.
+Choose assertions from the intended behavior before treating a candidate's own
+tests as sufficient evidence. Explain the cost and limits of the chosen repair.
+Do not invent model experiments or claim that a model cannot solve the problem.
+
+Retain useful search questions in titles. Deepen an existing answer when it
+already covers the question. A further article needs a distinct decision and
+enough evidence to answer it on its own. The October 31 batch is recorded in
+[the AI-era SQL review brief](ai-era-sql-2026-10-31/README.md).
+
 The first three themes receive the most attention. Keep the next thirty proposed articles rooted in established SQL databases and database internals. Every executable example in that series must be Rust, with SQL inside Rust query calls.
 
 | Priority | Theme                                  | What the reader should gain                                                                                      |
