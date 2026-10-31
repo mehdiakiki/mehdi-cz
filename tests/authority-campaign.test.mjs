@@ -287,6 +287,7 @@ test("the repository maps every written campaign source without counting unrelat
       "my-laptop-still-trusted-the-cracked-emudhra-keys",
       "pattern-shape-simd-search-performance-rust",
       "prompt-for-one-verifiable-change",
+      "rag-rust-postgresql-model-context",
       "reading-proc-self-maps-line-by-line",
       "recovery-code-must-survive-a-crash-too",
       "relocations-the-holes-the-compiler-leaves-for-the-linker",

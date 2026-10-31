@@ -100,7 +100,10 @@ async fn checkout_scope_decides_progress_before_the_dependency_is_released() {
         .unwrap()
         .unwrap();
     assert!(pool.try_acquire().is_none());
-    assert!(matches!(pool.acquire().await, Err(sqlx::Error::PoolTimedOut)));
+    assert!(matches!(
+        pool.acquire().await,
+        Err(sqlx::Error::PoolTimedOut)
+    ));
     assert!(!held.is_finished());
     release.send(()).unwrap();
     assert_eq!(held.await.unwrap().unwrap(), 12);
@@ -161,11 +164,15 @@ async fn quote_save_checks_the_input_revision_and_the_affected_row_count() {
         .execute(&admin)
         .await
         .unwrap();
-    assert_eq!(save_quote(&pool, 1, expected_revision, 900).await.unwrap(), 0);
-    let quote: Option<i64> = sqlx::query_scalar("SELECT quote_cents FROM pool_customers WHERE id = 1")
-        .fetch_one(&admin)
-        .await
-        .unwrap();
+    assert_eq!(
+        save_quote(&pool, 1, expected_revision, 900).await.unwrap(),
+        0
+    );
+    let quote: Option<i64> =
+        sqlx::query_scalar("SELECT quote_cents FROM pool_customers WHERE id = 1")
+            .fetch_one(&admin)
+            .await
+            .unwrap();
     assert_eq!(quote, None);
     assert_eq!(save_quote(&pool, 1, 13, 1200).await.unwrap(), 1);
     let quote: i64 = sqlx::query_scalar("SELECT quote_cents FROM pool_customers WHERE id = 1")
