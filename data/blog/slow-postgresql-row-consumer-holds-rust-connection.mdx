@@ -6,7 +6,7 @@ tags: ["rust", "postgresql", "sqlx", "backpressure"]
 authors: ["default"]
 draft: false
 reviewed: true
-reviewedHash: "352bd60b9ec7b763c21883d4da09a31a992d2d45dd50eb427ddc1735b438c00f"
+reviewedHash: "e22d29dab6a9e271180a2438924a535032d4fb1273b18e10c85a8e0f436c47cd"
 cluster: "rust-under-the-hood"
 campaign: "editorial"
 summary: "Follow PostgreSQL rows through a real HTTP download. See why a slow client can hold a SQLx connection, what bounded pages change, and what disconnect cleanup must release."
@@ -16,13 +16,13 @@ An export starts quickly. Then the person downloading it loses most of their net
 
 Suppose the export reads one row from PostgreSQL, sends it over HTTP, then reads the next row. That avoids collecting the whole result in a large vector. But the row stream still owns its database connection while the download is slow.
 
-One slow download can keep one checkout busy. Enough of them can occupy the pool.
+One slow download can keep one database connection busy. Enough of them can occupy the pool.
 
 The fix depends on what the export promises. Small pages can return the connection between reads. A single consistent snapshot may require keeping one transaction. We will look at both the resource problem and that tradeoff, with a real HTTP test as well as a smaller database example.
 
 ## The connection is borrowed for longer than the query timer suggests
 
-A pool shares a limited number of database connections between requests. A connection remains checked out until its borrower returns it. PostgreSQL being idle does not make that connection free for another Rust task.
+A pool shares a limited number of database connections between requests. A connection is checked out while one request borrows it. The pool can lend it to another request after it is returned. PostgreSQL being idle does not make that connection free for another Rust task.
 
 An async wait allows other tasks to run. It does not release the values held by the waiting task. That includes a SQLx connection borrowed by a row stream.
 
@@ -75,21 +75,26 @@ Two producers face the same paused client. The first fetches a SQLx row stream a
 
 The tests check three paths:
 
-| Path | What must happen while the client is paused | What must happen afterward |
-| --- | --- | --- |
-| One database stream | Another acquisition cannot finish | Disconnect stops the producer; a later query succeeds |
-| Bounded pages, then resume | An independent query returns seven before the client resumes | All 512 records arrive in order with their expected contents |
-| Bounded pages, then disconnect | The independent query still completes | The producer stops, its payload budget returns, and a later query succeeds |
+| Path                           | What must happen while the client is paused                  | What must happen afterward                                                 |
+| ------------------------------ | ------------------------------------------------------------ | -------------------------------------------------------------------------- |
+| One database stream            | Another acquisition cannot finish                            | Disconnect stops the producer; a later query succeeds                      |
+| Bounded pages, then resume     | An independent query returns seven before the client resumes | All 512 records arrive in order with their expected contents               |
+| Bounded pages, then disconnect | The independent query still completes                        | The producer stops, its payload budget returns, and a later query succeeds |
 
 A pool probe after the client resumes would answer a weaker question. Here, the client remains paused until the probe has its result. The checks also require the producer to be unfinished, so an already completed export cannot accidentally make the repair look successful.
+
+In the [recorded HTTP execution](https://github.com/mehdiakiki/mehdi-cz/actions/runs/41236971955/job/124642669933), all three cases passed. The retained stream kept the pool occupied. The paged version allowed `SELECT 7` while the client was paused, then delivered all 512 records when reading resumed. Both disconnect cases joined their producers, returned the tracked payload budget, and left the pool able to run `SELECT 99`. These are controlled observations, not throughput measurements.
 
 ## Return the connection before waiting to send
 
 The page producer reserves space before fetching. Each page has at most four of the fixed records:
 
 ```rust
-let mut reservation = budget.clone()
-    .acquire_many_owned(PAGE_BYTES as u32).await.unwrap();
+let mut reservation = budget
+    .clone()
+    .acquire_many_owned(PAGE_BYTES as u32)
+    .await
+    .unwrap();
 let page: Vec<(i32, String)> = sqlx::query_as(
     "SELECT i, lpad(i::text, 8, '0') || repeat('x', 4087) || chr(10) \
      FROM generate_series($1::int, $2::int) AS i",

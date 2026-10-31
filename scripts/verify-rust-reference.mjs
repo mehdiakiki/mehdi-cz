@@ -36,7 +36,9 @@ assert.equal(
   upstream.pull_requests.find((pr) => pr.number === 161698)?.merged_at,
   "2026-10-17T16:49:13Z"
 );
-console.log("Checked reviewed reference sources, the existing article date, sole author, and upstream status snapshot.");
+console.log(
+  "Checked reviewed reference sources, the existing article date, sole author, and upstream status snapshot."
+);
 
 if (process.argv[2] === "rendered") {
   const { allBlogs } = await import("../.contentlayer/generated/index.mjs");
@@ -50,15 +52,25 @@ if (process.argv[2] === "rendered") {
   for (const pr of upstream.pull_requests) {
     assert.ok(compiler.includes(`href="${pr.url}"`), `PR ${pr.number}`);
   }
-  assert.ok(compiler.includes('rel="canonical" href="https://www.mehdi.cz/work/rustc-late-metadata"'));
+  assert.ok(
+    compiler.includes('rel="canonical" href="https://www.mehdi.cz/work/rustc-late-metadata"')
+  );
   assert.ok(compiler.includes("Merged October 17, 2026"));
   const route = await readFile(`.next/server/app/blog/${article.slug}.html`, "utf8");
-  assert.ok(route.includes('rel="canonical" href="https://www.mehdi.cz/blog/' + article.slug + '"'));
-  for (const surface of ["public/search.json", "public/feed.xml", ".next/server/app/sitemap.xml.body"]) {
+  assert.ok(
+    route.includes('rel="canonical" href="https://www.mehdi.cz/blog/' + article.slug + '"')
+  );
+  for (const surface of [
+    "public/search.json",
+    "public/feed.xml",
+    ".next/server/app/sitemap.xml.body",
+  ]) {
     assert.ok((await readFile(surface, "utf8")).includes(article.slug), surface);
   }
   await writeFile("/tmp/editorial-evidence/previews/rust-start-here.html", hub);
   await writeFile("/tmp/editorial-evidence/previews/rustc-late-metadata.html", compiler);
   await writeFile("/tmp/editorial-evidence/previews/http-row-stream.html", route);
-  console.log("Checked the rendered start paths, compiler links, canonical URLs, and streaming article discovery.");
+  console.log(
+    "Checked the rendered start paths, compiler links, canonical URLs, and streaming article discovery."
+  );
 }

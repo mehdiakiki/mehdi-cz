@@ -169,7 +169,10 @@ export default function RustSystemsAtlasPage() {
 
       {startingPaths.length > 0 && (
         <section className="pb-14 md:pb-20" aria-labelledby="rust-start-here">
-          <h2 id="rust-start-here" className="text-3xl font-bold tracking-tight text-gray-950 dark:text-gray-100">
+          <h2
+            id="rust-start-here"
+            className="text-3xl font-bold tracking-tight text-gray-950 dark:text-gray-100"
+          >
             Start with your problem
           </h2>
           <p className="mt-4 max-w-3xl text-lg leading-8 text-gray-600 dark:text-gray-300">
@@ -177,7 +180,10 @@ export default function RustSystemsAtlasPage() {
           </p>
           <div className="mt-8 grid gap-5 lg:grid-cols-3">
             {startingPaths.map((path) => (
-              <article key={path.slug} className="rounded-lg border border-gray-200 p-6 dark:border-gray-800">
+              <article
+                key={path.slug}
+                className="rounded-lg border border-gray-200 p-6 dark:border-gray-800"
+              >
                 <h3 className="text-xl font-bold text-gray-950 dark:text-gray-100">{path.title}</h3>
                 <p className="mt-4 leading-7 text-gray-600 dark:text-gray-300">{path.firstCheck}</p>
                 {path.links[0] && (
@@ -204,8 +210,14 @@ export default function RustSystemsAtlasPage() {
         </section>
       )}
 
-      <section className="border-t border-gray-200 py-10 dark:border-gray-800" aria-labelledby="rust-work-behind-the-guides">
-        <h2 id="rust-work-behind-the-guides" className="text-2xl font-bold text-gray-950 dark:text-gray-100">
+      <section
+        className="border-t border-gray-200 py-10 dark:border-gray-800"
+        aria-labelledby="rust-work-behind-the-guides"
+      >
+        <h2
+          id="rust-work-behind-the-guides"
+          className="text-2xl font-bold text-gray-950 dark:text-gray-100"
+        >
           Work behind the explanations
         </h2>
         <p className="mt-4 max-w-3xl leading-7 text-gray-600 dark:text-gray-300">

@@ -83,10 +83,16 @@ export default function RustcLateMetadataCaseStudy() {
         My changes make that boundary clearer. They do not change how you write a function or add a
         new Rust language feature.
       </p>
+      <p>
+        A crate is one unit of Rust code being compiled, such as a library. Metadata describes that
+        code, including its types and functions. An archive member is one file inside the archive.
+      </p>
 
       <div className="not-prose my-8 overflow-x-auto">
         <table className="w-full border-collapse text-left text-sm leading-6">
-          <caption className="mb-3 text-left font-semibold">A simplified view of a Rust library</caption>
+          <caption className="mb-3 text-left font-semibold">
+            A simplified view of a Rust library
+          </caption>
           <thead>
             <tr className="border-b border-gray-300 dark:border-gray-700">
               <th className="p-3">Part of the archive</th>
@@ -96,12 +102,16 @@ export default function RustcLateMetadataCaseStudy() {
           </thead>
           <tbody>
             <tr className="border-b border-gray-200 dark:border-gray-800">
-              <td className="p-3"><code>lib.rmeta</code></td>
+              <td className="p-3">
+                <code>lib.rmeta</code>
+              </td>
               <td className="p-3">Information about the crate&apos;s Rust code</td>
               <td className="p-3">While compiling code that uses the crate</td>
             </tr>
             <tr className="border-b border-gray-200 dark:border-gray-800">
-              <td className="p-3"><code>lib.rmeta-link</code></td>
+              <td className="p-3">
+                <code>lib.rmeta-link</code>
+              </td>
               <td className="p-3">Which objects came from Rust, and link-only library filenames</td>
               <td className="p-3">While linking</td>
             </tr>
@@ -175,8 +185,14 @@ export default function RustcLateMetadataCaseStudy() {
       </p>
       <p>
         Those decisions are visible in the reviews of{" "}
-        <a href="https://github.com/rust-lang/rust/pull/156735#discussion_r3265352732">when to read the data</a>{" "}
-        and <a href="https://github.com/rust-lang/rust/pull/156735#discussion_r3265394249">how to identify each library</a>.
+        <a href="https://github.com/rust-lang/rust/pull/156735#discussion_r3265352732">
+          when to read the data
+        </a>{" "}
+        and{" "}
+        <a href="https://github.com/rust-lang/rust/pull/156735#discussion_r3265394249">
+          how to identify each library
+        </a>
+        .
       </p>
 
       <h2>A cache with a small lifetime</h2>
@@ -186,8 +202,8 @@ export default function RustcLateMetadataCaseStudy() {
         result, keyed by the rlib path, for that link operation.
       </p>
       <p>
-        It is not a persistent build cache shared by future builds. That short lifetime matters:
-        a later build must read its own inputs. The cache became{" "}
+        It is not a persistent build cache shared by future builds. That short lifetime matters: a
+        later build must read its own inputs. The cache became{" "}
         <a href="https://github.com/rust-lang/rust/pull/158194">a separate pull request</a> while
         the filename move was under review.
       </p>
@@ -270,15 +286,16 @@ export default function RustcLateMetadataCaseStudy() {
       <p>
         The AIX follow-up merged on October 17, 2026. AIX uses the XCOFF object format. An archive
         member is a file inside the archive; a section is a region inside that file. Finding the
-        right archive member is only the first step. The reader also has to find the metadata
-        inside it in the way that format expects.
+        right archive member is only the first step. The reader also has to find the metadata inside
+        it in the way that format expects.
       </p>
       <p>
         The merged fix passes the existing <code>is_like_aix</code> target flag through the shared
-        reader and the LTO paths. This reuses information the compiler already knows. It also removes
-        a separate AIX path that had duplicated part of the reading logic. The{" "}
+        reader and the LTO paths. This reuses information the compiler already knows. It also
+        removes a separate AIX path that had duplicated part of the reading logic. The{" "}
         <a href="https://github.com/rust-lang/rust/pull/161698#discussion_r3935089872">review</a>{" "}
-        and <a href="https://github.com/rust-lang/rust/pull/161698/files">merged diff</a> show that choice.
+        and <a href="https://github.com/rust-lang/rust/pull/161698/files">merged diff</a> show that
+        choice.
       </p>
       <p>
         I did not test the change on AIX hardware. The pull request reported that its CI had no AIX

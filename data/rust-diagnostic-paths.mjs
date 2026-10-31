@@ -31,8 +31,7 @@ export const rustDiagnosticPaths = [
   {
     slug: "memory-and-slow-consumers",
     title: "Memory grows while a consumer is slow",
-    firstCheck:
-      "Follow data through the tasks and queues. Check which of them still holds it.",
+    firstCheck: "Follow data through the tasks and queues. Check which of them still holds it.",
     caseIds: ["RFA-011", "RFA-207"],
     articleSlugs: [
       "bounded-rust-channel-database-producer-memory",

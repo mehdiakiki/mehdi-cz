@@ -1,4 +1,8 @@
-use axum::{body::{Body, Bytes}, routing::get, Router};
+use axum::{
+    body::{Body, Bytes},
+    routing::get,
+    Router,
+};
 use futures_util::{stream, TryStreamExt};
 use sqlx::{postgres::PgPoolOptions, PgPool};
 use std::{
@@ -6,7 +10,10 @@ use std::{
     io,
     net::SocketAddr,
     pin::Pin,
-    sync::{atomic::{AtomicBool, AtomicUsize, Ordering}, Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
     task::{Context, Poll},
     time::Duration,
 };
@@ -25,7 +32,10 @@ const PAGE_BYTES: usize = PAGE_ROWS as usize * ROW_BYTES;
 const PAYLOAD_BUDGET: usize = 2 * PAGE_BYTES;
 
 #[derive(Clone, Copy, Debug)]
-enum Mode { RetainedStream, BoundedPages }
+enum Mode {
+    RetainedStream,
+    BoundedPages,
+}
 
 #[derive(Default)]
 struct Observations {
@@ -47,7 +57,9 @@ struct ReservedRow {
 }
 
 impl AsRef<[u8]> for ReservedRow {
-    fn as_ref(&self) -> &[u8] { &self.data }
+    fn as_ref(&self) -> &[u8] {
+        &self.data
+    }
 }
 
 impl Drop for ReservedRow {
@@ -55,12 +67,18 @@ impl Drop for ReservedRow {
         let bytes = self.data.len();
         drop(std::mem::take(&mut self.data));
         drop(self.reservation.take());
-        self.observations.live_payload.fetch_sub(bytes, Ordering::SeqCst);
+        self.observations
+            .live_payload
+            .fetch_sub(bytes, Ordering::SeqCst);
         self.observations.payload_changed.notify_one();
     }
 }
 
-fn owned_row(body: String, reservation: OwnedSemaphorePermit, observed: &Arc<Observations>) -> Bytes {
+fn owned_row(
+    body: String,
+    reservation: OwnedSemaphorePermit,
+    observed: &Arc<Observations>,
+) -> Bytes {
     assert_eq!(body.len(), ROW_BYTES);
     assert_eq!(reservation.num_permits(), ROW_BYTES);
     let live = observed.live_payload.fetch_add(ROW_BYTES, Ordering::SeqCst) + ROW_BYTES;
@@ -87,11 +105,23 @@ async fn produce(
             let mut rows = sqlx::query_as::<_, (i32, String)>(
                 "SELECT i, lpad(i::text, 8, '0') || repeat('x', 4087) || chr(10) \
                  FROM generate_series(1, $1::int) AS i",
-            ).bind(ROWS).fetch(&mut *connection);
+            )
+            .bind(ROWS)
+            .fetch(&mut *connection);
             loop {
-                let reservation = budget.clone().acquire_many_owned(ROW_BYTES as u32).await.unwrap();
-                let Some((_, body)) = rows.try_next().await? else { break };
-                if sender.send(owned_row(body, reservation, &observed)).await.is_err() {
+                let reservation = budget
+                    .clone()
+                    .acquire_many_owned(ROW_BYTES as u32)
+                    .await
+                    .unwrap();
+                let Some((_, body)) = rows.try_next().await? else {
+                    break;
+                };
+                if sender
+                    .send(owned_row(body, reservation, &observed))
+                    .await
+                    .is_err()
+                {
                     return Ok(());
                 }
             }
@@ -100,8 +130,11 @@ async fn produce(
             let mut first = 1;
             while first <= ROWS {
                 // article:http-page:start
-                let mut reservation = budget.clone()
-                    .acquire_many_owned(PAGE_BYTES as u32).await.unwrap();
+                let mut reservation = budget
+                    .clone()
+                    .acquire_many_owned(PAGE_BYTES as u32)
+                    .await
+                    .unwrap();
                 let page: Vec<(i32, String)> = sqlx::query_as(
                     "SELECT i, lpad(i::text, 8, '0') || repeat('x', 4087) || chr(10) \
                      FROM generate_series($1::int, $2::int) AS i",
@@ -114,7 +147,11 @@ async fn produce(
                 // fetch_all has returned the checkout before a slow send.
                 for (_, body) in page {
                     let row_reservation = reservation.split(ROW_BYTES).unwrap();
-                    if sender.send(owned_row(body, row_reservation, &observed)).await.is_err() {
+                    if sender
+                        .send(owned_row(body, row_reservation, &observed))
+                        .await
+                        .is_err()
+                    {
                         return Ok(());
                     }
                 }
@@ -147,15 +184,25 @@ struct ObservedSocket {
 }
 
 impl AsyncRead for ObservedSocket {
-    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buffer: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
         Pin::new(&mut self.socket).poll_read(cx, buffer)
     }
 }
 
 impl AsyncWrite for ObservedSocket {
-    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, bytes: &[u8]) -> Poll<io::Result<usize>> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bytes: &[u8],
+    ) -> Poll<io::Result<usize>> {
         let result = Pin::new(&mut self.socket).poll_write(cx, bytes);
-        self.observations.write_pending.store(result.is_pending(), Ordering::SeqCst);
+        self.observations
+            .write_pending
+            .store(result.is_pending(), Ordering::SeqCst);
         if result.is_pending() {
             self.observations.write_waits.fetch_add(1, Ordering::SeqCst);
             self.observations.socket_changed.notify_one();
@@ -180,10 +227,20 @@ impl axum::serve::Listener for ObservedListener {
     type Addr = SocketAddr;
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
         let (socket, address) = self.listener.accept().await.unwrap();
-        socket2::SockRef::from(&socket).set_send_buffer_size(16 * 1024).unwrap();
-        (ObservedSocket { socket, observations: self.observations.clone() }, address)
+        socket2::SockRef::from(&socket)
+            .set_send_buffer_size(16 * 1024)
+            .unwrap();
+        (
+            ObservedSocket {
+                socket,
+                observations: self.observations.clone(),
+            },
+            address,
+        )
     }
-    fn local_addr(&self) -> io::Result<Self::Addr> { self.listener.local_addr() }
+    fn local_addr(&self) -> io::Result<Self::Addr> {
+        self.listener.local_addr()
+    }
 }
 
 type Producer = JoinHandle<Result<(), sqlx::Error>>;
@@ -199,25 +256,42 @@ async fn start_server(
     let observed_route = observed.clone();
     let (started, producer) = oneshot::channel();
     let started = Arc::new(Mutex::new(Some(started)));
-    let app = Router::new().route("/export", get(move || {
-        let pool = pool.clone();
-        let budget = budget.clone();
-        let observed = observed_route.clone();
-        let started = started.clone();
-        async move {
-            let (sender, receiver) = mpsc::channel(1);
-            let task = tokio::spawn(produce(pool, mode, budget, sender, observed.clone()));
-            let guard = StopProducer { producer: task.abort_handle(), observations: observed };
-            started.lock().unwrap().take().unwrap().send(task).unwrap();
-            Body::from_stream(stream::unfold((receiver, guard), |(mut receiver, guard)| async move {
-                receiver.recv().await.map(|row| (Ok::<_, Infallible>(row), (receiver, guard)))
-            }))
-        }
-    }));
+    let app = Router::new().route(
+        "/export",
+        get(move || {
+            let pool = pool.clone();
+            let budget = budget.clone();
+            let observed = observed_route.clone();
+            let started = started.clone();
+            async move {
+                let (sender, receiver) = mpsc::channel(1);
+                let task = tokio::spawn(produce(pool, mode, budget, sender, observed.clone()));
+                let guard = StopProducer {
+                    producer: task.abort_handle(),
+                    observations: observed,
+                };
+                started.lock().unwrap().take().unwrap().send(task).unwrap();
+                Body::from_stream(stream::unfold(
+                    (receiver, guard),
+                    |(mut receiver, guard)| async move {
+                        receiver
+                            .recv()
+                            .await
+                            .map(|row| (Ok::<_, Infallible>(row), (receiver, guard)))
+                    },
+                ))
+            }
+        }),
+    );
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
-    let listener = ObservedListener { listener, observations: observed.clone() };
-    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+    let listener = ObservedListener {
+        listener,
+        observations: observed.clone(),
+    };
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
     (address, server, producer)
 }
 
@@ -225,16 +299,23 @@ async fn connect_client(address: SocketAddr) -> BufReader<TcpStream> {
     let socket = TcpSocket::new_v4().unwrap();
     socket.set_recv_buffer_size(16 * 1024).unwrap();
     let mut socket = socket.connect(address).await.unwrap();
-    socket.write_all(b"GET /export HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").await.unwrap();
+    socket
+        .write_all(b"GET /export HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
     let mut client = BufReader::new(socket);
     let mut header = String::new();
     loop {
         let count = client.read_line(&mut header).await.unwrap();
         assert!(count > 0 && header.len() <= 8192);
-        if header.ends_with("\r\n\r\n") { break; }
+        if header.ends_with("\r\n\r\n") {
+            break;
+        }
     }
     assert!(header.starts_with("HTTP/1.1 200"), "{header}");
-    assert!(header.to_ascii_lowercase().contains("transfer-encoding: chunked"));
+    assert!(header
+        .to_ascii_lowercase()
+        .contains("transfer-encoding: chunked"));
     client
 }
 
@@ -263,7 +344,9 @@ async fn read_row(client: &mut BufReader<TcpStream>, expected: i32) -> bool {
 async fn wait_for_socket_pressure(observed: &Observations) {
     loop {
         let changed = observed.socket_changed.notified();
-        if observed.write_pending.load(Ordering::SeqCst) { return; }
+        if observed.write_pending.load(Ordering::SeqCst) {
+            return;
+        }
         changed.await;
     }
 }
@@ -271,7 +354,9 @@ async fn wait_for_socket_pressure(observed: &Observations) {
 async fn wait_for_body_drop(observed: &Observations) {
     loop {
         let changed = observed.body_changed.notified();
-        if observed.body_dropped.load(Ordering::SeqCst) { return; }
+        if observed.body_dropped.load(Ordering::SeqCst) {
+            return;
+        }
         changed.await;
     }
 }
@@ -279,14 +364,19 @@ async fn wait_for_body_drop(observed: &Observations) {
 async fn wait_for_payload_release(observed: &Observations) {
     loop {
         let changed = observed.payload_changed.notified();
-        if observed.live_payload.load(Ordering::SeqCst) == 0 { return; }
+        if observed.live_payload.load(Ordering::SeqCst) == 0 {
+            return;
+        }
         changed.await;
     }
 }
 
 async fn run_case(mode: Mode, disconnect: bool) {
-    let pool = PgPoolOptions::new().max_connections(1)
-        .connect(&std::env::var("SQL_RUST_PG_URL").unwrap()).await.unwrap();
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&std::env::var("SQL_RUST_PG_URL").unwrap())
+        .await
+        .unwrap();
     let budget = Arc::new(Semaphore::new(PAYLOAD_BUDGET));
     let observed = Arc::new(Observations::default());
     let (address, server, producer) = start_server(&pool, mode, &budget, &observed).await;
@@ -294,39 +384,61 @@ async fn run_case(mode: Mode, disconnect: bool) {
     let producer = producer.await.unwrap();
     assert!(read_row(&mut client, 1).await);
     // The test now stops reading. Wait for actual transport pressure.
-    timeout(Duration::from_secs(8), wait_for_socket_pressure(&observed)).await.unwrap();
+    timeout(Duration::from_secs(8), wait_for_socket_pressure(&observed))
+        .await
+        .unwrap();
     assert!(observed.decoded_rows.load(Ordering::SeqCst) < ROWS as usize);
     assert!(!producer.is_finished());
     match mode {
         Mode::RetainedStream => {
-            assert!(timeout(Duration::from_millis(250), pool.acquire()).await.is_err());
+            assert!(timeout(Duration::from_millis(250), pool.acquire())
+                .await
+                .is_err());
         }
         Mode::BoundedPages => {
-            let value: i32 = timeout(Duration::from_secs(5),
-                sqlx::query_scalar("SELECT 7").fetch_one(&pool)).await.unwrap().unwrap();
+            let value: i32 = timeout(
+                Duration::from_secs(5),
+                sqlx::query_scalar("SELECT 7").fetch_one(&pool),
+            )
+            .await
+            .unwrap()
+            .unwrap();
             assert_eq!(value, 7);
         }
     }
     let paused_rows = observed.decoded_rows.load(Ordering::SeqCst);
     assert!(paused_rows < ROWS as usize);
     if !disconnect {
-        for expected in 2..=ROWS { assert!(read_row(&mut client, expected).await); }
+        for expected in 2..=ROWS {
+            assert!(read_row(&mut client, expected).await);
+        }
         assert!(!read_row(&mut client, ROWS + 1).await);
     }
     drop(client);
-    timeout(Duration::from_secs(8), wait_for_body_drop(&observed)).await.unwrap();
+    timeout(Duration::from_secs(8), wait_for_body_drop(&observed))
+        .await
+        .unwrap();
     match timeout(Duration::from_secs(8), producer).await.unwrap() {
         Ok(result) => result.unwrap(),
         Err(error) => assert!(disconnect && error.is_cancelled(), "{error}"),
     }
-    timeout(Duration::from_secs(8), wait_for_payload_release(&observed)).await.unwrap();
+    timeout(Duration::from_secs(8), wait_for_payload_release(&observed))
+        .await
+        .unwrap();
     assert_eq!(budget.available_permits(), PAYLOAD_BUDGET);
-    let value: i32 = timeout(Duration::from_secs(5),
-        sqlx::query_scalar("SELECT 99").fetch_one(&pool)).await.unwrap().unwrap();
+    let value: i32 = timeout(
+        Duration::from_secs(5),
+        sqlx::query_scalar("SELECT 99").fetch_one(&pool),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     assert_eq!(value, 99);
     let peak = observed.peak_payload.load(Ordering::SeqCst);
     assert!(peak > 0 && peak <= PAYLOAD_BUDGET);
-    if !disconnect { assert_eq!(observed.decoded_rows.load(Ordering::SeqCst), ROWS as usize); }
+    if !disconnect {
+        assert_eq!(observed.decoded_rows.load(Ordering::SeqCst), ROWS as usize);
+    }
     println!("HTTP_ROW_STREAM: mode={mode:?}; disconnect={disconnect}; real socket write pending; decoded while client paused={paused_rows}/{ROWS}; peak owned HTTP payload={peak}/{PAYLOAD_BUDGET} bytes; producer joined; payload and permits released; final query=99");
     server.abort();
     assert!(server.await.unwrap_err().is_cancelled());
@@ -335,15 +447,24 @@ async fn run_case(mode: Mode, disconnect: bool) {
 
 #[tokio::test]
 async fn streaming_a_query_retains_the_checkout_until_http_disconnects() {
-    timeout(Duration::from_secs(30), run_case(Mode::RetainedStream, true)).await.unwrap();
+    timeout(
+        Duration::from_secs(30),
+        run_case(Mode::RetainedStream, true),
+    )
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn bounded_pages_free_the_pool_during_a_slow_http_download() {
-    timeout(Duration::from_secs(30), run_case(Mode::BoundedPages, false)).await.unwrap();
+    timeout(Duration::from_secs(30), run_case(Mode::BoundedPages, false))
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
 async fn disconnecting_a_paged_download_stops_its_producer_and_returns_its_budget() {
-    timeout(Duration::from_secs(30), run_case(Mode::BoundedPages, true)).await.unwrap();
+    timeout(Duration::from_secs(30), run_case(Mode::BoundedPages, true))
+        .await
+        .unwrap();
 }
