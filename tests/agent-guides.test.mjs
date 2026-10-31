@@ -11,8 +11,9 @@ const catalog = JSON.parse(readFileSync("data/agent-guides.json", "utf8"));
 const now = new Date("2026-11-01T00:00:00Z");
 const sources = catalog.guides.map((guide) => readFileSync(`data/blog/${guide.slug}.mdx`, "utf8"));
 
-test("the three exports preserve the complete reviewed bodies and Rust examples", () => {
-  assert.equal(catalog.guides.length, 3);
+test("the exports preserve the complete reviewed bodies and Rust examples", () => {
+  assert.ok(catalog.guides.length >= 3);
+  assert.equal(new Set(catalog.guides.map((guide) => guide.slug)).size, catalog.guides.length);
   const guides = catalog.guides.map((guide, i) => {
     const result = reviewedGuide(catalog, guide, sources[i], now);
     assert.ok(result, guide.slug);
@@ -34,7 +35,7 @@ test("the three exports preserve the complete reviewed bodies and Rust examples"
     return result;
   });
   const index = guideIndex(catalog, guides);
-  assert.equal(index.guides.length, 3);
+  assert.equal(index.guides.length, catalog.guides.length);
   for (const guide of guides) {
     assert.ok(llmsText(catalog, guides).includes(guide.entry.markdownUrl));
   }
@@ -128,6 +129,24 @@ test("task lookup includes the observation that changes the diagnosis and its li
       evidence: /32,768/,
       limit: /not RSS/,
     },
+    {
+      question: "The commit reply was lost. Should the agent generate a new retry key?",
+      slug: "postgresql-commit-reply-lost-rust",
+      evidence: /same stored tenant and intent/,
+      limit: /does not make an email or an external payment atomic/,
+    },
+    {
+      question: "My export uses a bounded background task. Why is the pool still busy?",
+      slug: "slow-postgresql-row-consumer-holds-rust-connection",
+      evidence: /while the download is still paused/,
+      limit: /does not give one consistent snapshot/,
+    },
+    {
+      question: "The tool is read-only. Can another customer's invoices still leak?",
+      slug: "read-only-postgresql-mcp-tool-limits",
+      evidence: /without the normal query predicate/,
+      limit: /does not implement an MCP transport/,
+    },
   ];
   for (const task of tasks) {
     const guide = catalog.guides.find((candidate) => candidate.slug === task.slug);
@@ -140,11 +159,15 @@ test("task lookup includes the observation that changes the diagnosis and its li
 
 test("the applicability versions match the pinned Rust fixture and database workflow", () => {
   const manifest = readFileSync("experiments/sql-rust/postgres-sqlite/Cargo.toml", "utf8");
+  const backend = readFileSync("experiments/rust-backend/Cargo.toml", "utf8");
   const workflow = readFileSync(".github/workflows/content-safety.yml", "utf8");
   for (const guide of catalog.guides) {
     assert.ok(manifest.includes(`version = "=${guide.testedWith.sqlx}"`));
     assert.ok(manifest.includes(`version = "=${guide.testedWith.tokio}"`));
     assert.equal(guide.testedWith.postgresql, "18.6");
     assert.ok(workflow.includes('SQL_RUST_PG_EXPECT_VERSION_NUM: "180006"'));
+    if (guide.testedWith.axum) {
+      assert.ok(backend.includes(`axum = "=${guide.testedWith.axum}"`));
+    }
   }
 });
