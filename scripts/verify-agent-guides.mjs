@@ -52,15 +52,14 @@ try {
   const directory = await get("/rust/guides");
   assert.equal(directory.status, 200);
   const directoryBody = await directory.text();
-  assert.ok(
-    directoryBody.includes(`rel="canonical" href="${catalog.siteUrl}/rust/guides"`)
-  );
-  const escaped = (value) => value
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#x27;");
+  assert.ok(directoryBody.includes(`rel="canonical" href="${catalog.siteUrl}/rust/guides"`));
+  const escaped = (value) =>
+    value
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;")
+      .replaceAll('"', "&quot;")
+      .replaceAll("'", "&#x27;");
   for (const guide of expected) {
     assert.ok(directoryBody.includes(`id="${guide.entry.slug}"`));
     assert.ok(directoryBody.includes(escaped(guide.entry.question)));

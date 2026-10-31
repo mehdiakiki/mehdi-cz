@@ -38,10 +38,7 @@ export default function RustGuides() {
         ]}
       />
       <div className="max-w-3xl py-10 md:py-14">
-        <Link
-          href="/rust"
-          className="text-primary-600 dark:text-primary-400 text-sm font-medium"
-        >
+        <Link href="/rust" className="text-primary-600 dark:text-primary-400 text-sm font-medium">
           Back to Rust
         </Link>
         <h1 className="mt-5 text-4xl font-bold tracking-tight md:text-5xl">
