@@ -11,7 +11,6 @@ import Link from "@/components/Link";
 import PageTitle from "@/components/PageTitle";
 import ScrollTopAndComment from "@/components/ScrollTopAndComment";
 import SectionContainer from "@/components/SectionContainer";
-import { getRustAtlasGrowthCohort } from "@/data/rust-atlas-growth-experiments.mjs";
 import { getRustFailureEvidence, rustFailureEvidenceUrl } from "@/data/rust-failure-evidence.mjs";
 import { getRustFailureArea, rustFailureAtlasEntries } from "@/data/rust-failure-atlas.mjs";
 import { canonicalRustFailureCaseId } from "@/data/rust-failure-intent-review.mjs";
@@ -104,7 +103,6 @@ export default async function RustFailurePage({ params }: { params: Promise<{ sl
   if (!area) return notFound();
 
   const executableEvidence = getRustFailureEvidence(failure.caseId);
-  const growthCohort = getRustAtlasGrowthCohort(failure.caseId);
   const evidenceRunner = executableEvidence ? getRustFailureRunner(failure.caseId) : undefined;
   const evidenceLabel = evidenceRunner?.label || "Compiler evidence";
   const status = publicationStatus(failure);
@@ -316,7 +314,6 @@ export default async function RustFailurePage({ params }: { params: Promise<{ sl
                       data-umami-event="rust-failure-evidence-download"
                       data-umami-event-case={failure.caseId}
                       data-umami-event-artifact="failing-source"
-                      data-umami-event-cohort={growthCohort?.cohort.slug}
                     >
                       Download the failing fixture
                     </Link>
@@ -328,7 +325,6 @@ export default async function RustFailurePage({ params }: { params: Promise<{ sl
                       data-umami-event="rust-failure-evidence-download"
                       data-umami-event-case={failure.caseId}
                       data-umami-event-artifact="repaired-source"
-                      data-umami-event-cohort={growthCohort?.cohort.slug}
                     >
                       Download the repaired fixture
                     </Link>
@@ -345,7 +341,6 @@ export default async function RustFailurePage({ params }: { params: Promise<{ sl
                           data-umami-event="rust-failure-evidence-download"
                           data-umami-event-case={failure.caseId}
                           data-umami-event-artifact="failing-manifest"
-                          data-umami-event-cohort={growthCohort?.cohort.slug}
                         >
                           Download the failing Cargo manifest
                         </Link>
@@ -363,7 +358,6 @@ export default async function RustFailurePage({ params }: { params: Promise<{ sl
                           data-umami-event="rust-failure-evidence-download"
                           data-umami-event-case={failure.caseId}
                           data-umami-event-artifact="repaired-manifest"
-                          data-umami-event-cohort={growthCohort?.cohort.slug}
                         >
                           Download the repaired Cargo manifest
                         </Link>
@@ -380,7 +374,6 @@ export default async function RustFailurePage({ params }: { params: Promise<{ sl
                         data-umami-event="rust-failure-evidence-download"
                         data-umami-event-case={failure.caseId}
                         data-umami-event-artifact="failing-cargo-config"
-                        data-umami-event-cohort={growthCohort?.cohort.slug}
                       >
                         Download the failing Cargo configuration
                       </Link>
@@ -397,7 +390,6 @@ export default async function RustFailurePage({ params }: { params: Promise<{ sl
                         data-umami-event="rust-failure-evidence-download"
                         data-umami-event-case={failure.caseId}
                         data-umami-event-artifact="repaired-cargo-config"
-                        data-umami-event-cohort={growthCohort?.cohort.slug}
                       >
                         Download the repaired Cargo configuration
                       </Link>
@@ -411,7 +403,6 @@ export default async function RustFailurePage({ params }: { params: Promise<{ sl
                         data-umami-event="rust-failure-evidence-download"
                         data-umami-event-case={failure.caseId}
                         data-umami-event-artifact="foreign-host"
-                        data-umami-event-cohort={growthCohort?.cohort.slug}
                       >
                         Download the foreign host fixture
                       </Link>
@@ -428,7 +419,6 @@ export default async function RustFailurePage({ params }: { params: Promise<{ sl
                         data-umami-event="rust-failure-evidence-download"
                         data-umami-event-case={failure.caseId}
                         data-umami-event-artifact="allocator-owner"
-                        data-umami-event-cohort={growthCohort?.cohort.slug}
                       >
                         Download the allocator-owner fixture
                       </Link>
@@ -445,7 +435,6 @@ export default async function RustFailurePage({ params }: { params: Promise<{ sl
                         data-umami-event="rust-failure-evidence-download"
                         data-umami-event-case={failure.caseId}
                         data-umami-event-artifact="resource-runner"
-                        data-umami-event-cohort={growthCohort?.cohort.slug}
                       >
                         Download the resource-limit runner
                       </Link>
@@ -598,7 +587,6 @@ export default async function RustFailurePage({ params }: { params: Promise<{ sl
                 className="underline hover:text-gray-700 dark:hover:text-gray-300"
                 data-umami-event="rust-failure-professional-cta"
                 data-umami-event-case={failure.caseId}
-                data-umami-event-cohort={growthCohort?.cohort.slug}
                 data-umami-event-destination="work"
               >
                 Selected engineering work
