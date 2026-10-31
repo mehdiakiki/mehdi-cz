@@ -1,152 +1,159 @@
 ---
 title: "Caching AI Results Requires an Identity and Freshness Model"
 date: "2026-12-10T09:00:00+01:00"
-tags: ["AI caching", "LLM engineering", "cache invalidation", "RAG", "production AI"]
+tags: ["rust", "postgresql", "AI caching", "cache invalidation", "RAG"]
+authors: ["default"]
 draft: false
 reviewed: true
-reviewedHash: "1c8e6cab9aa9c4367a73a663fd6e323a4472dc8fab79a86ce339eb3115dd61e3"
 cluster: "reliable-ai-systems"
 campaign: "authority-2026"
 opportunity: "AI-036"
-summary: "An AI result is reusable only when task identity, instructions, model policy, authorized context, tools, and freshness still match. I build the key and invalidation rules before adding the cache."
+summary: "A matching cache key can still return an answer based on an edited, deleted or forbidden source. Use a Rust and PostgreSQL reproduction to separate task identity, current access and source freshness."
+lastmod: "2026-12-10T09:00:00+01:00"
+reviewedHash: "cdce8910cf16af29885eba450647ef00089199eee35657f68d81601f859c458e"
 ---
 
-Caching an AI answer looks like an easy saving: if the same question arrives twice, return the first result.
+The same customer asks the same question. The cache returns the same answer. In between, someone revoked access to the document that answer quotes.
 
-Then I ask what “same” means.
+The cache lookup can work exactly as written and still return content the customer should no longer receive.
 
-The user text may match while permissions changed. The knowledge index may contain a corrected document. A tool schema may have a new required field. The model alias may point to another snapshot. Even the expected answer format may belong to a new prompt version.
+Before adding a result cache, decide what must remain true when an old answer is used. Which task produced it? Which sources supported it? Does this caller still have access, and are those sources still the same versions?
 
-This is why I treat AI caching as an identity and freshness problem before I treat it as a storage problem.
+Let's make those questions observable with a small Rust and PostgreSQL example. The answer is a fixed string in this fixture. There is no model call, answer-quality evaluation or hit-rate claim.
 
-## Provider prompt caching is not application result caching
+## Decide what a hit is allowed to reuse
 
-These are different mechanisms.
+A question string rarely describes the whole task. The same words can run under another prompt, output format, tool policy, document collection or user identity.
 
-[OpenAI prompt caching](https://developers.openai.com/api/docs/guides/prompt-caching) can reuse computation for matching prompt prefixes. The provider still produces a response, and usage metadata tells me how cached input was treated.
+I would start with an explicit task contract:
 
-An application result cache skips some or all workflow execution and returns a stored outcome. That means my system—not the model provider—claims the old result is still correct and authorized.
+| Dependency | What needs to match |
+| --- | --- |
+| Task and input | The same operation and the input normalization it promises |
+| Instructions and output | Prompt behavior, required fields and validation rules |
+| Model and tools | The chosen model policy and permitted tool behavior |
+| Retrieval | The query, search policy and relevant corpus revision |
+| Caller | Tenant, principal and the visibility rules for the result |
+| Sources | Every source supplied to generation, with its identity and version |
 
-I can use both. I do not give them the same invalidation rules.
+Store dependencies for sources the answer used even when the final text did not cite them. These are inputs to the decision. Hashing them does not establish that they are complete or current. In particular, a stored permission value can be just as stale as a stored answer.
 
-## The key begins with the task contract
+Use an unambiguous key encoding. Keep credentials and private document text out of keys that may appear in logs. The [tenant cache guide](/blog/tenant-in-cache-key-not-only-record-id) follows collisions across tenant and provider-account namespaces.
 
-For a deterministic HTTP cache, method and URI may carry much of the identity. [RFC 9111](https://www.rfc-editor.org/rfc/rfc9111) describes HTTP caching semantics and validators. AI workflows usually depend on more hidden inputs.
+## A cache key does not notice a source edit
 
-My logical key may include:
+The fixture stores a source document, a grant allowing Alice to read it, and an answer based on that source. The cached value records its tenant, principal, contract version, source ID and source revision.
 
-```text
-task type and task version
-normalized user input
-instruction/prompt version
-model routing policy version
-output schema version
-retrieval corpus snapshot
-authorization scope or visibility fingerprint
-tool definitions and relevant tool-data versions
-locale and product configuration
-```
+An unchanged request can reuse the answer. Changing the contract version must produce a miss. Asking as another user or tenant must also miss.
 
-I hash a canonical representation of these fields. I never place raw secrets, full private documents, or bearer tokens in a cache key.
+Then the source body changes while the cached value remains in memory. A plain lookup still finds the old answer. Including a tenant and user in the key did not tell the cache that the source changed.
 
-The authenticated user ID is not always the right authorization dimension. Two users may share exactly the same permitted corpus; one user's permissions may also change. I prefer a stable visibility-policy fingerprint that changes when access changes.
+The fixture gives each document a database-owned revision. A trigger assigns a new sequence value before both inserts and updates. It also replaces an explicitly supplied old revision. The writer cannot accidentally preserve the revision when changing the body or recreating a document.
 
-## I separate three cached things
+The validator compares the cached revision with the visible row's current revision. The old answer becomes a miss. A newly built value with the updated source can become a hit again.
 
-One large “AI response cache” hides useful boundaries. I often separate:
+The version is an identity token, not a count of edits. Sequence gaps are harmless. Reusing the document ID after deletion must also get a new revision; otherwise an old value could match a different document that happened to restart at revision one. The test deliberately supplies the old revision on reinsertion and requires the trigger to replace it.
 
-1. **Retrieval cache:** query plus corpus and permission snapshot returns document identities.
-2. **Model-call cache:** exact effective input plus model snapshot returns raw structured output.
-3. **Product-result cache:** validated workflow outcome plus business dependencies returns a user-facing result.
+The [trigger documentation](https://www.postgresql.org/docs/18/sql-createtrigger.html) describes how a before-row trigger can change the inserted or updated row. This is one possible version issuer. An immutable source revision or a suitable content identity can serve the same purpose. Choose an issuer that covers every write path in your system. Adding a `revision` column that some writers ignore leaves the original problem in place. Restoring a database or resetting its version issuer needs a fresh cache namespace; that operation is outside this fixture.
 
-Each layer has different freshness.
+## Check current access before returning the saved text
 
-A retrieved document list becomes stale when the index changes. A model call may remain reproducible only with a pinned model. A product answer about an account balance becomes stale when the balance changes, even if prompt and model are identical.
+The full [Rust fixture](https://github.com/mehdiakiki/mehdi-cz/blob/85f6329a6cf36e944adbb4b4890b0f9ff7deb04f/experiments/rust-backend/tests/database_boundaries.rs) defines three small types: `Principal` carries the host's tenant and user, `CachedAnswer` carries the saved dependencies and text, and `CacheUse` distinguishes a hit, a miss and a denied source.
 
-This separation also shows where a cache hit saved work.
+The application first finds a candidate using its complete request key. The function below validates that candidate; key construction is outside this fixture.
 
-## Freshness comes from dependencies
+Here is its reuse function:
 
-TTL is useful as a final bound, but it is a weak primary model. “Valid for one hour” says nothing about what changed after five seconds.
-
-I list the facts the answer depended on:
-
-```json
-{
-  "corpus_version": "docs-1842",
-  "policy_version": "access-91",
-  "account_version": 731,
-  "prompt_version": "support-answer-12",
-  "model_policy": "quality-route-4"
+```rust
+async fn reuse_answer(
+    pool: &PgPool,
+    principal: &Principal,
+    contract: i32,
+    cached: &CachedAnswer,
+) -> Result<CacheUse> {
+    if (cached.tenant, cached.user, cached.contract) != (principal.tenant, principal.user, contract)
+        || cached.sources.is_empty()
+    {
+        return Ok(CacheUse::Miss);
+    }
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET TRANSACTION READ ONLY")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "SELECT set_config('app.tenant_id', $1, true),
+                set_config('app.principal_id', $2, true)",
+    )
+    .bind(principal.tenant)
+    .bind(principal.user)
+    .execute(&mut *tx)
+    .await?;
+    let ids: Vec<i64> = cached.sources.iter().map(|(id, _)| *id).collect();
+    let visible: Vec<(i64, i64)> = sqlx::query_as(
+        "SELECT id, revision FROM cache_source_review.documents
+         WHERE id = ANY($1) ORDER BY id",
+    )
+    .bind(&ids)
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    if visible.len() != cached.sources.len() {
+        return Ok(CacheUse::Denied);
+    }
+    if visible != cached.sources {
+        return Ok(CacheUse::Miss);
+    }
+    Ok(CacheUse::Hit(cached.text.clone()))
 }
 ```
 
-An event can invalidate entries by dependency, or the versions can be included in the key so new reads naturally miss old values. I still keep a TTL for forgotten dependencies and storage control.
+The function first checks the caller and contract. It then asks PostgreSQL for the cached sources and their revisions under the restricted reader role.
 
-The [retrieval-index invalidation article](/blog/a-retrieval-index-needs-an-invalidation-strategy) explains why corpus freshness must follow document lifecycle, not only elapsed time.
+Row policies limit documents to the current tenant and the principal's current grants. A second policy limits which grants that role can see. If a required source is no longer visible, the function returns `Denied`. If its version changed, it returns `Miss`. Only the remaining path returns the saved text.
 
-## Permissions must be checked on every hit
+This query still does work on a cache hit. That can be a reasonable trade when it avoids retrieval or a model call, but this fixture does not measure the saving. If validation costs as much as rebuilding the answer, reconsider what the cache should store.
 
-I do not treat “authorized when cached” as “authorized now”.
+The host must obtain the principal from authentication. Alice and the other principals are fixed test identities here. A model argument must not select another user's database context. The [PostgreSQL MCP tool example](/blog/read-only-postgresql-mcp-tool-limits) explains that boundary and the scope of a restricted database role.
 
-Before returning a hit, the system checks current access to the result or to the sources represented by it. For a result containing citations, I verify that every cited source remains visible. If this check is as expensive as recomputing the workflow, that tells me the cache boundary may be wrong.
+The reuse function also propagates database errors. An unavailable permission check is not evidence that the old grant still applies.
 
-Shared caches need tenant separation in both storage and metrics. A missing tenant dimension is not a low hit-rate bug; it is a data leak.
+## Revoke access while the value stays warm
 
-Sensitive content may not be cacheable at all, or may require encryption, short retention, regional placement, and deletion propagation. I make eligibility explicit by task type.
+The [recorded GitHub run](https://github.com/mehdiakiki/mehdi-cz/actions/runs/41247556267/job/124674040829) exercises the following cases:
 
-## Semantic caching is a product decision
-
-Semantic caches reuse an answer for inputs considered similar by an embedding or classifier. This can improve hit rate. It also changes the meaning of a hit from “same identity” to “close enough”.
-
-I would consider it for low-risk explanatory content with strong source validation. I avoid it for:
-
-- account-specific facts;
-- legal, medical, or financial decisions;
-- tool arguments and irreversible actions;
-- requests where one negation changes intent;
-- answers whose permitted sources differ by user.
-
-The similarity threshold needs an evaluation set containing near-duplicates that should **not** share an answer. Average semantic similarity is not a safety test.
-
-## Cache only validated outcomes
-
-If a workflow produces structured output, I validate the schema and business constraints before writing the cache. I also store enough evidence to explain the result:
-
-```text
-created_at
-expires_at
-dependency versions
-model and prompt identity
-validation result
-source/citation identities
-cache policy version
-```
-
-Errors need separate rules. Caching a permanent “document not found” may be valid for a short period. Caching a provider timeout as if it were a negative answer is dangerous.
-
-## My test matrix
-
-I test a hit and every reason it should become a miss:
-
-| Change | Expected result |
+| Change after a value is cached | Required result |
 | --- | --- |
-| identical effective inputs | hit |
-| whitespace normalized by contract | hit |
-| prompt version changes | miss |
-| corpus snapshot changes | miss |
-| access revoked | deny, never return old content |
-| tool schema changes | miss |
-| tenant changes | isolated miss |
-| TTL expires | miss |
-| dependency event arrives twice | idempotent invalidation |
+| Caller, contract and source unchanged | Hit |
+| Contract version changes | Miss |
+| Tenant or principal changes | Miss |
+| A claimed source belongs to another user's grant | Denied |
+| Source body changes and receives a new revision | Miss |
+| Access is revoked while the text remains cached | Denied |
+| Source is deleted | Denied |
+| The same document ID is inserted again and access restored | Miss |
 
-I also test races: invalidation arriving while a result is computed, and two workers filling the same missing key. A stale writer should not overwrite a result built from newer dependencies.
+The revocation case does not evict the cached text first. The bytes remain present. PostgreSQL's current row policy makes the source unavailable to the reuse check, which refuses to return those bytes.
 
-## The metric I care about
+Refusing reuse does not erase the saved bytes. A storage-deletion promise needs its own retention and propagation policy. The example assumes this task is allowed to store an answer at all.
 
-Hit rate alone rewards unsafe reuse. I measure saved cost and latency beside stale-hit incidents, authorization denials, invalidation lag, and quality by cache policy.
+That ordering makes the counterexample useful. A test that deletes the cache entry before revoking access would never exercise a warm but forbidden result. The [row-security documentation](https://www.postgresql.org/docs/18/ddl-rowsecurity.html) explains why these checks use a non-owner role without `BYPASSRLS`.
 
-A low-risk cache with a modest hit rate can be more useful than a high-hit semantic cache that occasionally returns the wrong tenant's old truth.
+## State the moment your permission promise covers
 
-The principle I keep is simple: an AI answer does not become reusable because its text looks familiar. It becomes reusable when I can name its complete identity, prove its dependencies are fresh, and re-check that the current caller may see it.
+This function checks access and revisions together in one read statement. Its promise applies to that statement's visible database snapshot.
+
+A grant can change after validation and before a response is sent. The transaction does not hold a permission lock through the network exchange. It cannot recall text already sent to a model provider or another client.
+
+If your product promises a stronger revocation boundary, define how validation and delivery coordinate. Adding one more permission query still leaves a time interval after that query. PostgreSQL's [transaction isolation documentation](https://www.postgresql.org/docs/18/transaction-iso.html) helps distinguish a consistent snapshot from a promise about later changes.
+
+## Keep the other dependencies in view
+
+Checking cited sources does not detect every change that might alter an answer. A newly added document could change retrieval even when all old citations remain unchanged. Track a revision for the document collection and retrieval policy as part of the contract.
+
+The fixture's contract number stands in for such caller-supplied versions. It does not discover a changed prompt, provider model alias or tool schema. The application must advance those identities when their behavior changes.
+
+Expiry is still useful for retention and forgotten dependencies. It cannot replace authorization: an answer with fifty minutes left on its TTL can become forbidden now. This fixture does not test expiry, distributed invalidation, cache encryption or semantic similarity matching.
+
+Also keep application result caching separate from provider prompt caching. [OpenAI's prompt-caching documentation](https://developers.openai.com/api/docs/guides/prompt-caching#does-prompt-caching-affect-output-generation) describes reuse of a matching input prefix while the model generates a new response. It does not make a previously saved application answer current or authorized.
+
+The practical check is simple to describe: leave an old value warm, change something it depended on, then ask whether the application still returns it. Start with the changes your product says must matter. A passing lookup test is only the beginning of that investigation.

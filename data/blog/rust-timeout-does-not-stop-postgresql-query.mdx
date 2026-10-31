@@ -1,15 +1,15 @@
 ---
 title: "A Rust Timeout Can Leave PostgreSQL Work Running"
 date: "2026-10-30T10:02:25Z"
-lastmod: "2026-10-30T10:02:25Z"
+lastmod: "2026-10-31T22:29:38Z"
 tags: ["rust", "sqlx", "postgresql", "cancellation"]
 authors: ["default"]
 draft: false
 reviewed: true
-reviewedHash: "a6627033b7c0f41c705a3489b736afd53c10f617e57a93831e8a0cf17ca9ce70"
 cluster: "rust-under-the-hood"
 campaign: "editorial"
-summary: "Let a Rust query future time out while PostgreSQL waits for a row lock. Observe the server work, then compare a database statement timeout and transaction recovery."
+summary: "Observe server work after a Rust timeout, then check statement budgets, failed transactions and timeout settings across reused SQLx connections."
+reviewedHash: "84837deb79484e5016f77fab658ed23312265dd2570989f304197e7f9ecc9071"
 ---
 
 The request timed out, so the database operation must have stopped. That assumption can turn an ordinary retry into a duplicate write.
@@ -18,7 +18,7 @@ A Tokio deadline controls how long a Rust future is awaited. The remote database
 
 This reproduction makes the difference visible. A transaction holds a row lock. Another connection tries to update that row. Rust stops waiting, but an observer can still see the same PostgreSQL session waiting for the same lock. Releasing the lock lets the update complete.
 
-The test uses SQLx 0.8.6, Tokio 1.48.0, and PostgreSQL 18. It keeps the connection alive deliberately. It does not close the socket or test a proxy's disconnect policy. The complete fixture is `pg_timeout_work.rs` in [the PostgreSQL lab](https://github.com/mehdiakiki/mehdi-cz/tree/main/experiments/sql-rust/postgres-sqlite).
+The test uses SQLx 0.8.6, Tokio 1.48.0, and PostgreSQL 18. It keeps the connection alive deliberately. It does not close the socket or test a proxy's disconnect policy. The complete fixture is `pg_timeout_work.rs` in [the PostgreSQL lab](https://github.com/mehdiakiki/mehdi-cz/tree/85f6329a6cf36e944adbb4b4890b0f9ff7deb04f/experiments/sql-rust/postgres-sqlite).
 
 ## Establish where the query reached
 
@@ -101,6 +101,45 @@ The [PostgreSQL timeout documentation](https://www.postgresql.org/docs/18/runtim
 Here `SET LOCAL` limits the setting to the explicit transaction. That avoids silently leaving a request-specific limit on a pooled connection. Choose the setting's scope deliberately when applying the same idea in a service.
 
 The error code alone does not identify every cancellation source. PostgreSQL also uses `57014` for other query cancellation. This test knows its source because it controls the lock and statement limit. An application should retain the relevant error context rather than classifying every cancellation as a request deadline.
+
+## SET can reach the next pool borrower
+
+A separate failure can appear after the original request has finished. A handler changes `statement_timeout`, returns its connection to the pool, and another request borrows that same PostgreSQL session.
+
+A new checkout is not necessarily a new session. A plain `SET statement_timeout` belongs to the session. Putting it inside a transaction does not limit it to that transaction if the transaction commits.
+
+The [pool-setting fixture](https://github.com/mehdiakiki/mehdi-cz/blob/85f6329a6cf36e944adbb4b4890b0f9ff7deb04f/experiments/rust-backend/tests/database_boundaries.rs) makes this visible with a one-connection pool. It records the backend PID, establishes a known baseline of zero, then sets a 40-millisecond session limit. After the handle is returned, the next borrower must have the same PID and see `40ms`.
+
+That borrower's 150-millisecond sleep is canceled with `57014`. The borrower did not set a deadline. It inherited the previous request's setting. The test also commits a transaction containing plain `SET` and checks that the setting still survives.
+
+Here is the transaction-scoped comparison:
+
+```rust
+let mut tx = next.begin().await?;
+sqlx::query("SET LOCAL statement_timeout = '40ms'")
+    .execute(&mut *tx)
+    .await?;
+sqlx::query("SELECT 1").execute(&mut *tx).await?;
+tx.commit().await?;
+```
+
+After this commit, the next borrower must see the original zero setting on the same backend. Its sleep can complete. Zero is the fixture's chosen baseline; it is not an assertion about the defaults of every deployed pool.
+
+PostgreSQL's [SET documentation](https://www.postgresql.org/docs/18/sql-set.html) distinguishes those scopes. `SET LOCAL` ends with the explicit transaction. It does not establish a useful request limit when issued outside that transaction block.
+
+The [recorded run](https://github.com/mehdiakiki/mehdi-cz/actions/runs/41247556267/job/124674040829) checks the other exits as well:
+
+| Exit from the transaction | What the next borrower must observe |
+| --- | --- |
+| Commit after `SET LOCAL` | Same backend, original timeout, successful slow read |
+| Statement timeout followed by explicit rollback | Same backend, original timeout, successful slow read |
+| Task aborted after setting the limit, then joined | Same backend, original timeout, successful slow read |
+
+In the abort case, the task signals that setup has completed and waits at a gate between database commands. The test aborts it, awaits the canceled task, then borrows and inspects the session. That ordering checks recovery before another request can overwrite the setting and hide a leak.
+
+This cancellation case does not interrupt an executing database command. It does not replace the earlier lock-wait observation or establish that every dropped Rust future stops server work.
+
+For a request-specific database budget, choose the transaction boundary and keep its cleanup owned. If a service deliberately uses session settings, verify its reset or connection-discard policy on every exit. A pool can have custom hooks; the test here uses the pinned SQLx behavior shown by its complete fixture, not a promise about every connection manager.
 
 ## Keep the deadlines in the same design
 

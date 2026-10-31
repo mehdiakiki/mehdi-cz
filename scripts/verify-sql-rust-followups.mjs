@@ -23,6 +23,9 @@ const priorRevisions = JSON.parse(
 const referenceRevisions = JSON.parse(
   await readFile("docs/editorial/rust-reference-release-2026-10-31.json", "utf8")
 );
+const boundaryRevisions = JSON.parse(
+  await readFile("docs/editorial/database-boundary-updates-2026-10-31.json", "utf8")
+);
 const posts = [];
 for (const article of manifest.articles) {
   const source = await readFile(article.path, "utf8");
@@ -33,13 +36,18 @@ for (const article of manifest.articles) {
   assert.equal(data.date, release.publish_at);
   assert.equal(data.reviewedHash, articleReviewHash(source), article.slug);
   const approved = release.articles.find((item) => item.slug === article.slug);
+  const boundaryRevision = boundaryRevisions.articles.find((item) => item.slug === article.slug);
   const revised = revisedEditions.articles.find(
     (item) => item.kind === "revision" && item.slug === article.slug
   );
   const priorRevision = [...referenceRevisions.articles, ...priorRevisions.articles].find(
     (item) => item.slug === article.slug && item.kind === "update"
   );
-  if (revised) {
+  if (boundaryRevision) {
+    assert.equal(boundaryRevision.previousReviewedHash, priorRevision?.reviewedHash ?? approved?.reviewedHash, article.slug);
+    assert.equal(data.reviewedHash, boundaryRevision.reviewedHash, article.slug);
+    assert.equal(data.lastmod, boundaryRevision.lastmod, article.slug);
+  } else if (revised) {
     assert.equal(
       revised.previousReviewedHash,
       priorRevision?.reviewedHash ?? approved?.reviewedHash,
@@ -70,7 +78,7 @@ for (const article of manifest.articles) {
   });
   assert.ok(!source.includes("{{snippet:"), article.slug);
   const fences = [...content.matchAll(/^```([^\n]*)\n([\s\S]*?)^```/gm)];
-  const snippets = revised?.snippets || article.snippets;
+  const snippets = boundaryRevision?.snippets || revised?.snippets || article.snippets;
   assert.equal(fences.length, snippets.length, article.slug);
   for (const [index, snippet] of snippets.entries()) {
     assert.equal(fences[index][1], "rust");

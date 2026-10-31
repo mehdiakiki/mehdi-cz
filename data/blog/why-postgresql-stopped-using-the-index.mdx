@@ -1,100 +1,118 @@
 ---
 title: "PostgreSQL Chose a Sequential Scan: What to Check First"
 date: "2026-11-06T13:00:00Z"
-tags: ["postgresql", "sql", "performance", "databases"]
+tags: ["rust", "sqlx", "postgresql", "query plans", "databases"]
+authors: ["default"]
 draft: false
 reviewed: true
-reviewedHash: "587b7d4aca8c3c0b76a81297df5f3f6a8d071add819bd3c23cb3adcfd17e7a25"
 cluster: "reliable-data-integrations"
 campaign: "editorial"
-summary: "Read an orders query plan, compare estimated rows and buffers, and decide whether statistics, query shape, or an index needs investigation."
+summary: "Compare a real PostgreSQL plan before and after an ordered index. Follow the rows below LIMIT, check estimates, and decide which work an index would avoid."
+lastmod: "2026-11-06T13:00:00Z"
+reviewedHash: "5ab9b1f7c2addb5c3d34d3b4b44ebba32285089761e0e06a82e4febca8f1e28a"
 ---
 
-The index is still there. The query is still the same. But the endpoint has become slow, and the plan now says `Seq Scan`.
+The endpoint asks for five orders. PostgreSQL reads thousands of rows and sorts them. An index exists, but the plan says `Seq Scan`.
 
-It is tempting to force the index and move on. Sometimes that helps explain the problem. It is a poor first permanent fix, though. PostgreSQL may have changed its plan because the data changed, and the new choice may even be reasonable.
+That is enough reason to investigate. It is not enough reason to force an index. The existing index might find matching rows without supplying their order. A large customer might own most of the table. The estimate might even be right.
 
-Let's use a simple case: an orders page that shows one tenant's recent unpaid orders. We want to find out which part of that request became expensive.
+Let's follow one query through two plans. The [Rust fixture](https://github.com/mehdiakiki/mehdi-cz/blob/85f6329a6cf36e944adbb4b4890b0f9ff7deb04f/experiments/rust-backend/tests/database_boundaries.rs) uses SQLx 0.8.6 and PostgreSQL 18.6. It keeps the query, bound tenant and data fixed while adding an index that can supply the requested order.
 
-## Capture the actual query and values
+## Start with the query the application sends
 
-Start with the SQL the application sends, including its parameter types. An integer compared with text, an extra cast, or a different ordering can matter. The query copied from a ticket may not be the query running in production.
+The fixture asks for one tenant's newest unpaid orders:
 
-Here is the shape we are investigating:
-
-```sql
-EXPLAIN (ANALYZE, BUFFERS)
-SELECT id, created_at
-FROM orders
-WHERE tenant_id = 42
-  AND status = 'unpaid'
-ORDER BY created_at DESC
-LIMIT 50;
+```rust
+const ORDERS: &str = "SELECT id FROM limit_plan_review.orders
+    WHERE tenant_id = $1 AND status = 'unpaid'
+    ORDER BY created_at DESC, id DESC LIMIT 5";
 ```
 
-Use representative data in a controlled database. `EXPLAIN ANALYZE` executes the statement. For a costly read, that still means real work; for a write, it means real side effects. Start with plain `EXPLAIN` if running the query is not yet acceptable.
+The ID breaks ties when two orders have the same timestamp. Without a complete ordering, two valid executions could disagree about which rows belong in the first five.
 
-In the output, compare estimated rows with actual rows at each node. Find where they first become very different. Also read `loops`: a cheap operation repeated many times can dominate the request. [PostgreSQL's EXPLAIN guide](https://www.postgresql.org/docs/18/using-explain.html) explains these fields and why node timings cannot simply be added together.
+The tenant is a bound parameter. `alpha` is a fixed test value here. In an application, derive that scope from the authenticated request. An execution-plan example does not establish the application's authorization boundary.
 
-Consider this shortened teaching example from the scan below the sort and limit. Its numbers are invented to explain the fields; this is not recorded output or a performance result:
+Use the actual parameter types and representative values when investigating a service. A cast, predicate or sort direction can change the available plan. A query pasted into a ticket may differ from the one the driver sends.
 
-```text
-Seq Scan on orders (cost=0.00..2400.00 rows=100 width=16)
-  (actual time=0.020..18.000 rows=20000 loops=1)
-  Filter: ((tenant_id = 42) AND (status = 'unpaid'))
-  Rows Removed by Filter: 80000
-  Buffers: shared hit=960 read=40
+The helper captures the plan through the same Rust connection:
+
+```rust
+async fn order_plan(connection: &mut PgConnection, tenant: &str) -> Result<Value> {
+    let explain = format!("EXPLAIN (ANALYZE, BUFFERS, TIMING OFF, FORMAT JSON) {ORDERS}");
+    let Json(plan): Json<Value> = sqlx::query_scalar(&explain)
+        .bind(tenant)
+        .fetch_one(connection)
+        .await?;
+    Ok(plan)
+}
 ```
 
-The estimate was 100 matching rows; the scan produced 20,000. That difference makes statistics worth investigating. It is not proof that the scan itself was the wrong choice. The filter also discarded 80,000 rows, so ask whether an index could avoid enough of that reading and the later sort.
+`EXPLAIN ANALYZE` executes the statement. Here that means a bounded read in a disposable database. For a query that is expensive or changes data, first decide whether executing it is acceptable. Plain `EXPLAIN` shows estimates without running the statement.
 
-The buffer line describes 960 shared-buffer hits and 40 reads into shared buffers. It doesn't mean 1,000 distinct disk reads, and a read can still be served by the operating system's cache. Compare buffer work alongside elapsed time. Parent nodes include their children's buffer activity, so don't add every line as if it were separate work. The [EXPLAIN reference](https://www.postgresql.org/docs/18/sql-explain.html) defines these counters.
+SQLx's `json` feature enables the typed result used here. JSON makes the plan easy for the fixture to inspect. The [PostgreSQL EXPLAIN guide](https://www.postgresql.org/docs/18/using-explain.html) describes the plan tree and its fields.
 
-When `loops` is greater than one, displayed actual rows and time are averages per execution. Read them together with the loop count. Keep the complete plan: this fragment alone cannot tell you how expensive the sort or the complete request was.
+## Follow the rows below LIMIT
 
-Save the plan with the query, parameter values, database version, and relevant settings. Keep private identifiers out of shared examples. A screenshot of just the top line leaves out much of what you need next.
+The table contains 20,000 orders. Alpha owns 19,000; beta owns 1,000. An existing index covers `(tenant_id, status)`. It does not supply `created_at DESC, id DESC`.
 
-## Check whether the planner knows the data
+The fixture requires the baseline to contain a sequential scan and a sort. It checks the nodes rather than assuming that writing a query with `LIMIT 5` made the database read five rows.
 
-Suppose tenant 42 has far more unpaid orders than most tenants. A plan based on a small average tenant may behave badly for this one.
+The [recorded execution](https://github.com/mehdiakiki/mehdi-cz/actions/runs/41247556267/job/124674040829) gives this comparison:
 
-[Planner statistics](https://www.postgresql.org/docs/18/planner-stats.html) are estimates, not a live count of every combination of values. They can also be out of date after a large import or a change in how rows are distributed.
+| Observation | Before the ordered index | After the ordered index |
+| --- | --- | --- |
+| Returned IDs | 19,999 through 19,995 | The same five IDs |
+| Access path | Sequential scan | Index-only scan |
+| Matching rows emitted by the scan | 19,000 | 5 |
+| Rows removed by the scan's tenant filter | 1,000 | No tenant filtering after the index condition |
+| Separate sort | Present | Absent |
 
-Look at when the table was last analyzed:
+These counts belong to the synthetic dataset. They are not a production speedup or disk-I/O measurement.
 
-```sql
-SELECT last_analyze, last_autoanalyze, n_mod_since_analyze
-FROM pg_stat_user_tables
-WHERE relid = 'public.orders'::regclass;
+Read the scan and its parent together. The sequential scan emits 19,000 matching rows and removes 1,000. With one loop, that accounts for all 20,000 table rows. The sort returns five rows to `LIMIT`, but it receives 19,000 candidates before it can choose them.
+
+A small sort result is therefore not evidence of small input work. The [index ordering documentation](https://www.postgresql.org/docs/18/indexes-ordering.html) explains why a matching B-tree can change this particular pattern.
+
+`Actual Rows` describes a node's output. With multiple loops, the displayed value is an average per execution. Keep the loop count and full tree with the result. A cropped line from the top of the plan cannot explain the work underneath it.
+
+## Check estimates before prescribing ANALYZE
+
+Compare estimated and actual rows at the earliest node where they diverge. A large difference can make statistics worth investigating. A sequential scan by itself does not show that statistics are stale.
+
+For this fixture, `ANALYZE` runs after the data is inserted. The baseline estimate of 19,000 qualifying rows matches the observed scan output. Most rows belong to alpha. Finding that tenant through the existing filter index still leaves many rows to read and sort. The experiment does not reproduce stale statistics, and it does not show that refreshing statistics repairs every slow query.
+
+For a real table, inspect `last_analyze`, `last_autoanalyze` and `n_mod_since_analyze` in `pg_stat_user_tables`. Consider a targeted statistics refresh after a large change, then capture the same query again. Keep the old plan so you can distinguish an estimate improvement from a reduction in actual work.
+
+Also read buffer counters carefully. A shared-buffer hit is not a disk read. A read into shared buffers can come from the operating system's cache. Parent counters include child work, so adding every node can count the same activity more than once. The [EXPLAIN reference](https://www.postgresql.org/docs/18/sql-explain.html) defines those counters.
+
+## Add the index that supplies the missing order
+
+The candidate index includes the equality filters followed by the ordering columns:
+
+```rust
+sqlx::query(
+    "CREATE INDEX orders_tenant_status_created_idx
+     ON limit_plan_review.orders
+        (tenant_id, status, created_at DESC, id DESC)",
+)
+.execute(&mut *tx)
+.await?;
 ```
 
-If a large data change happened after that, a targeted `ANALYZE public.orders` may be worth trying in the controlled investigation. It refreshes statistics; it does not rebuild the index. Read the [ANALYZE documentation](https://www.postgresql.org/docs/18/sql-analyze.html) before choosing where and when to run it.
+The fixture then runs the same bound query and captures another plan. It requires the named ordered index, no separate sort, and the same five IDs. Both comparisons happen in one Repeatable Read transaction over the unchanged fixture data. No planner method is disabled to manufacture the repair.
 
-Then capture the plan again. Did estimates improve? Did the scan change? Did elapsed time improve for the same values? Keep the earlier plan instead of overwriting it. Otherwise it becomes difficult to explain what changed.
+Matching the result matters. A faster query that dropped the tenant predicate, changed the sort or skipped valid orders would answer a different question.
 
-If the estimates are still wrong for related columns, extended statistics may help. That deserves its own small comparison. Don't raise every statistics target or add every possible statistic at once.
+The recorded node is called `Index Only Scan`, but it still reports five heap fetches for visibility checks. That name does not promise that no heap access happened.
 
-## Ask what work an index would avoid
+This is an index to investigate for this query. It is not a general prescription for every orders table. An index occupies storage and adds work to writes. Check existing indexes and other common queries before keeping another one. [The index write-cost investigation](/blog/index-cost-write-heavy-postgresql-table) follows that tradeoff separately.
 
-An index is useful when it avoids enough reading or sorting to pay for its own work. A sequential scan isn't automatically a mistake. Reading much of a table through an index can be more expensive than reading it directly.
+The ordinary `CREATE INDEX` above is used on an isolated fixture. Building an index on a busy service needs a deployment plan of its own. This experiment does not test that rollout.
 
-For our query, a possible index to investigate is:
+## Try the values your users actually send
 
-```sql
-CREATE INDEX orders_tenant_status_created_idx
-ON orders (tenant_id, status, created_at DESC);
-```
+Alpha owns almost the whole fixture table. A small tenant, an empty result or a different status can produce another plan. Repeat the investigation with representative inputs and the application's prepared-statement behavior. Keep the SQL, values, database version, settings and complete plans together.
 
-This is a candidate for the example, not an instruction to add it to every orders table. Check existing indexes first. Test other common queries and account for the extra write and storage cost. Building an index on a busy production table also needs a deployment plan; the plain command above is for a controlled fixture.
+If the query finishes quickly but the endpoint still waits, the [Rust request investigation](/blog/rust-request-waiting-for-pool-or-postgresql) separates pool acquisition, database waits and response work. A plan cannot explain time before the query reaches PostgreSQL.
 
-Check the query itself too. Is the sort necessary? Is the application asking for all columns when it only displays two? Is the slow tenant missing a selective condition? Adding an index before answering those questions can make the schema larger without fixing the request.
-
-## Try the other tenants too
-
-A result for one tenant is not enough. Compare a small tenant, a large tenant, an empty result, and the values from the original slow request. If the application uses prepared statements, inspect its behavior as well as a query pasted into an interactive session. If the query is fast but the endpoint is still slow, <ArticleLink slug="following-one-slow-request-through-an-app">separate database connection waiting from query time</ArticleLink> before changing another index.
-
-For a retrieval endpoint, changing the search method is a separate question from repairing a bad plan. The <ArticleLink slug="does-this-search-need-a-vector-database">PostgreSQL lexical and vector trial</ArticleLink> compares exact candidate lists before proposing another database.
-
-PostgreSQL 19's release candidate includes work on planner advice. It is still a [release candidate as of October 24](https://www.postgresql.org/about/news/postgresql-19-rc-1-released-3409/). New controls may be useful, but they don't remove the need to understand the query and data.
-
-Keep the two plans beside each other with the same SQL and parameter values. If `ANALYZE` improved estimates but the request is still slow, say that. It tells the next person to investigate the remaining read or sort work instead of repeating the statistics update.
+The useful conclusion is specific: the first plan had to sort many eligible rows to return five. The new index supplied their order and let this scan stop after five. That is evidence for this repair, with this query and data. It leaves the next investigation much clearer than treating `Seq Scan` as an error message.

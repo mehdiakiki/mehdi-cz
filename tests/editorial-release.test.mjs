@@ -17,6 +17,9 @@ import {
 const approval = JSON.parse(
   await readFile(new URL("../docs/editorial/release-2026-10-25.json", import.meta.url), "utf8")
 );
+const revisedGuides = JSON.parse(
+  await readFile(new URL("../docs/editorial/database-boundary-updates-2026-10-31.json", import.meta.url), "utf8")
+);
 const approvedSlugs = new Set(approval.articles.map((article) => article.slug));
 const editorialSeries = allEditorialSeries.filter((series) =>
   series.parts.every((slug) => approvedSlugs.has(slug))
@@ -44,7 +47,11 @@ test("the approved thirty sources have exact review hashes and one UTC slot per 
     assert.equal(post.draft, false, post.slug);
     assert.equal(post.reviewed, true, post.slug);
     assert.equal(hasValidReviewHash(post), true, post.slug);
-    assert.equal(post.reviewedHash, approval.articles[index].reviewedHash, post.slug);
+    const revision = revisedGuides.articles.find((article) => article.slug === post.slug);
+    if (revision) {
+      assert.equal(revision.previousReviewedHash, approval.articles[index].reviewedHash);
+    }
+    assert.equal(post.reviewedHash, revision?.reviewedHash ?? approval.articles[index].reviewedHash, post.slug);
     assert.equal(post.date, approval.articles[index].date, post.slug);
     assert.equal(Date.parse(post.date), start + index * day, post.slug);
     assert.equal(heldArticleSlugs.has(post.slug), false, post.slug);

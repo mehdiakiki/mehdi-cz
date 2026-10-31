@@ -358,6 +358,7 @@ const articleSlugsByTheme = {
     "the-readme-asked-for-a-different-job",
   ],
   "derived-state": [
+    "caching-ai-results-requires-an-identity-and-freshness-model",
     "no-timestamp-in-dependency-cache-key",
     "check-lockfile-before-blaming-rust-upgrade",
     "test-generated-code-from-empty-output",
