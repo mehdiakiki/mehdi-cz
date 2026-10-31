@@ -11,11 +11,14 @@ const release = JSON.parse(
   await readFile("docs/editorial/database-boundary-updates-2026-10-31.json", "utf8")
 );
 assert.equal(release.author, "Mehdi Akiki");
-assert.deepEqual(release.articles.map((article) => article.slug), [
-  "why-postgresql-stopped-using-the-index",
-  "rust-timeout-does-not-stop-postgresql-query",
-  "caching-ai-results-requires-an-identity-and-freshness-model",
-]);
+assert.deepEqual(
+  release.articles.map((article) => article.slug),
+  [
+    "why-postgresql-stopped-using-the-index",
+    "rust-timeout-does-not-stop-postgresql-query",
+    "caching-ai-results-requires-an-identity-and-freshness-model",
+  ]
+);
 const fixture = await readFile(release.fixture.path, "utf8");
 assert.equal(createHash("sha256").update(fixture).digest("hex"), release.fixture.sourceHash);
 
@@ -61,7 +64,11 @@ for (const article of release.articles) {
     );
     const excerpt = rust.match(marker)?.[1];
     assert.ok(excerpt, snippet.label);
-    assert.equal(unindent(fences[index][2]), unindent(excerpt), `${article.slug}: ${snippet.label}`);
+    assert.equal(
+      unindent(fences[index][2]),
+      unindent(excerpt),
+      `${article.slug}: ${snippet.label}`
+    );
   }
   console.log(`Verified reviewed source, original date and Rust excerpts: ${article.slug}`);
 }

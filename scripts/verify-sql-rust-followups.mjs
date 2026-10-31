@@ -44,7 +44,11 @@ for (const article of manifest.articles) {
     (item) => item.slug === article.slug && item.kind === "update"
   );
   if (boundaryRevision) {
-    assert.equal(boundaryRevision.previousReviewedHash, priorRevision?.reviewedHash ?? approved?.reviewedHash, article.slug);
+    assert.equal(
+      boundaryRevision.previousReviewedHash,
+      priorRevision?.reviewedHash ?? approved?.reviewedHash,
+      article.slug
+    );
     assert.equal(data.reviewedHash, boundaryRevision.reviewedHash, article.slug);
     assert.equal(data.lastmod, boundaryRevision.lastmod, article.slug);
   } else if (revised) {
