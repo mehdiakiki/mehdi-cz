@@ -12,7 +12,10 @@ fn ci_only() {
 }
 
 fn sqlstate(error: &sqlx::Error) -> Option<String> {
-    error.as_database_error()?.code().map(|value| value.into_owned())
+    error
+        .as_database_error()?
+        .code()
+        .map(|value| value.into_owned())
 }
 
 // article:start ordered-query
@@ -23,9 +26,7 @@ const ORDERS: &str = "SELECT id FROM limit_plan_review.orders
 
 // article:start capture-plan
 async fn order_plan(connection: &mut PgConnection, tenant: &str) -> Result<Value> {
-    let explain = format!(
-        "EXPLAIN (ANALYZE, BUFFERS, TIMING OFF, FORMAT JSON) {ORDERS}"
-    );
+    let explain = format!("EXPLAIN (ANALYZE, BUFFERS, TIMING OFF, FORMAT JSON) {ORDERS}");
     let Json(plan): Json<Value> = sqlx::query_scalar(&explain)
         .bind(tenant)
         .fetch_one(connection)
@@ -69,6 +70,7 @@ async fn a_small_limit_does_not_bound_the_input_to_a_sort() -> Result<()> {
             .execute(&mut *tx)
             .await?;
         let before = order_plan(&mut tx, "alpha").await?;
+        println!("LIMIT_BEFORE {}", serde_json::to_string(&before)?);
         let before_rows: Vec<i32> = sqlx::query_scalar(ORDERS)
             .bind("alpha")
             .fetch_all(&mut *tx)
@@ -79,11 +81,11 @@ async fn a_small_limit_does_not_bound_the_input_to_a_sort() -> Result<()> {
         plan_nodes(&before[0]["Plan"], &mut before_nodes);
         let scan = before_nodes.iter().find(|node| node["Node Type"] == "Seq Scan")
             .expect("the baseline must actually use a sequential scan");
-        assert_eq!(scan["Actual Rows"].as_u64(), Some(19000));
-        assert_eq!(scan["Rows Removed by Filter"].as_u64(), Some(1000));
-        assert_eq!(scan["Actual Loops"].as_u64(), Some(1));
+        assert_eq!(scan["Actual Rows"].as_f64(), Some(19000.0));
+        assert_eq!(scan["Rows Removed by Filter"].as_f64(), Some(1000.0));
+        assert_eq!(scan["Actual Loops"].as_f64(), Some(1.0));
         assert!(before_nodes.iter().any(|node| node["Node Type"] == "Sort"));
-        assert_eq!(before[0]["Plan"]["Actual Rows"].as_u64(), Some(5));
+        assert_eq!(before[0]["Plan"]["Actual Rows"].as_f64(), Some(5.0));
 
         // article:start ordered-index
         sqlx::query(
@@ -96,6 +98,7 @@ async fn a_small_limit_does_not_bound_the_input_to_a_sort() -> Result<()> {
         // article:end ordered-index
 
         let after = order_plan(&mut tx, "alpha").await?;
+        println!("LIMIT_AFTER {}", serde_json::to_string(&after)?);
         let after_rows: Vec<i32> = sqlx::query_scalar(ORDERS)
             .bind("alpha")
             .fetch_all(&mut *tx)
@@ -106,11 +109,9 @@ async fn a_small_limit_does_not_bound_the_input_to_a_sort() -> Result<()> {
         let scan = after_nodes.iter().find(|node| {
             node["Index Name"] == "orders_tenant_status_created_idx"
         }).expect("the repair must actually use the ordered index");
-        assert_eq!(scan["Actual Rows"].as_u64(), Some(5));
-        assert_eq!(scan["Actual Loops"].as_u64(), Some(1));
+        assert_eq!(scan["Actual Rows"].as_f64(), Some(5.0));
+        assert_eq!(scan["Actual Loops"].as_f64(), Some(1.0));
         assert!(!after_nodes.iter().any(|node| node["Node Type"] == "Sort"));
-        println!("LIMIT_BEFORE {}", serde_json::to_string(&before)?);
-        println!("LIMIT_AFTER {}", serde_json::to_string(&after)?);
         println!("LIMIT: same five IDs; baseline scanned 19000 eligible plus 1000 filtered rows; ordered index emitted five without Sort");
         tx.rollback().await?;
         discard(pool, "limit_plan_review").await;
@@ -120,9 +121,11 @@ async fn a_small_limit_does_not_bound_the_input_to_a_sort() -> Result<()> {
 }
 
 async fn session_state(connection: &mut PgConnection) -> Result<(i32, String)> {
-    Ok(sqlx::query_as("SELECT pg_backend_pid(), current_setting('statement_timeout')")
-        .fetch_one(connection)
-        .await?)
+    Ok(
+        sqlx::query_as("SELECT pg_backend_pid(), current_setting('statement_timeout')")
+            .fetch_one(connection)
+            .await?,
+    )
 }
 
 #[tokio::test]
@@ -232,12 +235,15 @@ async fn reuse_answer(
     contract: i32,
     cached: &CachedAnswer,
 ) -> Result<CacheUse> {
-    if (cached.tenant, cached.user, cached.contract) !=
-        (principal.tenant, principal.user, contract) || cached.sources.is_empty() {
+    if (cached.tenant, cached.user, cached.contract) != (principal.tenant, principal.user, contract)
+        || cached.sources.is_empty()
+    {
         return Ok(CacheUse::Miss);
     }
     let mut tx = pool.begin().await?;
-    sqlx::query("SET TRANSACTION READ ONLY").execute(&mut *tx).await?;
+    sqlx::query("SET TRANSACTION READ ONLY")
+        .execute(&mut *tx)
+        .await?;
     sqlx::query(
         "SELECT set_config('app.tenant_id', $1, true),
                 set_config('app.principal_id', $2, true)",
@@ -269,8 +275,10 @@ async fn visible_source(pool: &PgPool) -> Result<(i64, i64, String)> {
     let mut tx = pool.begin().await?;
     sqlx::query("SELECT set_config('app.tenant_id','alpha',true), set_config('app.principal_id','alice',true)")
         .execute(&mut *tx).await?;
-    let row = sqlx::query_as("SELECT id, revision, body FROM cache_source_review.documents WHERE id=1")
-        .fetch_one(&mut *tx).await?;
+    let row =
+        sqlx::query_as("SELECT id, revision, body FROM cache_source_review.documents WHERE id=1")
+            .fetch_one(&mut *tx)
+            .await?;
     tx.commit().await?;
     Ok(row)
 }
@@ -286,14 +294,14 @@ async fn a_warm_answer_needs_current_access_and_source_versions() -> Result<()> 
              CREATE SEQUENCE document_revision;
              CREATE TABLE documents(
                 tenant_id text NOT NULL, id bigint NOT NULL, body text NOT NULL,
-                revision bigint NOT NULL DEFAULT nextval('cache_source_review.document_revision'),
+                revision bigint NOT NULL,
                 PRIMARY KEY(tenant_id,id));
              CREATE FUNCTION advance_revision() RETURNS trigger LANGUAGE plpgsql AS $$
                 BEGIN
                     NEW.revision := nextval('cache_source_review.document_revision');
                     RETURN NEW;
                 END $$;
-             CREATE TRIGGER document_changed BEFORE UPDATE ON documents
+             CREATE TRIGGER document_changed BEFORE INSERT OR UPDATE ON documents
                 FOR EACH ROW EXECUTE FUNCTION advance_revision();
              CREATE TABLE access_grants(
                 tenant_id text NOT NULL, principal text NOT NULL, document_id bigint NOT NULL,
@@ -358,10 +366,12 @@ async fn a_warm_answer_needs_current_access_and_source_versions() -> Result<()> 
         assert_eq!(reuse_answer(&reader, &principal, 7, &cached).await?, CacheUse::Hit(cached.text.clone()));
         sqlx::query("DELETE FROM documents WHERE tenant_id='alpha' AND id=1").execute(&admin).await?;
         assert_eq!(reuse_answer(&reader, &principal, 7, &cached).await?, CacheUse::Denied);
-        sqlx::query("INSERT INTO documents(tenant_id,id,body) VALUES ('alpha',1,'replacement source')")
-            .execute(&admin).await?;
+        sqlx::query("INSERT INTO documents(tenant_id,id,body,revision) VALUES ('alpha',1,'replacement source',$1)")
+            .bind(new_revision).execute(&admin).await?;
         sqlx::query("INSERT INTO access_grants VALUES ('alpha','alice',1)").execute(&admin).await?;
         assert_eq!(reuse_answer(&reader, &principal, 7, &cached).await?, CacheUse::Miss);
+        let (_, replacement_revision, _) = visible_source(&reader).await?;
+        assert_ne!(replacement_revision, new_revision);
         println!("CACHE: warm hit; contract/tenant mismatch missed; database-owned revision changed after edit; revoked and deleted sources denied; reinserted ID missed despite restored access");
         reader.close().await;
         sqlx::raw_sql("DROP SCHEMA cache_source_review CASCADE; DROP ROLE cache_source_reader")
