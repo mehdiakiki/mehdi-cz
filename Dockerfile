@@ -65,6 +65,7 @@ RUN addgroup -g 1001 -S nodejs && adduser -S nextjs -u 1001
 
 # Copy required runtime artifacts
 COPY --from=build /app/next.config.js ./next.config.js
+COPY --from=build /app/data/agent-guides.json ./data/agent-guides.json
 COPY --from=build /app/lib/next-supported-browser-polyfills-webpack.js ./lib/
 COPY --from=build /app/lib/next-supported-browser-polyfills.js ./lib/
 COPY --from=build /app/public ./public

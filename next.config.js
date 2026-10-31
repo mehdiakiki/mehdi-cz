@@ -6,6 +6,7 @@ const {
 } = require("./lib/next-supported-browser-polyfills-webpack.js");
 
 const repositoryRoot = __dirname;
+const agentGuides = require("./data/agent-guides.json");
 
 // You might need to insert additional domains in script-src if you are using external services
 const ContentSecurityPolicy = `
@@ -179,6 +180,24 @@ module.exports = () => {
           source: "/(.*)",
           headers: securityHeaders,
         },
+        {
+          source: "/llms.txt",
+          headers: [{ key: "Content-Type", value: "text/plain; charset=utf-8" }],
+        },
+        {
+          source: "/rust/guide-index",
+          headers: [{ key: "Content-Type", value: "application/json; charset=utf-8" }],
+        },
+        ...agentGuides.guides.map((guide) => ({
+          source: `/blog/${guide.slug}.md`,
+          headers: [
+            { key: "Content-Type", value: "text/markdown; charset=utf-8" },
+            {
+              key: "Link",
+              value: `<${agentGuides.siteUrl}/blog/${guide.slug}>; rel="canonical", </llms.txt>; rel="describedby"`,
+            },
+          ],
+        })),
         // Cache static assets aggressively
         {
           source: "/static/(.*)",
