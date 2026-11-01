@@ -188,6 +188,10 @@ module.exports = () => {
           source: "/rust/guide-index",
           headers: [{ key: "Content-Type", value: "application/json; charset=utf-8" }],
         },
+        {
+          source: "/rust-failure-atlas/evidence/:file(.*\\.rs)",
+          headers: [{ key: "Content-Type", value: "text/plain; charset=utf-8" }],
+        },
         ...agentGuides.guides.map((guide) => ({
           source: `/blog/${guide.slug}.md`,
           headers: [

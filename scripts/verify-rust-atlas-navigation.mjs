@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { setTimeout as delay } from "node:timers/promises";
 import { getRustFailureArea } from "../data/rust-failure-atlas.mjs";
@@ -40,6 +40,13 @@ try {
   assert.ok(ready, "The built server did not become ready");
   const html = await (await fetch(`${origin}/rust-failure-atlas`)).text();
   assert.ok(html.indexOf('id="failure-search"') < html.indexOf('id="atlas-featured"'));
+  for (const fixture of ["RFA-088/fail.rs", "RFA-088/fixed.rs", "RFA-033/fail/src/lib.rs"]) {
+    const path = `/rust-failure-atlas/evidence/${fixture}`;
+    const response = await fetch(origin + path);
+    assert.equal(response.status, 200, path);
+    assert.match(response.headers.get("content-type"), /^text\/plain(?:;|$)/i, path);
+    assert.equal(await response.text(), await readFile(`public${path}`, "utf8"), path);
+  }
   const wire = await (await fetch(`${origin}/rust-failure-atlas/search-index`)).json();
   const counts = new Map();
   for (const entry of wire.entries) counts.set(entry[1], (counts.get(entry[1]) || 0) + 1);
