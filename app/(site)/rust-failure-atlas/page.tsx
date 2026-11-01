@@ -49,19 +49,19 @@ const method = [
     number: "01",
     title: "Begin with the symptom",
     description:
-      "Use the exact message, target, timing, profile, and smallest environmental difference you can observe.",
+      "Keep the exact error and note what changed: Rust version, target, profile, or when the failure happens.",
   },
   {
     number: "02",
-    title: "Run a discriminating check",
+    title: "Separate the possible causes",
     description:
-      "Prefer one test that separates two possible causes over a long list of generic fixes.",
+      "Choose a check whose result changes what you investigate next. A build failure may come from the Rust code, the linker, or a missing library.",
   },
   {
     number: "03",
-    title: "Keep the fixture with the repair",
+    title: "Check the repair",
     description:
-      "Each case page ships a failing and a repaired fixture. The fixture shows that the failure reproduces and that the repair passes. The explanation is written by hand, and you can check it against the fixture.",
+      "Compare the failing example with the repaired one. Check what changed and what the result establishes. The explanation connects that result to the sources.",
   },
 ];
 
@@ -93,9 +93,7 @@ function RustFailureAtlasDirectory({ areas }: { areas: VisibleArea[] }) {
           Browse by failure family
         </h3>
         <p className="mt-2 leading-7 text-gray-600 dark:text-gray-400">
-          Each family page lists every record in that family, featured or not, with a stable anchor
-          for each case ID. Mechanisms and first checks appear here when you search or choose a
-          filter.
+          Choose a family to browse its cases. Each case starts with a symptom and a first check.
         </p>
       </div>
 
@@ -185,29 +183,45 @@ export default function RustFailureAtlasPage() {
         }}
       />
 
-      <header className="max-w-5xl pt-8 pb-14 md:pt-12 md:pb-20">
+      <header className="max-w-5xl pt-8 pb-6 md:pt-12 md:pb-8">
         <p className="text-primary-600 dark:text-primary-400 text-sm font-semibold tracking-[0.16em] uppercase">
           A practical Rust reference
-        </p>
-        <p className="mt-4 text-sm font-semibold tracking-[0.16em] text-gray-500 uppercase dark:text-gray-400">
-          Symptom &rarr; mechanism &rarr; evidence
         </p>
         <h1 className="mt-3 text-4xl leading-tight font-bold tracking-tight text-gray-950 md:text-6xl dark:text-gray-100">
           Rust Failure Atlas
         </h1>
         <p className="mt-7 max-w-4xl text-xl leading-9 text-gray-600 dark:text-gray-300">
-          A field guide for Rust failures that are difficult to name and easy to misdiagnose. Start
-          from what you can observe, isolate the mechanism, reproduce it, and verify the repair.
-        </p>
-        <p className="mt-5 max-w-3xl leading-7 text-gray-600 dark:text-gray-400">
-          The front of this page collects failures below the application layer: an FFI symbol that
-          disappears under LTO, a linker killed for memory, a sys crate that finds the wrong native
-          library, two copies of one native library in one binary, a C object built for the host
-          instead of the target, memory freed by the wrong allocator, and a doctest that sees a
-          different cfg. The full collection, including compiler diagnostics with a stable error
-          code, stays searchable below and on the family pages.
+          Your build fails only in release. A task stops making progress. A library works on one
+          machine but fails on another. Start with the error or the symptom, then follow a check
+          that can narrow the cause.
         </p>
       </header>
+
+      <section className="pt-2 pb-10 md:pb-14" aria-labelledby="atlas-cases">
+        <div className="max-w-4xl">
+          <h2
+            id="atlas-cases"
+            className="text-3xl font-bold tracking-tight text-gray-950 dark:text-gray-100"
+          >
+            Find your failure
+          </h2>
+          <p className="mt-4 text-lg leading-8 text-gray-600 dark:text-gray-400">
+            Paste the first error line or describe what you see. If several causes fit, use the
+            first check to tell them apart.
+          </p>
+        </div>
+        <div className="mt-8">
+          <RustFailureAtlasExplorer
+            areas={visibleAreas}
+            entryCount={entries.length}
+            indexPath="/rust-failure-atlas/search-index.json.gz"
+            fallbackIndexPath="/rust-failure-atlas/search-index"
+            areaPathPrefix="/rust-failure-atlas/area"
+          >
+            <RustFailureAtlasDirectory areas={visibleAreas} />
+          </RustFailureAtlasExplorer>
+        </div>
+      </section>
 
       <section
         className="grid gap-6 border-y border-gray-200 py-8 sm:grid-cols-3 dark:border-gray-800"
@@ -325,32 +339,6 @@ export default function RustFailureAtlasPage() {
             <p className="mt-3 leading-7 text-gray-600 dark:text-gray-400">{item.description}</p>
           </div>
         ))}
-      </section>
-
-      <section className="py-16 md:py-20" aria-labelledby="atlas-cases">
-        <div className="max-w-4xl">
-          <h2
-            id="atlas-cases"
-            className="text-3xl font-bold tracking-tight text-gray-950 dark:text-gray-100"
-          >
-            Find the failure you actually have
-          </h2>
-          <p className="mt-4 text-lg leading-8 text-gray-600 dark:text-gray-400">
-            Search error fragments and observed behavior. The first check is deliberately narrow: it
-            should remove a branch from the diagnosis, not merely produce more logs.
-          </p>
-        </div>
-        <div className="mt-8">
-          <RustFailureAtlasExplorer
-            areas={visibleAreas}
-            entryCount={entries.length}
-            indexPath="/rust-failure-atlas/search-index.json.gz"
-            fallbackIndexPath="/rust-failure-atlas/search-index"
-            areaPathPrefix="/rust-failure-atlas/area"
-          >
-            <RustFailureAtlasDirectory areas={visibleAreas} />
-          </RustFailureAtlasExplorer>
-        </div>
       </section>
 
       <section
