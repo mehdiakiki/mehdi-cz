@@ -299,7 +299,7 @@ export default function RustFailureAtlasExplorer({
         <div className="mt-4 flex flex-wrap gap-2" aria-label="Example searches">
           {[
             ["Future is not Send", "future not Send"],
-            ["A task stops moving", "Tokio stalls"],
+            ["A test hangs", "test hangs"],
             ["Build script keeps running", "build script reruns"],
             ["Debug works, release fails", "debug release"],
           ].map(([label, example]) => (

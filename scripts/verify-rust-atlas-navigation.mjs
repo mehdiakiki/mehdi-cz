@@ -82,6 +82,18 @@ try {
   await expect(page.locator("#atlas-search-status")).toContainText("Showing 1–40");
   assert.deepEqual(await ids(), firstPage);
 
+  for (const [label, query] of [
+    ["Future is not Send", "future not Send"],
+    ["A test hangs", "test hangs"],
+    ["Build script keeps running", "build script reruns"],
+    ["Debug works, release fails", "debug release"],
+  ]) {
+    await page.getByRole("button", { name: label, exact: true }).click();
+    await expect(input).toHaveValue(query);
+    await expect(page.locator("#atlas-search-status")).toContainText("Showing ");
+    await expect(results.first()).toBeVisible();
+  }
+
   await page.getByRole("button", { name: "Future is not Send", exact: true }).click();
   await expect(input).toHaveValue("future not Send");
   await expect(results.first()).toBeVisible();
