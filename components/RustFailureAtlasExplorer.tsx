@@ -11,7 +11,11 @@ import {
 } from "react";
 
 import IntentLink from "@/components/IntentLink";
-import { prepareRustFailureSearch, searchRustFailures, rustFailureResultPage } from "lib/rust-failure-search.mjs";
+import {
+  prepareRustFailureSearch,
+  searchRustFailures,
+  rustFailureResultPage,
+} from "lib/rust-failure-search.mjs";
 
 export interface RustFailureExplorerEntry {
   id: string;
@@ -100,23 +104,26 @@ export default function RustFailureAtlasExplorer({
   }, [areas, locationSearch]);
   const query = requestedUrlState.query;
   const area = requestedUrlState.area;
-  const updateSearch = useCallback((changes: { query?: string; area?: string; page?: number }, push = false) => {
-    const url = new URL(window.location.href);
-    if (changes.query !== undefined) {
-      if (changes.query.trim()) url.searchParams.set("q", changes.query);
-      else url.searchParams.delete("q");
-    }
-    if (changes.area !== undefined) {
-      if (changes.area !== "all") url.searchParams.set("area", changes.area);
-      else url.searchParams.delete("area");
-    }
-    if (changes.page && changes.page > 1) url.searchParams.set("page", String(changes.page));
-    else url.searchParams.delete("page");
-    const path = `${url.pathname}${url.search}${url.hash}`;
-    if (push) window.history.pushState({}, "", path);
-    else window.history.replaceState({}, "", path);
-    window.dispatchEvent(new Event("atlas-search-change"));
-  }, []);
+  const updateSearch = useCallback(
+    (changes: { query?: string; area?: string; page?: number }, push = false) => {
+      const url = new URL(window.location.href);
+      if (changes.query !== undefined) {
+        if (changes.query.trim()) url.searchParams.set("q", changes.query);
+        else url.searchParams.delete("q");
+      }
+      if (changes.area !== undefined) {
+        if (changes.area !== "all") url.searchParams.set("area", changes.area);
+        else url.searchParams.delete("area");
+      }
+      if (changes.page && changes.page > 1) url.searchParams.set("page", String(changes.page));
+      else url.searchParams.delete("page");
+      const path = `${url.pathname}${url.search}${url.hash}`;
+      if (push) window.history.pushState({}, "", path);
+      else window.history.replaceState({}, "", path);
+      window.dispatchEvent(new Event("atlas-search-change"));
+    },
+    []
+  );
   const urlStateReady = locationSearch !== null;
   const [entries, setEntries] = useState<RustFailureExplorerEntry[] | null>(null);
   const [indexStatus, setIndexStatus] = useState<IndexStatus>("idle");
@@ -247,7 +254,11 @@ export default function RustFailureAtlasExplorer({
     [area, query, searchIndex]
   );
   const hasActiveFilters = query.trim().length > 0 || area !== "all";
-  const results = rustFailureResultPage(filteredEntries, requestedUrlState.page, MAX_RENDERED_RESULTS);
+  const results = rustFailureResultPage(
+    filteredEntries,
+    requestedUrlState.page,
+    MAX_RENDERED_RESULTS
+  );
   const renderedEntries = results.entries;
 
   function changePage(page: number) {
@@ -299,7 +310,7 @@ export default function RustFailureAtlasExplorer({
                 updateSearch({ query: example, area: "all" });
                 requestIndex();
               }}
-              className="rounded-md border border-gray-300 bg-white px-3 py-2 text-sm text-gray-700 hover:border-primary-500 dark:border-gray-700 dark:bg-gray-950 dark:text-gray-300"
+              className="hover:border-primary-500 rounded-md border border-gray-300 bg-white px-3 py-2 text-sm text-gray-700 dark:border-gray-700 dark:bg-gray-950 dark:text-gray-300"
             >
               {label}
             </button>
@@ -409,118 +420,127 @@ export default function RustFailureAtlasExplorer({
             </div>
           ) : indexStatus === "ready" && renderedEntries.length > 0 ? (
             <>
-            <ol start={results.start} data-atlas-results className="mt-4 divide-y divide-gray-200 border-y border-gray-200 dark:divide-gray-800 dark:border-gray-800">
-              {renderedEntries.map((entry) => (
-                <li
-                  key={entry.id}
-                  id={entry.id.toLocaleLowerCase("en")}
-                  className="scroll-mt-24 py-8"
-                >
-                  <div className="flex flex-wrap items-center gap-x-3 gap-y-2 text-xs font-semibold tracking-[0.12em] uppercase">
-                    <span className="text-primary-600 dark:text-primary-400">{entry.id}</span>
-                    <span className="text-gray-500 dark:text-gray-400">{entry.areaLabel}</span>
-                    {entry.isPreview && (
-                      <span className="rounded-full bg-amber-100 px-2 py-1 text-amber-800 dark:bg-amber-950 dark:text-amber-300">
-                        Local preview
-                      </span>
-                    )}
-                  </div>
+              <ol
+                start={results.start}
+                data-atlas-results
+                className="mt-4 divide-y divide-gray-200 border-y border-gray-200 dark:divide-gray-800 dark:border-gray-800"
+              >
+                {renderedEntries.map((entry) => (
+                  <li
+                    key={entry.id}
+                    id={entry.id.toLocaleLowerCase("en")}
+                    className="scroll-mt-24 py-8"
+                  >
+                    <div className="flex flex-wrap items-center gap-x-3 gap-y-2 text-xs font-semibold tracking-[0.12em] uppercase">
+                      <span className="text-primary-600 dark:text-primary-400">{entry.id}</span>
+                      <span className="text-gray-500 dark:text-gray-400">{entry.areaLabel}</span>
+                      {entry.isPreview && (
+                        <span className="rounded-full bg-amber-100 px-2 py-1 text-amber-800 dark:bg-amber-950 dark:text-amber-300">
+                          Local preview
+                        </span>
+                      )}
+                    </div>
 
-                  <h3 className="mt-3 max-w-4xl text-2xl leading-9 font-bold tracking-tight text-gray-950 dark:text-gray-100">
+                    <h3 className="mt-3 max-w-4xl text-2xl leading-9 font-bold tracking-tight text-gray-950 dark:text-gray-100">
+                      {entry.destinationAvailable ? (
+                        <IntentLink
+                          href={entry.destinationPath}
+                          className="hover:text-primary-600 dark:hover:text-primary-400"
+                          data-umami-event="failure-atlas-case-open"
+                          data-umami-event-failure={entry.id}
+                        >
+                          {entry.symptom}
+                        </IntentLink>
+                      ) : (
+                        entry.symptom
+                      )}
+                    </h3>
+
+                    <dl className="mt-5 grid gap-5 lg:grid-cols-2">
+                      <div>
+                        <dt className="text-sm font-semibold text-gray-950 dark:text-gray-100">
+                          First check
+                        </dt>
+                        <dd className="mt-1 leading-7 text-gray-600 dark:text-gray-400">
+                          {entry.firstCheck}
+                        </dd>
+                      </div>
+                      <div>
+                        <dt className="text-sm font-semibold text-gray-950 dark:text-gray-100">
+                          Possible cause
+                        </dt>
+                        <dd className="mt-1 leading-7 text-gray-600 dark:text-gray-400">
+                          {entry.likelyCause}
+                        </dd>
+                      </div>
+                    </dl>
+
+                    {entry.hasExecutableFixture ? (
+                      <div className="mt-5 flex flex-wrap gap-2" aria-label="Evidence included">
+                        <span className="bg-primary-50 text-primary-800 dark:bg-primary-950 dark:text-primary-300 rounded-full px-3 py-1 text-xs font-semibold">
+                          Failing and repaired fixture
+                        </span>
+                        {entry.evidence.map((item) => (
+                          <span
+                            key={item}
+                            className="rounded-full bg-gray-100 px-3 py-1 text-xs font-medium text-gray-600 dark:bg-gray-800 dark:text-gray-300"
+                          >
+                            {item}
+                          </span>
+                        ))}
+                      </div>
+                    ) : (
+                      <p className="mt-5 text-sm leading-6 text-gray-600 dark:text-gray-400">
+                        No executable fixture exists for this record yet.
+                      </p>
+                    )}
+
                     {entry.destinationAvailable ? (
                       <IntentLink
                         href={entry.destinationPath}
-                        className="hover:text-primary-600 dark:hover:text-primary-400"
+                        className="text-primary-600 hover:text-primary-700 dark:text-primary-400 dark:hover:text-primary-300 mt-5 inline-block font-semibold"
                         data-umami-event="failure-atlas-case-open"
                         data-umami-event-failure={entry.id}
                       >
-                        {entry.symptom}
+                        {entry.hasExecutableFixture
+                          ? "Read the reproduction and repair"
+                          : "Read the article"}
+                        : {entry.destinationTitle} &rarr;
                       </IntentLink>
-                    ) : entry.symptom}
-                  </h3>
-
-                  <dl className="mt-5 grid gap-5 lg:grid-cols-2">
-                    <div>
-                      <dt className="text-sm font-semibold text-gray-950 dark:text-gray-100">
-                        First check
-                      </dt>
-                      <dd className="mt-1 leading-7 text-gray-600 dark:text-gray-400">
-                        {entry.firstCheck}
-                      </dd>
-                    </div>
-                    <div>
-                      <dt className="text-sm font-semibold text-gray-950 dark:text-gray-100">
-                        Possible cause
-                      </dt>
-                      <dd className="mt-1 leading-7 text-gray-600 dark:text-gray-400">
-                        {entry.likelyCause}
-                      </dd>
-                    </div>
-                  </dl>
-
-                  {entry.hasExecutableFixture ? (
-                    <div className="mt-5 flex flex-wrap gap-2" aria-label="Evidence included">
-                      <span className="bg-primary-50 text-primary-800 dark:bg-primary-950 dark:text-primary-300 rounded-full px-3 py-1 text-xs font-semibold">
-                        Failing and repaired fixture
-                      </span>
-                      {entry.evidence.map((item) => (
-                        <span
-                          key={item}
-                          className="rounded-full bg-gray-100 px-3 py-1 text-xs font-medium text-gray-600 dark:bg-gray-800 dark:text-gray-300"
-                        >
-                          {item}
-                        </span>
-                      ))}
-                    </div>
-                  ) : (
-                    <p className="mt-5 text-sm leading-6 text-gray-600 dark:text-gray-400">
-                      No executable fixture exists for this record yet.
-                    </p>
-                  )}
-
-                  {entry.destinationAvailable ? (
-                    <IntentLink
-                      href={entry.destinationPath}
-                      className="text-primary-600 hover:text-primary-700 dark:text-primary-400 dark:hover:text-primary-300 mt-5 inline-block font-semibold"
-                      data-umami-event="failure-atlas-case-open"
-                      data-umami-event-failure={entry.id}
-                    >
-                      {entry.hasExecutableFixture
-                        ? "Read the reproduction and repair"
-                        : "Read the article"}
-                      : {entry.destinationTitle} &rarr;
-                    </IntentLink>
-                  ) : (
-                    <p className="mt-5 text-sm leading-6 text-gray-500 dark:text-gray-400">
-                      Not published yet: {entry.destinationTitle}
-                    </p>
-                  )}
-                </li>
-              ))}
-            </ol>
-            {results.pageCount > 1 && (
-              <nav aria-label="Search result pages" className="mt-6 flex flex-wrap items-center justify-between gap-4">
-                <button
-                  type="button"
-                  disabled={results.page === 1}
-                  onClick={() => changePage(results.page - 1)}
-                  className="rounded-md border border-gray-300 px-4 py-2 text-sm font-medium disabled:cursor-not-allowed disabled:opacity-40 dark:border-gray-700"
+                    ) : (
+                      <p className="mt-5 text-sm leading-6 text-gray-500 dark:text-gray-400">
+                        Not published yet: {entry.destinationTitle}
+                      </p>
+                    )}
+                  </li>
+                ))}
+              </ol>
+              {results.pageCount > 1 && (
+                <nav
+                  aria-label="Search result pages"
+                  className="mt-6 flex flex-wrap items-center justify-between gap-4"
                 >
-                  Previous page
-                </button>
-                <span className="text-sm text-gray-600 dark:text-gray-400" aria-current="page">
-                  Page {results.page} of {results.pageCount}
-                </span>
-                <button
-                  type="button"
-                  disabled={results.page === results.pageCount}
-                  onClick={() => changePage(results.page + 1)}
-                  className="rounded-md border border-gray-300 px-4 py-2 text-sm font-medium disabled:cursor-not-allowed disabled:opacity-40 dark:border-gray-700"
-                >
-                  Next page
-                </button>
-              </nav>
-            )}
+                  <button
+                    type="button"
+                    disabled={results.page === 1}
+                    onClick={() => changePage(results.page - 1)}
+                    className="rounded-md border border-gray-300 px-4 py-2 text-sm font-medium disabled:cursor-not-allowed disabled:opacity-40 dark:border-gray-700"
+                  >
+                    Previous page
+                  </button>
+                  <span className="text-sm text-gray-600 dark:text-gray-400" aria-current="page">
+                    Page {results.page} of {results.pageCount}
+                  </span>
+                  <button
+                    type="button"
+                    disabled={results.page === results.pageCount}
+                    onClick={() => changePage(results.page + 1)}
+                    className="rounded-md border border-gray-300 px-4 py-2 text-sm font-medium disabled:cursor-not-allowed disabled:opacity-40 dark:border-gray-700"
+                  >
+                    Next page
+                  </button>
+                </nav>
+              )}
             </>
           ) : indexStatus === "ready" ? (
             <div className="mt-5 rounded-lg border border-dashed border-gray-300 p-8 dark:border-gray-700">

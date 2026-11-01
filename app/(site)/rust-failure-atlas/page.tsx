@@ -206,8 +206,8 @@ export default function RustFailureAtlasPage() {
             Find your failure
           </h2>
           <p className="mt-4 text-lg leading-8 text-gray-600 dark:text-gray-400">
-            Paste the first error line or describe what you see. If several causes fit, use the first
-            check to tell them apart.
+            Paste the first error line or describe what you see. If several causes fit, use the
+            first check to tell them apart.
           </p>
         </div>
         <div className="mt-8">
@@ -340,8 +340,6 @@ export default function RustFailureAtlasPage() {
           </div>
         ))}
       </section>
-
-
 
       <section
         className="border-y border-gray-200 py-16 dark:border-gray-800"

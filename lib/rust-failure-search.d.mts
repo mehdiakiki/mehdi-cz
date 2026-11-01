@@ -18,12 +18,18 @@ export type PreparedRustFailure<T extends SearchableRustFailure> = {
   codes: Set<string>;
 };
 
-export function prepareRustFailureSearch<T extends SearchableRustFailure>(entries: T[]): PreparedRustFailure<T>[];
+export function prepareRustFailureSearch<T extends SearchableRustFailure>(
+  entries: T[]
+): PreparedRustFailure<T>[];
 export function searchRustFailures<T extends SearchableRustFailure>(
   index: PreparedRustFailure<T>[],
   options?: { query?: string; area?: string }
 ): T[];
-export function rustFailureResultPage<T>(entries: T[], requestedPage: unknown, pageSize?: number): {
+export function rustFailureResultPage<T>(
+  entries: T[],
+  requestedPage: unknown,
+  pageSize?: number
+): {
   entries: T[];
   page: number;
   pageCount: number;

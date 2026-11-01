@@ -261,9 +261,7 @@ export default async function RustFailurePage({ params }: { params: Promise<{ sl
                     </dd>
                   </div>
                   <div>
-                    <dt className="font-semibold text-gray-950 dark:text-gray-100">
-                      First check
-                    </dt>
+                    <dt className="font-semibold text-gray-950 dark:text-gray-100">First check</dt>
                     <dd className="mt-2 leading-7 text-gray-600 dark:text-gray-400">
                       {indexEntry.firstCheck}
                     </dd>
