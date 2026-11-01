@@ -11,6 +11,7 @@ import {
 } from "react";
 
 import IntentLink from "@/components/IntentLink";
+import { prepareRustFailureSearch, searchRustFailures, rustFailureResultPage } from "lib/rust-failure-search.mjs";
 
 export interface RustFailureExplorerEntry {
   id: string;
@@ -63,7 +64,11 @@ const MAX_RENDERED_RESULTS = 40;
 
 const subscribeToLocationSearch = (onStoreChange: () => void) => {
   window.addEventListener("popstate", onStoreChange);
-  return () => window.removeEventListener("popstate", onStoreChange);
+  window.addEventListener("atlas-search-change", onStoreChange);
+  return () => {
+    window.removeEventListener("popstate", onStoreChange);
+    window.removeEventListener("atlas-search-change", onStoreChange);
+  };
 };
 
 const getLocationSearch = () => window.location.search;
@@ -88,14 +93,30 @@ export default function RustFailureAtlasExplorer({
 
     return {
       query: params.get("q") || "",
+      page: params.get("page") || "1",
       area:
         requestedArea && areas.some((item) => item.slug === requestedArea) ? requestedArea : "all",
     };
   }, [areas, locationSearch]);
-  const [queryOverride, setQuery] = useState<string | null>(null);
-  const [areaOverride, setArea] = useState<string | null>(null);
-  const query = queryOverride ?? requestedUrlState.query;
-  const area = areaOverride ?? requestedUrlState.area;
+  const query = requestedUrlState.query;
+  const area = requestedUrlState.area;
+  const updateSearch = useCallback((changes: { query?: string; area?: string; page?: number }, push = false) => {
+    const url = new URL(window.location.href);
+    if (changes.query !== undefined) {
+      if (changes.query.trim()) url.searchParams.set("q", changes.query);
+      else url.searchParams.delete("q");
+    }
+    if (changes.area !== undefined) {
+      if (changes.area !== "all") url.searchParams.set("area", changes.area);
+      else url.searchParams.delete("area");
+    }
+    if (changes.page && changes.page > 1) url.searchParams.set("page", String(changes.page));
+    else url.searchParams.delete("page");
+    const path = `${url.pathname}${url.search}${url.hash}`;
+    if (push) window.history.pushState({}, "", path);
+    else window.history.replaceState({}, "", path);
+    window.dispatchEvent(new Event("atlas-search-change"));
+  }, []);
   const urlStateReady = locationSearch !== null;
   const [entries, setEntries] = useState<RustFailureExplorerEntry[] | null>(null);
   const [indexStatus, setIndexStatus] = useState<IndexStatus>("idle");
@@ -220,53 +241,24 @@ export default function RustFailureAtlasExplorer({
     return () => window.removeEventListener("hashchange", redirectLegacyCaseFragment);
   }, [areaPathPrefix, entries, loadIndex]);
 
-  useEffect(() => {
-    if (!urlStateReady) return;
-
-    const url = new URL(window.location.href);
-    const normalizedQuery = query.trim();
-
-    if (normalizedQuery) url.searchParams.set("q", normalizedQuery);
-    else url.searchParams.delete("q");
-
-    if (area !== "all") url.searchParams.set("area", area);
-    else url.searchParams.delete("area");
-
-    window.history.replaceState({}, "", `${url.pathname}${url.search}${url.hash}`);
-  }, [area, query, urlStateReady]);
-
-  const filteredEntries = useMemo(() => {
-    if (!entries) return [];
-
-    const queryTokens = query.trim().toLocaleLowerCase("en").split(/\s+/).filter(Boolean);
-
-    return entries.filter((entry) => {
-      if (area !== "all" && entry.area !== area) return false;
-      if (queryTokens.length === 0) return true;
-
-      const searchableText = [
-        entry.id,
-        entry.areaLabel,
-        entry.symptom,
-        entry.likelyCause,
-        entry.firstCheck,
-        entry.destinationTitle,
-        ...entry.searchTerms,
-        ...entry.evidence,
-      ]
-        .join(" ")
-        .toLocaleLowerCase("en");
-
-      return queryTokens.every((token) => searchableText.includes(token));
-    });
-  }, [area, entries, query]);
-
+  const searchIndex = useMemo(() => prepareRustFailureSearch(entries || []), [entries]);
+  const filteredEntries = useMemo(
+    () => searchRustFailures(searchIndex, { query, area }),
+    [area, query, searchIndex]
+  );
   const hasActiveFilters = query.trim().length > 0 || area !== "all";
-  const renderedEntries = filteredEntries.slice(0, MAX_RENDERED_RESULTS);
+  const results = rustFailureResultPage(filteredEntries, requestedUrlState.page, MAX_RENDERED_RESULTS);
+  const renderedEntries = results.entries;
+
+  function changePage(page: number) {
+    updateSearch({ page }, true);
+    const summary = document.getElementById("atlas-search-status");
+    summary?.focus({ preventScroll: true });
+    summary?.scrollIntoView({ block: "start", behavior: "auto" });
+  }
 
   function clearFilters() {
-    setQuery("");
-    setArea("all");
+    updateSearch({ query: "", area: "all" });
   }
 
   return (
@@ -276,7 +268,7 @@ export default function RustFailureAtlasExplorer({
           htmlFor="failure-search"
           className="block text-sm font-semibold text-gray-950 dark:text-gray-100"
         >
-          Search the symptom you can observe
+          Search an error or describe what happened
         </label>
         <input
           id="failure-search"
@@ -285,19 +277,40 @@ export default function RustFailureAtlasExplorer({
           onFocus={requestIndex}
           onPointerEnter={requestIndex}
           onChange={(event) => {
-            setQuery(event.target.value);
+            updateSearch({ query: event.target.value });
             requestIndex();
           }}
-          placeholder="For example: future not Send, build reruns, open64, task stalls"
+          placeholder="Try an error code, future not Send, or build script reruns"
           aria-describedby="atlas-search-status"
           className="ring-primary-500 mt-3 w-full rounded-md border border-gray-300 bg-white px-4 py-3 text-gray-950 outline-none placeholder:text-gray-500 focus:ring-2 dark:border-gray-700 dark:bg-gray-950 dark:text-gray-100"
         />
+
+        <div className="mt-4 flex flex-wrap gap-2" aria-label="Example searches">
+          {[
+            ["Future is not Send", "future not Send"],
+            ["A task stops moving", "Tokio stalls"],
+            ["Build script keeps running", "build script reruns"],
+            ["Debug works, release fails", "debug release"],
+          ].map(([label, example]) => (
+            <button
+              key={example}
+              type="button"
+              onClick={() => {
+                updateSearch({ query: example, area: "all" });
+                requestIndex();
+              }}
+              className="rounded-md border border-gray-300 bg-white px-3 py-2 text-sm text-gray-700 hover:border-primary-500 dark:border-gray-700 dark:bg-gray-950 dark:text-gray-300"
+            >
+              {label}
+            </button>
+          ))}
+        </div>
 
         <div className="mt-5 flex flex-wrap gap-2" aria-label="Filter by failure family">
           <button
             type="button"
             onClick={() => {
-              setArea("all");
+              updateSearch({ area: "all" });
               requestIndex();
             }}
             aria-pressed={area === "all"}
@@ -314,7 +327,7 @@ export default function RustFailureAtlasExplorer({
               key={item.slug}
               type="button"
               onClick={() => {
-                setArea(item.slug);
+                updateSearch({ area: item.slug });
                 requestIndex();
               }}
               aria-pressed={area === item.slug}
@@ -348,12 +361,12 @@ export default function RustFailureAtlasExplorer({
             aria-live="polite"
           >
             {indexStatus === "ready"
-              ? "Detailed search data is ready. Enter a symptom or choose a family."
+              ? "Search is ready. Enter a symptom or choose a family."
               : indexStatus === "loading"
-                ? "Preparing detailed search data. The complete directory remains available below."
+                ? "Loading the cases. You can still browse the families below."
                 : indexStatus === "error"
-                  ? "Detailed search data could not load. The complete directory remains available below."
-                  : "Browse the failure families below, or search to load the detailed records."}
+                  ? "Search could not load. You can still browse the families below."
+                  : "Type an error or choose an example. You can also browse a family below."}
           </p>
           {children}
         </>
@@ -363,16 +376,15 @@ export default function RustFailureAtlasExplorer({
             id="atlas-search-status"
             className="mt-6 scroll-mt-24 text-sm text-gray-500 dark:text-gray-400"
             aria-live="polite"
+            tabIndex={-1}
           >
             {indexStatus === "ready"
-              ? `Showing ${renderedEntries.length} of ${filteredEntries.length} matching records${
-                  filteredEntries.length > MAX_RENDERED_RESULTS
-                    ? `. Refine the search to see beyond the first ${MAX_RENDERED_RESULTS}.`
-                    : "."
-                }`
+              ? results.total
+                ? `Showing ${results.start}–${results.end} of ${results.total} matching cases.`
+                : "No matching cases."
               : indexStatus === "error"
-                ? "Detailed search data could not be loaded."
-                : "Loading detailed failure records…"}
+                ? "The cases could not be loaded."
+                : "Loading the cases…"}
           </p>
 
           {indexStatus === "error" ? (
@@ -396,7 +408,8 @@ export default function RustFailureAtlasExplorer({
               </button>
             </div>
           ) : indexStatus === "ready" && renderedEntries.length > 0 ? (
-            <ol className="mt-4 divide-y divide-gray-200 border-y border-gray-200 dark:divide-gray-800 dark:border-gray-800">
+            <>
+            <ol start={results.start} data-atlas-results className="mt-4 divide-y divide-gray-200 border-y border-gray-200 dark:divide-gray-800 dark:border-gray-800">
               {renderedEntries.map((entry) => (
                 <li
                   key={entry.id}
@@ -414,24 +427,33 @@ export default function RustFailureAtlasExplorer({
                   </div>
 
                   <h3 className="mt-3 max-w-4xl text-2xl leading-9 font-bold tracking-tight text-gray-950 dark:text-gray-100">
-                    {entry.symptom}
+                    {entry.destinationAvailable ? (
+                      <IntentLink
+                        href={entry.destinationPath}
+                        className="hover:text-primary-600 dark:hover:text-primary-400"
+                        data-umami-event="failure-atlas-case-open"
+                        data-umami-event-failure={entry.id}
+                      >
+                        {entry.symptom}
+                      </IntentLink>
+                    ) : entry.symptom}
                   </h3>
 
                   <dl className="mt-5 grid gap-5 lg:grid-cols-2">
                     <div>
                       <dt className="text-sm font-semibold text-gray-950 dark:text-gray-100">
-                        Likely mechanism
+                        First check
                       </dt>
                       <dd className="mt-1 leading-7 text-gray-600 dark:text-gray-400">
-                        {entry.likelyCause}
+                        {entry.firstCheck}
                       </dd>
                     </div>
                     <div>
                       <dt className="text-sm font-semibold text-gray-950 dark:text-gray-100">
-                        First discriminating check
+                        Possible cause
                       </dt>
                       <dd className="mt-1 leading-7 text-gray-600 dark:text-gray-400">
-                        {entry.firstCheck}
+                        {entry.likelyCause}
                       </dd>
                     </div>
                   </dl>
@@ -476,14 +498,38 @@ export default function RustFailureAtlasExplorer({
                 </li>
               ))}
             </ol>
+            {results.pageCount > 1 && (
+              <nav aria-label="Search result pages" className="mt-6 flex flex-wrap items-center justify-between gap-4">
+                <button
+                  type="button"
+                  disabled={results.page === 1}
+                  onClick={() => changePage(results.page - 1)}
+                  className="rounded-md border border-gray-300 px-4 py-2 text-sm font-medium disabled:cursor-not-allowed disabled:opacity-40 dark:border-gray-700"
+                >
+                  Previous page
+                </button>
+                <span className="text-sm text-gray-600 dark:text-gray-400" aria-current="page">
+                  Page {results.page} of {results.pageCount}
+                </span>
+                <button
+                  type="button"
+                  disabled={results.page === results.pageCount}
+                  onClick={() => changePage(results.page + 1)}
+                  className="rounded-md border border-gray-300 px-4 py-2 text-sm font-medium disabled:cursor-not-allowed disabled:opacity-40 dark:border-gray-700"
+                >
+                  Next page
+                </button>
+              </nav>
+            )}
+            </>
           ) : indexStatus === "ready" ? (
             <div className="mt-5 rounded-lg border border-dashed border-gray-300 p-8 dark:border-gray-700">
               <p className="font-semibold text-gray-950 dark:text-gray-100">
                 No matching case yet.
               </p>
               <p className="mt-2 leading-7 text-gray-600 dark:text-gray-400">
-                Try the exact compiler or linker phrase, the affected target, or a shorter mechanism
-                such as cancellation, feature, span, or provenance.
+                Try the first line of the error, an error code, or a few words about the symptom.
+                You can also clear the search and browse a family.
               </p>
               <button
                 type="button"

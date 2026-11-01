@@ -262,7 +262,7 @@ export default async function RustFailurePage({ params }: { params: Promise<{ sl
                   </div>
                   <div>
                     <dt className="font-semibold text-gray-950 dark:text-gray-100">
-                      First discriminating check
+                      First check
                     </dt>
                     <dd className="mt-2 leading-7 text-gray-600 dark:text-gray-400">
                       {indexEntry.firstCheck}
@@ -590,6 +590,16 @@ export default async function RustFailurePage({ params }: { params: Promise<{ sl
                 data-umami-event-destination="work"
               >
                 Selected engineering work
+              </Link>
+              {" · "}
+              <Link
+                href="/contact"
+                className="underline hover:text-gray-700 dark:hover:text-gray-300"
+                data-umami-event="rust-failure-professional-cta"
+                data-umami-event-case={failure.caseId}
+                data-umami-event-destination="contact"
+              >
+                Ask about a similar Rust problem
               </Link>
             </p>
           </div>

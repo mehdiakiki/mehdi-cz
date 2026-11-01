@@ -490,7 +490,7 @@ test("the systems atlas and launched failure index are connected to discovery", 
   assert.match(footer, /<FooterNavigation \/>/);
   assert.match(footerNavigation, /href: "\/rust-failure-atlas"/);
   assert.match(explorer, /URLSearchParams/);
-  assert.match(explorer, /queryTokens\.every/);
+  assert.match(explorer, /searchRustFailures/);
   assert.match(caseRoute, /rel="prev"/);
   assert.match(caseRoute, /rel="next"/);
   assert.match(caseRoute, /Continue by mechanism/);
