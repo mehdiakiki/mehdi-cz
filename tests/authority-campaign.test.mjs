@@ -374,6 +374,9 @@ test("the repository maps every written campaign source without counting unrelat
       "writing-through-mmap-who-decides-when-data-reaches-the-disk",
       "your-data-is-not-on-disk-when-write-returns",
       "zero-copy-does-not-mean-zero-memory-access-aho-corasick-rust",
+      "what-rtk-really-saved-in-my-claude-code-setup",
+      "who-writes-the-instructions-your-coding-agent-follows",
+      "what-claude-code-loads-agents-md-claude-md-and-nested-files",
     ].sort()
   );
   assert.deepEqual(report.backlogErrors.sourceMappingErrors, []);

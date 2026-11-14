@@ -1,0 +1,213 @@
+---
+title: "What rtk Really Saved in My Claude Code Setup, and What It Changed"
+date: "2026-11-15T10:30:00Z"
+tags: ["ai", "claude-code", "agent-security", "llm cost", "tooling"]
+draft: false
+reviewed: true
+reviewedHash: "ae2a77a6d8e3ecb3f8000a8a5ee9611a749b0393d05d17224fc8142712b69485"
+authors: ["default"]
+cluster: "reliable-ai-systems"
+campaign: "editorial"
+summary: "I measured rtk, a token-saving tool, inside my Claude Code setup. It gave two wrong answers, and one is still there after the update. Its hook also approved a force push without asking me, and its own savings number fell from 125.5M to 4.8M tokens."
+---
+
+I use Claude Code with a small tool called rtk, "Rust Token Killer". It is a command line proxy written in Rust. When the agent runs a shell command, rtk runs it and makes the output shorter. Shorter output means fewer tokens for the model. Fewer tokens means lower cost and more free space in the context window.
+
+The instruction file that rtk added to my setup said: "60-90% savings on dev operations".
+
+On October 25, one of my agent sessions noticed a strange answer. It ran `diff` on two files, and rtk said "Files are identical". The files were different.
+
+So on November 14 I made an experiment. I had two questions. How much does rtk really save on my laptop? And what does it change, besides the length of the output?
+
+## How rtk sits between the agent and the shell
+
+The agent does not call rtk itself. A hook does it. In Claude Code, a hook is a script that runs at a fixed moment. My hook ran before every Bash command. It asked rtk if it had a rewrite for the command:
+
+```bash
+REWRITTEN=$(rtk rewrite "$CMD" 2>/dev/null)
+```
+
+If rtk had one, the hook swapped the command. The agent asks for `git log`, but `rtk git log` runs. Usually the agent does not see the swap. It only sees the shorter output.
+
+These are some rewrites from rtk 0.33.1, the version I had then:
+
+```text
+diff a b                              -> rtk diff a b
+cat file                              -> rtk read file
+git log --oneline                     -> rtk git log --oneline
+git push --force                      -> rtk git push --force
+curl -X DELETE https://example.com/x  -> rtk curl -X DELETE https://example.com/x
+rm file                               -> no rewrite
+git reset --hard                      -> no rewrite
+```
+
+Remember the `git push --force` line. We will come back to it.
+
+## The diff that said "identical"
+
+First I made the October problem again. Two small config files, and only one character is different:
+
+```bash
+printf 'timeout = 30\nretries = 3\n' > old.conf
+printf 'timeout = 30\nretries = 5\n' > new.conf
+diff old.conf new.conf; echo "exit=$?"
+```
+
+Through the hook, with rtk 0.33.1:
+
+```text
+[ok] Files are identical
+exit=0
+```
+
+The real `diff`, with `rtk proxy` to skip the rewrite:
+
+```text
+2c2
+< retries = 3
+---
+> retries = 5
+exit=1
+```
+
+For `diff`, exit status 0 means "the files are the same". So this was not a shorter answer. It was the opposite answer. An agent that checks a config change with `diff` would believe that nothing changed.
+
+## The merge commit that was not there
+
+Next, a small repository with four commits. One of them is a merge commit. I asked for `git log` through the hook:
+
+```text
+1c6479d main work (7 seconds ago) <lab>
+6c1eda8 feature work (7 seconds ago) <lab>
+5feafef first commit (8 seconds ago) <lab>
+```
+
+Three commits. The merge commit is missing. The raw `git log` starts with it:
+
+```text
+commit 07a0f695ad5056ba96a5ced1ffaada2cf20982d9
+Merge: 1c6479d 6c1eda8
+```
+
+This is easy to miss, because `git log --oneline` through the hook showed all four commits. Of the two formats I tried, only the default one lost the merge. So the answer to "was this branch merged?" depended on the flags the agent chose.
+
+I tested `curl` also. There, the wrapped and the raw output had the same size and the same first bytes: 45,256 bytes for an HTML page and 18,473 bytes for a JSON file. So not every rewrite changes facts. But you only know which ones do when you test them.
+
+## The hook also approves commands
+
+When the hook rewrote a command, it did not only change it. It also approved it:
+
+```json
+"permissionDecision": "allow",
+"permissionDecisionReason": "RTK auto-rewrite",
+```
+
+[Claude Code's hook documentation](https://code.claude.com/docs/en/hooks) says that `"allow"` skips the permission prompt, with a few exceptions. It also says: "Deny and ask rules are still evaluated regardless of what the hook returns". My settings had no deny rules and no ask rules.
+
+So I made one more test, on a throwaway repository with a local remote. I started a fresh Claude Code session (`claude -p`, Haiku model) and asked it to run exactly one command: `git push --force origin HEAD:main`. One run per case, with rtk 0.33.1:
+
+| Case | Permission mode                          | rtk hook | What happened                             |
+| ---- | ---------------------------------------- | -------- | ----------------------------------------- |
+| A    | default                                  | on       | the force push ran, no question           |
+| B    | default                                  | off      | blocked: "This command requires approval" |
+| C    | default, with an ask rule for `git push` | on       | blocked                                   |
+| D    | auto                                     | on       | the force push ran                        |
+| E    | auto                                     | off      | the force push ran                        |
+
+For B and E, I started Claude Code without my user settings, so the hook was not loaded. But the rest of my user setup was missing too. For A and B, the run "Case A again" further below shows that the hook's approval made the difference. For D and E, I cannot say this.
+
+A against B is the important pair. In default mode, you expect a question before a force push. With the hook, there was no question.
+
+C shows one fix. It works because rtk itself reads the ask rule. Its rewrite step returns exit code 3 in that case, and then the hook does not approve.
+
+In E, with no hook, the auto mode classifier accepted a force push that I asked for, to a local test remote. In D, the hook had already said "allow", so I do not know if the classifier decided.
+
+The default-mode results come from the permission system, not from the model's judgment, so I expect them to repeat. Claude Code reported a cost of less than 4 cents for all the runs in this article together.
+
+## Is an ask or deny rule always enough?
+
+Case C worked only because rtk read the ask rule itself. The hook documentation has one more sentence that matters here. Claude Code evaluates permission rules "against the input your hook returns, not the input Claude sent". So the rule is checked against the command that will really run.
+
+What happens when a hook rewrites `git push` into something else, and approves it? I wrote a small test hook for this. It approves every `git push`. In one version, it also adds `rtk proxy` in front of the command. Same throwaway repository, same prompt, without my user settings, one run each:
+
+| Rule in the project settings | Test hook                   | What happened      |
+| ---------------------------- | --------------------------- | ------------------ |
+| ask `Bash(git push:*)`       | approves, command unchanged | blocked            |
+| ask `Bash(git push:*)`       | approves, command rewritten | the force push ran |
+| deny `Bash(git push:*)`      | approves, command rewritten | the force push ran |
+| deny `Bash(git push:*)`      | approves, command unchanged | blocked            |
+
+So a rule that you wrote for `git push` does not match `rtk proxy git push`. A hook that rewrites and approves can walk around it.
+
+To be fair to rtk: it checks the rules itself. With a deny rule for `git push` in the folder, rtk 1.2.0 does not rewrite the command at all (its rewrite step returns exit code 2), so Claude Code sees the original `git push`, which the deny rule matches, as in the last row of the table. The risk is in any rewriting hook that does not make this check.
+
+## How much did it save?
+
+rtk counts its own savings. This was my counter with rtk 0.33.1, for all projects on this laptop:
+
+```text
+Total commands:    99265
+Input tokens:      1149.4M
+Output tokens:     1024.4M
+Tokens saved:      125.5M (10.9%)
+```
+
+So about 11 percent, not 60 to 90 percent. The big percentages are true for some commands. `rtk diff` removed 77 percent of its output on average, and `rtk ls` removed 68 percent. But the biggest line was `cat`, rewritten to `rtk read`: 9,349 calls, with 13 percent removed on average.
+
+Something else looked wrong to me. Eight calls in the history counted for 16.5 million saved tokens, about 2 million per call. These were giant outputs, from five curl downloads and three large `git diff` calls.
+
+Hmm, but would the model really read 2 million tokens from one command? No. Claude Code does not put a giant output into the context. In my session, an output of 39.6 KB already came back as a 2 KB preview and the path of a file. So most of these "saved" tokens were never going to reach the model.
+
+## Then I updated
+
+The `diff` bug was already known. [rtk issue #781](https://github.com/rtk-ai/rtk/issues/781) was opened in March and closed in September, and a commenter confirmed the fix in v0.48.0. My laptop was far behind. So I made a backup of the old binary and its database, checked the download against the release checksum, and installed rtk 1.2.0. Then I made the same tests again.
+
+`rtk diff` on the two config files now showed the changed line and returned exit 1:
+
+```text
+~   2 retries = 3 → retries = 5
+exit=1
+```
+
+The merge commit is still missing. With rtk 1.2.0, `rtk git log` left it out in the default format, and now also with `--oneline`. This is `rtk git log --oneline`:
+
+```text
+1c6479d main work
+6c1eda8 feature work
+5feafef first commit
+exit=0
+```
+
+This one is known too. [rtk issue #3792](https://github.com/rtk-ai/rtk/issues/3792) says that `git log` "silently drops merge commits (--no-merges injected)". It was closed as a duplicate of older reports, and in September a collaborator wrote that it "still reproduces". So updating fixed one wrong answer, not both.
+
+Case A again, default mode with the hook: this time the force push was blocked, "This command requires approval".
+
+The last one is a change in behavior, not only a bug fix. From a folder with no project settings, `rtk rewrite` now returns exit code 3 for every command I tried, also for `git status`. So rtk still proposes its rewrite, but it does not approve it anymore. It looks like it now approves only commands that my settings already allow. In my site repository, where my settings allow `git push`, it still returns 0 for it.
+
+And the counter changed. rtk 1.2.0 read the same history and printed this:
+
+```text
+Total commands:    95923
+Input tokens:      32.4M
+Output tokens:     28.0M
+Tokens saved:      4.8M (14.7%)
+Excluded:          3512 oversized outputs (input past the ~30k-char agent cap)
+```
+
+The new version does the same check that I did above. It leaves out the outputs that are bigger than what the agent receives. With that rule, my history went from 125.5 million saved tokens to 4.8 million. That is about 50 tokens per command. (The per-command table under this summary still shows the large old numbers, so I use the summary line.)
+
+rtk also told me that my hook script was outdated, and my tests after the update used that old script. So I ran `rtk init -g --auto-patch`. It replaced the script with a new hook command, `rtk hook claude`, and it rewrote rtk's instruction file. In a fresh session with the new hook, the force push was blocked again: "This command requires approval". I have not measured the savings of the new hook yet.
+
+## What I take from this
+
+Saving tokens is a good goal. But a tool that changes command output is not only a cost tool. It changes what the agent knows. The old version also changed what the agent was allowed to do. I found the approval change only in this test. A tool between your agent and the shell is part of your security setup.
+
+The limits of this test: one laptop, Claude Code 2.1.325, rtk 0.33.1 and 1.2.0, and one run per permission case. The token numbers are rtk's own estimates.
+
+If you use a tool like this, this is what I would do:
+
+- Update it, and read the release notes. The `diff` bug was fixed upstream in v0.48.0, weeks before I noticed it. But the `git log` problem is still there in rtk 1.2.0, so updating is not enough.
+- Read the savings number carefully. Ask how many of those tokens the model would really read.
+- For commands whose output is evidence, skip the rewrite (`rtk proxy diff`, `rtk proxy git log`), or compare files with `cmp` and `git hash-object`.
+- Add ask or deny rules for commands that push, deploy or delete. Then check that every hook which rewrites commands respects them, because Claude Code checks the rules against the rewritten command.
+- Test the commands your agent runs often: raw output against rewritten output, on a small case where you know the right answer.

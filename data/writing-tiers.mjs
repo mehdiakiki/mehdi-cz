@@ -356,6 +356,8 @@ const articleSlugsByTheme = {
     "the-safe-path-changed-before-it-was-opened",
     "localhost-is-not-an-admin-password",
     "the-readme-asked-for-a-different-job",
+    "who-writes-the-instructions-your-coding-agent-follows",
+    "what-claude-code-loads-agents-md-claude-md-and-nested-files",
   ],
   "derived-state": [
     "caching-ai-results-requires-an-identity-and-freshness-model",
@@ -489,6 +491,7 @@ const articleSlugsByTheme = {
     "why-postgresql-stopped-using-the-index",
     "following-one-slow-request-through-an-app",
     "does-this-search-need-a-vector-database",
+    "what-rtk-really-saved-in-my-claude-code-setup",
   ],
 };
 
