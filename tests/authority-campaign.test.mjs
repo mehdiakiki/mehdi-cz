@@ -380,6 +380,9 @@ test("the repository maps every written campaign source without counting unrelat
       "when-an-agent-rule-needs-a-hook-not-a-sentence",
       "auditing-an-agent-instruction-file-line-by-line",
       "moving-the-rust-failure-atlas-to-rust-1-100",
+      "rules-search-small-model-big-model-agent-one-task-measured",
+      "estimate-the-monthly-cost-of-an-ai-feature-before-building-it",
+      "move-the-ai-work-nobody-waits-for-out-of-the-request",
     ].sort()
   );
   assert.deepEqual(report.backlogErrors.sourceMappingErrors, []);

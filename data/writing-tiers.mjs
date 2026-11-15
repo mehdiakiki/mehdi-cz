@@ -455,6 +455,7 @@ const articleSlugsByTheme = {
     "every-new-commit-cancelled-the-check-that-mattered",
     "the-scheduler-worked-and-the-article-never-appeared",
     "the-timeout-ended-one-process-not-the-job",
+    "move-the-ai-work-nobody-waits-for-out-of-the-request",
   ],
   measurement: [
     "pgvector-filtered-search-too-few-results",
@@ -495,6 +496,8 @@ const articleSlugsByTheme = {
     "what-rtk-really-saved-in-my-claude-code-setup",
     "auditing-an-agent-instruction-file-line-by-line",
     "moving-the-rust-failure-atlas-to-rust-1-100",
+    "rules-search-small-model-big-model-agent-one-task-measured",
+    "estimate-the-monthly-cost-of-an-ai-feature-before-building-it",
   ],
 };
 
