@@ -1,0 +1,162 @@
+---
+title: "Which Subagent Can Use the Cheap Model: the Reader or the Reviewer?"
+date: "2026-11-18T16:30:00Z"
+tags: ["ai", "claude-code", "subagents", "code-review", "llm-cost"]
+draft: false
+reviewed: true
+reviewedHash: "d3e180c50150a3cc9bce7401a0d8500b4ade1f6b7e7b2ed73df692676630685e"
+authors: ["default"]
+cluster: "reliable-ai-systems"
+campaign: "editorial"
+summary: "I gave a reading subagent and a reviewing subagent different models, from Haiku to Opus, and let them review a small Rust crate with three planted bugs. Every setup found all three bugs. The real differences were the cost, a handoff that the main session quietly shortened, and one data-loss bug that I had not planted."
+---
+
+I use six personal subagents in Claude Code. On November 14 I looked at their settings. All six say `model: opus`. Also the scout, whose only job is to read code and report what is there.
+
+There is a common idea for a setup like this: let the cheap model read, and let the strong model decide. If this is true, my scout could run on Haiku, and only the reviewer needs Opus.
+
+But I see a risk. The reviewer only knows what the scout tells it. If the cheap scout drops one important line, the strong reviewer never sees the bug. It decides well, on bad information.
+
+So I made an experiment. My question: in a setup with a reading subagent and a reviewing subagent, which one can use a cheaper model without missing bugs?
+
+## A crate with three planted bugs
+
+I wrote a small Rust crate for this test. It is constructed, not a real project: a job queue for several tenants, with worker threads, a journal on disk and a rate limiter. It has 13 source files, 769 lines of Rust, and a README with nine requirements.
+
+I planted three bugs, from easy to hard:
+
+| Bug                      | File                      | What is wrong                                                                                                                            |
+| ------------------------ | ------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| Off-by-one (easy)        | `limiter.rs`              | `hits.len() as u32 > self.limit` lets one extra job through in each window                                                               |
+| Swallowed error (medium) | `journal/file.rs`         | a failed fsync only increments a counter, and `append` still returns `Ok`                                                                |
+| Unbounded queue (hard)   | `queue.rs`, `dispatch.rs` | the `Full` check counts the backlog and the running jobs, but every job moves at once into an unbounded channel, where nothing counts it |
+
+The third bug needs reasoning across three files. If you read only `submit`, the limit check looks fine.
+
+For each bug, I first wrote a test from the README. Each test fails on the crate and passes on a fixed copy. The queue test has one blocked worker and `max_pending = 2`, and it submits ten jobs:
+
+```text
+accepted=10 full=0     (planted crate)
+accepted=3 full=7      (fixed copy)
+```
+
+I also left correct code that looks suspicious. For example, `for attempt in 0..=max_retries` is right, because the README allows `max_retries + 1` runs in total. A reviewer that calls this an off-by-one is wrong.
+
+## Two subagents, and a reviewer that cannot open files
+
+I defined both agents in the scratch repository, in `.claude/agents/`. The scout:
+
+```markdown
+---
+name: scout
+description: Reads code and reports what is there. Use it first, to read a codebase and get a factual report before anyone judges the code.
+tools: Read, Grep, Glob
+model: haiku
+---
+
+You are a code scout. Read the code and the documents that the request is about.
+
+Return a report that lets another engineer review the code without opening the files:
+
+- the documented requirements;
+- each module and function: what it does, and how it handles errors, limits and edge cases.
+
+Report facts only. Do not judge whether the code is correct, and do not suggest fixes.
+```
+
+The reviewer:
+
+```markdown
+---
+name: reviewer
+description: Decides which problems in a code report are real bugs. Use it after the scout, and give it the scout's full report.
+tools: TaskStop
+model: opus
+---
+
+You are a code reviewer. You get a report about a codebase from a scout who read the code. You cannot open files, so judge from the report only.
+
+Compare the described behavior with the requirements. List only real bugs: behavior that breaks a requirement or fails in normal use. For each bug, give the file, the function, what goes wrong, and how sure you are. If the report lacks a detail that you need to decide, say what is missing.
+```
+
+The reviewer cannot open files. This is on purpose. A cheap scout only saves money if the expensive model works from its report. If the reviewer reads all the code again, the scout is only an extra cost. So I tested the version where the saving can exist.
+
+Why `TaskStop`? I first gave the reviewer `CronList`. The main session started the reviewer in the background, and it was refused: "Its tool list resolves to only `CronList`, which subagents aren't allowed to use." The documentation gives a short list of tools that background subagents keep. `CronList` is not on it, and `TaskStop` is. There is an older article here about [foreground and background subagents](/blog/claude-code-foreground-background-subagents).
+
+The main session was Sonnet. Its prompt asked it not to read the files, to ask the scout for a report, and then to give "the scout's full report, unchanged" to the reviewer. I tested four pairs, four runs each, one run after another: Haiku scout with Opus reviewer, Opus with Opus, Haiku with Sonnet, and Haiku with Haiku. I used Claude Code 2.1.325 with `claude -p` and only the project settings, so my personal agents and hooks did not load.
+
+## My first crate was too easy
+
+A first crate of 287 lines was too easy: Haiku in all three roles found every bug for about 2 cents. On the bigger crate, a Haiku-only pilot also found all three, for about 4 cents. Then I stopped calibrating. I did not make the bugs harder after that, because then I would only measure my own choice.
+
+## Every setup found every planted bug
+
+Costs are Claude Code's reported cost at list price, as the mean of four runs, in USD. The Sonnet column is the main session, plus the reviewer when the reviewer is also Sonnet. When the scout and the reviewer use the same model, they share one column.
+
+| Scout + reviewer | Planted bugs found | Sonnet | Haiku | Opus  | Total | Time  |
+| ---------------- | ------------------ | ------ | ----- | ----- | ----- | ----- |
+| Haiku + Opus     | 12 of 12           | 0.266  | 0.013 | 0.127 | 0.406 | 188 s |
+| Opus + Opus      | 12 of 12           | 0.209  |       | 0.509 | 0.718 | 204 s |
+| Haiku + Sonnet   | 12 of 12           | 0.267  | 0.015 |       | 0.283 | 164 s |
+| Haiku + Haiku    | 12 of 12           | 0.171  | 0.018 |       | 0.189 | 161 s |
+
+In all 16 runs, the answer named all three bugs, with the right file and the right reason. No reviewer called the correct retry loop an off-by-one. (In one Opus run, my usage limit stopped the main session right after the reviewer answered. I scored that run from the reviewer's own output.)
+
+So the planted bugs did not separate the setups. Hmm, why was the cheap reader enough?
+
+## The scout did not summarize, and it did not only read
+
+I saved every report. The Haiku scouts wrote 21,000 to 40,000 characters. The crate's source files and README together are 25,901 bytes. So the "summary" was about as long as the code, sometimes longer. The reports I read closely quoted the key lines exactly.
+
+And the scouts did more than read. My scout file says "do not judge". But the main session writes its own brief for each subagent. In all 16 runs, that brief asked the scout to point out code that looks suspicious or differs from the README. The scouts did it. One Haiku report had a section with this title:
+
+```text
+## 14. Deviations from the README (observed in the code, not judged)
+```
+
+It listed all three planted bugs. Every scout report pointed at all three, Haiku and Opus alike. So the cheap model did a first review, and the reviewer mostly confirmed it. The role in my agent file was weaker than the brief that the main session wrote at run time.
+
+## The handoff was cut in 7 of 16 runs
+
+My prompt said "unchanged". I compared the length of each scout report with the prompt the reviewer received.
+
+When the reviewer was Opus, the reviewer that answered always got the full report. But in one of those runs, Sonnet first sent a condensed copy, then stopped that reviewer and sent the full text. With a Haiku reviewer, Sonnet passed only 38 to 47 percent of the report, in all four runs, and said so in its answer. With a Sonnet reviewer, it did the same in two of four runs, with 30 and 46 percent, and introduced the short version as "the scout's full report".
+
+The bugs were still found. The short copies that I read kept the scout's list of deviations. But this is the weak point of the design. The reviewer cannot open the code, so it cannot know what the main session left out.
+
+## Where the money went
+
+The scout was the cheapest part: 1 to 2 cents per run with Haiku. Changing only the scout from Opus to Haiku cut the total from 0.72 to 0.41.
+
+The biggest cost was the main session, not the reviewer: on average 17 to 27 cents of Sonnet per run, more than the 13 cents of the Opus reviewer. The main session reads the long report, and then it writes it again, as output, into the reviewer's prompt. In the first run, Sonnet wrote 10,288 output tokens. At the list price from 2026-11-03, USD 10 per million output tokens, that is about 10 cents, almost half of that run's Sonnet cost.
+
+## The bug I did not plant
+
+The difference in quality between the setups came from a problem I did not plant. After a crash, the journal file can end with half a record. `FileJournal::open` continues that file and writes the next record right after the broken bytes. I checked it with a test:
+
+```text
+append -> Ok(()); replay records = [(1, "acme", "complete")], malformed = 1, torn = 0
+```
+
+Record 3 was accepted with `Ok`, and then it was gone. For a journal whose job is to survive a crash, that is a real bug.
+
+The Opus reviewer reported it in all 8 of its runs. The Haiku reviewer reported it in 3 of 4 runs. The fourth reported a broken line merged with a new record after a failed write, and said it could not tell whether `open` repairs the file. The Sonnet reviewer reported it as a bug in only 1 of 4 runs. In one run it called it a "robustness gap", not a bug. In one run the scout had not pointed it out, and the reviewer got only the code of `open`. In the other two runs, the reviewer's prompt contained the scout's note about the torn line. So twice, the Sonnet reviewer had the note and still did not call it a bug.
+
+## Limits
+
+This is one constructed crate of 769 lines, with bugs that I planted myself, after one calibration round. It is four runs per setup, on one laptop, on November 14 and 15, 2026. The main session was always Sonnet, the reviewer could not read files, and I scored each answer myself with a rubric that I wrote before the runs. The data-loss bug was not in that rubric. I counted it after I read the answers. In a codebase of 50,000 lines, a scout cannot copy everything. Then what the cheap model chooses to keep may matter much more. I did not test that.
+
+## What the runs support
+
+For this kind of review, the reader can be cheap. The Haiku scouts copied the important code and even pointed at the bugs, for 1 to 2 cents per run. Replacing the Opus scout with Haiku cut the total from USD 0.72 to 0.41, and no planted bug was lost.
+
+The reviewer is less clear. Every reviewer found the planted bugs. On the bug I did not plant, Opus reported it in 8 of 8 runs, Haiku in 3 of 4 and Sonnet in 1 of 4. That order does not follow the price, and four runs per setup are too few to rank models. If you pick a reviewer model, test it on a bug that you did not plant yourself.
+
+If you build a setup like this:
+
+- Plant two or three bugs in your own code and run your real setup on it, several times. One run tells you little.
+- Log the brief that the main session writes for each subagent. It can change the role you wrote in the agent file.
+- Compare the report the scout wrote with the prompt the reviewer got. Here, the main session cut the handoff in 7 of 16 runs.
+- Look at what the main session costs. Here, the Sonnet main session cost more per run than the Opus review.
+
+When you compare models for a role, look at the cost of the whole task, not only the price per token. There is more on that in <ArticleLink slug="cost-per-completed-task-for-ai-models">cost per completed task</ArticleLink>.
