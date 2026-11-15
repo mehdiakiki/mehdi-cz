@@ -500,6 +500,8 @@ const articleSlugsByTheme = {
     "estimate-the-monthly-cost-of-an-ai-feature-before-building-it",
     "does-my-skill-load-when-it-should",
     "turning-the-rust-failure-atlas-into-an-agent-skill",
+    "let-the-cheap-model-read-and-the-strong-model-decide",
+    "does-an-agents-md-make-a-coding-agent-better",
   ],
 };
 
