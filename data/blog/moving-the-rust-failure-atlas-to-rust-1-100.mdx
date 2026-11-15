@@ -1,0 +1,184 @@
+---
+title: "Moving the Rust Failure Atlas to Rust 1.100"
+date: "2026-11-24T10:30:00Z"
+tags: ["ai", "rust", "testing", "compiler", "toolchains"]
+draft: false
+reviewed: true
+reviewedHash: "6917a48ffeea63ee16c0cfadeacebcc1fcfe290a25c13f204f2fbba8dda7579f"
+authors: ["default"]
+cluster: "reliable-ai-systems"
+campaign: "editorial"
+summary: "I ran all 694 Rust Failure Atlas cases on Rust 1.99.1 and 1.100.0 and compared every line of output. Two cases broke, and 22 more show real changes. Checks on error codes and messages broke much less often than full snapshots."
+---
+
+My [Rust Failure Atlas](/rust-failure-atlas) has 694 small cases. Each case has a failing Rust program and a repaired one. A script checks three things. The failing program must still fail. Its output must still contain two or three expected pieces of text. And the repaired version must pass. On October 24, all 694 cases passed on Rust 1.99.1.
+
+Rust 1.100.0 came out on November 12. So on November 14 I made an experiment on my laptop. I ran every case on both toolchains, and I compared the full output, not only the expected pieces.
+
+I had two questions. What changes when the same programs meet a new compiler? And what does it mean for you, if your tests quote compiler messages?
+
+## Two checks, not one
+
+The Atlas check is short on purpose. For [RFA-031](/rust/failures/repr-packed-implicit-unaligned-reference), it looks only for `E0793` and for `reference to field of packed struct is unaligned`. It ignores the rest of the message. So a passing run can hide a changed note or a changed label.
+
+That is why I added a second step. I ran an unchanged copy of the check script, one case at a time. A small Node module, loaded before the script, recorded every command that the script started. The commands were rustc, cargo, the compiled programs, a C compiler, `nm` and a few more. Then I compared the recorded output of 1.99.1 and 1.100.0, line by line.
+
+But some output changes on every run. Paths contain random folder names, and Cargo prints how long a build took. So I compared in three layers:
+
+1. Mask only my folder paths, durations, thread ids and process ids.
+2. Also mask values that change between two runs on the same toolchain, like memory addresses and random file names. To find them, I ran the 60 changed cases a second time on each toolchain.
+3. Also mask values that belong to one release. These are, for example, the commit hash and line numbers of the standard library sources, symbol hashes, and the version number itself.
+
+## The first failure was my cache
+
+Two cases failed, and Rust 1.100 was not the reason. RFA-029 and RFA-030 failed on both toolchains with this:
+
+```text
+error: failed to download `tokio v1.53.1`
+
+Caused by:
+  attempting to make an HTTP request, but --offline was specified
+```
+
+The fixtures pin tokio 1.53.1, but my Cargo cache had only tokio 1.54.1. So I downloaded 1.53.1 into a separate Cargo home inside my test folder. Its checksum matches the lock files of the fixtures. With it, both cases passed on both toolchains, with the same output.
+
+This taught me two things before I looked at Rust 1.100 at all.
+
+First, run the old toolchain again, on the same day. If I had run only 1.100.0, these two failures would have looked like Rust 1.100 problems.
+
+Second, look at what caught the problem. The failing program did fail. But it failed to build, and not with the timeout it documents. A test that only asks "does it fail?" would pass here. The Atlas check stopped because the expected text `failure process: timed out` was missing.
+
+## Two cases broke on Rust 1.100.0
+
+With the cache fixed, all 694 cases passed on 1.99.1, and 692 passed on 1.100.0.
+
+### RFA-106 depends on the version number
+
+[This case](/rust/failures/package-rust-version-newer-than-compiler) is a package that asks for a newer Rust than the compiler that builds it. Cargo 1.99.1 refuses it:
+
+```text
+error: rustc 1.99.1 is not supported by the following package:
+  rfa-rust-version@0.1.0 requires rustc 1.100
+```
+
+On 1.100.0, Cargo accepts the same package, because 1.100 is not newer anymore. So this case must move with every release. I wrote about this kind of version check in [What Breaks When Rust Reaches 1.100](/blog/what-breaks-when-rust-reaches-1-100). In a copy of the fixture, I changed the two manifests to 1.101 and 1.100. The copy passes the check on 1.100.0 and prints:
+
+```text
+error: rustc 1.100.0 is not supported by the following package:
+  rfa-rust-version@0.1.0 requires rustc 1.101
+```
+
+The case page quotes the old two lines, so its text must change too.
+
+### RFA-401 lost its error
+
+This case needs more than a new date. [RFA-401](/rust/failures/packed-type-cannot-transitively-contain-repr-align) puts a type with `#[repr(align(8))]` inside a `#[repr(packed)]` struct. Rust 1.99.1 rejects it:
+
+```text
+error[E0588]: packed type cannot transitively contain a `#[repr(align)]` type
+```
+
+Rust 1.100.0 compiles the same file. It prints two `dead_code` warnings and exits with status 0. And `rustc +1.100.0 --explain E0588` now starts with this line:
+
+```text
+#### Note: this error code is no longer emitted by the compiler.
+```
+
+Hmm, why? The [release notes](https://doc.rust-lang.org/stable/releases.html#version-11000-2026-11-12) say: "Turn the error for `repr(align)` fields in a `repr(packed)` type into a deny-by-default lint `aligned_fields_in_packed`". The [pull request](https://github.com/rust-lang/rust/pull/162160) gives the missing part: "The lint also only fires for `repr(C)` types". The fixture uses the default Rust representation. So nothing fires.
+
+But the check builds the failing file only up to metadata, without machine code. Maybe the new lint did not run at all? To check this, I made a small test. It is a constructed program, not an Atlas fixture. It has the same two types, and its `main` builds a value and prints the layout. Rust 1.99.1 rejects it with E0588. Rust 1.100.0 runs it:
+
+```text
+size_of::<Packet>() = 9, align_of::<Packet>() = 1, tag = 1, inner = 2
+```
+
+So the metadata build is not the reason. A full build accepts the type too, and the packed struct gets alignment 1. With `repr(C, packed)` and `repr(C, align(8))`, Rust 1.100.0 still refuses the code. But the error has no error code anymore, and it ends with this note:
+
+```text
+  = note: `#[deny(aligned_fields_in_packed)]` on by default
+```
+
+OK, now it makes sense. The page title says that a packed type cannot contain a `repr(align)` type. On Rust 1.100, the compiler refuses this only for `repr(C)` types, and through a lint. A copy of the fixture with `repr(C)` and the expected text `aligned_fields_in_packed` passes the check on 1.100.0. But to change what a case teaches is a decision for review, not for a script.
+
+## What changed in the cases that passed
+
+This is the comparison for all 694 cases:
+
+| Result                                          | Cases |
+| ----------------------------------------------- | ----- |
+| Same output after layer 1                       | 634   |
+| Different only in run-to-run values (layer 2)   | 5     |
+| Different only in release identifiers (layer 3) | 31    |
+| Compiler message changed, check still passes    | 16    |
+| Cargo build directory paths changed             | 4     |
+| Panic location moved                            | 1     |
+| Standard library symbol list changed            | 1     |
+| Check failed                                    | 2     |
+
+The 16 message changes are small, and several of them are more helpful. This is RFA-093 on Rust 1.99.1. I shortened the file paths:
+
+```text
+note: required because it's used within this closure
+ --> fail.rs:7:24
+  |
+7 |     std::thread::spawn(move || *worker_value.borrow_mut() += 1);
+  |                        ^^^^^^^
+```
+
+And this is Rust 1.100.0:
+
+```text
+note: required because `worker_value` is used within this closure
+ --> fail.rs:7:33
+  |
+7 |     std::thread::spawn(move || *worker_value.borrow_mut() += 1);
+  |                                 ^^^^^^^^^^^^
+```
+
+The new note names the variable. Four cases changed in this way. Some other examples:
+
+- The E0521 label "`value` is a reference that is only valid in the closure body" became "`value` is only valid in the closure body".
+- A suggestion changed from `const width: /* Type */ = 4_usize;` to `const width: usize = 4_usize;`.
+- In RFA-471 and RFA-474, the warnings next to the error are gone. In RFA-471, the last line changed from `error: aborting due to 1 previous error; 2 warnings emitted` to `error: aborting due to 1 previous error`.
+
+The Cargo paths follow the new build directory layout. In RFA-698, the path in the error changed from `debug/build/rfa-generated-file-wrong-directory-fb8908e69e313c13/out/generated.rs` to `debug/build/rfa-generated-file-wrong-directory/4792db4278b4953d/out/generated.rs`. The [release announcement](https://blog.rust-lang.org/2026/11/12/Rust-1.100.0/) describes this layout. It also warns that it "may break build processes and tests that had workarounds".
+
+In RFA-364, the repaired program catches a divide-by-zero panic on purpose. On 1.99.1 the panic location pointed into `library/core/src/num/mod.rs`. On 1.100.0 it points to my own line, `fixed.rs:8:54`.
+
+I did not find the message changes or the panic location change in the release notes. Then I searched the pages of all 60 changed cases for the changed lines. For the 24 real changes, I also searched for short phrases from them. Only the pages of RFA-106 and RFA-401 quote text that changed.
+
+The release announcement starts with the never type, which is now stable. The release also changed the "never type fallback" in editions before 2024. 43 Atlas cases use edition 2021, and none of them failed.
+
+## What this means for tests that quote compiler output
+
+A test that checks compiler output can compare a lot or a little. If a coding agent writes the test for you, it can write either style. So the choice is yours. This run shows what each choice cost for one release:
+
+| What the test compares                       | Changed from 1.99.1 to 1.100.0 |
+| -------------------------------------------- | ------------------------------ |
+| Full output, paths and times masked          | 60 of 694 cases                |
+| Full output, also run-to-run values masked   | 55 of 694                      |
+| Full output, also release identifiers masked | 24 of 694                      |
+| Error codes                                  | 1 of 328 cases that have one   |
+| Main error lines                             | 3 of 366                       |
+| Panic messages                               | 0 of 320                       |
+| Panic locations                              | 20 of 320                      |
+| The expected Atlas text                      | 2 of 694                       |
+
+The rows from error codes down to panic locations use the layer-1 output. In 19 of the 20 panic locations, only the path into the standard library sources changed.
+
+A main error line is the first line of an error, for example `error[E0793]: reference to field of packed struct is unaligned`. The short check failed in two cases. In both, the failure itself changed: one package is now accepted, and one program now compiles. The full comparison found these two too, but together with 58 other differences. None of these 58 changes a compiler message that its Atlas page quotes.
+
+So when your tests quote compiler messages, this is what I would do:
+
+- Check the reason for the failure. Use the error code and the main message, or the panic message. Notes, labels, column positions and paths inside the standard library change more often.
+- Never check only that it fails. My missing tokio failed too.
+- When you update the toolchain, run old and new on the same machine on the same day. Run the changed cases twice, so you can separate noise from change.
+- When a failing example starts to compile, stop. This is not a text update. Read the release notes, because the rule changed.
+- Do not write version numbers into tests that compare versions. Compute them from the toolchain that runs the test.
+- If a coding agent updates these tests for you, give it the same rule. It may accept changed notes and paths. A missing error is a question for a person.
+
+## Where the Atlas pages stand
+
+The case pages still say "Last run 2026-10-24 with Rust 1.99.1". The passing cases need the new toolchain and date. Also, 675 of the 694 case pages name Rust 1.99.1 in their own text. RFA-106 and RFA-401 need new fixtures and new text first.
+
+The limits of this run: one Linux laptop, rustc 1.99.1 (58cf8f9c3) and 1.100.0 (0ef1bc386), with their Cargo versions. I ran each case once per toolchain, and the 60 changed cases one more time. Everything ran on 2026-11-14, one case at a time. Other targets and other machines can show other differences.

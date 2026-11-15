@@ -377,6 +377,9 @@ test("the repository maps every written campaign source without counting unrelat
       "what-rtk-really-saved-in-my-claude-code-setup",
       "who-writes-the-instructions-your-coding-agent-follows",
       "what-claude-code-loads-agents-md-claude-md-and-nested-files",
+      "when-an-agent-rule-needs-a-hook-not-a-sentence",
+      "auditing-an-agent-instruction-file-line-by-line",
+      "moving-the-rust-failure-atlas-to-rust-1-100",
     ].sort()
   );
   assert.deepEqual(report.backlogErrors.sourceMappingErrors, []);
