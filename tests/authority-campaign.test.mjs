@@ -387,6 +387,9 @@ test("the repository maps every written campaign source without counting unrelat
       "turning-the-rust-failure-atlas-into-an-agent-skill",
       "let-the-cheap-model-read-and-the-strong-model-decide",
       "does-an-agents-md-make-a-coding-agent-better",
+      "do-you-need-a-frontier-model-to-fix-a-rust-compile-error",
+      "cost-per-completed-task-for-ai-models",
+      "try-one-model-at-lower-effort-before-building-a-router",
     ].sort()
   );
   assert.deepEqual(report.backlogErrors.sourceMappingErrors, []);

@@ -1,0 +1,115 @@
+---
+title: "Try One Model at Lower Effort Before You Build a Router"
+date: "2026-11-20T10:30:00Z"
+tags: ["ai", "llm cost", "model routing", "prompt caching", "claude-code"]
+draft: false
+reviewed: true
+reviewedHash: "5f3c27988a96997ab16982b353d298b6a6fa70662aeb2f63ca4e612fd628fd28"
+authors: ["default"]
+cluster: "reliable-ai-systems"
+campaign: "editorial"
+summary: "A router sends each task to a cheap model first and escalates when a check fails. I computed one from real runs on 40 Rust fixes and compared it with one strong model at low effort. It would never have escalated, and the reason was the check, not the models."
+---
+
+The plan sounds smart. Send every task to the cheapest model. Check the answer. If the check fails, send the task again to a strong model. Most tasks stay cheap, and the hard ones still get solved. People call this a router, or a cascade.
+
+Before you build something like that, check if it is worth the code. Anthropic's guide on [cost and intelligence](https://platform.claude.com/docs/en/about-claude/models/optimizing-for-cost-and-intelligence) gives a clear order:
+
+> Tune one model before you add a second: sweep effort on your current model first, because most workloads end there, and if the sweep shows a gap, price the stronger model alone at low effort. Build a pairing only if it beats the single model's whole curve of score against spend.
+
+So I tried this order on real data: 40 failing Rust programs from my Rust Failure Atlas, the same runs as in <ArticleLink slug="do-you-need-a-frontier-model-to-fix-a-rust-compile-error">my test of which model fixes Rust errors</ArticleLink>. Each model got the failing file and the compiler output and returned a fixed file. An automatic check compiled the fix, and for programs that panic, it ran the fix and required exit status 0.
+
+## Four ways to run the same tasks
+
+- **Haiku alone.** Haiku 5.5 at the default effort. In Claude Code 2.1.325 the default was medium; I read it in the request log.
+- **Haiku, then Opus.** The router. Haiku first, and Opus 5.5 (medium) only when the check fails. I did not build a running router. I computed it from the two sets of runs: for each case, the Haiku attempt, plus the Opus attempt if Haiku's fix failed the check.
+- **Sonnet alone.** Sonnet 5.5 at the default effort, also medium.
+- **Opus at low effort.** Opus 5.5 with `--effort low`.
+
+One call per case and setting, on November 14 and 15, 2026, on my laptop. Costs are the `total_cost_usd` that Claude Code reported, at list prices.
+
+## The results
+
+| Setup                              | Passed the check | Accepted after I read it | Cost per task that passed | Cost per accepted fix |
+| ---------------------------------- | ---------------- | ------------------------ | ------------------------- | --------------------- |
+| Haiku alone                        | 40               | 34                       | USD 0.00108               | USD 0.00127           |
+| Haiku, then Opus on a failed check | 40               | 34                       | USD 0.00108               | USD 0.00127           |
+| Sonnet alone                       | 40               | 32                       | USD 0.01774               | USD 0.02218           |
+| Opus at low effort                 | 39               | 37                       | USD 0.03793               | USD 0.03998           |
+
+The router row is a copy of the Haiku row. Every one of Haiku's 40 fixes passed the check, so the computed router would never have called Opus. It would cost nothing extra, and give nothing extra.
+
+Opus at low effort was about 31 times more expensive per accepted fix, and it had 3 more accepted fixes, 37 against 34. Its one failed check was a formatting problem: it answered with two code blocks, and the last one was a single line. A second try passed.
+
+Sonnet cost 16 times more than Haiku and had 2 fewer accepted fixes, so it is not a middle option here.
+
+## The router can only see what the check sees
+
+Haiku had 6 fixes that I did not accept: 4 wrong and 2 questionable. All 6 passed the check. For a router, they look exactly like good fixes.
+
+Here is one of them. In case RFA-682, a program drops one channel sender, keeps a clone alive, and expects the receiver to see "disconnected". Haiku changed the expectation:
+
+```rust
+    assert!(matches!(result, Err(TryRecvError::Empty)),
+        "a channel remains connected while any Sender clone is alive");
+```
+
+The program now passes, and it checks the wrong thing. Opus at low effort moved `drop(hidden_sender)` before `try_recv()` and kept the original expectation. Both answers compile and exit 0. A router that escalates on "does it compile and exit 0" cannot tell them apart, so it keeps Haiku's answer.
+
+So the quality of a router is the quality of its check. With a weak check, the router gives you the cheap model's answers at the cheap model's price, plus code to maintain.
+
+## What a stricter check would do
+
+I tried two stricter triggers on the same data. Both are computed, not run: Haiku first, and Opus at medium when the trigger fires.
+
+| Escalate when                                            | Escalations | Haiku's 6 bad fixes caught | Accepted | Cost per accepted fix |
+| -------------------------------------------------------- | ----------- | -------------------------- | -------- | --------------------- |
+| the check fails                                          | 0           | 0                          | 34       | USD 0.00127           |
+| the check fails, or `rustc` printed a warning            | 10          | 1                          | 35       | USD 0.01118           |
+| the check fails, or the fix changed a line with `assert` | 11          | 3                          | 36       | USD 0.01291           |
+
+Warnings were a bad signal. All 10 warnings were about unused code in a tiny program, and 9 of the 10 escalated fixes were fine. The rule caught 1 of the 6 bad fixes, RFA-514, and only because of an unused-function warning, not the FFI one.
+
+The rule about assertions was better: it caught 3. But 8 of its 11 escalations were fine fixes, because in many runtime cases the correct repair does change an assertion. It also missed a wrong fix where the changed value sat on its own line inside a multi-line `assert_eq!`. And in one caught case, RFA-682, Opus at medium made the same wrong change as Haiku. So escalation is not a guarantee either.
+
+These two routers land between Haiku alone and Opus at low effort, on both quality and cost. They are about one accepted fix above a straight line between those two, and one fix in 40 is inside the noise of one run. The guide compares a pairing with one model's whole effort curve, and I measured only one effort for Haiku. So my data cannot say that a pairing wins here.
+
+## Caches belong to one model
+
+A router has one more cost that is easy to miss. Prompt caching works per model.
+
+Every call in my setup sends about 10,000 tokens of context, and 6,406 of them are the same for every case. In my first test calls, before the main runs, I sent the same case to Haiku, then Sonnet, then Opus, a few seconds apart:
+
+| Call                    | Cache read | Cache write | Cost        |
+| ----------------------- | ---------- | ----------- | ----------- |
+| Haiku                   | 6,406      | 3,911       | USD 0.00113 |
+| Sonnet, 5 seconds later | 0          | 10,296      | USD 0.04336 |
+| Opus, 4 seconds later   | 0          | 10,292      | USD 0.08958 |
+
+Haiku's warm cache did not help Sonnet or Opus at all. Each model wrote the whole context into its own cache, at twice the normal input price, because Claude Code uses the one-hour cache. A warm Opus call at medium effort cost about USD 0.037 in my main runs. The cold one cost USD 0.08958, more than twice as much.
+
+In a router, the strong model is called only for failures. If escalations come less often than once an hour, the cache lifetime here, each one pays that first write. One model for everything keeps one cache warm.
+
+In the main runs, the cache reads looked the same for every setting:
+
+| Setup              | First attempts | Read 6,406 tokens from the cache | Cold (read 0) |
+| ------------------ | -------------- | -------------------------------- | ------------- |
+| Haiku alone        | 40             | 39                               | 1             |
+| Sonnet alone       | 40             | 39                               | 1             |
+| Opus at low effort | 40             | 38                               | 1             |
+| Opus at medium     | 40             | 39                               | 0             |
+
+The two Opus calls that read more had used a tool they did not need, which added requests. The size of the cached part is the same for all models. What differs is its price: reading 6,406 tokens cost about USD 0.00006 on Haiku and USD 0.00128 on Opus.
+
+Effort is not free for the cache either. In my test calls, I sent the same case to Opus at medium, then at low. The low-effort call read 7,266 tokens from the cache that the medium call had just written, not all 10,294. The [prompt caching page](https://platform.claude.com/docs/en/build-with-claude/prompt-caching) says that changing the effort value "can invalidate message blocks". So pick one effort level per workload, and do not switch it on every request. For my main runs, I kept the same case on the two Opus settings more than an hour apart, so the medium call could not read the low call's prompt. The shared part did carry over: the first Opus medium call read the 6,406 prefix tokens that an Opus low call had written 4 seconds before. That is also why the Opus at medium row has no cold call.
+
+## What this comparison cannot tell you
+
+One laptop, one answer per case and setting, 40 cases. Only Opus ran at two effort levels; Haiku and Sonnet ran only at medium. On 40 cases, a gap of 3 accepted fixes is not a clear difference. I used Claude Code 2.1.325, which adds its own context to every call. The router numbers are computed from the runs, not from a running router, and they use Opus attempts with a warm cache, which is the best case for the router. The cases are small single-file programs. "Accepted" is my judgment, with the repaired file from the atlas as the statement of intent. A usage limit stopped my runs on the first evening, so the Opus at medium runs ran the next morning.
+
+## Before you write a router
+
+1. Run your current model at two or three effort levels on a sample of real tasks. Measure cost per accepted task, not per token. In my runs, Opus at low effort cost only a few percent less per call than at medium, because the fixed context was most of the bill.
+2. Run the stronger model alone at low effort on the same sample. Here it tied with Opus at medium for the most accepted fixes, 37 of 40, at about 31 times the price of Haiku per accepted fix.
+3. Look at the tasks where the cheap model failed, and ask: would your check have caught this? In my data, the answer was no for all six. Then a router cannot help. Fix the check first.
+4. Build the router only if it beats the single models on your own numbers, with the cold cache of the second model included.
