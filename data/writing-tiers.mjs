@@ -498,6 +498,8 @@ const articleSlugsByTheme = {
     "moving-the-rust-failure-atlas-to-rust-1-100",
     "rules-search-small-model-big-model-agent-one-task-measured",
     "estimate-the-monthly-cost-of-an-ai-feature-before-building-it",
+    "does-my-skill-load-when-it-should",
+    "turning-the-rust-failure-atlas-into-an-agent-skill",
   ],
 };
 
