@@ -1,0 +1,149 @@
+---
+title: "Move the AI Work Nobody Waits For Out of the Request"
+date: "2026-11-22T16:30:00Z"
+tags: ["ai", "background-jobs", "rate-limits", "rust", "llm cost"]
+draft: false
+reviewed: true
+reviewedHash: "8221bc7f5e4ab1a7b07362536f2b0b30ede74a4cbdc354feb535dff942e5c319"
+authors: ["default"]
+cluster: "reliable-ai-systems"
+campaign: "editorial"
+summary: "I ran the same AI classification job with one, four and eight workers, killed it in the middle, and hit a usage limit by accident. A results file keyed by item id made every rerun safe. Here is what changed when the AI step left the request."
+---
+
+In [my routing experiment](/blog/rules-search-small-model-big-model-agent-one-task-measured), one classification call through `claude -p` took about 3 seconds from start to end. For 200 support messages, one after another, the run took 643 seconds.
+
+Now imagine this call inside a web request. A customer presses "send" on a support form, and the page waits while a model picks the intent of the message. Three seconds most of the time. In the same experiment, one call to Opus 5.5, the largest model I tested, took 78 seconds.
+
+But who needs the intent in that second? The message goes into a queue, and a person reads it later. Nobody waits for the routing. So the AI step can leave the request and run as a background job.
+
+I wanted to see what really changes then: the time, the errors, the limits, the retries, and what happens when the job dies in the middle. I made the experiment on November 14 and 15, on my laptop, with Claude Code 2.1.325 and Haiku 5.5, on the same banking messages (banking77 from PolyAI, CC BY 4.0).
+
+## The job
+
+The job is small. It has a list of items, each with an id. It has N workers. Each worker takes the next item, runs one `claude -p` call, checks the answer, and appends one line to a results file. The results file is the important part: it is keyed by item id.
+
+When the job starts, it reads the results file first and skips every item that already has a final result:
+
+```rust
+fn finished_ids(results: &str) -> HashSet<String> {
+    read_jsonl(results)
+        .iter()
+        .filter(|v| v["status"] != "error")
+        .filter_map(|v| v["id"].as_str().map(String::from))
+        .collect()
+}
+```
+
+```rust
+// Idempotency: skip every item that already has a final result.
+let done = finished_ids(&cfg.results);
+let pending: VecDeque<Example> = items.iter().filter(|e| !done.contains(&e.id)).cloned().collect();
+```
+
+"Idempotent" means you can run the same command again and it does not do the finished work twice. Here it comes from two small decisions. An item counts as finished only when it has a line that is not an error. And each line is written and flushed as soon as the item is done:
+
+```rust
+let mut f: std::sync::MutexGuard<File> = out.lock().unwrap();
+writeln!(f, "{line}").unwrap();
+f.flush().unwrap();
+```
+
+`read_jsonl` ignores lines that do not parse. So if the job dies while it writes a line, that item runs again (and, in the worst case, also the item written right after it).
+
+## The run I did not plan
+
+On the evening of November 14, I started the first run with four workers on 100 messages. The first 19 messages came back fine in about 13 seconds. Then my runner logged this error for every call:
+
+```text
+result error: "success" "You've hit your weekly limit · resets 6am (UTC)"
+```
+
+In this quote I show the time zone as UTC; the original message used another name for the same zone. This was not a per-minute API rate limit. It was the weekly usage limit of the Claude Code account I used for these calls, and other work on the same account had used most of it that week. The stream from Claude Code said `"status":"rejected"`, and the process ended with exit code 1.
+
+My runner did what I wrote: it retried each failed item two more times, after 2 and 4 seconds. So it made 243 calls that all failed, and it marked 81 items as errors. Claude Code reported a cost of 0 for these failed calls. They cost only time: the whole run took 243 seconds, and after the first 13 seconds nothing useful happened.
+
+This is the first lesson, and I did not plan it. A retry with a short wait helps with a short problem. It does not help with a limit that comes back at 6am. The message even said when. A better worker reads that, stops taking new items, and waits.
+
+The next morning, after the reset, I ran exactly the same command:
+
+```text
+items: 100, already done: 19, to run: 81, workers: 4
+wall time: 47.2 s
+```
+
+The 19 finished items were skipped. The 81 errors ran again, and all of them succeeded. Nothing was done twice, and I did not have to clean anything by hand.
+
+## One worker, four workers, eight workers
+
+Then I ran the same 100 messages three times, with a fresh results file each time, one run after the other:
+
+| Workers | Wall time | Seconds per message (incl. CLI start) | Errors | Retries inside Claude Code | Limit status |
+| ------- | --------- | ------------------------------------- | ------ | -------------------------- | ------------ |
+| 1       | 251.8 s   | 2.52                                  | 0      | 0                          | allowed      |
+| 4       | 61.7 s    | 2.43                                  | 0      | 0                          | allowed      |
+| 8       | 30.7 s    | 2.38                                  | 0      | 0                          | allowed      |
+
+Each call took about the same time. The total time went down almost in line with the number of workers: 4 workers were 4.1 times faster, 8 workers 8.2 times faster. At this size, nothing pushed back. No 429 error, no retry inside Claude Code, and every rate-limit event said `allowed`.
+
+So for 100 messages, parallel workers were simply faster. I would not stretch this result very far. 100 calls in 30 seconds is a light load. Anthropic's rate limit page describes "ramp limits": after a sharp increase in usage, requests "can return a 429 error even while you're under your ITPM and OTPM rate limits". It also advises to "start scheduled or bulk jobs at a low rate and spread requests evenly, rather than sending everything at once". (ITPM and OTPM are the limits on input and output tokens per minute.) A background job is the right place to follow this advice, because nobody waits.
+
+Two smaller things I noticed:
+
+- **The answers are not identical between runs.** The three runs got 68, 69 and 71 messages right. 94 of the 100 messages got the same answer all three times. The job should store the answer it got, and not assume that a rerun gives the same one.
+- **Reruns were cheap.** Claude Code writes the whole prompt to a one-hour cache. When I ran the same messages again within the hour, most input tokens were cache reads. The reported cost of the 4-worker run was USD 0.0033 for 100 messages, about 4.6 times less per message than the USD 0.0306 for 200 messages on the first night.
+
+## Results come back in any order
+
+With one worker, the results file had the same order as the input. With four workers, only 54 of 100 lines were in their input position. With eight, only 31. The first lines of the 8-worker file were `t1205`, `t2259`, `t2222`, `t1601`, while the input started with `t1271`, `t0707`, `t0211`, `t1205`.
+
+This is fine because nothing reads the file by position. Everything goes through the id.
+
+## Killing it in the middle
+
+Last, I made the crash on purpose. I started a 4-worker job on 60 messages and killed the whole process group after 15 seconds, the runner and its `claude` processes together. Then I ran the same command twice:
+
+```text
+result lines after the kill: 24
+started but no result line (in flight when killed):
+t0169
+t0632
+t1697
+t3054
+claude processes left: 0
+== run 2 (same command) 06:10:02
+items: 60, already done: 24, to run: 36, workers: 4
+wall time: 22.0 s
+result lines now: 60, unique ids: 60
+== run 3 (same command again) 06:10:25
+items: 60, already done: 60, to run: 0, workers: 4
+wall time: 0.0 s
+```
+
+Four calls were in flight when the job died. Their answers were lost, and those four messages ran again. So a crash costs you the calls that were running, not the whole job. In the end there were 60 lines for 60 ids, with no duplicate.
+
+## What the Batch API adds
+
+My workers call the model through Claude Code, and Claude Code reports their cost at normal list prices. When nobody waits, Anthropic also offers the Message Batches API. I did not measure it. This is what its documentation says, as I read it on November 14:
+
+- "All usage is charged at 50 percent of the standard API prices."
+- "most batches completing within 1 hour", and "Batches expire if processing does not complete within 24 hours."
+- "Batch results can be returned in any order, and might not match the ordering of requests when the batch was created." The documentation says to "always use the `custom_id` field" to match them.
+- Prompt caching works with batches, but "cache hits are provided on a best-effort basis".
+- The rate limit page says the Message Batches API "isn't subject to ramp limits".
+
+So the Batch API is the same idea as my job, at half the price, with a slower and less precise finish time. The `custom_id` plays the role of my item id. You still need the results file, or a table, keyed by that id.
+
+In [the cost estimate for this feature](/blog/estimate-the-monthly-cost-of-an-ai-feature-before-building-it), batch at half price was the cheapest line. The experiment here shows the other side: what you must build so that "later" stays correct.
+
+## What to do
+
+If an AI step does not need to answer the person who is waiting, take it out of the request. Then:
+
+- Give every item a stable id, and write one result per id. Make the job skip finished ids. This one rule made the crash, the limit and the reruns safe in my runs.
+- Count an item as finished only when it has a real answer. Errors stay open, so the next run picks them up.
+- Treat errors by kind. Retry a short failure with a short wait. When the error says "resets 6am", stop and wait for 6am.
+- Start with a few workers and grow slowly. In my small runs, 8 workers were 8 times faster and nothing complained, but limits react to sudden jumps.
+- If the answer can wait for hours, compare with the Batch API, and use its `custom_id` the same way.
+
+The limits of this experiment: one laptop, Claude Code 2.1.325, Haiku 5.5, 100 messages per worker setting, one run per setting, plus the crash and the limit event described above. My calls went through Claude Code, not directly through the API, so its own retry logic and caching are part of the result. I did not test the Batch API itself.

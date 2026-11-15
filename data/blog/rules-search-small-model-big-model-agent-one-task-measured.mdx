@@ -1,0 +1,209 @@
+---
+title: "Rules, Search, a Small Model, a Big Model, an Agent: One Task, Measured"
+date: "2026-11-20T16:30:00Z"
+tags: ["ai", "classification", "llm cost", "rust", "evaluation"]
+draft: false
+reviewed: true
+reviewedHash: "635ff58e58767c12f8b00396f001787777aa8e395228e07b1b7a557b5f877d13"
+authors: ["default"]
+cluster: "reliable-ai-systems"
+campaign: "editorial"
+summary: "I sent the same 200 bank support messages through keyword rules, search, three Claude models and an agent, and measured accuracy, cost per correct answer and time. The cheapest good result came from a small model that was shown similar labeled examples."
+---
+
+A customer writes to a bank: "I want to go back on what I did this morning."
+
+Somebody has to send this message to the right team. In the public dataset I used, the correct answer is `cancel_transfer`, one of 77 possible intents. An intent is simply the reason why the customer writes.
+
+When a team gets a task like this today, the first idea is often "let's use AI for it". But there is a ladder of options: keyword rules, search over messages that people already labeled, a small or a big model, or an agent with tools. Each step up costs more and takes longer. So on November 14 and 15 I measured how far each step gets, and what one correct answer costs, on the same messages.
+
+## The task and the test
+
+The data is [banking77](https://github.com/PolyAI-LDN/task-specific-datasets) from PolyAI, a public dataset of online banking questions, published under the [CC BY 4.0 license](https://creativecommons.org/licenses/by/4.0/) with the paper [Efficient Intent Detection with Dual Sentence Encoders](https://arxiv.org/abs/2003.04807) (Casanueva et al., 2020). The customer messages I quote come from it unchanged. The messages are not from one real bank. The conventions below are the conventions of the people who labeled the data. The set has 10,003 training messages and 3,080 test messages, each labeled with one of 77 intents. The intents are close to each other on purpose. For example, `card_arrival` ("my card has not arrived") and `card_delivery_estimate` ("how long does delivery take") are two different intents.
+
+I picked 200 test messages at random with a fixed seed (20261114), so anybody can rebuild the sample. They cover 73 of the 77 intents. I built the rules and the search only from the training messages, and I did not tune anything on the test messages.
+
+Steps 1 and 2 are a small Rust program. The model steps call Claude through Claude Code 2.1.325 in print mode (`claude -p`), one message per call, at effort `medium`. One run per step.
+
+## Step 1: keyword rules
+
+Rules are what most teams try first. When no rule matches, they can honestly say "I don't know".
+
+I wrote one rule per intent, 538 short terms in total, by reading the training messages. A term is a few words, like `lost my card`, or two parts that must both appear, like `transfer+declined`. The intent whose terms match the most words wins.
+
+```rust
+for rule in rules {
+    let mut score = 0;
+    let mut hits = Vec::new();
+    for term in &rule.terms {
+        if term.iter().all(|part| has_phrase(&words, part)) {
+            score += term.iter().map(|p| p.len()).sum::<usize>();
+            hits.push(term.iter().map(|p| p.join(" ")).collect::<Vec<_>>().join("+"));
+        }
+    }
+    // strictly greater: on a tie, the earlier rule keeps the win
+    if score > 0 && best.as_ref().map_or(true, |b| score > b.1) {
+        best = Some((&rule.intent, score, hits));
+    }
+}
+```
+
+On the 200 test messages:
+
+```text
+items: 200, correct: 103 (51.5%), answered: 130 (65.0%), correct when answered: 79.2%
+time: 8.836279ms total, 44.2 us per item
+```
+
+The rules answered 130 messages, and 103 of these answers were right. 70 messages matched no rule at all.
+
+Two real failures:
+
+- "I want to go back on what I did this morning" matched nothing. There is not one keyword in it.
+- "There is a Direct Debit that I don't recognize." went to `card_payment_not_recognised`. Two rules scored two words each, and the tie went to the rule that comes first in my file. The order of the rules changed the answer.
+
+## Step 2: search the labeled examples
+
+The second step does not try to understand anything. It takes the new message, finds the training messages that share the most rare words with it, and copies their intent. The scoring is BM25, a classic formula from search engines: rare words count more, and long messages count a bit less.
+
+```rust
+for w in &q {
+    if let Some(list) = self.postings.get(w) {
+        let df = list.len() as f64;
+        let idf = (1.0 + (n - df + 0.5) / (df + 0.5)).ln();
+        for &(d, tf) in list {
+            let norm = tf * (k1 + 1.0) / (tf + k1 * (1.0 - b + b * self.len[d] / self.avg_len));
+            *scores.entry(d).or_default() += idf * norm;
+        }
+    }
+}
+```
+
+The five best neighbours vote, weighted by their score:
+
+```text
+index: 10003 training messages, 2351 distinct words, built in 84.488516ms
+items: 200, 1-NN correct: 168 (84.0%), 5-NN vote correct: 171 (85.5%)
+time: 198.546067ms for all queries, 993 us per item
+```
+
+171 of 200, with no model, in about a millisecond per message. The 10,003 labeled examples contain the labelers' own idea of each intent, and search simply copies it.
+
+Two real failures:
+
+- "Can I top up using my car?" The customer meant "card". Two neighbours were about cheque or cash, and three had the Apple Pay or Google Pay label (one was "Can I top up using my apple watch?"), so the vote said `apple_pay_or_google_pay`.
+- "My card was taken by the ATM." The words "taken" and "ATM" pulled in messages about declined withdrawals. The right intent, `card_swallowed`, came third.
+
+## Step 3: a small model with the intent list
+
+Haiku 5.5 is the smallest and cheapest Claude model. The system prompt is short:
+
+```text
+You sort customer messages for the support team of a bank.
+Read the customer message and choose the one intent from the list below that matches it best.
+Answer with the intent name only, exactly as it is written in the list. Do not add any other text.
+
+Intents:
+card_arrival
+card_linking
+...
+```
+
+All 77 names follow. There are no tools. My Rust runner applies a strict output check: the answer must be exactly one of the 77 names. If it is not, the runner asks once more with the same prompt.
+
+```rust
+let answer = r["result"].as_str().unwrap_or("").trim().to_string();
+let valid = cfg.labels.contains(&answer);
+```
+
+```text
+correct: 134 (67.0%), invalid after retry: 6, errors: 0, extra attempts: 8, api retries inside CLI: 0
+Claude Code reported cost: USD 0.0306 total, USD 0.1529 per 1,000 items, USD 0.00023 per correct answer
+seconds per item (wall, incl. CLI start): mean 3.22, p50 2.66, p90 5.06, max 12.94
+```
+
+134 of 200. Less than search, which used no model at all.
+
+Hmm, why? The model only sees the names of the intents. It does not know where the people who labeled the data drew the line between two names. Search does not know either, but it copies decisions that people already made.
+
+Two real failures:
+
+- "My card was taken by the ATM." Haiku said `lost_or_stolen_card`. The label is `card_swallowed`.
+- "I ordered a card and I still haven't received it. It's been two weeks. What can I do?" Haiku said `card_delivery_estimate`. The label is `card_arrival`. Both names fit the sentence; only the data says which one is meant.
+
+The strict check earned its place: 8 of the 200 first answers were not on the list, and asking again fixed only 2.
+
+## Step 4: bigger models
+
+Same prompt, same check, same 200 messages. Only the model changes.
+
+```text
+Sonnet 5.5
+correct: 160 (80.0%), invalid after retry: 2, errors: 0, extra attempts: 2, api retries inside CLI: 0
+Claude Code reported cost: USD 0.5310 total, USD 2.6549 per 1,000 items, USD 0.00332 per correct answer
+
+Opus 5.5
+correct: 175 (87.5%), invalid after retry: 1, errors: 0, extra attempts: 1, api retries inside CLI: 0
+Claude Code reported cost: USD 1.1770 total, USD 5.8849 per 1,000 items, USD 0.00673 per correct answer
+```
+
+Sonnet got 26 more messages right than Haiku, at about 14 times the cost per correct answer. Opus got 175, four more than search. On 200 messages, four messages is not a clear difference: with this sample size, a result of 85% can easily move by five points either way.
+
+Most invalid answers were right answers with extra text, like Sonnet's "Wait, I need to match the list exactly as written...". I kept the strict check for every step, because a check that guesses is also a source of errors.
+
+Two real failures, mostly shared by Sonnet and Opus:
+
+- "My transfer to beneficiary didn't go through" (Sonnet) and "The account transfer I was trying to do failed." (both) became `failed_transfer`. The dataset labels them `beneficiary_not_allowed`.
+- "Why did I get a fee?" became `extra_charge_on_statement`. The label is `cash_withdrawal_charge`, which the message does not say. Search got it, because the training data has very similar sentences with that label, like "Why did I get a fee from the ATM?".
+
+So the bigger models fail where the dataset's labels are a convention, not common sense. More intelligence does not tell you a convention.
+
+## Step 5: give the model the examples
+
+So the next step is to give the model the examples. I tried two ways.
+
+**An agent.** The model gets two read-only tools, Grep and Read, and the file `train.csv` with all 10,003 labeled messages. The system prompt asks it to search the file before it answers. This is slower, so I ran it on the first 30 messages of the sample.
+
+```text
+Haiku agent:  correct: 24 (80.0%), USD 0.9198 per 1,000 items, turns per item: 2.67, tool uses per item: 1.67, mean 3.90 s
+Sonnet agent: correct: 25 (83.3%), USD 12.1999 per 1,000 items, turns per item: 2.37, tool uses per item: 1.37, mean 5.63 s
+```
+
+On the same 30 messages, plain Haiku got 20, Sonnet 22, Opus 26 and search 25. So the tools helped Haiku. But Grep returns lines in file order, and `train.csv` is grouped by intent. For "Please help me get a new card, I reside in the United States.", the first search of both agents, `new card` with a 40-line limit, returned only `card_arrival` lines. Both answered `order_physical_card`. The label is `country_support`, and search found it.
+
+**Examples in the prompt.** Then I did the boring version: my Rust search finds the 10 nearest training messages, and I put them, with their intents, under the customer message. Same Haiku, same system prompt, one call, all 200 messages:
+
+```text
+correct: 187 (93.5%), invalid after retry: 1, errors: 0, extra attempts: 2, api retries inside CLI: 0
+Claude Code reported cost: USD 0.0421 total, USD 0.2104 per 1,000 items, USD 0.00023 per correct answer
+seconds per item (wall, incl. CLI start): mean 2.23, p50 2.08, p90 2.88, max 4.47
+```
+
+187 of 200, the best result of the whole ladder, from the cheapest model. 11 of its 13 failures were also Opus failures, like "How long does a transfer take to be confirmed?" (`pending_transfer`; every step said `transfer_timing`).
+
+## All steps side by side
+
+| Step                           | Right of 200 | Right of first 30 | Reported cost per 1,000 messages | Cost per correct answer | Time per message |
+| ------------------------------ | ------------ | ----------------- | -------------------------------- | ----------------------- | ---------------- |
+| 1. Keyword rules               | 103          | 11                | none                             | none                    | 0.04 ms          |
+| 2. Search (BM25, 5 neighbours) | 171          | 25                | none                             | none                    | about 1 ms       |
+| 3. Haiku 5.5, intent list      | 134          | 20                | USD 0.15                         | USD 0.00023             | 3.2 s            |
+| 4. Sonnet 5.5, intent list     | 160          | 22                | USD 2.65                         | USD 0.0033              | 2.7 s            |
+| 4. Opus 5.5, intent list       | 175          | 26                | USD 5.88                         | USD 0.0067              | 3.2 s            |
+| 5. Haiku agent with Grep       | not run      | 24                | USD 0.92                         | USD 0.0012              | 3.9 s            |
+| 5. Sonnet agent with Grep      | not run      | 25                | USD 12.20                        | USD 0.0146              | 5.6 s            |
+| 5. Haiku with 10 examples      | 187          | 25                | USD 0.21                         | USD 0.00023             | 2.2 s            |
+
+The costs are what Claude Code reported for my runs, at list prices. They include Claude Code's own text in each call, so a direct API call would cost less. The times include starting the CLI for every message, which was about half of each call for the one-call steps, and less for the agents.
+
+## What I take from this
+
+Where was a simple step good enough? For this task, search was good enough to be the baseline: 85.5% for no money, and every model result should be compared with it. When its five neighbours all agreed, which happened for 81 of the 200 messages, it was right 81 times. Rules were not good enough.
+
+Where was it not enough? A model without examples did not know the dataset's conventions, and a bigger model only partly fixed that, at a higher price. The agent found examples, but its search tool had its own blind spots.
+
+The winner was the combination: search finds the examples, a small model reads them and decides. For this task, that is the measured place to start. A search-only answer is a natural fallback when the model fails the check, but I did not test that.
+
+To redo this on your own task, label a few hundred real messages, keep them out of everything you tune, and run the cheap steps first.
+
+The limits: 200 messages from one public dataset, one run per step, 30 messages for the agents, one laptop, Claude Code 2.1.325 with Haiku 5.5, Sonnet 5.5 and Opus 5.5 at effort `medium`, on November 14 and 15, 2026. Some labels in banking77 are debatable, so a few "failures" are really disagreements.
