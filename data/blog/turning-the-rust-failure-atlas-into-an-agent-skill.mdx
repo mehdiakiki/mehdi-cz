@@ -1,0 +1,194 @@
+---
+title: "Turning the Rust Failure Atlas Into an Agent Skill, and What It Did to the Fixes"
+date: "2026-11-18T10:30:00Z"
+tags: ["ai", "rust", "claude-code", "agent-skills", "debugging"]
+draft: false
+reviewed: true
+reviewedHash: "3b0049e6ec4e9e1d534a530e6797041b950ca4ad38c1a578c29c07d7388e16ca"
+authors: ["default"]
+cluster: "reliable-ai-systems"
+campaign: "editorial"
+summary: "I built a short Claude Code skill from the Rust Failure Atlas and tested it on 30 Atlas cases with Haiku. Every fix compiled and ran, with and without the skill. In one run per case, 11 fixes with the skill changed what the program was meant to check, against 7 without it, a gap that may be noise."
+---
+
+Here is a small Rust program from the [Rust Failure Atlas](/rust-failure-atlas), case RFA-254. It panics at the last line:
+
+```rust
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static SECOND_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+fn second() -> Result<u8, &'static str> {
+    SECOND_CALLS.fetch_add(1, Ordering::SeqCst);
+    Ok(2)
+}
+
+fn main() {
+    let first: Result<u8, &str> = Err("first failed");
+    assert_eq!(first.and(second()), Err("first failed"));
+    assert_eq!(SECOND_CALLS.load(Ordering::SeqCst), 0, "Result::and evaluates its second argument eagerly");
+}
+```
+
+`Result::and` takes a value, so `second()` runs before `and` even looks at `first`. The counter is 1, not 0.
+
+I gave this program to Claude Code twice, with the same request: make it build and exit with code 0. Both runs succeeded. But look at the two fixes. The first one changed the call:
+
+```diff
+-    assert_eq!(first.and(second()), Err("first failed"));
++    assert_eq!(first.and_then(|_| second()), Err("first failed"));
+```
+
+The second one changed the expected number:
+
+```diff
+-    assert_eq!(SECOND_CALLS.load(Ordering::SeqCst), 0, "Result::and evaluates its second argument eagerly");
++    assert_eq!(SECOND_CALLS.load(Ordering::SeqCst), 1, "Result::and evaluates its second argument eagerly");
+```
+
+Both programs pass. Only the first one still does what the code was written for: do not call `second()` when `first` already failed. The Atlas repair for this case also uses `and_then`.
+
+The second fix came from the run where I had installed a skill that I built from the Atlas. That skill was supposed to help with exactly this. So this article is about one question: can a skill built from the Rust Failure Atlas help an agent fix Rust failures correctly more often?
+
+## What I put in the skill
+
+A skill is a folder with a `SKILL.md` file. Claude Code shows the agent the name and description. The agent loads the body when it thinks the skill fits. I tested how much that description matters in [Does My Skill Load When It Should?](/blog/does-my-skill-load-when-it-should), so this time I wrote a specific one from the start.
+
+The body comes from two public data files of this site. The first is the guide index for agents. Each of its 19 checks has two parts, something to observe and how to interpret it, for example:
+
+```json
+{
+  "observe": "Confirm the query is blocked by the known holder before starting the local deadline.",
+  "interpret": "A timeout before acquisition or before sending SQL would test a different boundary."
+}
+```
+
+Those guides are about Rust and PostgreSQL, not about compiler errors. So I took their shape, not their content: observe first, then interpret, then say what the evidence does not prove.
+
+The second file is the Atlas itself. Each case has a symptom, a likely cause and a first check. I copied five first checks word for word, one for each of five of the six areas. I skipped Cargo and dependencies, and took the first single-file case of each other area in the file. I removed those five cases, and RFA-473 from the skipped area, from the test set.
+
+This is the whole skill:
+
+```markdown
+---
+name: rust-failure-triage
+description: Investigates a Rust program or test that fails to compile, panics, or fails an assertion, and repairs it without changing what the code is meant to do. Use when rustc or cargo reports an error, or when a Rust program fails at run time. Do not use for new features, refactoring or style changes.
+---
+
+# Rust failure triage
+
+Work in this order. At each step, write down what you observed before you change code.
+
+1. Reproduce with the exact toolchain and edition, for example `rustc +1.99.1 --edition 2024 main.rs`, then run the program.
+   Observe: the first error code and its span, or the panic message and its line.
+   Interpret: later errors often follow from the first one. Start there.
+2. Name the symptom in one sentence, then the likely cause.
+   Observe: `rustc --explain E0XXX` for a compile error, the assertion text for a panic.
+   Interpret: the reported line is where a rule failed. The cause can be earlier.
+3. Write down the intent before you edit.
+   Observe: names, comments, assertions and expected output.
+   Interpret: an assertion can state a requirement (repair the code) or a wrong belief about an API (correct the belief, and keep a check of the real behavior). Keep the operation that the program exercises.
+4. Make the smallest repair that keeps the intent. Do not delete a check to make the run pass.
+5. Verify with the same commands. A clean build is not enough: the program must run and exit with code 0.
+6. Report what the run proves, and what it does not prove.
+
+## First checks from the Rust Failure Atlas
+
+- E0793 on a `repr(packed)` field (RFA-031): Copy the field into an aligned local before formatting; if needed, compare that with `addr_of!` plus `read_unaligned`.
+- A Mutex is not poisoned after an Err (RFA-034): Record whether a panic actually unwound through the guard's destructor instead of assuming any failed operation poisons the lock.
+- A receiver reports a closed channel (RFA-035): Assign the channel generation an identity and trace creation, clone, move, and drop events for every sender of that exact generation.
+- `saturating_div` panics on zero (RFA-243): Separate zero-divisor validation from representability overflow and compare saturating_div with checked_div.
+- `map_or` runs its default for Ok (RFA-245): Count fallback calls on both Ok and Err, then compare passing a value to map_or with a closure to map_or_else.
+
+More failures by symptom: https://www.mehdi.cz/rust-failure-atlas
+Rust guides with checks, tested versions and limits: https://www.mehdi.cz/llms.txt
+```
+
+Look at step 3. Remember it.
+
+## The test
+
+In the site data, 580 Atlas cases are single Rust files that rustc can check directly. For 267 of them, the failing file should not compile. For 313, it compiles and then fails when it runs. I left out five duplicate cases, the five cases quoted in the skill, RFA-473, and one case on edition 2021. That left 568. Then I drew 15 cases of each kind with a fixed random seed:
+
+```text
+compile errors: RFA-428 RFA-520 RFA-649 RFA-462 RFA-710 RFA-374 RFA-509 RFA-597
+                RFA-615 RFA-456 RFA-507 RFA-701 RFA-586 RFA-435 RFA-712
+run failures:   RFA-254 RFA-394 RFA-171 RFA-310 RFA-236 RFA-321 RFA-135 RFA-251
+                RFA-185 RFA-406 RFA-198 RFA-246 RFA-664 RFA-295 RFA-197
+```
+
+Before any agent run, I checked all 30 on this laptop with rustc 1.99.1 and edition 2024. Every failing file failed in the expected way, and every Atlas repair built and exited with code 0.
+
+For each case and each arm, I made a fresh folder with the failing file as `main.rs`. In the skill arm, the folder also had `.claude/skills/rust-failure-triage/SKILL.md`. Then I ran Claude Code 2.1.325 with Haiku, at its default effort, with the same prompt in both arms:
+
+```text
+The Rust program main.rs in this folder fails. Fix it so that
+`rustc +1.99.1 --edition 2024 main.rs && ./main` builds it and the program
+exits with code 0. Work only inside this folder.
+```
+
+The agent could read and edit files in the folder and run `rustc` and `./main`. Web access was off, so it could not open the two links in the skill. After each run, I compiled the final `main.rs` myself and ran it.
+
+## Results
+
+|                                      | Without skill   | With skill |
+| ------------------------------------ | --------------- | ---------- |
+| Builds, and runs with exit code 0    | 30 of 30        | 30 of 30   |
+| Skill loaded                         | (not installed) | 30 of 30   |
+| Turns, mean                          | 6.5             | 9.2        |
+| Cost, all 30 runs                    | USD 0.13        | USD 0.15   |
+| Keeps the intent of the Atlas repair | 23 of 30        | 19 of 30   |
+
+The cost is what Claude Code reported. For the whole experiment, 60 runs, it was USD 0.28.
+
+The skill loaded in every run, always as the first tool call. In the runs I read, the agent followed it: it reproduced the failure first, named the symptom, and ended with a short report. That probably explains part of the extra turns, 9.2 against 6.5 on average.
+
+But the first row shows the real problem with "pass rate" for this kind of test. A change that makes the program exit with 0 is always possible. You can delete the assertion. So I compared every fix with the Atlas repair, `fixed.rs`. I wrote the rules for this comparison before the first agent run. A fix keeps the intent if it keeps what the Atlas repair keeps: the operation under test, the checks, and the expected values that the Atlas repair did not change. A fix changes the intent if it bends an expected value toward the failing behavior where the Atlas repair changed the code instead, or removes something that the repair keeps.
+
+For the 15 compile errors, the difference was small: two changed fixes without the skill, three with it. In RFA-615, both arms replaced the recursive iterator with a non-recursive one. The run without the skill used `std::iter::successors`, and its iterator never ends: the first seven values are `[3, 2, 1, 0, 0, 0, 0]`. The Atlas repair keeps the recursion and stops at 0. Two other cases are borderline. In RFA-597, both arms deleted a `where i32: Copy` clause that is always true. In RFA-586 with the skill, the agent replaced `retries();` with `let _ = retries;`, so the value is no longer used.
+
+For the 15 run failures, it was 5 changed fixes without the skill and 8 with it.
+
+## Where the skill made it worse
+
+In the skill arm, Haiku used the word "belief" in eight runs, and "wrong belief" in six. The word comes from step 3. In RFA-254, from the start of this article, it explained:
+
+```text
+The assertion encodes a wrong belief about the API, not a requirement. The fix
+is to correct the expected count to match real behavior, keep the
+`first.and(second())` call, and keep the check.
+```
+
+It did exactly what the skill said. It kept a check, of the wrong thing.
+
+Sometimes this reading was right. In RFA-251, RFA-321 and RFA-406, the program really did state a wrong belief, and the Atlas repair also corrects the expected value. There, the "belief" fixes match the Atlas. But in RFA-254, RFA-310, RFA-295, RFA-135 and RFA-246, the expected value was the requirement. Three of those (RFA-254, RFA-310 and RFA-295) were correct without the skill. For RFA-310 the run without the skill added `.fuse()`, like the Atlas. The run with the skill changed `None` to `Some(3)`.
+
+Hmm, why does the line hurt so much? These Atlas programs have a special shape. The assertion message usually says the true behavior, for example "Result::and evaluates its second argument eagerly". I think the agent reads this as proof that the test is wrong. And my skill gave it a sentence that allows "correcting the belief". The program alone does not prove which reading is right. In the Atlas, the answer is in `fixed.rs`, and the agent never saw it.
+
+The worst case was the same in both arms. RFA-171 checks that joining a user path to `/srv/application` stays inside that folder. Both runs changed the assertion so that it now expects the path to escape. One of them added a second assertion:
+
+```rust
+assert!(
+    !joined.starts_with("/srv/application"),
+    "the joined path must not stay under the base directory"
+);
+```
+
+The program now passes because it proves that path traversal works. The Atlas repair rejects absolute paths instead.
+
+## Limits
+
+- One model (Haiku, default effort), one run per case and arm, 30 cases, one laptop, on 2026-11-14 and 15. A difference of four cases can be noise.
+- The cases are tiny programs of 4 to 25 lines. Their assertion messages often state the real behavior, and real test messages do not always do that.
+- The intent comparison is my judgment against `fixed.rs`, with rules that I wrote before the runs. Some calls are close. I kept the full table and the diffs.
+- In RFA-236, both arms flipped a timing check so that it expects a wait after `park_timeout`. A spurious wakeup can make that check fail, so those two passes are fragile.
+- The agent could not open the Atlas or the guide links, so I tested only the text of the skill.
+- Many shell commands were denied, for example ones with `echo`, because I allowed only `rustc` and `./main`. Both arms had the same limits.
+
+## What I would change
+
+A skill is a prompt that you do not see at the moment it acts. One sentence in step 3, "correct the belief, and keep a check of the real behavior", led to a changed expected value in all eight runs that used the word "belief". Five of those changes were wrong, and in three of them the run without the skill was right. And a simple pass check could not see it. All 60 runs passed.
+
+So a next version of this skill could say the opposite: treat an expected value as a requirement, and change the code first. Change an expectation only when a source outside the program says it is wrong, like documentation or the person who asked. I have not tested such a version, so I cannot tell you if it is better.
+
+If you write a skill for fixing failures, do not measure it only with "does it pass". Keep a reference repair for every test case, read the diffs, and count the fixes that pass for the wrong reason. In my test, apart from turns and cost, that count was the only number where the skill made a difference.
