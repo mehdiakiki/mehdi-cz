@@ -358,6 +358,7 @@ const articleSlugsByTheme = {
     "the-readme-asked-for-a-different-job",
     "who-writes-the-instructions-your-coding-agent-follows",
     "what-claude-code-loads-agents-md-claude-md-and-nested-files",
+    "when-an-agent-rule-needs-a-hook-not-a-sentence",
   ],
   "derived-state": [
     "caching-ai-results-requires-an-identity-and-freshness-model",
@@ -492,6 +493,8 @@ const articleSlugsByTheme = {
     "following-one-slow-request-through-an-app",
     "does-this-search-need-a-vector-database",
     "what-rtk-really-saved-in-my-claude-code-setup",
+    "auditing-an-agent-instruction-file-line-by-line",
+    "moving-the-rust-failure-atlas-to-rust-1-100",
   ],
 };
 
