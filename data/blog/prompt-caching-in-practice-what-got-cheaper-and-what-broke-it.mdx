@@ -1,0 +1,146 @@
+---
+title: "Prompt Caching in Practice: What Got Cheaper and What Broke It"
+date: "2026-11-22T10:30:00Z"
+tags: ["ai", "prompt-caching", "claude-code", "llm-cost"]
+draft: false
+reviewed: true
+reviewedHash: "05da4e701c8f00ec39252a7bd8b1babc73f94a1f1bc486aaddc6e9a145f94257"
+authors: ["default"]
+cluster: "reliable-ai-systems"
+campaign: "editorial"
+summary: "I sent a constructed 6,900-token support policy with 18 questions through claude -p and read the cache fields of every call. Caching cut the reported cost from 0.025 to 0.011 USD. One timestamp inside the policy raised it to 0.041 USD, more than with no cache at all."
+---
+
+Imagine a support assistant that must follow a long policy. The model does not remember the previous request, so every customer question goes out together with the full policy again. In my test, the policy was about 6,900 tokens and a question was one short sentence.
+
+Prompt caching is made for this case. The provider keeps the processed start of a request for a while. When the next request starts with exactly the same text, that part is read from the cache, at a much lower price.
+
+I wanted to see this in real numbers, and then break it on purpose. So on November 14 I made an experiment with `claude -p`, the non-interactive mode of Claude Code.
+
+## The setup
+
+The policy is constructed: a support policy for a home goods store that does not exist, with return windows, refund times, shipping prices and warranty tables. It has 3,529 words. I gave it to the model with `--append-system-prompt`, which adds my text after Claude Code's own system prompt.
+
+A small script asked 18 short questions, one `claude -p` process per question, on Haiku 5.5 (`--model haiku`), with no tools (`--tools ""`) and `--setting-sources project,local`, so my personal hooks stayed out. With `--output-format json`, each call returns its token usage and `total_cost_usd`, the cost that Claude Code computes at list price.
+
+## Four numbers to read
+
+This is the usage part of the first call, copied from the JSON output:
+
+```json
+"total_cost_usd": 0.00246398,
+"usage": {
+  "input_tokens": 2,
+  "cache_creation_input_tokens": 10026,
+  "cache_read_input_tokens": 658,
+  "output_tokens": 904,
+  "cache_creation": {
+    "ephemeral_1h_input_tokens": 10026,
+    "ephemeral_5m_input_tokens": 0
+  }
+}
+```
+
+And this is the second call, with a different question:
+
+```json
+"total_cost_usd": 0.00037542,
+"usage": {
+  "input_tokens": 2,
+  "cache_creation_input_tokens": 621,
+  "cache_read_input_tokens": 10052,
+  "output_tokens": 301,
+  "cache_creation": {
+    "ephemeral_1h_input_tokens": 621,
+    "ephemeral_5m_input_tokens": 0
+  }
+}
+```
+
+`cache_read_input_tokens` were read from the cache, which is the cheap part. `cache_creation_input_tokens` were written to the cache, which costs more than normal input. `input_tokens` are the tokens after the last cache point, here only 2. And `cache_creation` says which cache lifetime the write used. Keep that one in mind.
+
+[Anthropic's prompt caching documentation](https://platform.claude.com/docs/en/build-with-claude/prompt-caching) gives the total as `total_input_tokens = cache_read_input_tokens + cache_creation_input_tokens + input_tokens`. So the second call had 10,675 input tokens, and 10,052 came from the cache. I call this the read share: 94 percent. The cost fell from 0.00246 to 0.00038 USD. For Haiku 5.5 the same page lists 0.10 USD per million normal input tokens, 0.20 USD for a one-hour cache write, and 0.01 USD for a cache read.
+
+## Five ways to send the same policy
+
+Then I changed one thing at a time. Each line is 18 calls on Haiku 5.5:
+
+| What I changed                                         | Read share, calls 2 to 18 | Average cost per call (USD) | Cost of all 18 calls (USD) |
+| ------------------------------------------------------ | ------------------------- | --------------------------- | -------------------------- |
+| Nothing, the same policy every time                    | 94.1%                     | 0.00059                     | 0.0107                     |
+| A timestamp line at the start of my appended text      | 6.1%                      | 0.00226                     | 0.0407                     |
+| The same timestamp line at the end of my appended text | 6.1%                      | 0.00226                     | 0.0406                     |
+| The timestamp in the question instead                  | 93.9%                     | 0.00050                     | 0.0090                     |
+| Caching turned off with `DISABLE_PROMPT_CACHING=1`     | 0%                        | 0.00138                     | 0.0248                     |
+
+The timestamp line was `Current time:` with the UTC date and time, down to the millisecond, so it was new on every call, like the time many apps add to their prompts. The fourth line is a bit cheaper than the first only because its first call found the policy already in the cache.
+
+The median time to the first token stayed between 3.2 and 3.8 seconds on every line, so caching did not change speed in a way I could see.
+
+## The end of the text was not safe either
+
+A timestamp at the start breaks the cache. That is easy to see. But the same line at the end broke it too. Hmm, why? The 6,900 tokens before the last line did not change.
+
+The documentation explains it. A cache entry is written at a cache breakpoint, and "Because the hash is cumulative, covering everything up to and including the breakpoint, changing any block at or before the breakpoint produces a different hash on the next request." The system also "does not write entries for any earlier position."
+
+So the right question is not "is the changing part at the end of my text?" but "is it before the cache point?". My reading of the numbers: the 10,052 tokens read are the whole system prompt, and the 621 written are the first message. My appended text sits inside the system prompt, so one new line at its end gives a new hash for all of it. Only 658 tokens were still read. They come before my text, so they are probably the start of Claude Code's own prompt, with a cache point of their own.
+
+OK, now it makes sense. It is the same problem as [a timestamp in a dependency cache key](/blog/no-timestamp-in-dependency-cache-key). And the fix follows: in the fourth line, the timestamp went into the question, after the system prompt, and the read share stayed at 94 percent.
+
+There is a second fix, for one flag only. The [Claude Code CLI reference](https://code.claude.com/docs/en/cli-reference) says that with `--system-prompt` you can add a line containing only `__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__`, and Claude Code splits the prompt there, "so the part above it stays cached while the part below changes". I tested policy, marker line and timestamp, 6 calls each way. With `--system-prompt`, calls 2 to 6 read 6,884 tokens from the cache. With `--append-system-prompt`, which the documentation does not mention here, every call wrote about 10,070 tokens again.
+
+## A broken cache costs more than no cache
+
+With the timestamp inside the policy, a call cost 0.00226 USD on average. With caching turned off, 0.00138 USD.
+
+The reason is the write price. Claude Code wrote every entry with the one-hour lifetime, and the documentation says: "Cache write tokens with a 1-hour TTL are 2 times the base input tokens price." A broken cache writes almost the whole prefix on every call and never reads it back.
+
+A five-minute write costs 1.25 times the input price. From these multipliers, a one-hour write pays off only when the entry is read at least twice, a five-minute write after one read.
+
+## The five minutes that were one hour
+
+The documentation says: "By default, the cache has a 5-minute lifetime." But my JSON showed one-hour writes everywhere. Claude Code's [page about prompt caching](https://code.claude.com/docs/en/prompt-caching) explains it: on a Claude subscription, within the plan's usage, it requests the one-hour lifetime for the main conversation, and `-p` runs count as main conversation. With an API key, the default is five minutes. My laptop uses a subscription.
+
+So I tested both. I made two new copies of the policy, each with one extra line at the top, so neither was cached yet. For one copy I set `FORCE_PROMPT_CACHING_5M=1`. Each copy got two calls, then my script waited 7 minutes and asked once more. The five-minute copy read only 658 tokens after the pause and wrote 10,032 again, for 0.00161 USD. The one-hour copy read 10,066 tokens, for 0.00060 USD.
+
+Both behaved as documented.
+
+## Switching the model starts almost from zero
+
+Next I asked the first question to Sonnet 5.5, with the same policy. The first Sonnet call wrote 9,202 tokens and cost 0.041 USD. The second read 9,249 tokens and cost 0.0039 USD.
+
+As the Claude Code page says, "each model has its own cache". A fallback model or a router pays its own first write.
+
+## How to check caching in your own app
+
+The Messages API returns the same fields in `usage`, so these checks work with or without Claude Code:
+
+- Log the three token counts for every request, with the model and a version of your prompt.
+- Compute the read share. A sudden drop means that something changed in the prefix. If you [estimate the monthly cost of an AI feature](/blog/estimate-the-monthly-cost-of-an-ai-feature-before-building-it), use the share you measured, not the best case.
+- Put everything that changes per request after the last cache point: the time, the user name, a request ID. In `claude -p`, that is the prompt argument, not the system prompt.
+- Read `cache_creation`. One-hour writes are only worth it when the gaps between your requests are longer than five minutes and shorter than an hour.
+- Watch writes that nobody reads. Each of my single-question calls wrote about 620 tokens of the first message to the cache. In single-question calls, only an identical question can read them later. At the one-hour price that cost about 0.00012 USD per call, a bit more than reading the 10,052 cached tokens.
+- After every prompt change, send the same request twice and check that the second one reads from the cache. This is the check I ran:
+
+```bash
+for i in 1 2; do
+  claude -p --model haiku --output-format json --tools "" \
+    --setting-sources project,local --no-session-persistence --max-budget-usd 0.10 \
+    --append-system-prompt-file policy.md "Can I return a lamp after 20 days?" < /dev/null \
+  | tee "runs/jqdemo/demo2_call$i.json" \
+  | jq -c '{read: .usage.cache_read_input_tokens, write: .usage.cache_creation_input_tokens, input: .usage.input_tokens, cost: .total_cost_usd}'
+done
+```
+
+```text
+{"read":10052,"write":620,"input":2,"cost":0.00058372}
+{"read":10672,"write":0,"input":2,"cost":0.00031242}
+```
+
+Note the `< /dev/null`. From a wrapper that kept stdin open, Claude Code waited 3 seconds, printed `Warning: no stdin data received in 3s, proceeding without it`, and sent 14,466 tokens instead of 10,670. `sleep 10 | claude -p ...` did the same. I did not find out what the extra tokens are, but the same command sent a bigger request when only its stdin changed.
+
+## Limits
+
+One laptop, November 14, 2026, between 22:35 and 23:16 UTC, Claude Code 2.1.325 on a Claude subscription. Haiku 5.5 for almost every call, 2 calls on Sonnet 5.5. 18 calls per line of the table, 6 per marker test, 3 per lifetime copy. The costs are Claude Code's reported list-price costs, not a bill. The policy and questions are constructed, and a long conversation behaves differently, because each turn can read the turns before it.
+
+All the caching runs cost about 0.20 USD of reported cost. After your next prompt change, look at `cache_read_input_tokens`. The answers will not tell you that the cache broke.

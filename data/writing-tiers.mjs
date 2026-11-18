@@ -505,6 +505,8 @@ const articleSlugsByTheme = {
     "do-you-need-a-frontier-model-to-fix-a-rust-compile-error",
     "cost-per-completed-task-for-ai-models",
     "try-one-model-at-lower-effort-before-building-a-router",
+    "prompt-caching-in-practice-what-got-cheaper-and-what-broke-it",
+    "what-breaks-when-you-change-the-model-behind-an-ai-feature",
   ],
 };
 
