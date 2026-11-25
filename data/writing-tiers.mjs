@@ -508,6 +508,7 @@ const articleSlugsByTheme = {
     "prompt-caching-in-practice-what-got-cheaper-and-what-broke-it",
     "what-breaks-when-you-change-the-model-behind-an-ai-feature",
     "the-full-cost-of-an-agent-written-pull-request",
+    "when-a-local-model-is-enough-and-when-an-api-model-is-cheaper",
   ],
 };
 
